@@ -1,0 +1,649 @@
+# vTen Kernel Abstraction & DSL Operations
+
+**Version 0.4.2 — March 2026**
+**참조 모델: `00_data_models.md` (Tensor, Kernel, CompositeKernel, OpKind, register())**
+**소스: 메인 스펙 §3-5, §10 + 서플리먼트 §18 (errata)**
+
+---
+
+## Table of Contents
+
+1. [RTL Interface Specification (kernel_spec.yaml)](#1-rtl-interface-specification)
+2. [Kernel Class](#2-kernel-class)
+3. [DSL Operations](#3-dsl-operations)
+4. [Kernel Composition](#4-kernel-composition)
+
+---
+
+## 1. RTL Interface Specification (kernel_spec.yaml)
+
+### 1.1 Zero RTL Intrusion
+
+모든 의미론적 매핑(텐서↔포트 바인딩, dtype, 패킹)은 `kernel_spec.yaml`에 존재한다. RTL 소스는 수정하지 않는다. CLI의 `vten spec --detect rtl/top.sv`가 YAML 스켈레톤을 자동 생성하며, 사용자는 의미론 정보만 채운다.
+
+### 1.2 kernel_spec.yaml 전체 예시
+
+```yaml
+kernel: conv3d_top
+rtl_top: rtl/conv3d_top.sv
+
+parameters:
+  C: "${C}"                      # project/runtime 스코프에서 해결
+  H: 32
+  K: 128
+
+memory_regions:
+  ddr:
+    base: 0x0000_0000
+    size: 0x1_0000_0000          # 4GB
+    alignment: 4096              # AXI burst 정렬
+
+interfaces:
+  ifm_stream:
+    rtl_port: s_axis_ifm
+    protocol: axi4_stream
+    tensor: ifm
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first
+
+  data_port:
+    rtl_port: m_axi_data
+    protocol: axi4
+    data_width: 256
+    memory_region: ddr
+    tensors: [ifm, weight, ofm]
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      alignment: packed
+
+  ctrl:
+    rtl_port: s_axilite_ctrl
+    protocol: axi4_lite
+    registers:
+      - name: start
+        offset: 0x00
+        fields: { go: "0:0" }
+      - name: status
+        offset: 0x04
+        fields: { done: "0:0", busy: "1:1" }
+      - name: ifm_base_lo
+        offset: 0x10
+        auto_bind: { tensor: ifm, value: address, bits: "31:0" }
+      - name: ifm_base_hi
+        offset: 0x14
+        auto_bind: { tensor: ifm, value: address, bits: "63:32" }
+      - name: weight_base_lo
+        offset: 0x18
+        auto_bind: { tensor: weight, value: address, bits: "31:0" }
+      - name: weight_base_hi
+        offset: 0x1C
+        auto_bind: { tensor: weight, value: address, bits: "63:32" }
+      - name: ofm_base_lo
+        offset: 0x20
+        auto_bind: { tensor: ofm, value: address, bits: "31:0" }
+      - name: ofm_base_hi
+        offset: 0x24
+        auto_bind: { tensor: ofm, value: address, bits: "63:32" }
+      - name: transfer_size
+        offset: 0x28
+        auto_bind: { tensor: ifm, value: size_beats }
+      - name: input_ch
+        offset: 0x30
+        auto_bind: { param: "${C}" }
+
+  ofm_hbm:
+    rtl_port: m_axi_ofm
+    protocol: axi4
+    data_width: 256
+    tensor: ofm
+    split:
+      mode: channel_interleave
+      ports:
+        - { name: hbm_ch0, base_addr: 0x00000000 }
+        - { name: hbm_ch1, base_addr: 0x00000000 }
+      interleave:
+        unit: 4096
+```
+
+YAML 필드별 상세 스키마, 파싱 규칙, 검증 로직은 `03_kernel_spec_schema.md` 참조.
+
+### 1.3 Packing Specification
+
+스트림 인터페이스의 비트 레벨 패킹 정의. Runtime 직렬화기가 처리하며 Kernel 클래스에는 투명.
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `element_width` | int (비트) | 각 데이터 원소의 비트 폭 |
+| `elements_per_beat` | int | 버스 비트당 패킹되는 원소 수 |
+| `bit_order` | `lsb_first` \| `msb_first` | 비트 내 배치 순서 |
+| `alignment` | `packed` \| `aligned` | packed: 갭 없음; aligned: 바이트 경계 정렬 |
+| `byte_order` | `little` \| `big` | 직렬화된 비트의 바이트 엔디안 |
+| `mode: custom` | fields 리스트 | 혼합 필드 비트: 각 필드에 이름과 비트 범위 |
+
+예시 — 24비트 버스에 4×6비트 원소, LSB-first:
+
+```yaml
+packing:
+  element_width: 6
+  elements_per_beat: 4
+  bit_order: lsb_first
+```
+
+커스텀 필드(혼합 타입 비트):
+
+```yaml
+packing:
+  mode: custom
+  fields:
+    - { name: data_a, bits: [0, 23] }
+    - { name: data_b, bits: [24, 47] }
+    - { name: valid_mask, bits: [48, 49] }
+    - { name: reserved, bits: [50, 63] }
+```
+
+### 1.4 Multi-Port Split
+
+단일 논리 텐서가 복수 물리 포트(예: HBM 채널)에 분산될 때의 분배 전략. Runtime이 직렬화된 데이터를 자동 분할하고 포트별 별도 IR 커맨드를 생성한다. DSL 사용자는 단일 `push_tensor`/`pull_tensor`만 작성.
+
+- `channel_interleave`: 고정 단위 크기로 라운드 로빈 (예: 4KB 청크)
+- `block_split`: 텐서 차원 또는 바이트 범위 기준 연속 분할
+
+---
+
+## 2. Kernel Class
+
+### 2.1 구조
+
+```python
+from vten import Kernel, Tensor, register
+
+class Conv3DKernel(Kernel):
+    spec = "specs/conv3d_top.yaml"
+
+    # ── 텐서 선언 (사양 역할) ──
+    ifm = Tensor(
+        shape=("${N}", "${C}", "${D}", "${H}", "${W}"),
+        dtype=torch.int8,
+        interface="ifm"
+    )
+    weight = Tensor(
+        shape=("${K}", "${C}", 3, 3, 3),
+        dtype=torch.int8,
+        interface="weight_mem"
+    )
+    ofm = Tensor(
+        shape=("${N}", "${K}", "${D}", "${H}", "${W}"),
+        dtype=torch.int32,
+        interface="ofm_hbm"
+    )
+
+    ctrl = register("ctrl")
+
+    # ── 입력 생성 (자유 형식 Python) ──
+    def generate_inputs(self, seed=None):
+        rng = torch.Generator()
+        if seed is not None:
+            rng.manual_seed(seed)
+        self.ifm.fill_random(generator=rng)
+        self.weight.fill_random(generator=rng)
+
+    # ── Golden reference (자유 형식 Python) ──
+    def forward(self):
+        return F.conv3d(self.ifm.to_float(), self.weight.to_float())
+
+    # ── 커스텀 검증 (선택적 오버라이드) ──
+    def verify(self, hw_output, golden):
+        return torch.allclose(hw_output, golden, atol=1e-2)
+```
+
+### 2.2 Tiling Responsibility
+
+레이아웃 타일링(예: NCDHW → N,C//32,D,H,W,32)은 `generate_inputs()`의 책임이며 직렬화 런타임의 책임이 아니다.
+
+**근거:**
+- 타일링 패턴은 가속기마다 다르며 기능적 참조 모델과 깊이 결합됨
+- 사용자 코드에 유지하면 임의 재배열에 대한 최대 유연성 확보
+- Runtime은 총 원소 수가 선언 형상과 일치하는지만 검증
+
+```python
+def generate_inputs(self, seed=None):
+    raw = torch.randn(self.N, self.C, self.D, self.H, self.W)
+    C2 = 32
+    tiled = raw.reshape(self.N, self.C//C2, C2, self.D, self.H, self.W)
+    tiled = tiled.permute(0, 1, 3, 4, 5, 2).contiguous()
+    self.ifm.data = tiled  # 직렬화기가 타일링된 형태를 수신
+```
+
+### 2.3 Complex Reference Models
+
+다단계 파이프라인, 복잡한 전처리, 데이터셋 기반 입력을 가진 가속기의 경우 Kernel 메서드는 제약 없는 Python이다:
+
+```python
+class ComplexPipelineKernel(Kernel):
+    spec = "specs/pipeline.yaml"
+    ifm = Tensor(...)
+
+    def generate_inputs(self, seed=None):
+        raw = load_from_dataset("imagenet", index=self.test_id)
+        preprocessed = custom_preprocessing(raw)
+        quantized = quantize(preprocessed, bits=8, scale=self.scale)
+        C2 = 32
+        tiled = quantized.reshape(N, C//C2, C2, D, H, W)
+        self.ifm.data = tiled.permute(0,1,3,4,5,2).contiguous()
+
+    def forward(self):
+        x = self.ifm.to_float()
+        x = custom_padding(x, mode='replicate')
+        x = F.conv3d(x, self.weight.to_float())
+        x = batch_norm_reference(x, self.bn_params)
+        return F.relu(x)
+```
+
+---
+
+## 3. DSL Operations
+
+### 3.1 연산 분류
+
+원본 논문의 `write_tensor`/`read_tensor`는 메모리맵 인터페이스에서 모호하다. 가속기가 버스 마스터인 경우 호스트↔메모리 전송과 가속기↔메모리 상호작용을 구분하는 2-레벨 분류를 사용한다.
+
+| 레벨 | 연산 | 의미 | MM (AXI4) 동작 | Stream 동작 |
+|------|------|------|----------------|-------------|
+| L1: Host↔Mem | `load_tensor` | Host → Device Memory | SHM 적재 | N/A |
+| | `store_tensor` | Device Memory → Host | SHM 읽기 | N/A |
+| L2: Accel↔Mem | `push_tensor` | Accel이 텐서 소비 | BFM 슬레이브가 accel 읽기에 응답 | BFM이 데이터 구동 |
+| | `pull_tensor` | Accel이 텐서 생성 | BFM 슬레이브가 accel 쓰기 수신 | BFM이 데이터 캡처 |
+| L3: Control | `write_register` | 레지스터 설정 | AXI-Lite 쓰기 | — |
+| | `read_register` | 레지스터 조회 | AXI-Lite 읽기 | — |
+| | `poll_register` | 조건 충족까지 블록 | AXI-Lite 반복 읽기 | — |
+| | `configure` | auto_bind 전체 레지스터 쓰기 | 모든 auto_bind WRITE_REG | — |
+| | `barrier` | 전역 동기화 펜스 | 모든 진행 중 연산 대기 | — |
+| Shorthand | `send_tensor` | = load + push (자동) | 두 단계 모두 | push만 |
+| | `recv_tensor` | = pull + store (자동) | 두 단계 모두 | pull만 |
+
+### 3.2 Dependency Model
+
+각 연산에는 두 수명주기 이벤트가 있다: **Issue** (DUT에 디스패치)와 **Commit** (DUT 실행 완료).
+
+1. **Sync/Async 모드**: Async는 즉시 디스패치 허용 (Issue_n ≈ Issue_{n+1}). Sync는 직렬 실행 강제 (Commit_n ≺ Issue_{n+1}).
+2. **Issue Dependencies**: 세밀한 제어: Commit_src ≺ Issue_dst. `dep=` 파라미터로 표현.
+3. **Commit Dependencies**: 종료 경계: Commit_dst ≤ Commit_src. `add_commit_dependency()`로 표현.
+4. **Barrier**: 전역 펜스. 이전 모든 연산이 commit된 후에야 후속 issue 가능.
+
+### 3.3 사용 예시: Memory-Mapped Interface
+
+가속기가 AXI 마스터인 경우의 전체 패턴:
+
+```python
+def run(self, ctx, cfg):
+    kernel = ctx.instantiate("conv3d_top", **cfg)
+    kernel.generate_inputs(seed=42)
+
+    # Phase 1: Host → Device Memory
+    l1 = ctx.load_tensor(kernel.ifm)
+    l2 = ctx.load_tensor(kernel.weight)
+
+    # Phase 2: Auto-configure (주소 레지스터, 형상 레지스터, BFM 주소 맵)
+    ctx.configure(kernel)
+
+    # Phase 3: 가속기 시작
+    w0 = ctx.write_register(kernel.ctrl, {"start": 1}, dep=[l1, l2])
+
+    # Phase 4: Accel이 메모리에서 읽고, 계산하고, 결과 기록
+    push1 = ctx.push_tensor(kernel.ifm, dep=w0)
+    push2 = ctx.push_tensor(kernel.weight, dep=w0)
+    pull1 = ctx.pull_tensor(kernel.ofm, dep=[push1, push2])
+
+    # Phase 5: done 대기
+    p1 = ctx.poll_register(kernel.ctrl, "done", dep=w0)
+    pull1.add_commit_dependency(p1)
+
+    # Phase 6: Device Memory → Host + 검증
+    s1 = ctx.store_tensor(kernel.ofm, dep=pull1)
+    ctx.verify(s1, kernel.forward())
+```
+
+### 3.4 사용 예시: Stream Interface (Shorthand)
+
+```python
+def run(self, ctx, cfg):
+    kernel = ctx.instantiate("conv3d_top", **cfg)
+    kernel.generate_inputs(seed=42)
+
+    w0 = ctx.write_register(kernel.ctrl, {"start": 1})
+    push1 = ctx.push_tensor(kernel.ifm, dep=w0)
+    pull1 = ctx.pull_tensor(kernel.ofm, dep=push1)
+    ctx.verify(pull1, kernel.forward())
+```
+
+### 3.5 configure() 동작
+
+`ctx.configure(kernel)`은 다음을 트리거한다:
+
+1. 모든 텐서에 대한 주소 할당 (미할당 시)
+2. 모든 `auto_bind` 레지스터에 대한 WRITE_REG IR 생성
+3. BFM 주소 맵 구축
+
+```python
+def run(self, ctx, cfg):
+    kernel = ctx.instantiate("conv3d_top", **cfg)
+    kernel.generate_inputs(seed=42)
+
+    ctx.load_tensor(kernel.ifm)
+    ctx.load_tensor(kernel.weight)
+    ctx.configure(kernel)       # ← auto_bind 레지스터 여기서 쓰기
+    ctx.write_register(kernel.ctrl, {"start": 1})
+    # ...
+```
+
+주소 강제 설정도 가능:
+
+```python
+kernel.ifm.set_address(0xDEAD_0000)
+ctx.configure(kernel)  # 강제 설정된 주소 사용
+```
+
+### 3.6 auto_bind 값 유형
+
+| 값 | 설명 |
+|----|------|
+| `address` | 텐서의 할당된 물리 주소. `bits`로 64비트 분할 (예: "31:0", "63:32") |
+| `size_bytes` | 직렬화된 총 크기 (바이트) |
+| `size_beats` | 버스 비트 단위 크기 (= size_bytes / (data_width / 8)) |
+| `size_elements` | 총 원소 수 |
+| `param` | 해결된 파라미터 값 (문자열 표현식) |
+| `expr` | 파라미터에 대한 임의 산술 표현식 |
+
+---
+
+## 4. Kernel Composition
+
+### 4.1 문제: Unit Test vs Integration Test
+
+단위 테스트에서는 모든 인터페이스에 BFM이 붙는다. 합성 설계에서는 일부 인터페이스가 BFM 없는 내부 RTL 와이어다.
+
+```
+Unit Test (MACKernel):
+  BFM_ifm ↔ [MAC.ifm_port]      ← BFM 필요
+  BFM_weight ↔ [MAC.weight_port]  ← BFM 필요
+  [MAC.ofm_port] ↔ BFM_ofm      ← BFM 필요
+
+Composed (NPUTop):
+  BFM_ddr ↔ [DMA_ifm] ──wire──→ [MAC.ifm_port]     ← 내부, BFM 없음
+  BFM_ddr ↔ [DMA_weight] ──wire──→ [MAC.weight_port]  ← 내부
+  [MAC.ofm_port] ──wire──→ [DMA_ofm] ↔ BFM_ddr     ← 내부
+```
+
+**핵심:** `connections`는 **이미 존재하는 RTL 내부 와이어**를 서술한다. vTen이 와이어를 생성하지 않으며, 어떤 인터페이스에 BFM이 붙고 어떤 것이 내부인지만 결정한다.
+
+### 4.2 interface_map
+
+`interface_map`은 합성의 핵심 메커니즘이다. 각 서브커널 인터페이스를 세 가지 상태 중 하나로 매핑:
+
+| 매핑 유형 | 구문 | 의미 |
+|-----------|------|------|
+| External | `"top_interface"` | 최상위 인터페이스에 매핑. BFM 생성. |
+| External + Bank | `("top_interface", "bank_name")` | 최상위 인터페이스 + 레지스터 뱅크 오프셋 |
+| Internal | `Internal()` | BFM 없음. RTL 와이어. |
+| Internal + Probe | `Internal(probe=True)` | BFM 없음, 패시브 모니터 부착. |
+
+### 4.3 CompositeKernel 정의
+
+```python
+class DMAKernel(Kernel):
+    spec = "specs/dma.yaml"
+    src = Tensor(shape=("${SIZE}",), dtype=torch.int8, interface="axi_master")
+    dst = Tensor(shape=("${SIZE}",), dtype=torch.int8, interface="stream_out")
+    ctrl = register("ctrl_lite")
+
+    def forward(self):
+        return self.src.data.clone()
+
+class MACKernel(Kernel):
+    spec = "specs/mac.yaml"
+    ifm = Tensor(..., interface="axis_ifm")
+    weight = Tensor(..., interface="axis_weight")
+    ofm = Tensor(..., interface="axis_ofm")
+    ctrl = register("ctrl_lite")
+
+    def forward(self):
+        return F.conv3d(self.ifm.to_float(), self.weight.to_float())
+```
+
+```python
+class NPUTopKernel(CompositeKernel):
+    spec = "specs/npu_top.yaml"
+
+    # ── 서브커널 바인딩 + interface_map ──
+    dma_ifm = DMAKernel.bind(
+        interface_map={
+            "axi_master": "ddr_port",           # External → BFM
+            "stream_out": Internal(),            # Internal → BFM 없음
+            "ctrl_lite": ("ctrl", "dma_ifm"),    # External + 레지스터 뱅크
+        }
+    )
+
+    dma_weight = DMAKernel.bind(
+        interface_map={
+            "axi_master": "ddr_port",           # dma_ifm과 공유
+            "stream_out": Internal(),
+            "ctrl_lite": ("ctrl", "dma_weight"),
+        }
+    )
+
+    mac = MACKernel.bind(
+        interface_map={
+            "axis_ifm": Internal(probe=True),    # Internal + 모니터
+            "axis_weight": Internal(),
+            "axis_ofm": Internal(probe=True),
+            "ctrl_lite": ("ctrl", "mac"),
+        }
+    )
+
+    dma_ofm = DMAKernel.bind(
+        interface_map={
+            "axi_master": "ddr_port",
+            "stream_out": Internal(),
+            "ctrl_lite": ("ctrl", "dma_ofm"),
+        }
+    )
+
+    # ── 최상위 텐서 노출 ──
+    ifm = dma_ifm.src.expose(interface="ddr_port")
+    weight = dma_weight.src.expose(interface="ddr_port")
+    ofm = dma_ofm.dst.expose(interface="ddr_port")
+
+    # ── 내부 연결 (golden 모델 체이닝용) ──
+    connections = [
+        Connect(dma_ifm.dst, mac.ifm),
+        Connect(dma_weight.dst, mac.weight),
+        Connect(mac.ofm, dma_ofm.src),
+    ]
+
+    # ── Golden 모델 ──
+    def forward(self):
+        ifm_loaded = self.dma_ifm.forward()
+        wgt_loaded = self.dma_weight.forward()
+        self.mac.ifm.data = ifm_loaded
+        self.mac.weight.data = wgt_loaded
+        mac_out = self.mac.forward()
+        self.dma_ofm.src.data = mac_out
+        return self.dma_ofm.forward()
+```
+
+### 4.4 connections 역할
+
+`connections`는 RTL 와이어를 **생성하지 않는다**. 목적:
+
+1. **Golden 모델 체이닝**: `forward()` 데이터 흐름 순서 결정
+2. **Probe 포인트**: `Internal(probe=True)` 연결에 패시브 모니터 부착
+3. **문서화**: RTL 내부 구조를 Python으로 서술
+4. **검증**: 런타임이 연결 쌍의 호환 형상/dtype 확인
+
+연결에 중간 변환 함수도 가능:
+
+```python
+connections = [
+    Connect(mac.ofm, dma_ofm.src,
+            transform=lambda x: quantize(x, bits=8)),
+]
+```
+
+### 4.5 Register Bank Offset
+
+복수 서브커널이 하나의 AXI-Lite 인터페이스를 공유할 때, 각각 다른 오프셋 범위를 점유:
+
+```yaml
+# npu_top kernel_spec.yaml
+interfaces:
+  ctrl:
+    rtl_port: s_axilite_ctrl
+    protocol: axi4_lite
+    register_banks:
+      dma_ifm:    { base_offset: 0x000 }
+      dma_weight: { base_offset: 0x100 }
+      mac:        { base_offset: 0x200 }
+      dma_ofm:    { base_offset: 0x300 }
+      global:     { base_offset: 0x400 }
+```
+
+DMAKernel의 오프셋 `0x00` 레지스터 → `dma_ifm` 뱅크에서 `0x000 + 0x00 = 0x000`, `dma_weight` 뱅크에서 `0x100 + 0x00 = 0x100`.
+
+### 4.6 Address Space Unification
+
+복수 서브커널이 같은 최상위 AXI 인터페이스(`"ddr_port"`)에 매핑될 때:
+
+1. 모든 텐서가 **동일 메모리 영역**에서 `AddressAllocator`로 할당
+2. **단일 BFM**이 복수 주소 범위로 생성
+3. 각 서브커널의 `auto_bind` 레지스터가 뱅크 오프셋을 통해 올바른 주소를 받음
+
+```
+ddr_port 메모리 레이아웃:
+  0x0000_0000 ~ 0x0001_FFFF  →  dma_ifm.src (IFM)
+  0x0002_0000 ~ 0x0002_7FFF  →  dma_weight.src (Weight)
+  0x0004_0000 ~ 0x0005_FFFF  →  dma_ofm.dst (OFM)
+
+단일 BFM이 세 범위 모두 서비스.
+```
+
+### 4.7 테스트 레벨에서의 합성
+
+```python
+class TestNPUTop(TestScenario):
+    kernel = "npu_top"
+
+    def run(self, ctx, cfg):
+        npu = ctx.instantiate("npu_top", **cfg)
+        npu.generate_inputs(seed=42)
+
+        l1 = ctx.load_tensor(npu.ifm)
+        l2 = ctx.load_tensor(npu.weight)
+        ctx.configure(npu)
+
+        w0 = ctx.write_register(npu.ctrl, {"start": 1}, dep=[l1, l2])
+
+        push1 = ctx.push_tensor(npu.ifm, dep=w0)
+        push2 = ctx.push_tensor(npu.weight, dep=w0)
+        pull1 = ctx.pull_tensor(npu.ofm, dep=[push1, push2])
+
+        p1 = ctx.poll_register(npu.ctrl, "done", dep=w0)
+        pull1.add_commit_dependency(p1)
+
+        s1 = ctx.store_tensor(npu.ofm, dep=pull1)
+        ctx.verify(s1, npu.forward())
+```
+
+MACKernel 코드는 **수정 없이** NPUTopKernel 내에서 재사용된다.
+
+**참고:** 이 예시는 서플리먼트 §18.3의 errata 해결 결과를 반영한다. Memory-mapped 인터페이스에서도 `push_tensor`/`pull_tensor`를 명시적으로 사용해야 한다 (Interpretation A 채택).
+
+### 4.8 interface_map 검증
+
+빌드 시점에 `InterfaceMapValidator`가 수행하는 검사:
+
+- 모든 서브커널 인터페이스가 매핑되어야 함 (미매핑 인터페이스 불허)
+- External 매핑은 호환 프로토콜이어야 함 (예: AXI4 → AXI4)
+- 메모리 영역 용량이 초과되지 않아야 함
+- 레지스터 뱅크가 겹치지 않아야 함
+- 연결된 텐서(via `connections`)가 호환 원소 수를 가져야 함
+
+### 4.9 Cross-Kernel Parameter Sharing
+
+CompositeKernel에서 상위 파라미터가 서브커널로 전파되며, 명시적 `params=`로 계산된 포워딩 가능:
+
+```python
+class NPUTopKernel(CompositeKernel):
+    dma = DMAKernel.bind(
+        params={"TRANSFER_SIZE": "${N}*${C}*${D}*${H}*${W}"}
+    )
+    mac = MACKernel.bind()
+    # 둘 다 project/runtime 스코프에서 C, D, H, W를 상속
+```
+
+---
+
+## IR Generation Flow (Full Example)
+
+사용자 코드:
+
+```python
+ctx.load_tensor(kernel.ifm)
+ctx.load_tensor(kernel.weight)
+ctx.configure(kernel)
+ctx.write_register(kernel.ctrl, {"start": 1})
+ctx.push_tensor(kernel.ifm)
+ctx.push_tensor(kernel.weight)
+ctx.pull_tensor(kernel.ofm)
+ctx.poll_register(kernel.ctrl, "done")
+ctx.store_tensor(kernel.ofm)
+```
+
+Runtime이 생성하는 IR:
+
+```
+# 주소 할당: ifm @ 0x0, weight @ 0x20000, ofm @ 0x40000
+
+LOAD(buf=0, size=131072)                          # ifm → SHM buf 0
+LOAD(buf=1, size=65536)                            # weight → SHM buf 1
+
+# configure (auto_bind)
+WRITE_REG(offset=0x10, value=0x00000000)           # ifm_base_lo
+WRITE_REG(offset=0x14, value=0x00000000)           # ifm_base_hi
+WRITE_REG(offset=0x18, value=0x00020000)           # weight_base_lo
+WRITE_REG(offset=0x1C, value=0x00000000)           # weight_base_hi
+WRITE_REG(offset=0x20, value=0x00040000)           # ofm_base_lo
+WRITE_REG(offset=0x24, value=0x00000000)           # ofm_base_hi
+WRITE_REG(offset=0x28, value=512)                  # transfer_size
+WRITE_REG(offset=0x30, value=64)                   # input_ch = C
+
+WRITE_REG(offset=0x00, value=0x1)                  # start.go = 1
+
+PUSH(iface=0, buf=0, proto=AXI4, addr=0x0, size=131072, role=SLAVE)
+PUSH(iface=0, buf=1, proto=AXI4, addr=0x20000, size=65536, role=SLAVE)
+
+PULL(iface=0, buf=2, proto=AXI4, addr=0x40000, size=131072, role=SLAVE)
+
+POLL_REG(offset=0x04, mask=0x1, expected=0x1)
+
+STORE(buf=2, size=131072)
+```
+
+BFM 주소 맵:
+
+```
+BFM "data_port" Address Map:
+  0x0000_0000 ~ 0x0001_FFFF  →  SHM buffer 0 (IFM, accel이 읽기)
+  0x0002_0000 ~ 0x0002_7FFF  →  SHM buffer 1 (Weight, accel이 읽기)
+  0x0004_0000 ~ 0x0005_FFFF  →  SHM buffer 2 (OFM, accel이 쓰기)
+
+DUT AXI Read Request: araddr=0x0000_1000, arlen=15
+  → 조회: buffer 0, offset 0x1000
+  → SHM buffer 0에서 16 비트 서빙
+
+DUT AXI Write Request: awaddr=0x0004_0000, awlen=15
+  → 조회: buffer 2, offset 0x0
+  → SHM buffer 2에 wdata 저장
+```
