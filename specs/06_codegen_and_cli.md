@@ -211,10 +211,46 @@ def _generate_bfm_index_mapping(self) -> dict:
     return iface_to_bfm
 ```
 
+### 3.4 Scheduler 파라미터 자동 계산 (v0.5)
+
+SVGenerator는 BFMConfig 배열과 Command 수에서 Scheduler 파라미터를 계산하여
+`tb_top.sv`의 `vten_command_scheduler` 인스턴스에 전달한다.
+기본값(MAX_BFMS=8, MAX_IFACES=16, MAX_CMDS=256)은 하한이며, 대규모 설계에서는 자동 상향된다.
+
+```python
+def _compute_scheduler_params(self, num_commands: int) -> dict:
+    """BFMConfig[]와 Command 수에서 Scheduler 파라미터 계산.
+
+    vten.toml [backend.scheduler] 오버라이드 적용.
+    """
+    max_bfms = max(8, len(self.bfm_configs))
+    max_ifaces = max(16, max(
+        (c.interface_id for c in self.bfm_configs), default=0) + 1)
+    max_cmds = max(256, num_commands)
+
+    # vten.toml override (자동 계산보다 큰 경우에만)
+    sched_cfg = self.config.get("backend", {}).get("scheduler", {})
+    max_bfms = max(max_bfms, sched_cfg.get("max_bfms", 0))
+    max_ifaces = max(max_ifaces, sched_cfg.get("max_ifaces", 0))
+    max_cmds = max(max_cmds, sched_cfg.get("max_cmds", 0))
+
+    return {
+        "max_bfms": max_bfms,
+        "max_ifaces": max_ifaces,
+        "max_cmds": max_cmds,
+    }
+```
+
 **Jinja2 템플릿 주입 (tb_top.sv.j2):**
 
 ```systemverilog
-// Codegen 생성: interface_id → BFM 인덱스 매핑
+// Codegen 생성: Scheduler 파라미터 + interface_id → BFM 인덱스 매핑
+vten_command_scheduler #(
+    .MAX_CMDS({{ max_cmds }}),
+    .MAX_BFMS({{ max_bfms }}),
+    .MAX_IFACES({{ max_ifaces }})
+) scheduler ( ... );
+
 initial begin
     // 기본값: -1 (BFM 없음)
     for (int i = 0; i < {{ max_ifaces }}; i++)
@@ -425,6 +461,11 @@ vivado_path = "/tools/Xilinx/Vivado/2024.1"
 compile_options = ["-timescale", "1ns/1ps"]
 timeout_ms = 0                    # 0 = batch mode (10s default)
 submit_timeout_s = 300
+
+[backend.scheduler]              # OPTIONAL. 자동 계산 값보다 큰 경우에만 적용
+# max_bfms = 48                  # default: max(8, BFM 수)
+# max_ifaces = 48                # default: max(16, interface_id 최대값+1)
+# max_cmds = 512                 # default: max(256, command 수)
 
 [backend.verilator]
 verilator_path = "/usr/bin/verilator"

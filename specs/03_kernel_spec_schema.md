@@ -140,6 +140,7 @@ data_port:
   rtl_port: m_axi_data
   protocol: axi4
   data_width: 256              # REQUIRED. 데이터 버스 폭 (비트)
+  addr_width: 64               # OPTIONAL. 주소 버스 폭 (비트, 기본 64)
   memory_region: ddr           # REQUIRED. 참조 메모리 영역
   tensors: [ifm, weight, ofm]  # 복수 텐서 공유 시 리스트
   # 또는 tensor: ifm           # 단일 텐서
@@ -158,6 +159,7 @@ data_port:
 | `rtl_port` | string | ✓ | — |
 | `protocol` | "axi4" | ✓ | — |
 | `data_width` | int | ✓ | — |
+| `addr_width` | int | — | 64 |
 | `memory_region` | string | ✓ | — |
 | `tensor` 또는 `tensors` | string 또는 list[string] | ✓ | — |
 | `packing` | PackingSpec | ✓ | — |
@@ -173,6 +175,7 @@ data_port:
 ctrl:
   rtl_port: s_axilite_ctrl
   protocol: axi4_lite
+  addr_width: 32               # OPTIONAL. 주소 버스 폭 (비트, 기본 32)
   registers:                   # REQUIRED (register_banks 없을 때)
     - name: start
       offset: 0x00
@@ -192,6 +195,7 @@ ctrl:
 |------|------|------|--------|
 | `rtl_port` | string | ✓ | — |
 | `protocol` | "axi4_lite" | ✓ | — |
+| `addr_width` | int | — | 32 |
 | `registers` | list[RegisterSpec] | ✓ | — |
 | `register_banks` | dict | — | None |
 
@@ -252,6 +256,10 @@ def _validate_packing(self, iface: InterfaceSpec):
     """Packing 유효성 검증."""
     if iface.packing is None:
         return
+
+    # custom mode: 필드 간 비트 겹침 검사 (00_data_models.md §5.1)
+    # 겹치면 ValidationError raise. allow_overlap 옵션 미지원.
+    iface.packing.validate_custom_fields()
 
     bus_width = iface.packing.bus_width  # 계산된 패킹 폭
 

@@ -146,6 +146,10 @@ vten/
         └── tests/
 ```
 
+## Workflow
+
+Implementer / Tester 분리 TDD 워크플로우: [`WORKFLOW.md`](WORKFLOW.md) 참조.
+
 ## Implementation Phases
 
 ```

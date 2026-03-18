@@ -186,7 +186,48 @@ Scheduler ──cmd_valid──► Active Table (queue[$])
               completion ──────► done_valid
 ```
 
-### 2.2 Active Table
+### 2.2 Module Declaration
+
+```systemverilog
+module vten_bfm_axi4 #(
+    parameter DATA_W = 256,
+    parameter ADDR_W = 64
+)(
+    input  logic clk, input logic rst_n,
+    // AXI4 Slave (DUT is master)
+    input  logic [ADDR_W-1:0]   s_araddr,
+    input  logic [7:0]          s_arlen,
+    input  logic [2:0]          s_arsize,
+    input  logic [1:0]          s_arburst,
+    input  logic                s_arvalid,
+    output logic                s_arready,
+    output logic [DATA_W-1:0]   s_rdata,
+    output logic [1:0]          s_rresp,
+    output logic                s_rlast,
+    output logic                s_rvalid,
+    input  logic                s_rready,
+    input  logic [ADDR_W-1:0]   s_awaddr,
+    input  logic [7:0]          s_awlen,
+    input  logic [2:0]          s_awsize,
+    input  logic [1:0]          s_awburst,
+    input  logic                s_awvalid,
+    output logic                s_awready,
+    input  logic [DATA_W-1:0]   s_wdata,
+    input  logic [DATA_W/8-1:0] s_wstrb,
+    input  logic                s_wlast,
+    input  logic                s_wvalid,
+    output logic                s_wready,
+    output logic [1:0]          s_bresp,
+    output logic                s_bvalid,
+    input  logic                s_bready,
+    // Scheduler interface
+    vten_bfm_cmd_if.bfm         cmd_if,
+    // Global cycle counter (from tb_top)
+    input  int                  cycle_count
+);
+```
+
+### 2.3 Active Table
 
 ```systemverilog
 typedef struct {
@@ -227,7 +268,7 @@ assign cmd_if.idle = (active_table.size() == 0)
 > (모듈 선언부에 추가, 이 문서에서는 간결함을 위해 포트 목록 생략).
 > 모든 Stats 기록(`issue_cycle`, `first_active` 등)에 이 포트 값을 사용.
 
-### 2.3 Address Matching
+### 2.4 Address Matching
 
 ```systemverilog
 function automatic int find_entry(logic [ADDR_W-1:0] addr, opcode_t op);
@@ -245,7 +286,22 @@ endfunction
 - DUT read (AR) → `OP_PUSH` 엔트리 매칭
 - DUT write (AW) → `OP_PULL` 엔트리 매칭
 
-### 2.4 Read Path (DUT reads ← BFM serves)
+> **동시 AR/AW 처리 정책 (v0.4.2):**
+>
+> AXI4 BFM은 Read Path와 Write Path를 완전히 독립된 `always_ff` 블록으로 구현한다.
+> 아래 동작은 모두 스펙으로 보장된다:
+>
+> | 항목 | 동작 |
+> |------|------|
+> | AR + AW 동일 사이클 수락 | 허용. `s_arready`와 `s_awready`가 각각 항상 1. |
+> | R-burst + W-burst 동시 in-flight | 허용. `r_active`와 `w_active`는 독립 신호이며 별도 `always_ff` 블록에서 관리. |
+> | `find_entry()` 동일 사이클 동시 호출 | 안전. AR path는 `OP_PUSH`, AW path는 `OP_PULL`만 검색하므로 서로 다른 엔트리를 참조. `active_table` 읽기는 비파괴적. |
+> | `active_table` 엔트리 동시 수정 | 안전. R/W Path는 서로 다른 인덱스(PUSH vs PULL 엔트리)를 수정하므로 충돌 없음. |
+> | `done_queue` 동시 push | 안전. v0.4.1에서 `done_queue`를 도입하여 동일 사이클 복수 완료 시 last-write-wins 손실 문제 해결. |
+>
+> 따라서 AR/AW 동시 처리를 위한 별도의 arbiter나 mutex는 필요하지 않다.
+
+### 2.5 Read Path (DUT reads ← BFM serves)
 
 ```systemverilog
 // AR channel: ideal slave, always accept
@@ -316,7 +372,7 @@ always_ff @(posedge clk) begin
 end
 ```
 
-### 2.5 Write Path (DUT writes → BFM captures)
+### 2.6 Write Path (DUT writes → BFM captures)
 
 ```systemverilog
 // AW channel: ideal slave
@@ -400,7 +456,7 @@ always_ff @(posedge clk) begin
 end
 ```
 
-### 2.6 Completion Tracking
+### 2.7 Completion Tracking
 
 ```systemverilog
 // v0.4.1: check_completion은 done_queue에 push.
@@ -443,7 +499,7 @@ end
 > Done Queue를 통해 복수 완료 이벤트를 순차 보고한다. 1사이클 추가 지연은
 > 수천 사이클 DUT 실행에 비해 무시 가능.
 
-### 2.7 DECERR Error Reporting (v0.4.2)
+### 2.8 DECERR Error Reporting (v0.4.2)
 
 `find_entry()` 주소 매칭 실패 시 DUT에 DECERR 응답을 반환하고, Scheduler에도 에러를 보고한다.
 `BackendErrorCode.ADDR_UNMATCH(1)` 사용 (`00_data_models.md` §10.13).
