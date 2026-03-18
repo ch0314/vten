@@ -88,11 +88,15 @@ ExecutionContext._run_verification()
 ```python
 class ExecutionContext:
     def __init__(self, backend: Backend, project_params: dict):
-        self._ops: list[Operation] = []
+        self._pending_ops: list[Operation] = []
         self._kernels: dict[str, KernelInstance] = {}
         self._backend = backend
         self._project_params = project_params
         self._verifications: list[VerificationTask] = []
+        self._alias_registry: AliasRegistry = AliasRegistry()
+        self._shm_manager: SHMManager = SHMManager()
+        self._last_compiled: CompiledResult | None = None
+        self._last_backend_result: BackendResult | None = None
 
     # ── Kernel Lifecycle ──
 
@@ -310,20 +314,87 @@ class KernelInstance:
         self._verifications.append(VerificationTask(
             op_handle=op_handle, golden=golden))
 
+    # ── Buffer Aliasing ──
+
+    def alias(self, src: TensorRef, dst: TensorRef) -> None:
+        """dst가 src의 SHM 버퍼를 직접 재사용하도록 선언.
+        상세: 01_kernel_and_dsl.md §3.7 참조."""
+        self._alias_registry.register(src, dst)
+
     # ── Execution ──
 
-    def run(self):
+    def run(self) -> 'BatchResult':
+        """Pending Operations를 하나의 Batch로 컴파일 → 제출 → 완료 대기.
+
+        여러 번 호출 가능. 각 호출은 직전 run() 이후 기록된 Operation만
+        컴파일한다. BatchResult를 반환한다 (00_data_models.md §13).
+
+        동작:
+            1. pending ops → 8-stage 파이프라인 컴파일.
+               alias registry를 참조하여 LOAD/STORE 자동 skip.
+            2. Commands → SHM Command Region 직렬화.
+            3. 새 LOAD 버퍼만 SHM Data Region에 기록.
+               이전 Batch에서 유효한 버퍼(alias)는 재기록하지 않음.
+            4. Buffer Descriptor Table 기록 (이번 Batch 버퍼만).
+            5. Control Header에 num_commands, num_buffers 기록.
+            6. host_status = CMD_READY; sem_post(h2b).
+            7. sem_timedwait(b2h, timeout) — Backend 완료 대기.
+            8. Stats Region 읽기 → BatchResult 구성.
+            9. 내부 상태 초기화:
+               - pending_ops = []
+               - cmd_id 카운터 0으로 리셋
+               - Command Region, Stats Region은 stale (다음 run()이 덮어씀)
+               - Data Region은 보존 (cross-Batch alias 지원)
+               - Alias registry 보존 (cross-Batch alias 유효)
+            10. BatchResult 반환.
+
+        후방호환:
+            Single-Invocation 테스트에서 run()을 1회 호출하면
+            기존 동작과 동일. 코드 변경 불필요.
+        """
         engine = RuntimeEngine(
             kernels=self._kernels,
-            ops=self._ops,
+            ops=self._pending_ops,
             project_params=self._project_params,
+            alias_registry=self._alias_registry,
+            shm_manager=self._shm_manager,
         )
         compiled = engine.compile()
-        result = self._backend.submit(
+        backend_result = self._backend.submit(
             shm_image=compiled.shm_image,
             bfm_configs=compiled.bfm_configs,
         )
-        self._run_verification(compiled, result)
+        self._last_compiled = compiled
+        self._last_backend_result = backend_result
+        self._pending_ops = []
+
+        # Deferred verification: run() 전에 등록된 verify() 실행
+        self._run_deferred_verifications(compiled, backend_result)
+
+        return BatchResult(
+            status="DONE",
+            total_cycles=backend_result.stats_total_cycles(),
+            per_command_stats=backend_result.stats,
+        )
+
+    # ── Verification ──
+
+    def verify(self, op_handle, golden):
+        """검증 수행.
+
+        ctx.run() 이전에 호출: deferred VerificationTask로 기록.
+            → run() 종료 시 자동 실행 (후방호환).
+        ctx.run() 이후에 호출: 즉시(eager) 검증 수행.
+            → SHM에서 버퍼 데이터를 읽어 golden과 비교.
+            → VerificationError 시 즉시 raise.
+        """
+        if self._last_compiled is not None:
+            # Eager mode: run() 이후 호출
+            self._verify_immediate(op_handle, golden)
+        else:
+            # Deferred mode: run() 이전 호출 (후방호환)
+            self._verifications.append(VerificationTask(
+                op_handle=op_handle, golden=golden))
 
     # ── Internal ──
 
@@ -338,7 +409,7 @@ class KernelInstance:
             golden=None, verify=False,
             **kwargs,
         )
-        self._ops.append(op)
+        self._pending_ops.append(op)
         return OperationHandle(op)
 
     def _normalize_deps(self, dep):
@@ -346,27 +417,33 @@ class KernelInstance:
         if isinstance(dep, OperationHandle): return [dep]
         return list(dep)
 
-    def _run_verification(self, compiled, result):
-        for task in self._verifications:
-            tensor_name = task.op_handle.op.tensor.name
-            buffer_id = compiled.buffer_ids[tensor_name]
-            raw_bytes = result.read_buffer(buffer_id)
+    def _verify_immediate(self, op_handle, golden):
+        """Eager verification: run() 이후 호출 시 즉시 비교."""
+        tensor_name = op_handle.op.tensor.name
+        buffer_id = self._last_compiled.buffer_ids[tensor_name]
+        raw_bytes = self._last_backend_result.read_buffer(buffer_id)
 
-            exposed = compiled.flattened_view.exposed_tensors[tensor_name]
-            iface = compiled.flattened_view.top_spec.get_interface(
-                exposed.top_interface)
-            deserializer = StreamSerializer(iface.packing)
-            hw_output = deserializer.deserialize(
-                raw_bytes,
-                exposed.origin_tensor._element_count,
-                exposed.origin_tensor._resolved_shape,
+        exposed = self._last_compiled.flattened_view.exposed_tensors[tensor_name]
+        iface = self._last_compiled.flattened_view.top_spec.get_interface(
+            exposed.top_interface)
+        deserializer = StreamSerializer(iface.packing)
+        hw_output = deserializer.deserialize(
+            raw_bytes,
+            exposed.origin_tensor._element_count,
+            exposed.origin_tensor._resolved_shape,
+        )
+        if not self._compare(hw_output, golden, exposed):
+            raise VerificationError(
+                tensor=tensor_name,
+                shape=exposed.origin_tensor._resolved_shape,
+                max_diff=self._max_diff(hw_output, golden),
             )
-            if not self._compare(hw_output, task.golden, exposed):
-                raise VerificationError(
-                    tensor=tensor_name,
-                    shape=exposed.origin_tensor._resolved_shape,
-                    max_diff=self._max_diff(hw_output, task.golden),
-                )
+
+    def _run_deferred_verifications(self, compiled, result):
+        """Deferred verification: run() 전에 등록된 verify() 일괄 실행."""
+        for task in self._verifications:
+            self._verify_immediate(task.op_handle, task.golden)
+        self._verifications.clear()
 ```
 
 ---
@@ -680,13 +757,20 @@ def _serialize_tensors(self, view):
 
 ### 8.2 StreamSerializer
 
+**직렬화 원소 순서: 항상 C-contiguous (row-major)**
+
+`serialize()`는 `tensor_data.flatten()`(PyTorch 기본 = C-contiguous)으로 원소를 순서화한다.
+즉 shape `[N, C, H, W]`일 때 W 축이 가장 빠르게 변한다.
+`deserialize()`도 동일한 순서를 따른다.
+
 ```python
 class StreamSerializer:
     def __init__(self, packing: PackingScheme):
         self.packing = packing
 
     def serialize(self, tensor_data) -> bytes:
-        flat = tensor_data.flatten()
+        """텐서 → 바이트 스트림. 원소 순서: C-contiguous (row-major)."""
+        flat = tensor_data.flatten()  # C-contiguous 보장
         beats = []
         for i in range(0, len(flat), self.packing.elements_per_beat):
             chunk = flat[i:i + self.packing.elements_per_beat]
@@ -708,9 +792,41 @@ class StreamSerializer:
         return beat_val.to_bytes(num_bytes, byteorder=self.packing.byte_order)
 
     def deserialize(self, raw_bytes, num_elements, shape=None):
-        """역방향: 바이트 스트림 → Tensor."""
+        """역방향: 바이트 스트림 → Tensor. 원소 순서: C-contiguous."""
         # 구현: _pack_beat의 역순
         ...
+
+    # ── 디버그 유틸리티 ──────────────────────────────────────────────
+
+    def beat_index_to_coords(self, beat_index: int,
+                             shape: tuple[int, ...]) -> list[tuple[int, ...]]:
+        """beat_index → 해당 beat에 포함된 원소들의 텐서 좌표 목록 반환.
+
+        직렬화 순서는 C-contiguous (row-major).
+        마지막 beat가 elements_per_beat보다 적은 원소를 포함하는 경우
+        실제 원소 수만큼만 반환한다.
+
+        사용 예 (Probe mismatch 로그):
+            coords = serializer.beat_index_to_coords(beat_idx, tensor.shape)
+            # coords = [(0, 5, 0, 0), (0, 5, 0, 1), ...]
+        """
+        elem_start = beat_index * self.packing.elements_per_beat
+        total_elems = math.prod(shape)
+        coords = []
+        for elem_idx in range(elem_start,
+                              min(elem_start + self.packing.elements_per_beat,
+                                  total_elems)):
+            coords.append(_flat_to_coords(elem_idx, shape))
+        return coords
+
+
+def _flat_to_coords(flat_idx: int, shape: tuple[int, ...]) -> tuple[int, ...]:
+    """C-contiguous flat index → 텐서 좌표 (shape 기준 row-major)."""
+    coords = []
+    for dim in reversed(shape):
+        coords.append(flat_idx % dim)
+        flat_idx //= dim
+    return tuple(reversed(coords))
 ```
 
 ### 8.3 MultiPortSerializer
@@ -838,6 +954,19 @@ class AddressAllocator:
 
 **핵심 설계:** 주소 할당은 `exposed_tensors`를 순회한다 (DSL 연산이 아님). Kernel 기반이므로 `configure()`가 모든 텐서 주소에 접근 가능 (R1 근거).
 
+**Alias 텐서의 주소 해결:** alias target 텐서는 별도 주소를 할당받지 않는다. `AddressAllocator.resolve_phys_addr()`에서 alias source의 주소를 반환한다.
+
+```python
+class AddressAllocator:
+    def resolve_phys_addr(self, tensor_path: str,
+                          alias_registry: AliasRegistry) -> int:
+        """alias된 텐서는 source의 phys_addr을 반환."""
+        if alias_registry.is_alias_target(tensor_path):
+            src_path = alias_registry.get_source(tensor_path)
+            return self.resolve_phys_addr(src_path, alias_registry)
+        return self._allocated_addrs[tensor_path]
+```
+
 ---
 
 ## 11. Stage 5: auto_bind & Bank Offset Resolution
@@ -933,12 +1062,21 @@ def _determine_role(self, protocol: Protocol, opcode: OpCode) -> Role:
 
 ```python
 def _allocate_buffer_ids(self, view: FlattenedKernelView) -> dict[str, int]:
-    """exposed_tensors 순회 순서로 buffer_id를 0부터 순차 할당."""
+    """exposed_tensors 순회 순서로 buffer_id를 0부터 순차 할당.
+
+    Alias target 텐서는 source와 동일한 buffer_id를 받는다.
+    해당 버퍼의 direction은 BIDIRECTIONAL로 승격된다.
+    """
     buffer_ids = {}
     next_id = 0
     for name in view.exposed_tensors:
-        buffer_ids[name] = next_id
-        next_id += 1
+        if self._alias_registry.is_alias_target(name):
+            # Alias target: source의 buffer_id 공유
+            src_name = self._alias_registry.get_source(name)
+            buffer_ids[name] = buffer_ids[src_name]
+        else:
+            buffer_ids[name] = next_id
+            next_id += 1
     return buffer_ids
 ```
 
@@ -1143,14 +1281,73 @@ def _lower_configure(self, op, view, next_cmd_id, op_to_cmd_range):
 
 **첫 WRITE_REG만 dep을 갖는 이유:** 후속 WRITE_REG는 같은 AXI-Lite BFM 큐를 대상으로 하여 자연스럽게 직렬화된다.
 
-### 12.6 Shorthand Expansion
+### 12.6 Shorthand Expansion (Alias-Aware)
+
+Shorthand(`send_tensor`, `recv_tensor`)는 alias registry를 참조하여 LOAD/STORE를 자동으로 skip한다. 사용자 DSL 코드 변경 없이 alias 선언만으로 최적화된 Command를 생성한다.
 
 ```python
-def _lower_recv_tensor(self, op, view, next_cmd_id, op_to_cmd_range):
+def _lower_send_tensor(self, op, view, next_cmd_id, op_to_cmd_range):
+    """send_tensor의 alias-aware lowering.
+
+    - alias target (alias(src, t)가 선언됨): PUSH만 생성. LOAD skip.
+      auto-dependency: src의 PULL cmd_id에 issue dep 추가.
+    - alias 아님: LOAD + PUSH 생성 (기존 동작).
+    """
     exposed = view.exposed_tensors[op.tensor.name]
     iface = view.top_spec.get_interface(exposed.top_interface)
     commands = []
     dep_ids = self._resolve_deps(op.dep, op_to_cmd_range)
+
+    is_alias_target = self._alias_registry.is_alias_target(exposed.name)
+
+    # LOAD (alias target이면 skip)
+    if not is_alias_target:
+        load_cmd = Command(
+            op=OpCode.LOAD, cmd_id=next_cmd_id,
+            buffer_id=self._buffer_ids[exposed.name],
+            size=exposed._serialized_size,
+            dep=dep_ids)
+        commands.append(load_cmd)
+        load_id = next_cmd_id
+        next_cmd_id += 1
+        push_dep = [load_id]
+    else:
+        # Auto-dependency: src의 PULL cmd_id에 의존
+        alias_src_name = self._alias_registry.get_source(exposed.name)
+        src_write_cmd_id = self._alias_registry.last_write_cmd_id(alias_src_name)
+        push_dep = dep_ids
+        if src_write_cmd_id is not None:
+            push_dep = list(set(push_dep + [src_write_cmd_id]))
+
+    # PUSH
+    push_cmd = Command(
+        op=OpCode.PUSH, cmd_id=next_cmd_id,
+        interface_id=self._get_iface_id(exposed.top_interface),
+        buffer_id=self._buffer_ids[exposed.name],
+        protocol=iface.protocol,
+        phys_addr=exposed.address or 0,
+        size=exposed._serialized_size,
+        role=self._determine_role(iface.protocol, OpCode.PUSH),
+        dep=push_dep)
+    commands.append(push_cmd)
+    next_cmd_id += 1
+
+    return commands, next_cmd_id
+
+
+def _lower_recv_tensor(self, op, view, next_cmd_id, op_to_cmd_range):
+    """recv_tensor의 alias-aware lowering.
+
+    - alias source (alias(t, dst)가 선언됨): PULL만 생성. STORE skip.
+      데이터는 SHM에 남아서 downstream consumer가 사용.
+    - alias 아님: PULL + STORE 생성 (기존 동작).
+    """
+    exposed = view.exposed_tensors[op.tensor.name]
+    iface = view.top_spec.get_interface(exposed.top_interface)
+    commands = []
+    dep_ids = self._resolve_deps(op.dep, op_to_cmd_range)
+
+    is_alias_source = self._alias_registry.is_alias_source(exposed.name)
 
     # PULL
     pull_cmd = Command(
@@ -1166,8 +1363,11 @@ def _lower_recv_tensor(self, op, view, next_cmd_id, op_to_cmd_range):
     pull_id = next_cmd_id
     next_cmd_id += 1
 
-    # STORE (메모리맵만)
-    if iface.protocol != Protocol.AXI4S:
+    # PULL cmd_id를 alias registry에 기록 (auto-dependency용)
+    self._alias_registry.record_write_cmd(exposed.name, pull_id)
+
+    # STORE (alias source이면 skip; 메모리맵이 아닌 스트림도 기존대로 skip)
+    if not is_alias_source and iface.protocol != Protocol.AXI4S:
         store_cmd = Command(
             op=OpCode.STORE, cmd_id=next_cmd_id,
             buffer_id=self._buffer_ids[exposed.name],
@@ -1177,6 +1377,10 @@ def _lower_recv_tensor(self, op, view, next_cmd_id, op_to_cmd_range):
 
     return commands, next_cmd_id
 ```
+
+**Cross-Batch alias에서의 auto-dependency:**
+
+`ctx.run()`은 blocking이므로, 이전 Batch의 모든 Command는 이미 완료된 상태. Cross-Batch alias 시 auto-dependency injection은 불필요 — `src_write_cmd_id`가 `None`이면 (이전 Batch에서 완료되었으므로) 의존을 추가하지 않는다. 현재 Batch의 cmd_id 공간과 이전 Batch의 cmd_id 공간은 독립적이다.
 
 ### 12.7 write_register Lowering
 

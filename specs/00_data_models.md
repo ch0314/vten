@@ -1,6 +1,6 @@
 # vTen Shared Data Models
 
-**Version 0.4.2 — March 2026**
+**Version 0.5.0 — March 2026**
 **Role: 모든 스펙 파일의 공유 타입 정의 (Single Source of Truth)**
 
 ---
@@ -8,17 +8,19 @@
 ## Table of Contents
 
 1. [Core Enumerations](#1-core-enumerations)
-2. [Tensor Class](#2-tensor-class)
-3. [Register Handle](#3-register-handle)
-4. [Kernel Base Classes](#4-kernel-base-classes)
-5. [KernelSpec Model (YAML Parse Result)](#5-kernelspec-model)
-6. [FlattenedKernelView & Related Structures](#6-flattenedkernelview--related-structures)
-7. [Operation & OperationHandle (Record Phase)](#7-operation--operationhandle)
-8. [Execution IR: Command](#8-execution-ir-command)
-9. [Binding Table](#9-binding-table)
-10. [SHM Constants & Structures](#10-shm-constants--structures)
-11. [Error Taxonomy](#11-error-taxonomy)
-12. [Compiled Result](#12-compiled-result)
+2. [Terminology Hierarchy](#2-terminology-hierarchy)
+3. [Tensor Class](#3-tensor-class)
+4. [Register Handle](#4-register-handle)
+5. [Kernel Base Classes](#5-kernel-base-classes)
+6. [KernelSpec Model (YAML Parse Result)](#6-kernelspec-model)
+7. [FlattenedKernelView & Related Structures](#7-flattenedkernelview--related-structures)
+8. [Operation & OperationHandle (Record Phase)](#8-operation--operationhandle)
+9. [Execution IR: Command](#9-execution-ir-command)
+10. [Binding Table](#10-binding-table)
+11. [SHM Constants & Structures](#11-shm-constants--structures)
+12. [Error Taxonomy](#12-error-taxonomy)
+13. [Compiled Result & Execution Types](#13-compiled-result--execution-types)
+14. [TestScenario & Test Discovery](#14-testscenario--test-discovery)
 
 ---
 
@@ -113,11 +115,51 @@ class CommandStatus(Enum):
 
 ---
 
-## 2. Tensor Class
+## 2. Terminology Hierarchy
+
+vTen 실행 모델의 4단계 용어 계층. 모든 스펙 문서가 이 정의를 따른다.
+
+### 2.1 Definitions
+
+| Term | Scope | Definition |
+|------|-------|------------|
+| **Command** | Lowest | 하나의 IR 명령. 64바이트 SHM 슬롯 1개를 차지한다. BFM dispatch 또는 내부 스케줄러 액션과 1:1 대응. 예: PUSH 1개, WRITE_REG 1개. |
+| **Operation** | DSL | DSL 메서드 호출 1회. IR lowering 시 여러 Command로 확장될 수 있다. 예: `send_tensor()` → LOAD + PUSH (2 commands). `configure()` → N × WRITE_REG. |
+| **Invocation** | Execution cycle | 하나의 가속기 실행 사이클: configure → 입력 전달 → 연산 → 출력 수집. 특정 파라미터 세트로 DUT를 한 번 "사용"하는 것에 해당. 하나의 Invocation은 보통 5–15개 Operation으로 구성. |
+| **Batch** | Host↔Backend | 하나의 SHM 제출 단위: 두 `ctx.run()` 호출 사이의 모든 Command (또는 시작부터 첫 `ctx.run()`까지). Batch 당 정확히 하나의 Host↔Backend 세마포어 핸드셰이크. 하나의 Batch에 하나 이상의 Invocation을 포함할 수 있다. §11.4, §11.5에서는 **Kernel Task**를 동의어로 사용 (후방호환). |
+
+### 2.2 Hierarchy Diagram
+
+```
+Batch (1 Host↔Backend handshake)
+├── Invocation 0 (accelerator run with config A)
+│   ├── Operation: send_tensor(ifm)        → Commands: LOAD, PUSH
+│   ├── Operation: send_tensor(weight)     → Commands: LOAD, PUSH
+│   ├── Operation: configure(kernel)       → Commands: WRITE_REG ×N
+│   ├── Operation: write_register(start=1) → Command:  WRITE_REG
+│   ├── Operation: recv_tensor(ofm)        → Command:  PULL  (aliased: STORE skipped)
+│   └── Operation: poll_register(done)     → Command:  POLL_REG
+├── Invocation 1 (accelerator run with config B)
+│   ├── Operation: send_tensor(ifm)        → Command:  PUSH  (aliased: LOAD skipped)
+│   ├── Operation: send_tensor(weight)     → Commands: LOAD, PUSH
+│   │   ...
+│   └── Operation: poll_register(done)     → Command:  POLL_REG
+└── ...more Invocations...
+```
+
+### 2.3 Usage Rules
+
+- **"layer"**는 vTen 용어가 아니다. 신경망 도메인에 속한다. 테스트 코드 주석에서 비공식적으로 사용할 수 있지만, DSL API에서는 사용하지 않는다. 올바른 vTen 용어는 **Invocation**.
+- **"Kernel Task"**는 Backend/SHM 프로토콜 맥락(§11.4, §11.5)에서 Batch의 동의어로 유효하다. 신규 스펙 텍스트에서는 "Batch"를 선호한다.
+- **"operation"** (소문자)는 DSL 수준 액션을 지칭한다. **"Command"**는 IR/SHM 수준 명령을 지칭한다. 이 둘을 혼용하지 않는다.
+
+---
+
+## 3. Tensor Class
 
 Kernel 클래스 내에서 텐서를 선언하고, 런타임 과정에서 데이터와 메타데이터를 누적하는 핵심 타입.
 
-### 2.1 Lifecycle & Timing
+### 3.1 Lifecycle & Timing
 
 텐서의 상태는 두 단계에서 설정된다:
 
@@ -140,7 +182,7 @@ Kernel 클래스 내에서 텐서를 선언하고, 런타임 과정에서 데이
 - `instantiate()`에서 runtime_params + project_params + kernel_spec params가
   모두 알려져 있으므로 eager resolution 가능
 
-### 2.2 Class Definition
+### 3.2 Class Definition
 
 ```python
 import torch
@@ -229,7 +271,7 @@ class Tensor:
 
 **주의: Tensor는 클래스 변수이다.** 하나의 Kernel 클래스에서 여러 인스턴스를 만들 때 텐서 상태(`data`, `_resolved_shape` 등)가 공유되는 문제를 방지하려면, `instantiate()` 시점에 각 인스턴스별로 텐서를 **복제(`copy.copy`)**해야 한다. 이는 KernelInstance에서 처리한다 (§6.4 참조).
 
-### 2.3 Kernel Descriptor Registration (구현 명세)
+### 3.3 Kernel Descriptor Registration (구현 명세)
 
 **방식: `__init_subclass__` 기반** (메타클래스보다 단순하며, Python 3.6+ 표준)
 
@@ -328,7 +370,7 @@ class CompositeKernel(Kernel):
 
 ---
 
-## 3. Register Handle
+## 4. Register Handle
 
 `register()` 헬퍼 함수와 그 반환 타입.
 
@@ -365,9 +407,9 @@ def register(interface_name: str) -> RegisterHandle:
 
 ---
 
-## 4. Kernel Base Classes
+## 5. Kernel Base Classes
 
-### 4.1 Kernel (Unit Kernel)
+### 5.1 Kernel (Unit Kernel)
 
 ```python
 class Kernel:
@@ -462,7 +504,7 @@ class Kernel:
         )
 ```
 
-### 4.2 TensorProxy & expose() Mechanism
+### 5.2 TensorProxy & expose() Mechanism
 
 `SubKernelBinding`에서 서브커널의 텐서에 접근하고 `expose()`를 호출하는 프록시 체인.
 이 코드는 **클래스 본문 평가 시점**(인스턴스 생성 전)에 동작해야 한다.
@@ -512,7 +554,7 @@ class ExposedTensorDef:
     top_interface: str       # "ddr_port"
 ```
 
-### 4.3 SubKernelBinding
+### 5.3 SubKernelBinding
 
 ```python
 @dataclass
@@ -565,7 +607,7 @@ for attr_name, attr_value in namespace.items():
         attr_value._attr_name = attr_name  # "dma_ifm", "mac", ...
 ```
 
-### 4.4 Connect (프록시 기반)
+### 5.4 Connect (프록시 기반)
 
 ```python
 class Connect:
@@ -611,7 +653,7 @@ class Connect:
         self.transform = transform
 ```
 
-### 4.5 Internal
+### 5.5 Internal
 
 ```python
 class Internal:
@@ -620,7 +662,7 @@ class Internal:
         self.probe = probe
 ```
 
-### 4.6 CompositeKernel
+### 5.6 CompositeKernel
 
 ```python
 class CompositeKernel(Kernel):
@@ -663,7 +705,7 @@ class CompositeKernel(Kernel):
         raise NotImplementedError
 ```
 
-### 4.7 전체 프록시 체인 예시
+### 5.7 전체 프록시 체인 예시
 
 ```python
 # ── 서브커널 정의 ──
@@ -715,11 +757,11 @@ class NPUTopKernel(CompositeKernel):
 
 ---
 
-## 5. KernelSpec Model (YAML Parse Result)
+## 6. KernelSpec Model (YAML Parse Result)
 
 `kernel_spec.yaml`을 파싱한 결과 생성되는 데이터 클래스들. 상세 파싱 규칙과 검증 로직은 `03_kernel_spec_schema.md` 참조.
 
-### 5.1 PackingScheme
+### 6.1 PackingScheme
 
 ```python
 @dataclass
@@ -748,9 +790,28 @@ class PackingScheme:
         else:
             elem_bytes = (self.element_width + 7) // 8
             return elem_bytes * 8 * self.elements_per_beat
+
+    def validate_custom_fields(self) -> None:
+        """custom mode일 때 필드 간 비트 겹침 검사.
+
+        파서(spec/parser.py)가 PackingScheme 생성 직후 호출한다.
+        겹치는 비트 범위가 있으면 ValidationError를 raise한다.
+        allow_overlap 옵션은 현재 미지원 — 명시적 공유가 필요하면 향후 확장.
+        """
+        if self.mode != "custom" or not self.custom_fields:
+            return
+        occupied: dict[int, str] = {}  # bit_pos → field_name
+        for field in self.custom_fields:
+            lo, hi = field.bits
+            for bit in range(lo, hi + 1):
+                if bit in occupied:
+                    raise ValidationError(
+                        f"custom_fields overlap: field '{field.name}' bits {field.bits} "
+                        f"conflicts with '{occupied[bit]}' at bit {bit}.")
+                occupied[bit] = field.name
 ```
 
-### 5.2 SplitSpec
+### 6.2 SplitSpec
 
 ```python
 @dataclass
@@ -770,7 +831,7 @@ class SplitSpec:
     interleave: InterleaveSpec | None = None
 ```
 
-### 5.3 AutoBindSpec
+### 6.3 AutoBindSpec
 
 ```python
 @dataclass
@@ -783,7 +844,7 @@ class AutoBindSpec:
     expr: str | None = None      # "${N}*${K}" 등 산술 표현식
 ```
 
-### 5.4 RegisterSpec
+### 6.4 RegisterSpec
 
 ```python
 @dataclass
@@ -801,7 +862,7 @@ class RegisterSpec:
     interface_name: str = ""  # 소속 인터페이스 (파서가 설정)
 ```
 
-### 5.5 MemoryRegion
+### 6.5 MemoryRegion
 
 ```python
 @dataclass
@@ -813,7 +874,7 @@ class MemoryRegion:
     alignment: int = 4096
 ```
 
-### 5.6 RegisterBankSpec
+### 6.6 RegisterBankSpec
 
 ```python
 @dataclass
@@ -823,7 +884,7 @@ class RegisterBankSpec:
     base_offset: int    # 베이스 오프셋 (예: 0x000)
 ```
 
-### 5.7 InterfaceSpec
+### 6.7 InterfaceSpec
 
 ```python
 @dataclass
@@ -833,6 +894,7 @@ class InterfaceSpec:
     rtl_port: str                            # RTL 포트 접두사
     protocol: Protocol
     data_width: int | None = None            # AXI4/AXI4S 데이터 폭 (비트)
+    addr_width: int | None = None            # AXI4/AXI4L 주소 버스 폭 (비트)
     memory_region: str | None = None         # AXI4: 매핑된 메모리 영역
     tensor: str | None = None                # 단일 텐서 이름 (AXI4S)
     tensors: list[str] | None = None         # 복수 텐서 (AXI4 공유 포트)
@@ -842,7 +904,12 @@ class InterfaceSpec:
     register_banks: list[RegisterBankSpec] | None = None  # 복수 서브커널 뱅크
 ```
 
-### 5.8 KernelSpec
+**`addr_width` 프로토콜별 기본값:**
+- AXI4: `addr_width` 미지정 시 **64** (파서가 기본값 적용)
+- AXI4-Lite: `addr_width` 미지정 시 **32** (파서가 기본값 적용)
+- AXI4-Stream: `addr_width` 해당 없음 (지정 시 무시)
+
+### 6.8 KernelSpec
 
 ```python
 @dataclass
@@ -887,12 +954,12 @@ class KernelSpec:
 
 ---
 
-## 6. FlattenedKernelView & Related Structures
+## 7. FlattenedKernelView & Related Structures
 
 CompositeKernel 플래트닝 후 모든 파이프라인 스테이지가 조작하는 중간 표현.
 Unit Kernel도 `_self` 서브커널 하나로 래핑되어 동일한 구조를 사용한다.
 
-### 6.1 InterfaceMapping
+### 7.1 InterfaceMapping
 
 ```python
 @dataclass
@@ -906,7 +973,7 @@ class InterfaceMapping:
     bank_offset: int = 0         # 해결된 뱅크 오프셋 (예: 0x000)
 ```
 
-### 6.2 ExposedTensor
+### 7.2 ExposedTensor
 
 ```python
 @dataclass
@@ -949,7 +1016,7 @@ class ExposedTensor:
         self.origin_tensor._address = addr
 ```
 
-### 6.3 ProbePoint
+### 7.3 ProbePoint
 
 ```python
 @dataclass
@@ -962,7 +1029,7 @@ class ProbePoint:
     golden_buffer_id: int | None = None
 ```
 
-### 6.4 KernelInstance
+### 7.4 KernelInstance
 
 ```python
 @dataclass
@@ -1031,7 +1098,7 @@ class KernelInstance:
 
 `compile()` 시에는 `_resolver`가 이미 설정되어 있으므로, Stage 1은 기존 resolver를 재사용하거나 재생성하여 결과가 일치하는지 확인한다.
 
-### 6.5 FlattenedKernelView
+### 7.5 FlattenedKernelView
 
 ```python
 @dataclass
@@ -1103,7 +1170,7 @@ class FlattenedKernelView:
 
 ---
 
-## 7. Operation & OperationHandle (Record Phase)
+## 8. Operation & OperationHandle (Record Phase)
 
 Record-then-Compile 아키텍처의 Pass 1에서 사용되는 경량 기록 구조.
 
@@ -1138,7 +1205,7 @@ class OperationHandle:
 
 ---
 
-## 8. Execution IR: Command
+## 9. Execution IR: Command
 
 Runtime이 생성하는 백엔드 독립적 명령 포맷. SHM에 64바이트 슬롯으로 패킹됨.
 
@@ -1200,7 +1267,7 @@ class Command:
 
 ---
 
-## 9. Binding Table
+## 10. Binding Table
 
 Runtime이 구축하는 텐서-인터페이스-BFM 매핑 테이블.
 
@@ -1237,6 +1304,7 @@ class BFMConfig:
     interface_name: str        # "ddr_port"
     protocol: Protocol
     data_width: int = 256      # 비트 단위
+    addr_width: int = 64       # 주소 버스 폭 (비트). AXI4=64, AXI4L=32
     role: str = "slave"
     address_ranges: list[tuple[int, int, int]] = field(default_factory=list)
         # [(addr, size, buf_id), ...] — AXI4용
@@ -1254,9 +1322,9 @@ class BindingTable:
 
 ---
 
-## 10. SHM Constants & Structures
+## 11. SHM Constants & Structures
 
-### 10.1 크기 상수
+### 11.1 크기 상수
 
 ```python
 CONTROL_SIZE     = 256    # 바이트
@@ -1266,14 +1334,14 @@ BUF_DESC_SIZE    = 24     # 바이트
 CACHE_LINE       = 64     # 데이터 영역 정렬 단위
 ```
 
-### 10.2 Magic Number & Protocol
+### 11.2 Magic Number & Protocol
 
 ```python
 SHM_MAGIC        = 0x5654454E   # "VTEN" (little-endian)
 PROTOCOL_VERSION = 0x00000003   # v0.4 protocol
 ```
 
-### 10.3 ControlHeader
+### 11.3 ControlHeader
 
 ```
 Offset  Size   Field                 Description
@@ -1301,7 +1369,7 @@ Offset  Size   Field                 Description
 
 **Total: 256 bytes.**
 
-### 10.4 host_status 값
+### 11.4 host_status 값
 
 | 값 | 이름 | 설명 |
 |----|------|------|
@@ -1310,7 +1378,7 @@ Offset  Size   Field                 Description
 | 2 | ACK | 결과 수신 확인 |
 | 3 | SHUTDOWN | 백엔드 종료 요청 |
 
-### 10.5 backend_status 값
+### 11.5 backend_status 값
 
 | 값 | 이름 | 설명 |
 |----|------|------|
@@ -1319,7 +1387,7 @@ Offset  Size   Field                 Description
 | 2 | DONE | 배치 성공 완료 |
 | 3 | ERROR | 에러 발생 (error_code/error_cmd_id/error_message 참조) |
 
-### 10.6 Control flags (offset 0x88)
+### 11.6 Control flags (offset 0x88)
 
 | 비트 | 이름 | 설명 |
 |------|------|------|
@@ -1329,7 +1397,7 @@ Offset  Size   Field                 Description
 | 3 | WAVEFORM_ON_FAIL | 검증 실패 시에만 파형 기록 |
 | 4-31 | reserved | 0이어야 함 |
 
-### 10.7 Command Slot Layout (64 bytes)
+### 11.7 Command Slot Layout (64 bytes)
 
 ```
 Offset  Size   Field              Description
@@ -1358,7 +1426,7 @@ Offset  Size   Field              Description
 
 미사용 의존성 슬롯은 `0xFFFF`로 설정.
 
-### 10.8 Buffer Descriptor Layout (24 bytes)
+### 11.8 Buffer Descriptor Layout (24 bytes)
 
 ```
 Offset  Size   Field              Description
@@ -1371,7 +1439,7 @@ Offset  Size   Field              Description
 0x10    8B     reserved           0이어야 함
 ```
 
-### 10.9 Stats Entry Layout (32 bytes)
+### 11.9 Stats Entry Layout (32 bytes)
 
 ```
 Offset  Size   Field                Description
@@ -1388,7 +1456,7 @@ Offset  Size   Field                Description
 0x1C    4B     stall_cycles        백프레셔 또는 소스 스톨 사이클 수
 ```
 
-### 10.10 SHM 크기 계산
+### 11.10 SHM 크기 계산
 
 ```python
 def calculate_shm_size(num_commands: int,
@@ -1407,7 +1475,7 @@ def calculate_shm_size(num_commands: int,
     return size
 ```
 
-### 10.11 SHM Memory Layout 개요
+### 11.11 SHM Memory Layout 개요
 
 ```
 SHM Base ("/vten_{session_id}")
@@ -1419,7 +1487,7 @@ SHM Base ("/vten_{session_id}")
 └─ [4] Data Region               (가변, 64-byte 정렬)
 ```
 
-### 10.12 Python Host SHM 유틸리티
+### 11.12 Python Host SHM 유틸리티
 
 ```python
 @dataclass
@@ -1502,7 +1570,7 @@ class CommandMetrics:
 
 ---
 
-### 10.13 Backend Error Codes
+### 11.13 Backend Error Codes
 
 SHM Control Region의 `error_code` 및 BFM `done_error_code` 신호에 사용되는 정수 값.
 
@@ -1531,6 +1599,31 @@ class BackendErrorCode:
 | `done_error_code` (BFM→Scheduler) | 인터페이스 신호 | BFM당 | 커맨드 단위 에러. Scheduler가 수집하여 Control Header로 전파. |
 | `error_code` (Stats Entry) | offset 0x02 | 커맨드당 | 해당 커맨드의 에러 코드 (정상 시 0) |
 
+**에러 코드 → Python 예외 매핑:**
+
+```python
+# error_code 정수 → BackendError 하위 클래스 매핑
+BACKEND_ERROR_MAP: dict[int, type[BackendError]] = {
+    BackendErrorCode.ADDR_UNMATCH:    BFMError,         # 1
+    BackendErrorCode.POLL_TIMEOUT:    PollTimeoutError,  # 2
+    BackendErrorCode.BFM_QUEUE_ERROR: BFMError,          # 3
+    BackendErrorCode.SCHEDULER_ERROR: BackendError,      # 4
+    BackendErrorCode.SHM_ACCESS_ERROR:BackendError,      # 5
+    BackendErrorCode.UNKNOWN_OPCODE:  BackendError,      # 6
+    BackendErrorCode.BFM_MAP_ERROR:   BackendError,      # 7
+    BackendErrorCode.PROBE_MISMATCH:  BackendError,      # 8
+    BackendErrorCode.TIMEOUT:         TimeoutError,      # 9
+}
+
+def raise_backend_error(code: int, cmd_id: int, message: str) -> None:
+    """SHM error_code를 읽어 적절한 BackendError 하위 예외를 raise한다.
+
+    매핑에 없는 코드는 BackendError(base)로 raise.
+    """
+    exc_cls = BACKEND_ERROR_MAP.get(code, BackendError)
+    raise exc_cls(f"[cmd_id={cmd_id}] {message} (error_code={code})")
+```
+
 **에러 전파 흐름:**
 
 ```
@@ -1553,13 +1646,20 @@ Controller: S_ERROR 진입
     │  │   └── snprintf(ctrl->error_message, 64, ...)
     │  └── sem_post(b2h)
     ▼
-Python Host: BackendError 예외
-    ├── code: int
-    ├── cmd_id: int
-    └── message: str
+Python Host (XsimBackend.submit_batch):
+    backend_status == ERROR → raise_backend_error(code, cmd_id, message)
+    backend_status == DONE  → return BackendResult(status=DONE, ...)
+    sem_timedwait 타임아웃  → raise TimeoutError(...)
 ```
 
-### 10.14 SHM Command Slot → bfm_cmd_t 변환 테이블
+**부분 실패(partial failure) 정책:**
+- `backend_status=ERROR` 시 `BackendResult`는 반환되지 않는다 (예외만 raise).
+- Stats Region: 에러 발생 이전까지 완료된 커맨드의 stats는 유효하다.
+  에러 커맨드 자체는 `CommandStatus.ERROR`(=4)로 기록된다.
+- Data Region 읽기: `backend_status=ERROR` 후 `read_buffer()` 호출 금지.
+  버퍼 내용이 불완전할 수 있음. 진단 목적으로만 허용 (결과 신뢰 불가).
+
+### 11.14 SHM Command Slot → bfm_cmd_t 변환 테이블
 
 Scheduler가 SHM에서 커맨드를 읽을 때 `bfm_cmd_t`(BFM 디스패치용)와 dependency 배열(의존성 추적용)로 분리한다.
 
@@ -1590,7 +1690,7 @@ Scheduler가 SHM에서 커맨드를 읽을 때 `bfm_cmd_t`(BFM 디스패치용)�
 
 ---
 
-## 11. Error Taxonomy
+## 12. Error Taxonomy
 
 ```
 VTenError
@@ -1606,7 +1706,8 @@ VTenError
 │   ├── BindingError                      # auto_bind 텐서 미발견
 │   ├── DependencyError                   # 순환 의존 등
 │   ├── DependencyLimitError              # dep > 4 초과
-│   └── ProbeError                        # probe golden 데이터 미제공
+│   ├── ProbeError                        # probe golden 데이터 미제공
+│   └── AliasError                        # 버퍼 앨리어싱 제약 위반 (크기, 패킹 불일치 등)
 ├── BackendError                          # 실행 시점
 │   ├── TimeoutError                      # 세마포어 타임아웃
 │   ├── BFMError                          # BFM 주소 미매칭 등
@@ -1625,9 +1726,9 @@ class VTenError(Exception):
 
 ---
 
-## 12. Compiled Result
+## 13. Compiled Result & Execution Types
 
-RuntimeEngine.compile()의 최종 산출물.
+RuntimeEngine.compile()의 최종 산출물 및 실행 관련 타입.
 
 ```python
 @dataclass
@@ -1648,22 +1749,49 @@ class VerificationTask:
 
 @dataclass
 class BackendResult:
-    """Backend 실행 완료 후 반환."""
-    status: int                # backend_status 값
-    error_code: int = 0
+    """Backend 실행 완료 후 반환.
+
+    반환 정책:
+    - backend_status == DONE  → BackendResult 반환 (status=2)
+    - backend_status == ERROR → raise_backend_error() 호출 (예외 raise, 반환 없음)
+    - sem_timedwait 타임아웃  → TimeoutError raise (반환 없음)
+
+    즉, BackendResult가 반환된 경우는 항상 status == 2 (DONE) 이다.
+    """
+    status: int                # backend_status 값 (항상 2=DONE)
+    error_code: int = 0        # 항상 0 (DONE 시)
     error_cmd_id: int = 0
     error_message: str = ""
+    stats: list["CmdStats"] = field(default_factory=list)  # 커맨드별 통계 (STATS_ENABLED 시)
 
     def read_buffer(self, buffer_id: int) -> bytes:
-        """SHM Data Region에서 특정 버퍼 읽기."""
+        """SHM Data Region에서 특정 버퍼 읽기.
+
+        backend_status=DONE 이후에만 호출 가능.
+        ERROR 후 호출 시 동작 미정의 (결과 신뢰 불가).
+        """
         ...
+
+
+@dataclass
+class BatchResult:
+    """ctx.run() 호출의 반환값. 하나의 Batch 실행 결과를 캡슐화.
+
+    Multi-Batch 실행 시, 각 ctx.run() 호출마다 하나의 BatchResult가 반환된다.
+    Stats Region은 Batch마다 덮어쓰이므로, per-command stats는
+    ctx.run() 반환 시점에 읽어서 이 객체에 저장된다.
+    """
+    status: str                           # "DONE" | "ERROR"
+    total_cycles: int                     # Backend 클럭 사이클 수
+    per_command_stats: list[CmdStats]     # 커맨드별 통계 (STATS_ENABLED 시)
+    error: BackendError | None = None     # 에러 상세 (ERROR 시)
 ```
 
 ---
 
-## 13. TestScenario & Test Discovery
+## 14. TestScenario & Test Discovery
 
-### 13.1 TestScenario
+### 14.1 TestScenario
 
 ```python
 class TestScenario:
@@ -1709,7 +1837,7 @@ class TestScenario:
         )
 ```
 
-### 13.2 Test Discovery
+### 14.2 Test Discovery
 
 CLI(`vten run --test <name>`)가 테스트를 발견하는 메커니즘:
 
@@ -1740,7 +1868,7 @@ def discover_test(test_name: str, tests_dir: str = "tests") -> TestScenario:
     ...
 ```
 
-### 13.3 Test Execution Flow
+### 14.3 Test Execution Flow
 
 ```
 vten run --test test_conv3d --config C=32
@@ -1758,8 +1886,13 @@ vten run --test test_conv3d --config C=32
     │
     ├── 4. 각 cfg에 대해:
     │       ctx = ExecutionContext(backend, base_cfg)
-    │       scenario.run(ctx, cfg)     # Record pass
-    │       ctx.run()                  # Compile + Submit + Verify
+    │       scenario.run(ctx, cfg)     # DSL 기록 + ctx.run() 호출 (1회 이상)
+    │       ctx.finalize()             # SHM cleanup
+    │
+    │   Note: scenario.run() 내부에서 ctx.run()을 직접 호출한다.
+    │   Single-Batch 시나리오는 ctx.run() 1회, Multi-Batch는 N회 호출.
+    │   각 ctx.run()은 pending ops를 compile → submit → wait하고
+    │   BatchResult를 반환한다. (상세: 02_runtime_engine.md §3)
     │
     └── 5. 결과 수집 → results/ 디렉토리
 ```
@@ -1770,21 +1903,22 @@ vten run --test test_conv3d --config C=32
 
 | 타입 | 정의 위치 (이 문서) | 사용하는 스펙 파일 |
 |------|---------------------|-------------------|
-| Tensor | §2 | 01, 02 |
-| RegisterHandle | §3 | 01, 02 |
-| Kernel, bind() | §4.1 | 01, 02 |
-| TensorProxy, ExposedTensorDef | §4.2 | 01, 02 |
-| SubKernelBinding | §4.3 | 01, 02 |
-| Connect, Internal | §4.4-4.5 | 01, 02 |
-| CompositeKernel | §4.6 | 01, 02 |
-| KernelSpec, InterfaceSpec | §5 | 02, 03, 04, 06 |
-| PackingScheme | §5.1 | 02, 03 |
-| FlattenedKernelView | §6 | 02 |
-| KernelInstance (eager resolution) | §6.4 | 02 |
-| Operation, OperationHandle | §7 | 02 |
-| Command | §8 | 02, 04 |
-| BindingTable, BFMConfig | §9 | 02, 04, 05, 06 |
-| SHM 상수 및 레이아웃 | §10 | 02, 04, 05 |
-| Error Taxonomy | §11 | 모든 파일 |
-| CompiledResult | §12 | 02, 06 |
-| TestScenario, discover_test | §13 | 06, 07 |
+| Terminology Hierarchy | §2 | 모든 파일 |
+| Tensor | §3 | 01, 02 |
+| RegisterHandle | §4 | 01, 02 |
+| Kernel, bind() | §5.1 | 01, 02 |
+| TensorProxy, ExposedTensorDef | §5.2 | 01, 02 |
+| SubKernelBinding | §5.3 | 01, 02 |
+| Connect, Internal | §5.4-5.5 | 01, 02 |
+| CompositeKernel | §5.6 | 01, 02 |
+| KernelSpec, InterfaceSpec | §6 | 02, 03, 04, 06 |
+| PackingScheme | §6.1 | 02, 03 |
+| FlattenedKernelView | §7 | 02 |
+| KernelInstance (eager resolution) | §7.4 | 02 |
+| Operation, OperationHandle | §8 | 02 |
+| Command | §9 | 02, 04 |
+| BindingTable, BFMConfig | §10 | 02, 04, 05, 06 |
+| SHM 상수 및 레이아웃 | §11 | 02, 04, 05 |
+| Error Taxonomy (AliasError 포함) | §12 | 모든 파일 |
+| CompiledResult, BatchResult | §13 | 02, 06 |
+| TestScenario, discover_test | §14 | 06, 07 |

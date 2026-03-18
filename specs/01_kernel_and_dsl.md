@@ -52,6 +52,7 @@ interfaces:
     rtl_port: m_axi_data
     protocol: axi4
     data_width: 256
+    addr_width: 64
     memory_region: ddr
     tensors: [ifm, weight, ofm]
     packing:
@@ -62,6 +63,7 @@ interfaces:
   ctrl:
     rtl_port: s_axilite_ctrl
     protocol: axi4_lite
+    addr_width: 32
     registers:
       - name: start
         offset: 0x00
@@ -261,8 +263,9 @@ class ComplexPipelineKernel(Kernel):
 | | `poll_register` | 조건 충족까지 블록 | AXI-Lite 반복 읽기 | — |
 | | `configure` | auto_bind 전체 레지스터 쓰기 | 모든 auto_bind WRITE_REG | — |
 | | `barrier` | 전역 동기화 펜스 | 모든 진행 중 연산 대기 | — |
-| Shorthand | `send_tensor` | = load + push (자동) | 두 단계 모두 | push만 |
-| | `recv_tensor` | = pull + store (자동) | 두 단계 모두 | pull만 |
+| Shorthand | `send_tensor` | = load + push (자동, alias 시 push만) | 두 단계 모두 | push만 |
+| | `recv_tensor` | = pull + store (자동, alias source 시 pull만) | 두 단계 모두 | pull만 |
+| | `alias` | 버퍼 재사용 선언 (Invocation 간) | 동일 | 동일 |
 
 ### 3.2 Dependency Model
 
@@ -356,6 +359,256 @@ ctx.configure(kernel)  # 강제 설정된 주소 사용
 | `size_elements` | 총 원소 수 |
 | `param` | 해결된 파라미터 값 (문자열 표현식) |
 | `expr` | 파라미터에 대한 임의 산술 표현식 |
+
+### 3.7 Buffer Aliasing
+
+다중 Invocation을 순차 실행할 때, 이전 Invocation의 출력 버퍼를 다음 Invocation의 입력으로 직접 재사용한다. Host↔Device 왕복(STORE + re-LOAD)을 제거하여 성능을 극대화한다.
+
+**용어:** Invocation, Batch 등의 정의는 `00_data_models.md §2 Terminology Hierarchy` 참조.
+
+#### 3.7.1 `ctx.alias()` API
+
+```python
+def alias(self, src: TensorRef, dst: TensorRef) -> None:
+    """dst가 src의 SHM 버퍼를 직접 재사용하도록 선언.
+
+    Parameters:
+        src: 이전 Invocation의 출력 텐서 (보통 recv_tensor 대상).
+        dst: 이후 Invocation의 입력 텐서 (보통 send_tensor 소스).
+
+    Effects:
+        - dst는 src와 동일한 buffer_id를 받는다 (새 SHM 할당 없음).
+        - IR lowering 시 자동으로:
+          - recv_tensor(src): STORE를 건너뜀 (src가 alias source이므로).
+          - send_tensor(dst): LOAD를 건너뜀 (dst가 alias target이므로).
+        - Auto-dependency: dst를 소비하는 첫 Command는 src를 쓴
+          마지막 Command(PULL)에 자동 의존.
+        - Buffer Descriptor direction이 BIDIRECTIONAL로 승격.
+        - Memory-mapped 인터페이스: dst의 auto_bind 주소 레지스터에
+          src의 phys_addr이 할당됨 (동일 물리 주소).
+
+    Constraints:
+        - dst.size_bytes <= src.size_bytes (빌드 타임 검증).
+        - src와 dst의 packing이 호환되어야 함 (동일 프로토콜 시
+          bus_width와 element_width 일치).
+        - dtype이 비호환이면 AliasError. Host Transform 패턴 사용 (§3.8.4).
+
+    Raises:
+        AliasError (00_data_models.md §12)
+    """
+```
+
+#### 3.7.2 Alias-Aware 동작 (send_tensor / recv_tensor)
+
+기존 `send_tensor`, `recv_tensor` API는 변경 없음. IR lowering 시 alias registry를 참조하여 자동으로 최적화한다.
+
+| 상황 | send_tensor(t) | recv_tensor(t) |
+|------|----------------|----------------|
+| t가 alias target | PUSH만 (LOAD skip) | — |
+| t가 alias source | — | PULL만 (STORE skip) |
+| t가 alias 없음 | LOAD + PUSH (기존) | PULL + STORE (기존) |
+
+사용자는 항상 `send_tensor`/`recv_tensor`만 사용한다. alias 여부에 따른 Command 생성은 Runtime이 결정한다.
+
+#### 3.7.3 Multiple Consumers (Fan-out)
+
+하나의 source 버퍼를 여러 downstream에 alias 가능:
+
+```python
+# Residual connection: layer0 output → layer1, layer2
+ctx.alias(layer0.ofm, layer1.ifm)    # consumer 1
+ctx.alias(layer0.ofm, layer2.skip)   # consumer 2
+```
+
+두 PUSH 모두 동일 `buffer_id` 참조. 읽기 전용이므로 충돌 없음.
+
+#### 3.7.4 Build-Time Validation
+
+```python
+def validate_alias(src: TensorBinding, dst: TensorBinding):
+    assert dst.size_bytes <= src.size_bytes  # 크기 제약
+    if src.protocol == dst.protocol:
+        assert src.packing.bus_width == dst.packing.bus_width
+        assert src.packing.element_width == dst.packing.element_width
+```
+
+### 3.8 Multi-Invocation Patterns
+
+`ctx.run()`을 여러 번 호출하여 다중 Batch를 생성하거나, alias를 사용하여 단일 Batch에 여러 Invocation을 포함할 수 있다. `ctx.run()` 확장 의미론은 `02_runtime_engine.md §3`을 참조.
+
+#### 3.8.1 Pattern 1: Single Batch (alias only)
+
+모든 Invocation을 단일 Batch에 포함. 최대 성능. Host↔Backend 핸드셰이크 1회.
+
+```python
+def run(self, ctx, cfg):
+    layers = [ctx.instantiate("conv3d_top", **LAYER_CONFIGS[i]) for i in range(5)]
+    for i, layer in enumerate(layers):
+        layer.weight.fill_random(seed=100 + i)
+
+    # ── Invocation 0: 외부 입력 ──
+    layers[0].ifm.fill_random(seed=0)
+    ctx.send_tensor(layers[0].ifm)
+    ctx.send_tensor(layers[0].weight)
+    ctx.configure(layers[0])
+    w = ctx.write_register(layers[0].ctrl, {"start": 1})
+    recv0 = ctx.recv_tensor(layers[0].ofm, dep=w)
+    poll = ctx.poll_register(layers[0].ctrl, "done", dep=w)
+    recv0.add_commit_dependency(poll)
+
+    # ── Invocations 1–4: alias chaining ──
+    for i in range(1, 5):
+        ctx.alias(layers[i - 1].ofm, layers[i].ifm)
+        ctx.send_tensor(layers[i].weight)
+        ctx.configure(layers[i])
+        w = ctx.write_register(layers[i].ctrl, {"start": 1}, dep=recv0)
+        ctx.send_tensor(layers[i].ifm, dep=recv0)  # aliased → PUSH only
+        recv0 = ctx.recv_tensor(layers[i].ofm, dep=w)
+        poll = ctx.poll_register(layers[i].ctrl, "done", dep=w)
+        recv0.add_commit_dependency(poll)
+
+    # ── 실행 ──
+    ctx.run()
+
+    # ── Golden ──
+    golden = layers[0].forward()
+    for i in range(1, 5):
+        layers[i].ifm.data = golden
+        golden = layers[i].forward()
+    ctx.verify(recv0, golden)
+```
+
+#### 3.8.2 Pattern 2: Chunked Batch (SHM 용량 관리)
+
+동시 활성 버퍼가 `/dev/shm` 한계를 초과할 때. Cross-Batch alias로 경계를 넘어 데이터 전달.
+
+```python
+def run(self, ctx, cfg):
+    layers = [ctx.instantiate("conv3d_top", **LAYER_CONFIGS[i]) for i in range(10)]
+    for i, layer in enumerate(layers):
+        layer.weight.fill_random(seed=100 + i)
+    layers[0].ifm.fill_random(seed=0)
+
+    CHUNK_SIZE = 5
+    prev_recv = None
+
+    for chunk_start in range(0, 10, CHUNK_SIZE):
+        chunk_end = min(chunk_start + CHUNK_SIZE, 10)
+
+        for i in range(chunk_start, chunk_end):
+            if i == 0:
+                ctx.send_tensor(layers[0].ifm)
+            else:
+                ctx.alias(layers[i - 1].ofm, layers[i].ifm)
+                ctx.send_tensor(layers[i].ifm,
+                                dep=prev_recv if i > chunk_start else None)
+
+            ctx.send_tensor(layers[i].weight)
+            ctx.configure(layers[i])
+            w = ctx.write_register(layers[i].ctrl, {"start": 1},
+                                   dep=prev_recv if i > chunk_start else None)
+            prev_recv = ctx.recv_tensor(layers[i].ofm, dep=w)
+            poll = ctx.poll_register(layers[i].ctrl, "done", dep=w)
+            prev_recv.add_commit_dependency(poll)
+
+        ctx.run()  # chunk마다 Batch 제출, Data Region 보존
+
+    golden = compute_golden_chain(layers)
+    ctx.verify(prev_recv, golden)
+```
+
+Host↔Backend 핸드셰이크: ceil(10/5) = 2회.
+
+#### 3.8.3 Pattern 3: Per-Invocation Batch (동적 제어 흐름)
+
+각 Invocation을 별도 Batch로. Host가 중간 결과를 검사하여 분기 가능.
+
+```python
+def run(self, ctx, cfg):
+    layers = [ctx.instantiate("conv3d_top", **LAYER_CONFIGS[i]) for i in range(5)]
+    for i, layer in enumerate(layers):
+        layer.weight.fill_random(seed=100 + i)
+    layers[0].ifm.fill_random(seed=0)
+    golden = None
+
+    for i in range(5):
+        if i == 0:
+            ctx.send_tensor(layers[0].ifm)
+        else:
+            ctx.alias(layers[i - 1].ofm, layers[i].ifm)
+            ctx.send_tensor(layers[i].ifm)    # cross-Batch alias → PUSH only
+
+        ctx.send_tensor(layers[i].weight)
+        ctx.configure(layers[i])
+        w = ctx.write_register(layers[i].ctrl, {"start": 1})
+        result = ctx.recv_tensor(layers[i].ofm, dep=w)
+        poll = ctx.poll_register(layers[i].ctrl, "done", dep=w)
+        result.add_commit_dependency(poll)
+
+        stats = ctx.run()
+
+        hw_output = result.to_tensor()
+        golden = layers[i].forward() if golden is None else (
+            setattr(layers[i], 'ifm_data', golden) or layers[i].forward())
+
+        if compute_confidence(hw_output) > cfg["early_exit_threshold"]:
+            ctx.verify(result, golden)
+            return
+
+    ctx.verify(result, golden)
+```
+
+#### 3.8.4 Pattern 4: Host Transform (강제 Batch 분리)
+
+dtype 변환 등 host-side 처리가 필요할 때. alias 불가 — 데이터가 Host를 경유해야 함.
+
+```python
+def run(self, ctx, cfg):
+    layer0 = ctx.instantiate("conv3d_top", **cfg["layer0"])  # ofm: int32
+    layer1 = ctx.instantiate("conv3d_top", **cfg["layer1"])  # ifm: int8
+
+    # ── Batch 0 ──
+    ctx.send_tensor(layer0.ifm)
+    ctx.send_tensor(layer0.weight)
+    ctx.configure(layer0)
+    w = ctx.write_register(layer0.ctrl, {"start": 1})
+    result0 = ctx.recv_tensor(layer0.ofm, dep=w)
+    poll = ctx.poll_register(layer0.ctrl, "done", dep=w)
+    result0.add_commit_dependency(poll)
+    ctx.run()
+
+    # ── Host transform: int32 → int8 requantize ──
+    ofm_int32 = result0.to_tensor()
+    scale = ofm_int32.abs().max() / 127.0
+    ifm_int8 = (ofm_int32.float() / scale).round().clamp(-128, 127).to(torch.int8)
+    layer1.ifm.data = ifm_int8
+
+    # ── Batch 1 ──
+    ctx.send_tensor(layer1.ifm)       # NOT aliased → LOAD + PUSH
+    ctx.send_tensor(layer1.weight)
+    ctx.configure(layer1)
+    w = ctx.write_register(layer1.ctrl, {"start": 1})
+    result1 = ctx.recv_tensor(layer1.ofm, dep=w)
+    poll = ctx.poll_register(layer1.ctrl, "done", dep=w)
+    result1.add_commit_dependency(poll)
+    ctx.run()
+
+    golden1 = compute_requantized_golden(layer0, layer1, scale)
+    ctx.verify(result1, golden1)
+```
+
+#### 3.8.5 Pattern Selection Guide
+
+```
+Q: 중간 결과에 대한 Host 개입이 필요한가?
+├─ No  → Q: 모든 Invocation이 SHM에 동시 적재 가능한가?
+│        ├─ Yes → Pattern 1 (Single Batch)
+│        └─ No  → Pattern 2 (Chunked Batch)
+└─ Yes → Q: 어떤 종류의 Host 개입인가?
+         ├─ 동적 제어 흐름 (결과 기반 분기)      → Pattern 3
+         ├─ 데이터 변환 (dtype 변환)              → Pattern 4
+         └─ 디버그 검증 (per-Invocation golden)   → Pattern 3 + ctx.verify()
+```
 
 ---
 

@@ -75,6 +75,58 @@ SHM 레이아웃은 `00_data_models.md` §10에서 상수 및 바이너리 포�
 | Conv3D 단위 테스트 | ~15 | 4 (+1 golden) | ~500KB | ~510KB |
 | NPU top (합성) | ~40 | 8 (+4 golden) | ~4MB | ~4.2MB |
 | Full 3D U-Net layer | ~100 | 12 | ~32MB | ~33MB |
+| 5-layer pipeline (single Batch) | ~32 | 6 | ~5MB | ~5.3MB |
+
+### 2.1 Multi-Batch Data Region Lifecycle
+
+`ctx.run()`을 여러 번 호출하는 Multi-Batch 실행 시, SHM 영역별 수명 정책:
+
+| 영역 | `ctx.run()` 사이 | 설명 |
+|------|------------------|------|
+| **Control Region** | 덮어쓰기 | 새 Batch의 `num_commands`, `num_buffers` 등으로 갱신 |
+| **Command Region** | 덮어쓰기 | 새 Batch의 Command 슬롯으로 교체 |
+| **Stats Region** | stale (BatchResult에 보존) | `ctx.run()` 반환 시 BatchResult에 캡처됨 |
+| **Buffer Descriptor Table** | 보존 + 추가 | 기존 descriptor 유지, 새 버퍼만 추가 |
+| **Data Region** | **보존** | 이전 Batch의 데이터 유지. Cross-Batch alias의 핵심. |
+
+```
+TestScenario.run() 시작
+  │
+  ├─ Batch 0: 버퍼 할당, LOAD, ctx.run(), 완료 대기
+  │   Data Region: [buf0: ifm][buf1: weight][buf2: ofm_by_DUT]
+  │
+  ├─ ctx.run() 반환
+  │   Data Region: 그대로 보존
+  │   Command/Stats Region: stale
+  │
+  ├─ Batch 1: buf2를 alias로 재사용, buf3(새 weight) 할당, ctx.run()
+  │   Data Region: [buf0: stale][buf1: stale][buf2: 재사용][buf3: new weight][buf4: new ofm]
+  │
+  └─ TestScenario.run() 종료 → SHM unmap 및 cleanup
+```
+
+**Buffer Validity Tracking (Python Runtime 측):**
+
+```python
+class SHMManager:
+    def __init__(self):
+        self._valid_buffers: set[int] = set()
+
+    def mark_valid(self, buffer_id: int):
+        """LOAD 완료 또는 Backend PULL 완료 후 호출."""
+        self._valid_buffers.add(buffer_id)
+
+    def is_valid(self, buffer_id: int) -> bool:
+        return buffer_id in self._valid_buffers
+
+    def invalidate(self, buffer_id: int):
+        """Host가 버퍼 데이터를 수정한 경우 (transform 후)."""
+        self._valid_buffers.discard(buffer_id)
+```
+
+Data Region이 단조 증가하여 `ctx.release_buffer()` 없이는 이전 버퍼를 회수하지 않는다. `/dev/shm` (tmpfs)은 보통 RAM의 50%이므로 대부분 시나리오에서 충분. `TestScenario.run()` 종료 시 전체 SHM segment가 unmap된다.
+
+**Backend (SV/C) 측 변경 없음:** Backend는 각 Batch를 독립적으로 처리한다. `S_WAIT_HOST → S_LOAD_BATCH → ... → S_COMPLETE → S_WAIT_HOST` 루프가 Batch마다 반복될 뿐이다. Data Region 보존은 Host 측 정책이며 Backend는 관여하지 않는다.
 
 ---
 
@@ -200,7 +252,7 @@ reset ──►│  S_INIT  │────────────────�
 |------|------|
 | `S_INIT` | DPI-C: `vten_shm_init()`. Magic/version 검증. Stale 세마포어 drain. `b2h` post (ready). |
 | `S_WAIT_HOST` | DPI-C: `vten_wait_host_signal_safe(timeout_ms)`. 타임아웃 시: 재시도. CMD_READY: 전이. SHUTDOWN: 전이. |
-| `S_LOAD_BATCH` | SHM에서 모든 Command 슬롯을 로컬 캐시로 일괄 읽기 (DPI-C memcpy). `backend_status = RUNNING` 설정. |
+| `S_LOAD_BATCH` | SHM에서 모든 Command 슬롯을 로컬 캐시로 일괄 읽기 (DPI-C memcpy). `backend_status = RUNNING` 설정. Multi-Batch 시 이전 Batch의 Data Region은 보존된 상태. |
 | `S_FEED` | 로컬 캐시의 커맨드를 Scheduler에 `feed_valid`/`feed_ready` 핸드셰이크로 순차 전달. 완료 시 `feed_done` 펄스. |
 | `S_EXECUTE` | BFM 완료 시그널 모니터링. 커맨드별 Issue/Commit 추적. Stats Region 기록. 에러 시 S_ERROR. 모든 커맨드 Committed 시 전이. |
 | `S_DRAIN` | In-flight BFM 응답 대기 (예: 최종 AXI 쓰기 응답, B-channel 큐 drain). 모든 BFM idle 시 전이. |
@@ -916,11 +968,34 @@ localparam logic [15:0] DEP_NONE = 16'hFFFF;
 
 ## 10. Command Scheduler
 
+### 10.0 파라미터 자동 결정
+
+`MAX_CMDS`, `MAX_BFMS`, `MAX_IFACES`는 코드젠 단계에서 `BFMConfig[]` 배열과 Command 수로부터 자동 결정된다. 기본값은 소규모 설계(인터페이스 ≤8개)를 위한 하한이며, 대규모 설계에서는 코드젠이 자동으로 상향한다.
+
+**자동 계산 규칙:**
+
+```python
+max_bfms   = max(8,   len(bfm_configs))
+max_ifaces = max(16,  max(cfg.interface_id for cfg in bfm_configs) + 1)
+max_cmds   = max(256, num_commands)
+```
+
+**수동 오버라이드**: `vten.toml`의 `[backend.scheduler]` 섹션에서 지정 가능. 자동 계산 값보다 큰 경우에만 적용.
+
+```toml
+[backend.scheduler]
+max_bfms = 48
+max_ifaces = 48
+max_cmds = 512
+```
+
+**코드젠 적용**: SVGenerator가 `tb_top.sv` 생성 시 `vten_command_scheduler` 인스턴스의 파라미터로 전달한다 (§3.3 of `06_codegen_and_cli.md` 참조).
+
 ```systemverilog
 module vten_command_scheduler #(
-    parameter MAX_CMDS = 256,
-    parameter MAX_BFMS = 8,
-    parameter MAX_IFACES = 16
+    parameter MAX_CMDS = 256,      // 코드젠이 override
+    parameter MAX_BFMS = 8,        // 코드젠이 override
+    parameter MAX_IFACES = 16      // 코드젠이 override
 )(
     input  logic clk,
     input  logic rst_n,
