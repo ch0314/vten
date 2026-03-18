@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from vten.runtime.errors import SpecValidationError
+from vten.errors import SpecValidationError
 from vten.spec.models import (
     AutoBindSpec,
     CustomField,

@@ -6,10 +6,14 @@ Spec reference: 00_data_models.md §3-4, 01_kernel_and_dsl.md §2
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
 from vten.kernel.tensor import Tensor
+
+if TYPE_CHECKING:
+    from vten.kernel.composite import SubKernelBinding
 
 
 @dataclass
@@ -82,7 +86,3 @@ class Kernel:
             interface_map=interface_map,
             params=params,
         )
-
-
-# Avoid circular import at module level
-from vten.kernel.composite import SubKernelBinding  # noqa: E402, F401

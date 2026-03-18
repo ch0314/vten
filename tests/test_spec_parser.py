@@ -27,7 +27,7 @@ from vten.spec.models import (
     CustomField,
 )
 from vten.spec.parser import parse_kernel_spec
-from vten.runtime.errors import SpecValidationError
+from vten.errors import SpecValidationError
 
 
 # ── Helper ─────────────────────────────────────────────────────────
@@ -619,7 +619,7 @@ class TestPackingScheme:
                 CustomField(name="b", bits=(4, 11)),  # overlaps with a
             ],
         )
-        from vten.runtime.errors import ValidationError
+        from vten.errors import ValidationError
         with pytest.raises(ValidationError, match="overlap"):
             p.validate_custom_fields()
 

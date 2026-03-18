@@ -582,27 +582,27 @@ class TestCommandStatus:
 class TestErrorHierarchy:
 
     def test_base_error(self):
-        from vten.runtime.errors import VTenError
+        from vten.errors import VTenError
 
         assert issubclass(VTenError, Exception)
 
     def test_spec_validation_error(self):
-        from vten.runtime.errors import VTenError, SpecValidationError
+        from vten.errors import VTenError, SpecValidationError
 
         assert issubclass(SpecValidationError, VTenError)
 
     def test_binding_error(self):
-        from vten.runtime.errors import VTenError, BindingError
+        from vten.errors import VTenError, BindingError
 
         assert issubclass(BindingError, VTenError)
 
     def test_validation_error(self):
-        from vten.runtime.errors import VTenError, ValidationError
+        from vten.errors import VTenError, ValidationError
 
         assert issubclass(ValidationError, VTenError)
 
     def test_raise_and_catch(self):
-        from vten.runtime.errors import VTenError, SpecValidationError
+        from vten.errors import VTenError, SpecValidationError
 
         with pytest.raises(VTenError):
             raise SpecValidationError("test error")

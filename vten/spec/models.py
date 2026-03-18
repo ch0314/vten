@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
-from vten.runtime.errors import SpecValidationError
+from vten.errors import SpecValidationError, ValidationError
 
 
 # ── Enums (from 00_data_models.md §1) ──
@@ -121,7 +121,7 @@ class PackingScheme:
             lo, hi = cf.bits
             for bit in range(lo, hi + 1):
                 if bit in occupied:
-                    raise SpecValidationError(
+                    raise ValidationError(
                         f"overlap: field '{cf.name}' bits {cf.bits} "
                         f"conflicts with '{occupied[bit]}' at bit {bit}."
                     )
