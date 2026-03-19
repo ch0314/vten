@@ -97,6 +97,7 @@ def _verilate(
         "-Wno-WIDTHEXPAND", "-Wno-CASEINCOMPLETE",
         "-Wno-IGNOREDRETURN", "-Wno-WIDTHTRUNC",
         "-Wno-DEPRECATED", "-Wno-WIDTHCONCAT",
+        "-Wno-MULTIDRIVEN",
         "--threads", "1",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -216,6 +217,20 @@ def axi4_driver() -> Path:
     return _build_driver(mdir, "axi4_driver.cpp", "axi4_driver")
 
 
+# ── Session-scoped: scheduler ──
+
+@pytest.fixture(scope="session")
+def scheduler_driver() -> Path:
+    """Compile vten_command_scheduler driver. Returns executable path."""
+    if VERILATOR_BIN is None or VERILATOR_INC is None:
+        pytest.skip("verilator not found")
+    mdir = _verilate(
+        "tb_scheduler.sv", "tb_scheduler", "scheduler",
+        sv_dir=WRAPPERS_DIR,
+    )
+    return _build_driver(mdir, "scheduler_driver.cpp", "scheduler_driver")
+
+
 # ── Test-scoped fixtures ──
 
 @pytest.fixture
@@ -251,6 +266,15 @@ def axi4_sim(axi4_driver):
     from tests.phase3.sim_harness import VerilatorSim
 
     with VerilatorSim(axi4_driver) as sim:
+        yield sim
+
+
+@pytest.fixture
+def scheduler_sim(scheduler_driver):
+    """Create a VerilatorSim instance for scheduler."""
+    from tests.phase3.sim_harness import VerilatorSim
+
+    with VerilatorSim(scheduler_driver) as sim:
         yield sim
 
 

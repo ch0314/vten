@@ -361,6 +361,25 @@ int main() {
                    "\"b_queue\":%d,\"r_active\":%d,\"w_active\":%d}\n",
                    at_size, rp_size, wp_size, dq_size, bq_size, r_act, w_act);
         }
+        else if (strcmp(cmd, "read_stats") == 0) {
+            int cmd_id = json_int(line_buf, "cmd_id", 0);
+            StatsEntry stats;
+            int rc = mock_read_stats(cmd_id, &stats);
+            if (rc != 0) {
+                printf("{\"error\":\"stats not available\"}\n");
+            } else {
+                printf("{\"ok\":true,\"status\":%d,\"error_code\":%d,"
+                       "\"issue_cycle\":%u,\"commit_cycle\":%u,"
+                       "\"first_active\":%u,\"last_active\":%u,"
+                       "\"active_cycles\":%u,\"total_beats\":%u,"
+                       "\"stall_cycles\":%u}\n",
+                       (int)stats.status, (int)stats.error_code,
+                       stats.issue_cycle, stats.commit_cycle,
+                       stats.first_active_cycle, stats.last_active_cycle,
+                       stats.active_cycles, stats.total_beats,
+                       stats.stall_cycles);
+            }
+        }
         else if (strcmp(cmd, "destroy") == 0) {
             if (dut) { dut->final(); delete dut; dut = nullptr; }
             if (ctx) { delete ctx; ctx = nullptr; }

@@ -118,6 +118,15 @@ const char* mock_get_last_error_msg(void);
 /* Get wait_host return value (default: 0=OK). Set to control FSM. */
 void mock_set_wait_host_result(int result);
 
+/* Read stats entry for a given cmd_id. Returns 0 on success, -1 if not available. */
+int mock_read_stats(int cmd_id, StatsEntry* out);
+
+/* Read raw bytes from mock SHM at given offset. Returns bytes read. */
+int mock_read_shm_bytes(int offset, void* out, int size);
+
+/* Get session_seq field from control header. */
+int mock_get_session_seq(void);
+
 #ifdef __cplusplus
 }
 #endif

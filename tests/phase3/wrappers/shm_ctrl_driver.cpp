@@ -203,6 +203,8 @@ int main(int argc, char** argv) {
                 printf("{\"value\":%d}\n", mock_get_complete_count());
             else if (strcmp(field, "error_count") == 0)
                 printf("{\"value\":%d}\n", mock_get_error_count());
+            else if (strcmp(field, "session_seq") == 0)
+                printf("{\"value\":%d}\n", mock_get_session_seq());
             else { printf("{\"error\":\"unknown field\"}\n"); continue; }
         }
         else if (strcmp(cmd, "get_internals") == 0) {
@@ -210,6 +212,23 @@ int main(int argc, char** argv) {
                    (int)dut->rootp->vten_shm_controller__DOT__num_commands,
                    (int)dut->rootp->vten_shm_controller__DOT__feed_idx,
                    sim_time);
+        }
+        else if (strcmp(cmd, "read_shm") == 0) {
+            int offset = json_int(line_buf, "offset", 0);
+            int size = json_int(line_buf, "size", 4);
+            if (size > 1024) size = 1024;
+            uint8_t buf[1024];
+            int rc = mock_read_shm_bytes(offset, buf, size);
+            if (rc < 0) {
+                printf("{\"error\":\"read_shm failed\"}\n");
+            } else {
+                printf("{\"ok\":true,\"bytes\":[");
+                for (int i = 0; i < rc; i++) {
+                    if (i > 0) printf(",");
+                    printf("%d", (int)buf[i]);
+                }
+                printf("]}\n");
+            }
         }
         else if (strcmp(cmd, "destroy") == 0) {
             if (dut) { dut->final(); delete dut; dut = nullptr; }

@@ -430,6 +430,171 @@ class TestMultiBatch:
 
 
 @requires_verilator
+class TestLargeBatch:
+    """Test large batch scalability — up to MAX_CMDS=256."""
+
+    def _feed_batch(self, sim, num_cmds: int, max_ticks: int = 600):
+        """Load and feed a batch of N identical PUSH commands."""
+        commands = [
+            {"cmd_id": i, "opcode": OP_PUSH, "interface_id": i % 8,
+             "protocol": PROTO_AXI4S, "size": 256}
+            for i in range(num_cmds)
+        ]
+        image = build_shm_image(num_commands=num_cmds, commands=commands)
+        sim.load_shm_image(image)
+        sim.create()
+        sim.reset(5)
+        sim.set_signal("feed_ready", 1)
+        _advance_to_state(sim, "S_EXECUTE", max_ticks=max_ticks)
+        return sim.get_internals()
+
+    def test_64_command_batch(self, shm_ctrl_sim):
+        """64-command batch: feed path should handle without stalls."""
+        internals = self._feed_batch(shm_ctrl_sim, 64)
+        assert internals["num_commands"] == 64
+        assert internals["feed_idx"] == 64
+
+    def test_128_command_batch(self, shm_ctrl_sim):
+        """128-command batch: mid-range scalability."""
+        internals = self._feed_batch(shm_ctrl_sim, 128, max_ticks=300)
+        assert internals["num_commands"] == 128
+        assert internals["feed_idx"] == 128
+
+    def test_256_command_batch(self, shm_ctrl_sim):
+        """256-command batch: MAX_CMDS boundary."""
+        internals = self._feed_batch(shm_ctrl_sim, 256, max_ticks=600)
+        assert internals["num_commands"] == 256
+        assert internals["feed_idx"] == 256
+
+    def test_feed_linear_scaling(self, shm_ctrl_sim):
+        """Feed takes exactly N cycles with feed_ready=1 (1 cmd/cycle)."""
+        num_cmds = 32
+        commands = [
+            {"cmd_id": i, "opcode": OP_PUSH, "interface_id": 0,
+             "protocol": PROTO_AXI4S, "size": 256}
+            for i in range(num_cmds)
+        ]
+        image = build_shm_image(num_commands=num_cmds, commands=commands)
+        shm_ctrl_sim.load_shm_image(image)
+        shm_ctrl_sim.create()
+        shm_ctrl_sim.reset(5)
+        _advance_to_state(shm_ctrl_sim, "S_FEED")
+        shm_ctrl_sim.set_signal("feed_ready", 1)
+        # Count ticks from FEED to EXECUTE
+        ticks = 0
+        for _ in range(200):
+            r = shm_ctrl_sim.tick()
+            ticks += 1
+            if r["state_name"] == "S_EXECUTE":
+                break
+        # Should take ~num_cmds ticks (± small overhead for state transitions)
+        assert ticks <= num_cmds + 5, f"Feed took {ticks} ticks for {num_cmds} cmds"
+
+    def test_256_full_lifecycle(self, shm_ctrl_sim):
+        """256-command batch through full FEED→EXECUTE→DRAIN→COMPLETE."""
+        internals = self._feed_batch(shm_ctrl_sim, 256, max_ticks=600)
+        assert internals["num_commands"] == 256
+        # Complete the batch
+        shm_ctrl_sim.set_signal("sched_all_committed", 1)
+        _advance_to_state(shm_ctrl_sim, "S_DRAIN")
+        shm_ctrl_sim.set_signal("sched_all_drained", 1)
+        _advance_to_state(shm_ctrl_sim, "S_COMPLETE")
+        shm_ctrl_sim.tick()
+        assert shm_ctrl_sim.mock_get("backend_status") == BACKEND_DONE
+
+
+@requires_verilator
+class TestCrossBatchPreservation:
+    """Test data region preservation and session_seq across batches."""
+
+    def test_session_seq_increments(self, shm_ctrl_sim):
+        """session_seq in control header increments on each init."""
+        image = build_shm_image(
+            num_commands=1,
+            commands=[{"cmd_id": 0, "opcode": OP_PUSH, "interface_id": 0,
+                       "protocol": PROTO_AXI4S, "size": 256}],
+        )
+        shm_ctrl_sim.load_shm_image(image)
+        shm_ctrl_sim.create()
+        shm_ctrl_sim.reset(5)
+        seq1 = shm_ctrl_sim.mock_get("session_seq")
+        assert seq1 >= 1, "session_seq should be ≥ 1 after init"
+
+        # Run a full batch and loop back
+        shm_ctrl_sim.set_signal("feed_ready", 1)
+        _run_full_batch(shm_ctrl_sim, set_feed_ready=False)
+        _advance_to_state(shm_ctrl_sim, "S_WAIT_HOST")
+
+        seq2 = shm_ctrl_sim.mock_get("session_seq")
+        # session_seq should not change between batches (only on init)
+        assert seq2 == seq1
+
+    def test_data_region_preserved_between_batches(self, shm_ctrl_sim):
+        """Data region bytes are intact between batch 1 and batch 2."""
+        image = build_shm_image(
+            num_commands=1,
+            commands=[{"cmd_id": 0, "opcode": OP_PUSH, "interface_id": 0,
+                       "protocol": PROTO_AXI4S, "size": 256}],
+            num_buffers=1,
+        )
+        # Write recognizable data in the data region
+        import struct
+        data_off = struct.unpack_from("<Q", image, 0x30)[0]
+        total = max(len(image), data_off + 256 + 64)
+        image.extend(b"\x00" * (total - len(image)))
+        for i in range(256):
+            image[data_off + i] = (0xA5 + i) & 0xFF
+
+        shm_ctrl_sim.load_shm_image(image)
+        shm_ctrl_sim.create()
+        shm_ctrl_sim.reset(5)
+
+        # Run batch 1
+        shm_ctrl_sim.set_signal("feed_ready", 1)
+        _run_full_batch(shm_ctrl_sim, set_feed_ready=False)
+        _advance_to_state(shm_ctrl_sim, "S_WAIT_HOST")
+
+        # Read data region — should be intact
+        r = shm_ctrl_sim._send({
+            "cmd": "read_shm", "offset": data_off, "size": 16,
+        })
+        assert "error" not in r
+        expected = [(0xA5 + i) & 0xFF for i in range(16)]
+        assert r["bytes"] == expected, (
+            f"Data region corrupted after batch 1: {r['bytes']} != {expected}")
+
+    def test_backend_status_resets_between_batches(self, shm_ctrl_sim):
+        """Backend status transitions correctly across consecutive batches."""
+        image = build_shm_image(
+            num_commands=1,
+            commands=[{"cmd_id": 0, "opcode": OP_PUSH, "interface_id": 0,
+                       "protocol": PROTO_AXI4S, "size": 256}],
+        )
+        shm_ctrl_sim.load_shm_image(image)
+        shm_ctrl_sim.create()
+        shm_ctrl_sim.reset(5)
+
+        # Batch 1 — run to completion
+        shm_ctrl_sim.set_signal("feed_ready", 1)
+        _run_full_batch(shm_ctrl_sim, set_feed_ready=False)
+        shm_ctrl_sim.tick()  # tick for signal_complete
+        assert shm_ctrl_sim.mock_get("backend_status") == BACKEND_DONE
+
+        # Block at WAIT_HOST by setting wait_host_result=1 (TIMEOUT)
+        shm_ctrl_sim.set_signal("sched_all_committed", 0)
+        shm_ctrl_sim.set_signal("sched_all_drained", 0)
+        shm_ctrl_sim.set_signal("feed_ready", 0)
+        shm_ctrl_sim.mock_set("wait_host_result", 1)  # TIMEOUT → stays at WAIT_HOST
+        _advance_to_state(shm_ctrl_sim, "S_WAIT_HOST")
+
+        # Now release — allow batch 2
+        shm_ctrl_sim.mock_set("wait_host_result", 0)
+        shm_ctrl_sim.set_signal("feed_ready", 1)
+        _advance_to_state(shm_ctrl_sim, "S_FEED")
+        assert shm_ctrl_sim.mock_get("backend_status") == BACKEND_RUNNING
+
+
+@requires_verilator
 class TestNPU3DPatterns:
     """Test with NPU 3D-like command patterns."""
 

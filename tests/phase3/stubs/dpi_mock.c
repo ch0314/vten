@@ -147,6 +147,24 @@ void mock_set_wait_host_result(int result) {
     wait_host_result = result;
 }
 
+int mock_read_stats(int cmd_id, StatsEntry* out) {
+    if (stats_base == NULL || out == NULL) return -1;
+    memcpy(out, stats_base + cmd_id * STATS_SLOT_SIZE, sizeof(StatsEntry));
+    return 0;
+}
+
+int mock_read_shm_bytes(int offset, void* out, int size) {
+    if (shm_mem == NULL || out == NULL) return -1;
+    if (offset + size > shm_mem_size) return -1;
+    memcpy(out, shm_mem + offset, (size_t)size);
+    return size;
+}
+
+int mock_get_session_seq(void) {
+    if (ctrl == NULL) return -1;
+    return (int)ctrl->session_seq;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * DPI-C function implementations (called by verilator)
  * ═══════════════════════════════════════════════════════════════════════════ */

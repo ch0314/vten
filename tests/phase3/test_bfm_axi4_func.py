@@ -267,6 +267,46 @@ class TestIdleAndReset:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+class TestErrorPaths:
+    """Test AXI4 error responses (DECERR for unmatched addresses)."""
+
+    def test_read_decerr_unmatched_address(self, axi4_sim):
+        """Read burst to address outside active_table → DECERR (rresp=3)."""
+        image = _build_axi4_image(OP_PUSH, size=64, phys_addr=0x1000)
+        _setup(axi4_sim, image)
+        _issue_cmd(axi4_sim, OP_PUSH, size=64, phys_addr=0x1000)
+        _tick(axi4_sim, 2)
+
+        # Read at unmatched address (way outside buffer range)
+        r = _read_burst(axi4_sim, 0x5000, 1)
+        assert r["ar_done"] == 1, "AR handshake should still complete"
+        assert r["rresp"] == 3, "Expected DECERR (rresp=11b=3) for unmatched address"
+
+    def test_write_decerr_unmatched_address(self, axi4_sim):
+        """Write burst to unmatched address → DECERR (bresp=3)."""
+        image = _build_axi4_image(OP_PULL, size=64, phys_addr=0x1000)
+        _setup(axi4_sim, image)
+        _issue_cmd(axi4_sim, OP_PULL, size=64, phys_addr=0x1000)
+        _tick(axi4_sim, 2)
+
+        # Write at unmatched address
+        r = _write_burst(axi4_sim, 0x5000, 1)
+        assert r["aw_done"] == 1
+        assert r["bresp"] == 3, "Expected DECERR (bresp=11b=3) for unmatched address"
+
+    def test_read_decerr_still_returns_rlast(self, axi4_sim):
+        """Even on DECERR, the BFM should return rlast to complete the burst."""
+        image = _build_axi4_image(OP_PUSH, size=64, phys_addr=0x1000)
+        _setup(axi4_sim, image)
+        _issue_cmd(axi4_sim, OP_PUSH, size=64, phys_addr=0x1000)
+        _tick(axi4_sim, 2)
+
+        r = _read_burst(axi4_sim, 0xDEAD_0000, 4)
+        assert r["rlast"] == 1, "DECERR burst must still complete with rlast"
+        # BFM may respond with single DECERR beat + rlast (valid AXI behavior)
+        assert r["beats"] >= 1
+
+
 class TestNPU3DPatterns:
     """Test patterns matching real NPU 3D memory transactions."""
 
