@@ -49,8 +49,15 @@ class Kernel:
                 cls._register_handles[attr_name] = attr_value
 
     def tensors(self) -> list[Tensor]:
-        """Return list of all Tensor descriptors for this kernel."""
-        return list(self.__class__._tensor_descriptors.values())
+        """Return list of all Tensor descriptors for this kernel.
+
+        Returns instance-level copies if they exist (e.g., after
+        copy.copy in KernelInstance.initialize), falling back to
+        class-level descriptors.
+        """
+        return [
+            getattr(self, name) for name in self.__class__._tensor_descriptors
+        ]
 
     def get_tensor(self, name: str) -> Tensor:
         """Get a tensor by name."""

@@ -1,0 +1,153 @@
+"""Stage 3: Tensor Serialization.
+
+StreamSerializer and MultiPortSerializer.
+
+Spec reference: 02_runtime_engine.md §8
+"""
+
+from __future__ import annotations
+
+import math
+from typing import TYPE_CHECKING
+
+import torch
+
+from vten.spec.models import PackingScheme
+
+if TYPE_CHECKING:
+    from vten.spec.models import SplitSpec
+
+
+def _flat_to_coords(flat_idx: int, shape: tuple[int, ...]) -> tuple[int, ...]:
+    """C-contiguous flat index → tensor coordinates (row-major)."""
+    coords: list[int] = []
+    for dim in reversed(shape):
+        coords.append(flat_idx % dim)
+        flat_idx //= dim
+    return tuple(reversed(coords))
+
+
+class StreamSerializer:
+    """Serialize tensors to byte streams using PackingScheme."""
+
+    def __init__(self, packing: PackingScheme) -> None:
+        self.packing = packing
+
+    def serialize(self, tensor_data: torch.Tensor) -> bytes:
+        """Tensor → byte stream. Element order: C-contiguous (row-major)."""
+        flat = tensor_data.flatten()
+        beats: list[bytes] = []
+        for i in range(0, len(flat), self.packing.elements_per_beat):
+            chunk = flat[i : i + self.packing.elements_per_beat]
+            beat = self._pack_beat(chunk)
+            beats.append(beat)
+        return b"".join(beats)
+
+    def _pack_beat(self, elements: torch.Tensor) -> bytes:
+        beat_val = 0
+        ew = self.packing.element_width
+        mask = (1 << ew) - 1
+        for idx, elem in enumerate(elements):
+            raw = int(elem) & mask
+            if self.packing.bit_order == "lsb_first":
+                shift = idx * ew
+            else:
+                shift = (self.packing.elements_per_beat - 1 - idx) * ew
+            beat_val |= raw << shift
+        num_bytes = (self.packing.bus_width + 7) // 8
+        return beat_val.to_bytes(num_bytes, byteorder=self.packing.byte_order)
+
+    def deserialize(
+        self,
+        raw_bytes: bytes,
+        num_elements: int,
+        shape: tuple[int, ...] | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """Byte stream → Tensor. Element order: C-contiguous."""
+        ew = self.packing.element_width
+        epb = self.packing.elements_per_beat
+        mask = (1 << ew) - 1
+        bytes_per_beat = (self.packing.bus_width + 7) // 8
+
+        # Determine if sign-extension is needed
+        _unsigned_dtypes = {torch.uint8}
+        # torch.uint16/uint32/uint64 may not exist in older PyTorch versions
+        for _name in ("uint16", "uint32", "uint64"):
+            if hasattr(torch, _name):
+                _unsigned_dtypes.add(getattr(torch, _name))
+        signed = dtype not in _unsigned_dtypes if dtype is not None else True
+
+        elements: list[int] = []
+        for beat_idx in range(0, len(raw_bytes), bytes_per_beat):
+            beat_bytes = raw_bytes[beat_idx : beat_idx + bytes_per_beat]
+            beat_val = int.from_bytes(beat_bytes, byteorder=self.packing.byte_order)
+            for idx in range(epb):
+                if len(elements) >= num_elements:
+                    break
+                if self.packing.bit_order == "lsb_first":
+                    shift = idx * ew
+                else:
+                    shift = (epb - 1 - idx) * ew
+                val = (beat_val >> shift) & mask
+                # Sign-extend only for signed types
+                if signed and val >= (1 << (ew - 1)):
+                    val -= 1 << ew
+                elements.append(val)
+
+        out_dtype = dtype if dtype is not None else torch.int32
+        tensor = torch.tensor(elements, dtype=out_dtype)
+        if shape is not None:
+            tensor = tensor.reshape(shape)
+        return tensor
+
+    def beat_index_to_coords(
+        self, beat_index: int, shape: tuple[int, ...]
+    ) -> list[tuple[int, ...]]:
+        """beat_index → tensor coordinates of elements in that beat."""
+        elem_start = beat_index * self.packing.elements_per_beat
+        total_elems = math.prod(shape)
+        coords: list[tuple[int, ...]] = []
+        for elem_idx in range(
+            elem_start,
+            min(elem_start + self.packing.elements_per_beat, total_elems),
+        ):
+            coords.append(_flat_to_coords(elem_idx, shape))
+        return coords
+
+
+class MultiPortSerializer:
+    """Split serialized data across multiple ports."""
+
+    def split_tensor(
+        self, serialized: bytes, split_spec: SplitSpec
+    ) -> dict[str, bytes]:
+        if split_spec.mode == "channel_interleave":
+            return self._interleave_split(serialized, split_spec)
+        elif split_spec.mode == "block_split":
+            return self._block_split(serialized, split_spec)
+        else:
+            raise ValueError(f"Unknown split mode: {split_spec.mode}")
+
+    def _interleave_split(
+        self, data: bytes, spec: SplitSpec
+    ) -> dict[str, bytes]:
+        unit = spec.interleave.unit
+        num_ports = len(spec.ports)
+        result: dict[str, bytearray] = {p.name: bytearray() for p in spec.ports}
+        for i in range(0, len(data), unit):
+            port_idx = (i // unit) % num_ports
+            result[spec.ports[port_idx].name].extend(data[i : i + unit])
+        return {k: bytes(v) for k, v in result.items()}
+
+    def _block_split(
+        self, data: bytes, spec: SplitSpec
+    ) -> dict[str, bytes]:
+        num_ports = len(spec.ports)
+        block_size = len(data) // num_ports
+        result: dict[str, bytes] = {}
+        for i, port in enumerate(spec.ports):
+            start = i * block_size
+            end = start + block_size if i < num_ports - 1 else len(data)
+            result[port.name] = data[start:end]
+        return result

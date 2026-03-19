@@ -22,11 +22,13 @@ class Tensor:
         shape: tuple[str | int, ...],
         dtype: torch.dtype,
         interface: str,
+        direction: Any | None = None,
     ) -> None:
         # Declaration time (Kernel class body)
         self.shape = shape
         self.dtype = dtype
         self.interface = interface
+        self.direction = direction  # None → inferred from protocol/role at Stage 0
         self.name: str = ""
 
         # instantiate() time (eager resolution)
@@ -91,7 +93,10 @@ class Tensor:
         return self._element_count
 
     def __repr__(self) -> str:
-        return (
+        parts = (
             f"Tensor(name={self.name!r}, shape={self.shape}, "
-            f"dtype={self.dtype}, interface={self.interface!r})"
+            f"dtype={self.dtype}, interface={self.interface!r}"
         )
+        if self.direction is not None:
+            parts += f", direction={self.direction!r}"
+        return parts + ")"

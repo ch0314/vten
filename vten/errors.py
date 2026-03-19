@@ -86,6 +86,10 @@ class ProbeError(CompilationError):
     pass
 
 
+class AliasError(CompilationError):
+    pass
+
+
 # ── Backend errors (Execution time) ──
 
 
