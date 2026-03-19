@@ -194,7 +194,8 @@ class Tensor:
 
     # ── 선언 시 설정 (Kernel 클래스 본문) ──
 
-    def __init__(self, shape: tuple, dtype: torch.dtype, interface: str):
+    def __init__(self, shape: tuple, dtype: torch.dtype, interface: str,
+                 direction: Direction | None = None):
         """
         Args:
             shape: 텐서 형상. 문자열 차원("${C}")은 파라미터 해결 후 정수로 변환.
@@ -202,10 +203,15 @@ class Tensor:
             dtype: 데이터 타입. torch.int8, torch.int32, torch.float32 등.
             interface: 이 텐서가 바인딩되는 kernel_spec.yaml의 인터페이스 이름.
                        예: "ifm_stream", "data_port"
+            direction: 데이터 전송 방향 (Optional).
+                       AXI4-Stream: 생략 가능 — protocol/role에서 자동 추론.
+                       AXI4 (MM): 같은 포트에 읽기/쓰기 텐서가 혼재할 수 있으므로
+                                  명시 권장. 생략 시 HOST_TO_DEV로 기본값.
         """
         self.shape = shape          # 원본 (미해결) 형상 — 문자열 포함 가능
         self.dtype = dtype
         self.interface = interface
+        self.direction = direction  # None이면 Stage 0에서 protocol/role로 추론
         self.name: str = ""         # Kernel 메타클래스에 의해 속성명으로 자동 설정
 
         # ── instantiate() 시점에 설정 (eager resolution) ──
@@ -333,7 +339,7 @@ self.kernel_class_instance = self.kernel_class()
 for tensor_name in self.kernel_class._tensor_descriptors:
     class_tensor = self.kernel_class._tensor_descriptors[tensor_name]
     instance_tensor = copy.copy(class_tensor)  # shallow copy 충분
-    # copy.copy: shape, dtype, interface, name은 공유 (불변)
+    # copy.copy: shape, dtype, interface, direction, name은 공유 (불변)
     # data, _resolved_shape, _element_count, _address는 None으로 초기화됨
     setattr(self.kernel_class_instance, tensor_name, instance_tensor)
     instance_tensor._resolve_shape(self._resolver)

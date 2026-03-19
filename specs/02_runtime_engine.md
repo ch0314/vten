@@ -607,13 +607,28 @@ def _parse_mapping(self, sub_kernel_name, sub_iface_name,
             f"'{sub_iface_name}': invalid mapping value {mapping_value!r}")
 ```
 
-### 5.3 Direction Inference
+### 5.3 Direction Resolution
 
-프로토콜과 역할로부터 텐서 방향 추론:
-- AXI4-Stream PUSH (BFM 마스터) → HOST_TO_DEV
-- AXI4-Stream PULL (BFM 슬레이브) → DEV_TO_HOST
-- AXI4에서 accel이 읽는 텐서 → HOST_TO_DEV
-- AXI4에서 accel이 쓰는 텐서 → DEV_TO_HOST
+텐서의 데이터 전송 방향은 다음 우선순위로 결정한다:
+
+**1단계 — 명시값 우선:** `Tensor(direction=Direction.HOST_TO_DEV)` 등으로
+명시된 경우 해당 값을 그대로 사용한다. 추론하지 않는다.
+
+**2단계 — 프로토콜/역할 추론 (direction=None인 경우):**
+- AXI4-Stream: role=MASTER (BFM이 송신) → HOST_TO_DEV,
+               role=SLAVE (BFM이 수신) → DEV_TO_HOST
+- AXI4-Lite: 레지스터 전용이므로 텐서 방향 해당 없음
+
+**AXI4 (Memory-Mapped) 특별 규칙:**
+같은 AXI4 포트에 읽기/쓰기 텐서가 혼재할 수 있으므로
+AXI4 인터페이스에 바인딩된 텐서는 `direction`을 명시해야 한다.
+생략 시 `HOST_TO_DEV`로 기본값을 사용하지만, 경고를 발생시킨다.
+
+```python
+# 예시: 같은 ddr_port에 입출력 텐서 혼재
+ifm = Tensor(shape, torch.int8, "ddr_port", direction=Direction.HOST_TO_DEV)
+ofm = Tensor(shape, torch.int8, "ddr_port", direction=Direction.DEV_TO_HOST)
+```
 
 ---
 
