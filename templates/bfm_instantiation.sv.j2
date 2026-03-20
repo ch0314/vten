@@ -1,0 +1,12 @@
+// ── BFM Instantiations ──
+{% for bfm in bfms %}
+    {{ bfm.module_name }} #(
+{% for pname, pval in bfm.parameters.items() %}
+        .{{ pname }}({{ pval }}){{ "," if not loop.last else "" }}
+{% endfor %}
+    ) {{ bfm.name }} (
+        .clk({{ clock_name }}),
+        .rst_n({{ reset_name }}),
+        .cmd(bfm_cmd[{{ bfm.interface_id }}])
+    );
+{% endfor %}

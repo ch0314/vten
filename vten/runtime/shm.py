@@ -45,6 +45,18 @@ DIRECTION_ENCODING = {
     Direction.BIDIRECTIONAL: 2,
 }
 
+# Host status values (Control Region offset 0x08)
+HOST_STATUS_IDLE = 0
+HOST_STATUS_CMD_READY = 1
+HOST_STATUS_ACK = 2
+HOST_STATUS_SHUTDOWN = 3
+
+# Backend status values (Control Region offset 0x0C)
+BACKEND_STATUS_IDLE = 0
+BACKEND_STATUS_RUNNING = 1
+BACKEND_STATUS_DONE = 2
+BACKEND_STATUS_ERROR = 3
+
 
 # ── BufferDescriptor ──
 

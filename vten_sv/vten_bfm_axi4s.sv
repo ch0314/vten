@@ -137,6 +137,9 @@ module vten_bfm_axi4s #(
     endtask
 
     task automatic finish_command();
+        // NBA timing: total_beats/active_cycles increments are scheduled via
+        // NBA in the same cycle — the final increment is not yet visible here.
+        // Stats intentionally report the pre-NBA values (N-1).
         cmd_active <= 0;
         cmd_if.done_valid  <= 1'b1;
         cmd_if.done_cmd_id <= current_cmd.cmd_id;
@@ -144,7 +147,8 @@ module vten_bfm_axi4s #(
         cmd_if.done_error_code <= 16'd0;
         vten_write_cmd_stats(current_cmd.cmd_id,
             CMD_COMMITTED, issue_cycle, cycle_count,
-            first_active, last_active,
+            (first_active == 0) ? cycle_count : first_active,
+            cycle_count,
             active_cycles, total_beats, stall_cycles);
     endtask
 endmodule

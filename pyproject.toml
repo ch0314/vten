@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=1.24",
     "pyyaml>=6.0",
     "jinja2>=3.1",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -25,3 +26,4 @@ include = ["vten*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

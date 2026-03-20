@@ -1,0 +1,206 @@
+`timescale {{ timescale }}
+
+`include "vten_types.svh"
+
+module tb_top;
+
+    // ── Clock and Reset ──
+    logic {{ clock_name }};
+    logic {{ reset_name }};
+
+    initial {{ clock_name }} = 0;
+    always #({{ clock_period_ns / 2.0 }}) {{ clock_name }} = ~{{ clock_name }};
+
+    initial begin
+{% if reset_active_low %}
+        {{ reset_name }} = 0;
+        #100;
+        {{ reset_name }} = 1;
+{% else %}
+        {{ reset_name }} = 1;
+        #100;
+        {{ reset_name }} = 0;
+{% endif %}
+    end
+
+    // ── Wire Declarations ──
+{% for bfm in bfms %}
+{% if bfm.protocol == "axi4_stream" %}
+    logic [{{ bfm.data_width - 1 }}:0] {{ bfm.rtl_port_prefix }}_tdata;
+    logic                              {{ bfm.rtl_port_prefix }}_tvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_tready;
+    logic                              {{ bfm.rtl_port_prefix }}_tlast;
+{% elif bfm.protocol == "axi4" %}
+    logic [63:0]                       {{ bfm.rtl_port_prefix }}_araddr;
+    logic [7:0]                        {{ bfm.rtl_port_prefix }}_arlen;
+    logic [2:0]                        {{ bfm.rtl_port_prefix }}_arsize;
+    logic [1:0]                        {{ bfm.rtl_port_prefix }}_arburst;
+    logic                              {{ bfm.rtl_port_prefix }}_arvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_arready;
+    logic [{{ bfm.data_width - 1 }}:0] {{ bfm.rtl_port_prefix }}_rdata;
+    logic [1:0]                        {{ bfm.rtl_port_prefix }}_rresp;
+    logic                              {{ bfm.rtl_port_prefix }}_rlast;
+    logic                              {{ bfm.rtl_port_prefix }}_rvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_rready;
+    logic [63:0]                       {{ bfm.rtl_port_prefix }}_awaddr;
+    logic [7:0]                        {{ bfm.rtl_port_prefix }}_awlen;
+    logic [2:0]                        {{ bfm.rtl_port_prefix }}_awsize;
+    logic [1:0]                        {{ bfm.rtl_port_prefix }}_awburst;
+    logic                              {{ bfm.rtl_port_prefix }}_awvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_awready;
+    logic [{{ bfm.data_width - 1 }}:0] {{ bfm.rtl_port_prefix }}_wdata;
+    logic [{{ bfm.data_width // 8 - 1 }}:0] {{ bfm.rtl_port_prefix }}_wstrb;
+    logic                              {{ bfm.rtl_port_prefix }}_wlast;
+    logic                              {{ bfm.rtl_port_prefix }}_wvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_wready;
+    logic [1:0]                        {{ bfm.rtl_port_prefix }}_bresp;
+    logic                              {{ bfm.rtl_port_prefix }}_bvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_bready;
+{% elif bfm.protocol == "axi4_lite" %}
+    logic [31:0]                       {{ bfm.rtl_port_prefix }}_awaddr;
+    logic                              {{ bfm.rtl_port_prefix }}_awvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_awready;
+    logic [31:0]                       {{ bfm.rtl_port_prefix }}_wdata;
+    logic                              {{ bfm.rtl_port_prefix }}_wvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_wready;
+    logic [31:0]                       {{ bfm.rtl_port_prefix }}_araddr;
+    logic                              {{ bfm.rtl_port_prefix }}_arvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_arready;
+    logic [31:0]                       {{ bfm.rtl_port_prefix }}_rdata;
+    logic                              {{ bfm.rtl_port_prefix }}_rvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_rready;
+{% endif %}
+{% endfor %}
+
+    // ── DUT Instantiation ──
+    {{ top_module }} dut (
+        .{{ clock_name }}({{ clock_name }}),
+        .{{ reset_name }}({{ reset_name }}){% if bfms %},{% endif %}
+
+{% for bfm in bfms %}
+{% if bfm.protocol == "axi4_stream" %}
+        .{{ bfm.rtl_port_prefix }}_tdata({{ bfm.rtl_port_prefix }}_tdata),
+        .{{ bfm.rtl_port_prefix }}_tvalid({{ bfm.rtl_port_prefix }}_tvalid),
+        .{{ bfm.rtl_port_prefix }}_tready({{ bfm.rtl_port_prefix }}_tready),
+        .{{ bfm.rtl_port_prefix }}_tlast({{ bfm.rtl_port_prefix }}_tlast){{ "," if not loop.last else "" }}
+{% elif bfm.protocol == "axi4" %}
+        .{{ bfm.rtl_port_prefix }}_araddr({{ bfm.rtl_port_prefix }}_araddr),
+        .{{ bfm.rtl_port_prefix }}_arlen({{ bfm.rtl_port_prefix }}_arlen),
+        .{{ bfm.rtl_port_prefix }}_arsize({{ bfm.rtl_port_prefix }}_arsize),
+        .{{ bfm.rtl_port_prefix }}_arburst({{ bfm.rtl_port_prefix }}_arburst),
+        .{{ bfm.rtl_port_prefix }}_arvalid({{ bfm.rtl_port_prefix }}_arvalid),
+        .{{ bfm.rtl_port_prefix }}_arready({{ bfm.rtl_port_prefix }}_arready),
+        .{{ bfm.rtl_port_prefix }}_rdata({{ bfm.rtl_port_prefix }}_rdata),
+        .{{ bfm.rtl_port_prefix }}_rresp({{ bfm.rtl_port_prefix }}_rresp),
+        .{{ bfm.rtl_port_prefix }}_rlast({{ bfm.rtl_port_prefix }}_rlast),
+        .{{ bfm.rtl_port_prefix }}_rvalid({{ bfm.rtl_port_prefix }}_rvalid),
+        .{{ bfm.rtl_port_prefix }}_rready({{ bfm.rtl_port_prefix }}_rready),
+        .{{ bfm.rtl_port_prefix }}_awaddr({{ bfm.rtl_port_prefix }}_awaddr),
+        .{{ bfm.rtl_port_prefix }}_awlen({{ bfm.rtl_port_prefix }}_awlen),
+        .{{ bfm.rtl_port_prefix }}_awsize({{ bfm.rtl_port_prefix }}_awsize),
+        .{{ bfm.rtl_port_prefix }}_awburst({{ bfm.rtl_port_prefix }}_awburst),
+        .{{ bfm.rtl_port_prefix }}_awvalid({{ bfm.rtl_port_prefix }}_awvalid),
+        .{{ bfm.rtl_port_prefix }}_awready({{ bfm.rtl_port_prefix }}_awready),
+        .{{ bfm.rtl_port_prefix }}_wdata({{ bfm.rtl_port_prefix }}_wdata),
+        .{{ bfm.rtl_port_prefix }}_wstrb({{ bfm.rtl_port_prefix }}_wstrb),
+        .{{ bfm.rtl_port_prefix }}_wlast({{ bfm.rtl_port_prefix }}_wlast),
+        .{{ bfm.rtl_port_prefix }}_wvalid({{ bfm.rtl_port_prefix }}_wvalid),
+        .{{ bfm.rtl_port_prefix }}_wready({{ bfm.rtl_port_prefix }}_wready),
+        .{{ bfm.rtl_port_prefix }}_bresp({{ bfm.rtl_port_prefix }}_bresp),
+        .{{ bfm.rtl_port_prefix }}_bvalid({{ bfm.rtl_port_prefix }}_bvalid),
+        .{{ bfm.rtl_port_prefix }}_bready({{ bfm.rtl_port_prefix }}_bready){{ "," if not loop.last else "" }}
+{% elif bfm.protocol == "axi4_lite" %}
+        .{{ bfm.rtl_port_prefix }}_awaddr({{ bfm.rtl_port_prefix }}_awaddr),
+        .{{ bfm.rtl_port_prefix }}_awvalid({{ bfm.rtl_port_prefix }}_awvalid),
+        .{{ bfm.rtl_port_prefix }}_awready({{ bfm.rtl_port_prefix }}_awready),
+        .{{ bfm.rtl_port_prefix }}_wdata({{ bfm.rtl_port_prefix }}_wdata),
+        .{{ bfm.rtl_port_prefix }}_wvalid({{ bfm.rtl_port_prefix }}_wvalid),
+        .{{ bfm.rtl_port_prefix }}_wready({{ bfm.rtl_port_prefix }}_wready),
+        .{{ bfm.rtl_port_prefix }}_araddr({{ bfm.rtl_port_prefix }}_araddr),
+        .{{ bfm.rtl_port_prefix }}_arvalid({{ bfm.rtl_port_prefix }}_arvalid),
+        .{{ bfm.rtl_port_prefix }}_arready({{ bfm.rtl_port_prefix }}_arready),
+        .{{ bfm.rtl_port_prefix }}_rdata({{ bfm.rtl_port_prefix }}_rdata),
+        .{{ bfm.rtl_port_prefix }}_rvalid({{ bfm.rtl_port_prefix }}_rvalid),
+        .{{ bfm.rtl_port_prefix }}_rready({{ bfm.rtl_port_prefix }}_rready){{ "," if not loop.last else "" }}
+{% endif %}
+{% endfor %}
+    );
+
+    // ── SHM Controller ──
+    logic        feed_valid;
+    bfm_cmd_t    feed_data;
+    logic        feed_ready;
+    logic        feed_done;
+    logic        sched_all_committed;
+    logic        sched_all_drained;
+    logic        sched_error;
+    logic [15:0] sched_error_cmd_id;
+    logic [15:0] sched_error_code;
+
+    vten_shm_controller #(
+        .MAX_CMDS({{ max_cmds }})
+    ) shm_ctrl (
+        .clk({{ clock_name }}),
+        .rst_n({{ reset_name }}),
+        .feed_valid(feed_valid),
+        .feed_data(feed_data),
+        .feed_ready(feed_ready),
+        .feed_done(feed_done),
+        .sched_all_committed(sched_all_committed),
+        .sched_all_drained(sched_all_drained),
+        .sched_error(sched_error),
+        .sched_error_cmd_id(sched_error_cmd_id),
+        .sched_error_code(sched_error_code)
+    );
+
+    // ── Command Scheduler ──
+    vten_bfm_cmd_if bfm_cmd[{{ max_bfms }}]();
+
+    vten_command_scheduler #(
+        .MAX_CMDS({{ max_cmds }}),
+        .MAX_BFMS({{ max_bfms }}),
+        .MAX_IFACES({{ max_ifaces }})
+    ) scheduler (
+        .clk({{ clock_name }}),
+        .rst_n({{ reset_name }}),
+        .feed_valid(feed_valid),
+        .feed_data(feed_data),
+        .feed_ready(feed_ready),
+        .feed_done(feed_done),
+        .all_committed(sched_all_committed),
+        .all_drained(sched_all_drained),
+        .error(sched_error),
+        .error_cmd_id(sched_error_cmd_id),
+        .error_code(sched_error_code)
+    );
+
+    // ── iface_to_bfm Mapping ──
+    initial begin
+        for (int i = 0; i < {{ max_ifaces }}; i++)
+            scheduler.iface_to_bfm[i] = -1;
+{% for iface_id, bfm_idx in iface_to_bfm.items() %}
+        scheduler.iface_to_bfm[{{ iface_id }}] = {{ bfm_idx }};
+{% endfor %}
+    end
+
+    // ── BFM Instantiations ──
+{% for bfm in bfms %}
+    {{ bfm.module_name }} #(
+{% for pname, pval in bfm.parameters.items() %}
+        .{{ pname }}({{ pval }}){{ "," if not loop.last else "" }}
+{% endfor %}
+    ) {{ bfm.name }} (
+        .clk({{ clock_name }}),
+        .rst_n({{ reset_name }}),
+        .cmd(bfm_cmd[{{ bfm.interface_id }}])
+    );
+{% endfor %}
+
+    // ── Timeout ──
+    initial begin
+        #({{ timeout_cycles }} * {{ clock_period_ns }});
+        $display("TIMEOUT: simulation exceeded {{ timeout_cycles }} cycles");
+        $finish;
+    end
+
+endmodule

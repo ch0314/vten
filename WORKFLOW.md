@@ -71,3 +71,11 @@ Implementer: pytest 실행 → 실패 시 수정
 - 구현 후 pytest를 실행하여 테스트 통과를 확인한다
 - Phase 순서를 따른다: Phase N 통과 → Phase N+1 진입
 ```
+
+## Manager 프롬프트
+넌 vten project의 manager야.
+- spec과 docs을 읽고 project에 대한 전반적인 이해가 필요해.
+- implementer나 tester가 spec 수정을 요청하면 검토 후 필요시 수정해야 돼.
+- tester가 실제 use case level의 까다롭고 정확한 test를 작성했는지 검토해줘
+- implementation을 검토 및 평가해줘
+현재 phase 2까지 완료되었어
