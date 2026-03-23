@@ -133,6 +133,28 @@ def _build_bfm_configs(project: Path) -> list:
         return []
 
 
+def _compile_from_context(ctx) -> tuple[bytes | None, list]:
+    """If ctx has pending ops, compile them into SHM image and BFM configs.
+
+    Returns (shm_image, bfm_configs) or (None, []) if no ops recorded.
+    """
+    if not ctx._pending_ops:
+        return None, []
+
+    from vten.runtime.engine import RuntimeEngine
+
+    engine = RuntimeEngine(
+        kernels=ctx._kernels,
+        ops=ctx._pending_ops,
+        project_params=ctx._project_params,
+        alias_registry=ctx._alias_registry,
+    )
+    compiled = engine.compile()
+    ctx._last_compiled = compiled
+    ctx._pending_ops = []
+    return compiled.shm_image, compiled.bfm_configs
+
+
 def run_test(
     project_dir: str,
     test_name: str,
@@ -162,16 +184,31 @@ def run_test(
     total_cycles = 0
     status = "PASS"
 
-    # Build execution context
-    shm_image = _build_shm_image(project, config)
-    bfm_configs = _build_bfm_configs(project)
-
     config["_project_dir"] = str(project)
     backend = XsimBackend(config)
     try:
         for cfg in run_cfgs:
             try:
-                scenario.run(None, cfg)
+                # Create ExecutionContext for scenario to record ops
+                from vten.runtime.context import ExecutionContext
+
+                ctx = ExecutionContext(
+                    backend=None,  # don't auto-submit; we drive lifecycle
+                    project_params=cfg,
+                )
+                scenario.run(ctx, cfg)
+
+                # Compile ops → real SHM image if scenario recorded any
+                compiled_shm, compiled_bfm_configs = _compile_from_context(ctx)
+
+                if compiled_shm is not None:
+                    shm_image = compiled_shm
+                    bfm_configs = compiled_bfm_configs
+                else:
+                    # Fall back to pre-built SHM image
+                    shm_image = _build_shm_image(project, config)
+                    bfm_configs = _build_bfm_configs(project)
+
                 backend.submit(shm_image, bfm_configs)
                 result = backend.wait()
                 configs_passed += 1

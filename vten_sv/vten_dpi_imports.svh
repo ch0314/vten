@@ -49,6 +49,13 @@ import "DPI-C" function void vten_write_data(
     input int buf_id, input int offset, input int size,
     input bit [7:0] src []);
 
+// Scalar byte access — portable across all simulators (no open array issues)
+import "DPI-C" function int  vten_read_data_byte(
+    input int buf_id, input int offset);
+
+import "DPI-C" function void vten_write_data_byte(
+    input int buf_id, input int offset, input int value);
+
 // ── Stats Region ──
 import "DPI-C" function void vten_write_cmd_stats(
     input int cmd_id, input int status,
@@ -63,6 +70,9 @@ import "DPI-C" function void vten_write_cmd_status(
 import "DPI-C" function void vten_read_golden(
     input int buf_id, input int beat_index,
     output bit [7:0] dst []);
+
+import "DPI-C" function int  vten_read_golden_byte(
+    input int buf_id, input int byte_offset);
 
 import "DPI-C" function void vten_log_mismatch(
     input int cycle, input int beat,

@@ -183,7 +183,12 @@ class XsimBackend(Backend):
         raise_backend_error(code, cmd_id, message)
 
     def _start_xsim(self) -> None:
-        """Launch xsim subprocess with session_id plusarg."""
+        """Launch xsim subprocess with session_id plusarg.
+
+        Note: --sv_lib is an xelab option, not xsim.
+        The DPI-C library is linked during elaboration.
+        xsim must run from the directory containing xsim.dir/.
+        """
         vivado_path = self._vivado_path
         if vivado_path:
             xsim_bin = os.path.join(vivado_path, "bin", "xsim")
@@ -191,20 +196,29 @@ class XsimBackend(Backend):
             xsim_bin = "xsim"
 
         rtl_cfg = self._config.get("rtl", {})
-        top_module = rtl_cfg.get("top_module", "tb_top")
+        top_module = rtl_cfg.get("tb_module", "tb_top")
+
+        # xsim must run from directory containing xsim.dir/
+        # Priority: config key > [backend.xsim].xsim_dir > _project_dir > cwd
+        xsim_cfg = self._config.get("backend", {}).get("xsim", {})
+        xsim_cwd = self._config.get("_xsim_dir",
+                       xsim_cfg.get("xsim_dir",
+                           self._config.get("_project_dir", ".")))
+        # Resolve relative paths against project dir
         project_dir = self._config.get("_project_dir", ".")
+        if not os.path.isabs(xsim_cwd):
+            xsim_cwd = os.path.normpath(os.path.join(project_dir, xsim_cwd))
 
         cmd = [
             xsim_bin, top_module,
             "--runall",
-            "--sv_lib", "build/lib/libvten_shm",
-            f"+SESSION_ID={self._session_id}",
-            f"+TIMEOUT_MS={self._timeout_ms}",
+            "--testplusarg", f"SESSION_ID={self._session_id}",
+            "--testplusarg", f"TIMEOUT_MS={self._timeout_ms}",
         ]
 
         self._process = subprocess.Popen(
             cmd,
-            cwd=project_dir,
+            cwd=xsim_cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )

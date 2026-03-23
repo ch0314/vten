@@ -16,6 +16,24 @@ from vten.spec.models import InterfaceSpec, KernelSpec, Protocol
 from vten.spec.parser import parse_kernel_spec
 
 
+def _infer_bfm_role(iface: InterfaceSpec) -> str:
+    """Infer BFM role from protocol and interface conventions.
+
+    AXI4-Stream: rtl_port 's_*' → DUT is slave → BFM is master (pushes data)
+                 rtl_port 'm_*' → DUT is master → BFM is slave (pulls data)
+    AXI4:        BFM is always slave (DUT initiates reads/writes)
+    AXI4-Lite:   BFM is always master (drives register access)
+    """
+    if iface.protocol == Protocol.AXI4L:
+        return "master"
+    if iface.protocol == Protocol.AXI4:
+        return "slave"
+    # AXI4-Stream: infer from rtl_port prefix
+    if iface.rtl_port and iface.rtl_port.startswith("s_"):
+        return "master"  # DUT slave input → BFM drives data
+    return "slave"  # DUT master output → BFM receives data
+
+
 def _derive_bfm_configs(spec: KernelSpec) -> list[BFMConfig]:
     """Derive BFMConfig list from KernelSpec interfaces."""
     configs: list[BFMConfig] = []
@@ -25,7 +43,7 @@ def _derive_bfm_configs(spec: KernelSpec) -> list[BFMConfig]:
             protocol=iface.protocol,
             data_width=iface.data_width or 256,
             addr_width=iface.addr_width or 64,
-            role="slave",
+            role=_infer_bfm_role(iface),
         )
         configs.append(cfg)
     return configs

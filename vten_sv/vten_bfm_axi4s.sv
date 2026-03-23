@@ -36,6 +36,9 @@ module vten_bfm_axi4s #(
     // v0.4.1: idle signal — used by Scheduler for all_drained
     assign cmd_if.idle = !cmd_active && (cmd_queue.size() == 0);
 
+    // Note: module-level open arrays removed — using scalar DPI-C byte access
+    // for xsim compatibility (svGetArrElemPtr1/svGetArrayPtr unreliable).
+
     // Command receive
     always_ff @(posedge clk) begin
         if (cmd_if.cmd_valid) cmd_queue.push_back(cmd_if.cmd_data);
@@ -72,41 +75,50 @@ module vten_bfm_axi4s #(
     end
 
     // MASTER mode: PUSH (SHM → DUT)
+    // NBA-aware: on handshake, drive NEXT beat; on initial, drive beat 0.
     task automatic execute_master();
-        bit [7:0] beat_data [0:BYTES_PER_BEAT-1];
-        vten_read_data(current_cmd.buffer_id,
-                       beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, beat_data);
-
-        for (int i = 0; i < BYTES_PER_BEAT; i++)
-            m_tdata[i*8 +: 8] <= beat_data[i];
-
-        m_tvalid <= 1'b1;
-        m_tlast  <= (beat_count == expected_beats - 1);
-
         if (m_tvalid && m_tready) begin
-            beat_count <= beat_count + 1;
+            // Current beat consumed
             active_cycles <= active_cycles + 1;
             total_beats <= total_beats + 1;
             if (first_active == 0) first_active <= cycle_count;
             last_active <= cycle_count;
             if (beat_count == expected_beats - 1) begin
+                // Last beat — done
                 m_tvalid <= 1'b0;
+                beat_count <= beat_count + 1;
                 finish_command();
+            end else begin
+                // Drive next beat data (beat_count+1)
+                for (int i = 0; i < BYTES_PER_BEAT; i++)
+                    m_tdata[i*8 +: 8] <= vten_read_data_byte(
+                        current_cmd.buffer_id,
+                        (beat_count + 1) * BYTES_PER_BEAT + i);
+                m_tlast <= ((beat_count + 1) == expected_beats - 1);
+                beat_count <= beat_count + 1;
             end
-        end else if (m_tvalid && !m_tready)
+        end else if (!m_tvalid) begin
+            // Initial: drive first beat
+            for (int i = 0; i < BYTES_PER_BEAT; i++)
+                m_tdata[i*8 +: 8] <= vten_read_data_byte(
+                    current_cmd.buffer_id,
+                    beat_count * BYTES_PER_BEAT + i);
+            m_tvalid <= 1'b1;
+            m_tlast  <= (expected_beats == 1);
+        end else begin
+            // m_tvalid=1 but not ready → stall
             stall_cycles <= stall_cycles + 1;
+        end
     endtask
 
     // SLAVE mode: PULL (DUT → SHM)
     task automatic execute_slave();
         s_tready <= 1'b1;
         if (s_tvalid && s_tready) begin
-            bit [7:0] wr_data [0:BYTES_PER_BEAT-1];
             for (int i = 0; i < BYTES_PER_BEAT; i++)
-                wr_data[i] = s_tdata[i*8 +: 8];
-
-            vten_write_data(current_cmd.buffer_id,
-                            beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, wr_data);
+                vten_write_data_byte(current_cmd.buffer_id,
+                                     beat_count * BYTES_PER_BEAT + i,
+                                     s_tdata[i*8 +: 8]);
             beat_count <= beat_count + 1;
             active_cycles <= active_cycles + 1;
             total_beats <= total_beats + 1;
@@ -115,11 +127,11 @@ module vten_bfm_axi4s #(
 
             // Probe mode: beat-by-beat golden comparison
             if (current_cmd.probe) begin : probe_blk
-                bit [7:0] golden_data [0:BYTES_PER_BEAT-1];
                 logic [DATA_W-1:0] golden;
-                vten_read_golden(current_cmd.golden_buf_id, beat_count, golden_data);
                 for (int i = 0; i < BYTES_PER_BEAT; i++)
-                    golden[i*8 +: 8] = golden_data[i];
+                    golden[i*8 +: 8] = vten_read_golden_byte(
+                        current_cmd.golden_buf_id,
+                        beat_count * BYTES_PER_BEAT + i);
                 if (s_tdata !== golden)
                     vten_log_mismatch(cycle_count, beat_count,
                                       golden[DATA_W-1:DATA_W/2],

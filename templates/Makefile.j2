@@ -8,7 +8,7 @@ all: lib build run
 lib:
 	mkdir -p {{ lib_dir }}
 	gcc -shared -fPIC -o {{ lib_dir }}/libvten_shm.so \
-		{{ vten_sv_dir }}/../vten_sv/vten_shm_bridge.c -lrt -lpthread
+		{{ vten_sv_dir }}/vten_shm_bridge.c -lrt -lpthread
 
 build: lib
 {% if vivado_path %}

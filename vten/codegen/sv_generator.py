@@ -140,17 +140,23 @@ class SVGenerator:
                     (f"{prefix}_bready", "input", 1),
                 ]
             elif bfm.protocol == "axi4_lite":
+                addr_w = bfm.parameters.get("ADDR_W", 32) if hasattr(bfm, "parameters") else 32
                 signals = [
-                    (f"{prefix}_awaddr", "input", 32),
+                    (f"{prefix}_awaddr", "input", addr_w),
                     (f"{prefix}_awvalid", "input", 1),
                     (f"{prefix}_awready", "output", 1),
-                    (f"{prefix}_wdata", "input", 32),
+                    (f"{prefix}_wdata", "input", bfm.data_width),
+                    (f"{prefix}_wstrb", "input", bfm.data_width // 8),
                     (f"{prefix}_wvalid", "input", 1),
                     (f"{prefix}_wready", "output", 1),
-                    (f"{prefix}_araddr", "input", 32),
+                    (f"{prefix}_bresp", "output", 2),
+                    (f"{prefix}_bvalid", "output", 1),
+                    (f"{prefix}_bready", "input", 1),
+                    (f"{prefix}_araddr", "input", addr_w),
                     (f"{prefix}_arvalid", "input", 1),
                     (f"{prefix}_arready", "output", 1),
-                    (f"{prefix}_rdata", "output", 32),
+                    (f"{prefix}_rdata", "output", bfm.data_width),
+                    (f"{prefix}_rresp", "output", 2),
                     (f"{prefix}_rvalid", "output", 1),
                     (f"{prefix}_rready", "input", 1),
                 ]
@@ -174,6 +180,10 @@ class SVGenerator:
             params: dict = {"DATA_W": cfg.data_width}
             if cfg.protocol == Protocol.AXI4:
                 params["ADDR_W"] = cfg.addr_width
+            elif cfg.protocol == Protocol.AXI4S:
+                params["MODE"] = '"MASTER"' if cfg.role == "master" else '"SLAVE"'
+            elif cfg.protocol == Protocol.AXI4L:
+                params["ADDR_W"] = cfg.addr_width or 32
 
             bfms.append(BFMInstance(
                 name=f"bfm_{cfg.interface_name}",

@@ -39,6 +39,7 @@ from vten.runtime.resolver import ParameterResolver
 from vten.runtime.serializer import MultiPortSerializer, StreamSerializer
 from vten.runtime.shm import (
     BUF_DESC_SIZE,
+    CACHE_LINE,
     CMD_SLOT_SIZE,
     CONTROL_SIZE,
     DIRECTION_ENCODING,
@@ -499,7 +500,8 @@ class RuntimeEngine:
         cmd_offset = CONTROL_SIZE
         stats_offset = cmd_offset + CMD_SLOT_SIZE * num_commands
         bufdesc_offset = stats_offset + STATS_SLOT_SIZE * num_commands
-        data_region_offset = bufdesc_offset + BUF_DESC_SIZE * num_buffers
+        data_region_raw = bufdesc_offset + BUF_DESC_SIZE * num_buffers
+        data_region_offset = (data_region_raw + CACHE_LINE - 1) & ~(CACHE_LINE - 1)
 
         # Pack control header
         pack_control_header(

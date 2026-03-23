@@ -133,6 +133,8 @@ void vten_read_command_deps(int cmd_id,
 /* Data region */
 void vten_read_data(int buf_id, int offset, int size, void* dst);
 void vten_write_data(int buf_id, int offset, int size, const void* src);
+int  vten_read_data_byte(int buf_id, int offset);
+void vten_write_data_byte(int buf_id, int offset, int value);
 
 /* Stats region */
 void vten_write_cmd_stats(int cmd_id, int status,
@@ -143,6 +145,7 @@ void vten_write_cmd_status(int cmd_id, int status);
 
 /* Probe */
 void vten_read_golden(int buf_id, int beat_index, void* dst);
+int  vten_read_golden_byte(int buf_id, int byte_offset);
 void vten_log_mismatch(int cycle, int beat,
     int expected_hi, int expected_lo,
     int actual_hi, int actual_lo);

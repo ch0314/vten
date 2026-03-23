@@ -42,6 +42,17 @@ module vten_shm_controller #(
     // Command local cache (bulk read from SHM)
     bfm_cmd_t cmd_cache [0:MAX_CMDS-1];
 
+    // Runtime session ID: plusarg overrides parameter default.
+    // Guarded by VERILATOR define — Verilator needs commandArgs() setup
+    // which the functional test harness doesn't provide.
+    string runtime_session_id;
+    initial begin
+`ifndef VERILATOR
+        if (!$value$plusargs("SESSION_ID=%s", runtime_session_id))
+`endif
+            runtime_session_id = SESSION_ID;
+    end
+
     // ── Single always_ff: state transitions + datapath + DPI-C ──
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -57,7 +68,7 @@ module vten_shm_controller #(
             case (state)
                 // ── Init: SHM connection ──
                 S_INIT: begin
-                    if (vten_shm_init(SESSION_ID) == 0)
+                    if (vten_shm_init(runtime_session_id) == 0)
                         state <= S_WAIT_HOST;
                     else
                         state <= S_ERROR;
@@ -133,6 +144,8 @@ module vten_shm_controller #(
                 S_EXECUTE: begin
                     if (sched_error)
                         state <= S_ERROR;
+                    else if (sched_all_drained)
+                        state <= S_COMPLETE;  // Skip S_DRAIN
                     else if (sched_all_committed)
                         state <= S_DRAIN;
                 end

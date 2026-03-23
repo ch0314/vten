@@ -134,16 +134,25 @@ vten/
 │   ├── test_runtime_shm.py
 │   └── test_e2e_passthrough.py
 └── examples/                  # Phase 5: E2E examples
-    ├── passthrough/
+    ├── passthrough/           # 단일 커널 예제 프로젝트
+    │   ├── vten.toml
     │   ├── rtl/passthrough.sv
-    │   ├── specs/passthrough.yaml
-    │   ├── kernels/passthrough_kernel.py
-    │   └── tests/test_passthrough.py
-    └── conv3d/
+    │   └── kernels/
+    │       └── passthrough/
+    │           ├── kernel_spec.yaml
+    │           ├── passthrough_kernel.py
+    │           └── tests/test_passthrough.py
+    └── conv3d/                # 멀티 커널 예제 프로젝트
+        ├── vten.toml
         ├── rtl/
-        ├── specs/
-        ├── kernels/
-        └── tests/
+        ├── ip/
+        └── kernels/
+            ├── conv3d/
+            │   ├── kernel_spec.yaml
+            │   └── tests/
+            └── npu_top/
+                ├── kernel_spec.yaml
+                └── tests/
 ```
 
 ## Workflow
@@ -277,15 +286,23 @@ RTL 소스가 크기 때문에 vten/ 안으로 옮기지 않는다.
 ```
 /home/user/vten/          ← VTEN_ROOT (pip install -e .)
 /home/user/my_npu/        ← PROJECT_ROOT (vten.toml이 있는 곳)
-    ├── rtl/              # 대용량 RTL (이동 불가)
-    ├── specs/            # kernel_spec.yaml
-    ├── kernels/          # Kernel 클래스
-    └── tests/            # TestScenario
+    ├── vten.toml
+    ├── rtl/              # 공유 RTL (대용량, 이동 불가)
+    ├── ip/               # Vivado IP 정의 (.xci)
+    ├── build/            # 프로젝트 레벨 빌드 (ip_gen, lib, sv_lib)
+    ├── kernels/          # 커널별 디렉토리
+    │   ├── conv3d/
+    │   │   ├── kernel_spec.yaml
+    │   │   ├── conv3d_kernel.py
+    │   │   ├── tests/
+    │   │   └── build/    # 커널별 빌드 (generated, xsim.dir, shm)
+    │   └── npu_top/
+    └── results/          # 테스트 결과
 ```
 
 **두 가지 경로 기준점:**
 - `VTEN_ROOT`: `import vten`으로 해결. SV 라이브러리, 템플릿 위치.
-- `PROJECT_ROOT`: `vten.toml` 위치. RTL, specs, kernels, tests, build 출력.
+- `PROJECT_ROOT`: `vten.toml` 위치. RTL, kernels, build, results.
 
 상세: `specs/path_resolution.md` 참조.
 
@@ -294,3 +311,5 @@ RTL 소스가 크기 때문에 vten/ 안으로 옮기지 않는다.
 - 절대 경로를 하드코딩하지 않는다
 - `kernel_spec.yaml`의 `rtl_top`은 PROJECT_ROOT 기준
 - `vten.toml`의 `[rtl].sources`도 PROJECT_ROOT 기준
+- `kernel_spec.yaml`은 `kernels/<name>/` 디렉토리에 위치 (레거시: `specs/`)
+- 커널별 빌드 출력은 `kernels/<name>/build/`에 분리

@@ -7,7 +7,7 @@
     logic                              {{ bfm.rtl_port_prefix }}_tlast;
 {% elif bfm.protocol == "axi4" %}
     // AR channel
-    logic [63:0]                       {{ bfm.rtl_port_prefix }}_araddr;
+    logic [{{ bfm.parameters.ADDR_W - 1 }}:0] {{ bfm.rtl_port_prefix }}_araddr;
     logic [7:0]                        {{ bfm.rtl_port_prefix }}_arlen;
     logic [2:0]                        {{ bfm.rtl_port_prefix }}_arsize;
     logic [1:0]                        {{ bfm.rtl_port_prefix }}_arburst;
@@ -20,7 +20,7 @@
     logic                              {{ bfm.rtl_port_prefix }}_rvalid;
     logic                              {{ bfm.rtl_port_prefix }}_rready;
     // AW channel
-    logic [63:0]                       {{ bfm.rtl_port_prefix }}_awaddr;
+    logic [{{ bfm.parameters.ADDR_W - 1 }}:0] {{ bfm.rtl_port_prefix }}_awaddr;
     logic [7:0]                        {{ bfm.rtl_port_prefix }}_awlen;
     logic [2:0]                        {{ bfm.rtl_port_prefix }}_awsize;
     logic [1:0]                        {{ bfm.rtl_port_prefix }}_awburst;
@@ -37,9 +37,27 @@
     logic                              {{ bfm.rtl_port_prefix }}_bvalid;
     logic                              {{ bfm.rtl_port_prefix }}_bready;
 {% elif bfm.protocol == "axi4_lite" %}
-    logic [31:0]                       {{ bfm.rtl_port_prefix }}_awaddr;
-    logic [31:0]                       {{ bfm.rtl_port_prefix }}_wdata;
-    logic [31:0]                       {{ bfm.rtl_port_prefix }}_araddr;
-    logic [31:0]                       {{ bfm.rtl_port_prefix }}_rdata;
+    // AW channel
+    logic [{{ bfm.parameters.ADDR_W - 1 }}:0] {{ bfm.rtl_port_prefix }}_awaddr;
+    logic                              {{ bfm.rtl_port_prefix }}_awvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_awready;
+    // W channel
+    logic [{{ bfm.data_width - 1 }}:0] {{ bfm.rtl_port_prefix }}_wdata;
+    logic [{{ bfm.data_width // 8 - 1 }}:0] {{ bfm.rtl_port_prefix }}_wstrb;
+    logic                              {{ bfm.rtl_port_prefix }}_wvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_wready;
+    // B channel
+    logic [1:0]                        {{ bfm.rtl_port_prefix }}_bresp;
+    logic                              {{ bfm.rtl_port_prefix }}_bvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_bready;
+    // AR channel
+    logic [{{ bfm.parameters.ADDR_W - 1 }}:0] {{ bfm.rtl_port_prefix }}_araddr;
+    logic                              {{ bfm.rtl_port_prefix }}_arvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_arready;
+    // R channel
+    logic [{{ bfm.data_width - 1 }}:0] {{ bfm.rtl_port_prefix }}_rdata;
+    logic [1:0]                        {{ bfm.rtl_port_prefix }}_rresp;
+    logic                              {{ bfm.rtl_port_prefix }}_rvalid;
+    logic                              {{ bfm.rtl_port_prefix }}_rready;
 {% endif %}
 {% endfor %}

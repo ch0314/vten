@@ -333,6 +333,22 @@ void vten_write_data(int buf_id, int offset, int size, const svOpenArrayHandle s
     }
 }
 
+int vten_read_data_byte(int buf_id, int offset) {
+    if (data_base == NULL) return 0;
+    if (!buf_cache_valid) _load_buf_cache();
+    if (buf_id < 0 || buf_id >= MAX_BUFFERS) return 0;
+    BufferDescriptor* desc = &buf_cache[buf_id];
+    return (int)(*(data_base + (int)desc->data_offset + offset));
+}
+
+void vten_write_data_byte(int buf_id, int offset, int value) {
+    if (data_base == NULL) return;
+    if (!buf_cache_valid) _load_buf_cache();
+    if (buf_id < 0 || buf_id >= MAX_BUFFERS) return;
+    BufferDescriptor* desc = &buf_cache[buf_id];
+    *(data_base + (int)desc->data_offset + offset) = (uint8_t)value;
+}
+
 void vten_write_cmd_stats(int cmd_id, int status,
     int issue_cycle, int commit_cycle,
     int first_active, int last_active,
@@ -358,6 +374,15 @@ void vten_write_cmd_status(int cmd_id, int status) {
 
     StatsEntry* entry = (StatsEntry*)(stats_base + cmd_id * STATS_SLOT_SIZE);
     entry->status = (uint8_t)status;
+}
+
+int vten_read_golden_byte(int buf_id, int byte_offset) {
+    if (data_base == NULL) return 0;
+    if (!buf_cache_valid) _load_buf_cache();
+    if (buf_id < 0 || buf_id >= MAX_BUFFERS) return 0;
+    BufferDescriptor* desc = &buf_cache[buf_id];
+    if (byte_offset >= (int)desc->size) return 0;
+    return (int)(*(data_base + (int)desc->data_offset + byte_offset));
 }
 
 void vten_read_golden(int buf_id, int beat_index, const svOpenArrayHandle dst) {

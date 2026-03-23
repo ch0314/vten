@@ -661,3 +661,423 @@ class TestSVGeneratorSignalCompleteness:
         assert "awready" in lower, "AXI4-Lite missing awready"
         assert "wvalid" in lower, "AXI4-Lite missing wvalid"
         assert "wready" in lower, "AXI4-Lite missing wready"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §6  BFM port connections — regression tests for C1–C6 bugs
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _generate_axi4_only(tmp_path: Path) -> str:
+    """Generate tb_top.sv with a single AXI4 BFM and return content."""
+    from vten.codegen.sv_generator import SVGenerator
+
+    spec = KernelSpec(
+        kernel_name="test_axi4",
+        rtl_top="rtl/test.sv",
+        interfaces={
+            "ddr": InterfaceSpec(
+                name="ddr", rtl_port="m_axi_ddr",
+                protocol=Protocol.AXI4, data_width=256, addr_width=64,
+            ),
+        },
+    )
+    cfgs = [BFMConfig(interface_name="ddr", protocol=Protocol.AXI4, data_width=256,
+                       addr_width=64, role="slave")]
+    gen = SVGenerator(kernel_spec=spec, bfm_configs=cfgs, project_config=_minimal_config())
+    gen.generate(str(tmp_path))
+    return (tmp_path / "tb_top.sv").read_text()
+
+
+def _generate_axilite_only(tmp_path: Path) -> str:
+    """Generate tb_top.sv with a single AXI4-Lite BFM and return content."""
+    from vten.codegen.sv_generator import SVGenerator
+
+    spec = KernelSpec(
+        kernel_name="test_axilite",
+        rtl_top="rtl/test.sv",
+        interfaces={
+            "ctrl": InterfaceSpec(
+                name="ctrl", rtl_port="s_axi_ctrl",
+                protocol=Protocol.AXI4L, addr_width=16,
+                registers=[RegisterSpec(name="reg0", offset=0x10)],
+            ),
+        },
+    )
+    cfgs = [BFMConfig(interface_name="ctrl", protocol=Protocol.AXI4L, data_width=32,
+                       addr_width=16, role="master")]
+    gen = SVGenerator(kernel_spec=spec, bfm_configs=cfgs, project_config=_minimal_config())
+    gen.generate(str(tmp_path))
+    return (tmp_path / "tb_top.sv").read_text()
+
+
+class TestBFMPortConnections:
+    """Regression: BFM instance blocks must have actual AXI port connections.
+
+    Verifies C1–C6 bug fixes: BFM instantiations in tb_top.sv must contain
+    port connections like .s_araddr(wire), not just module-level wire declarations.
+    """
+
+    # ── AXI4 BFM (s_ prefix ports per vten_bfm_axi4.sv) ──
+
+    def test_axi4_bfm_instance_has_s_araddr(self, tmp_path: Path):
+        """AXI4 BFM instance has .s_araddr( port connection."""
+        content = _generate_axi4_only(tmp_path)
+        assert ".s_araddr(" in content, "AXI4 BFM missing .s_araddr( port"
+
+    def test_axi4_bfm_instance_has_s_awaddr(self, tmp_path: Path):
+        content = _generate_axi4_only(tmp_path)
+        assert ".s_awaddr(" in content, "AXI4 BFM missing .s_awaddr( port"
+
+    def test_axi4_bfm_instance_has_s_rdata(self, tmp_path: Path):
+        content = _generate_axi4_only(tmp_path)
+        assert ".s_rdata(" in content, "AXI4 BFM missing .s_rdata( port"
+
+    def test_axi4_bfm_instance_has_s_wdata(self, tmp_path: Path):
+        content = _generate_axi4_only(tmp_path)
+        assert ".s_wdata(" in content, "AXI4 BFM missing .s_wdata( port"
+
+    def test_axi4_bfm_instance_has_s_wstrb(self, tmp_path: Path):
+        content = _generate_axi4_only(tmp_path)
+        assert ".s_wstrb(" in content, "AXI4 BFM missing .s_wstrb( port"
+
+    def test_axi4_bfm_instance_has_s_bresp(self, tmp_path: Path):
+        content = _generate_axi4_only(tmp_path)
+        assert ".s_bresp(" in content, "AXI4 BFM missing .s_bresp( port"
+
+    def test_axi4_bfm_instance_has_s_rresp(self, tmp_path: Path):
+        content = _generate_axi4_only(tmp_path)
+        assert ".s_rresp(" in content, "AXI4 BFM missing .s_rresp( port"
+
+    def test_axi4_bfm_instance_has_s_rlast(self, tmp_path: Path):
+        content = _generate_axi4_only(tmp_path)
+        assert ".s_rlast(" in content, "AXI4 BFM missing .s_rlast( port"
+
+    def test_axi4_bfm_instance_has_s_arlen(self, tmp_path: Path):
+        content = _generate_axi4_only(tmp_path)
+        assert ".s_arlen(" in content, "AXI4 BFM missing .s_arlen( port"
+
+    def test_axi4_bfm_instance_has_s_arsize(self, tmp_path: Path):
+        content = _generate_axi4_only(tmp_path)
+        assert ".s_arsize(" in content, "AXI4 BFM missing .s_arsize( port"
+
+    def test_axi4_bfm_instance_has_s_arburst(self, tmp_path: Path):
+        content = _generate_axi4_only(tmp_path)
+        assert ".s_arburst(" in content, "AXI4 BFM missing .s_arburst( port"
+
+    def test_axi4_bfm_all_s_prefix_ports(self, tmp_path: Path):
+        """AXI4 BFM has all 24 s_-prefix port connections."""
+        content = _generate_axi4_only(tmp_path)
+        expected = [
+            ".s_araddr(", ".s_arlen(", ".s_arsize(", ".s_arburst(",
+            ".s_arvalid(", ".s_arready(",
+            ".s_rdata(", ".s_rresp(", ".s_rlast(", ".s_rvalid(", ".s_rready(",
+            ".s_awaddr(", ".s_awlen(", ".s_awsize(", ".s_awburst(",
+            ".s_awvalid(", ".s_awready(",
+            ".s_wdata(", ".s_wstrb(", ".s_wlast(", ".s_wvalid(", ".s_wready(",
+            ".s_bresp(", ".s_bvalid(", ".s_bready(",
+        ]
+        for port in expected:
+            assert port in content, f"AXI4 BFM missing port {port}"
+
+    # ── AXI4-Lite BFM (m_ prefix ports per vten_bfm_axilite.sv) ──
+
+    def test_axilite_bfm_instance_has_m_awaddr(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert ".m_awaddr(" in content, "AXI4-Lite BFM missing .m_awaddr( port"
+
+    def test_axilite_bfm_instance_has_m_wdata(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert ".m_wdata(" in content, "AXI4-Lite BFM missing .m_wdata( port"
+
+    def test_axilite_bfm_instance_has_m_wstrb(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert ".m_wstrb(" in content, "AXI4-Lite BFM missing .m_wstrb( port"
+
+    def test_axilite_bfm_instance_has_m_bresp(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert ".m_bresp(" in content, "AXI4-Lite BFM missing .m_bresp( port"
+
+    def test_axilite_bfm_instance_has_m_rresp(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert ".m_rresp(" in content, "AXI4-Lite BFM missing .m_rresp( port"
+
+    def test_axilite_bfm_instance_has_m_araddr(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert ".m_araddr(" in content, "AXI4-Lite BFM missing .m_araddr( port"
+
+    def test_axilite_bfm_instance_has_m_rdata(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert ".m_rdata(" in content, "AXI4-Lite BFM missing .m_rdata( port"
+
+    def test_axilite_bfm_all_m_prefix_ports(self, tmp_path: Path):
+        """AXI4-Lite BFM has all 17 m_-prefix port connections."""
+        content = _generate_axilite_only(tmp_path)
+        expected = [
+            ".m_awaddr(", ".m_awvalid(", ".m_awready(",
+            ".m_wdata(", ".m_wstrb(", ".m_wvalid(", ".m_wready(",
+            ".m_bresp(", ".m_bvalid(", ".m_bready(",
+            ".m_araddr(", ".m_arvalid(", ".m_arready(",
+            ".m_rdata(", ".m_rresp(", ".m_rvalid(", ".m_rready(",
+        ]
+        for port in expected:
+            assert port in content, f"AXI4-Lite BFM missing port {port}"
+
+    # ── AXI4-Stream BFM (master vs slave role) ──
+
+    def test_axi4s_master_bfm_m_ports_connected(self, tmp_path: Path):
+        """AXI4-Stream master BFM: .m_tdata(wire), .m_tvalid(wire), etc."""
+        content = _generate_passthrough(tmp_path)
+        # s_axis_in is master role BFM (drives data into DUT)
+        assert ".m_tdata(s_axis_in_tdata)" in content, \
+            "AXI4S master BFM missing .m_tdata(wire) connection"
+        assert ".m_tvalid(s_axis_in_tvalid)" in content
+        assert ".m_tready(s_axis_in_tready)" in content
+        assert ".m_tlast(s_axis_in_tlast)" in content
+
+    def test_axi4s_master_bfm_s_ports_tied_off(self, tmp_path: Path):
+        """AXI4-Stream master BFM: .s_tdata('0), .s_tvalid(1'b0) tie-off."""
+        content = _generate_passthrough(tmp_path)
+        assert ".s_tdata('0)" in content, "AXI4S master BFM missing .s_tdata('0) tie-off"
+        assert ".s_tvalid(1'b0)" in content, "AXI4S master BFM missing .s_tvalid(1'b0) tie-off"
+
+    def test_axi4s_slave_bfm_s_ports_connected(self, tmp_path: Path):
+        """AXI4-Stream slave BFM: .s_tdata(wire), .s_tvalid(wire), etc."""
+        content = _generate_passthrough(tmp_path)
+        # m_axis_out is slave role BFM (receives data from DUT)
+        assert ".s_tdata(m_axis_out_tdata)" in content, \
+            "AXI4S slave BFM missing .s_tdata(wire) connection"
+        assert ".s_tvalid(m_axis_out_tvalid)" in content
+        assert ".s_tready(m_axis_out_tready)" in content
+        assert ".s_tlast(m_axis_out_tlast)" in content
+
+    def test_axi4s_slave_bfm_m_tready_tied_high(self, tmp_path: Path):
+        """AXI4-Stream slave BFM: .m_tready(1'b1) tie-off."""
+        content = _generate_passthrough(tmp_path)
+        assert ".m_tready(1'b1)" in content, "AXI4S slave BFM missing .m_tready(1'b1) tie-off"
+
+
+class TestBFMCmdIfPortName:
+    """Regression: BFM uses .cmd_if(bfm_cmd[N]), not .cmd(bfm_cmd[N])."""
+
+    def test_cmd_if_port_name(self, tmp_path: Path):
+        """BFM instance has .cmd_if(bfm_cmd[N]) port."""
+        content = _generate_passthrough(tmp_path)
+        assert re.search(r"\.cmd_if\(bfm_cmd\[", content), \
+            "BFM missing .cmd_if(bfm_cmd[N]) — found .cmd( instead?"
+
+    def test_no_dot_cmd_port(self, tmp_path: Path):
+        """BFM instance does NOT have .cmd(bfm_cmd[N])."""
+        content = _generate_passthrough(tmp_path)
+        # .cmd( without _if is the old buggy pattern
+        assert not re.search(r"\.cmd\(bfm_cmd\[", content), \
+            "BFM has old .cmd(bfm_cmd[N]) pattern — should be .cmd_if(..."
+
+    def test_cmd_if_npu_40bfm(self, tmp_path: Path):
+        """All 40 NPU BFMs have .cmd_if(bfm_cmd[N])."""
+        content = _generate_npu(tmp_path)
+        matches = re.findall(r"\.cmd_if\(bfm_cmd\[\d+\]\)", content)
+        assert len(matches) >= 40, (
+            f"Expected >= 40 .cmd_if(bfm_cmd[N]) ports, found {len(matches)}"
+        )
+
+
+class TestCycleCounter:
+    """Regression: tb_top.sv has cycle_count declaration, increment, BFM connection."""
+
+    def test_cycle_count_declaration(self, tmp_path: Path):
+        """int cycle_count; declared in tb_top.sv."""
+        content = _generate_passthrough(tmp_path)
+        assert "int cycle_count" in content, "Missing 'int cycle_count' declaration"
+
+    def test_cycle_count_always_ff_increment(self, tmp_path: Path):
+        """cycle_count incremented in always_ff block."""
+        content = _generate_passthrough(tmp_path)
+        assert "cycle_count <= cycle_count + 1" in content, \
+            "Missing cycle_count increment in always_ff"
+
+    def test_cycle_count_connected_to_all_bfms(self, tmp_path: Path):
+        """All BFMs have .cycle_count(cycle_count) connection."""
+        content = _generate_passthrough(tmp_path)
+        count = content.count(".cycle_count(cycle_count)")
+        # passthrough has 2 BFMs
+        assert count >= 2, f"Expected >= 2 .cycle_count(cycle_count), found {count}"
+
+    def test_cycle_count_npu_40bfm(self, tmp_path: Path):
+        """All 40 NPU BFMs have .cycle_count(cycle_count)."""
+        content = _generate_npu(tmp_path)
+        count = content.count(".cycle_count(cycle_count)")
+        assert count >= 40, f"Expected >= 40 .cycle_count(cycle_count), found {count}"
+
+
+class TestAXI4LiteSignalCompleteness:
+    """Regression: AXI4-Lite wstrb/bresp/rresp in wire decl, DUT, BFM."""
+
+    def test_wire_declarations_have_wstrb(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert "_wstrb" in content, "Wire declaration missing _wstrb"
+
+    def test_wire_declarations_have_bresp(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert "_bresp" in content, "Wire declaration missing _bresp"
+
+    def test_wire_declarations_have_rresp(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert "_rresp" in content, "Wire declaration missing _rresp"
+
+    def test_dut_connections_have_wstrb(self, tmp_path: Path):
+        """DUT instance has .xxx_wstrb(xxx_wstrb) connection."""
+        content = _generate_axilite_only(tmp_path)
+        assert re.search(r"\.\w+_wstrb\(\w+_wstrb\)", content), \
+            "DUT missing wstrb port connection"
+
+    def test_dut_connections_have_bresp(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert re.search(r"\.\w+_bresp\(\w+_bresp\)", content), \
+            "DUT missing bresp port connection"
+
+    def test_dut_connections_have_rresp(self, tmp_path: Path):
+        content = _generate_axilite_only(tmp_path)
+        assert re.search(r"\.\w+_rresp\(\w+_rresp\)", content), \
+            "DUT missing rresp port connection"
+
+
+class TestAXI4StreamMODEParameter:
+    """Regression: AXI4-Stream BFM has .MODE("MASTER"/"SLAVE") parameter."""
+
+    def test_mode_parameter_exists(self, tmp_path: Path):
+        """Rendered tb_top.sv has .MODE( parameter for AXI4S BFMs."""
+        content = _generate_passthrough(tmp_path)
+        assert ".MODE(" in content, "AXI4S BFM missing .MODE( parameter"
+
+    def test_master_role_mode_value(self, tmp_path: Path):
+        """Master role BFM has .MODE("MASTER")."""
+        content = _generate_passthrough(tmp_path)
+        assert '.MODE("MASTER")' in content, \
+            "AXI4S master BFM missing .MODE(\"MASTER\")"
+
+    def test_slave_role_mode_value(self, tmp_path: Path):
+        """Slave role BFM has .MODE("SLAVE")."""
+        content = _generate_passthrough(tmp_path)
+        assert '.MODE("SLAVE")' in content, \
+            "AXI4S slave BFM missing .MODE(\"SLAVE\")"
+
+    def test_svgenerator_builds_mode_parameter(self):
+        """SVGenerator._build_context() sets MODE in AXI4S BFM parameters."""
+        from vten.codegen.sv_generator import SVGenerator
+
+        gen = SVGenerator(
+            kernel_spec=_passthrough_spec(),
+            bfm_configs=_passthrough_bfm_configs(),
+            project_config=_minimal_config(),
+        )
+        ctx = gen._build_context()
+        for bfm in ctx.tb.bfms:
+            if bfm.protocol == "axi4_stream":
+                assert "MODE" in bfm.parameters, f"BFM {bfm.name} missing MODE parameter"
+                if bfm.role == "master":
+                    assert "MASTER" in bfm.parameters["MODE"]
+                else:
+                    assert "SLAVE" in bfm.parameters["MODE"]
+
+
+class TestADDR_WParameterization:
+    """Regression: Wire widths use ADDR_W parameter, not hardcoded [63:0]."""
+
+    def test_axi4_wire_uses_parameterized_addr_width(self, tmp_path: Path):
+        """AXI4 araddr/awaddr wire width from ADDR_W, not [63:0] hardcode."""
+        content = _generate_axi4_only(tmp_path)
+        # With ADDR_W=64, wire should be [63:0] — but it should come from
+        # bfm.parameters.ADDR_W in template, not hardcoded.
+        # Verify the template rendered correctly for ADDR_W=64:
+        assert re.search(r"logic\s+\[63:0\]\s+\w+_araddr", content), \
+            "AXI4 araddr wire width incorrect for ADDR_W=64"
+        assert re.search(r"logic\s+\[63:0\]\s+\w+_awaddr", content), \
+            "AXI4 awaddr wire width incorrect for ADDR_W=64"
+
+    def test_axi4_different_addr_width(self, tmp_path: Path):
+        """AXI4 with ADDR_W=48 produces [47:0] wire width."""
+        from vten.codegen.sv_generator import SVGenerator
+
+        spec = KernelSpec(
+            kernel_name="test_axi4_48",
+            rtl_top="rtl/test.sv",
+            interfaces={
+                "mem": InterfaceSpec(
+                    name="mem", rtl_port="m_axi_mem",
+                    protocol=Protocol.AXI4, data_width=256, addr_width=48,
+                ),
+            },
+        )
+        cfgs = [BFMConfig(interface_name="mem", protocol=Protocol.AXI4, data_width=256,
+                           addr_width=48, role="slave")]
+        gen = SVGenerator(kernel_spec=spec, bfm_configs=cfgs, project_config=_minimal_config())
+        gen.generate(str(tmp_path))
+        content = (tmp_path / "tb_top.sv").read_text()
+        assert re.search(r"logic\s+\[47:0\]\s+\w+_araddr", content), \
+            "AXI4 araddr should be [47:0] for ADDR_W=48"
+        assert "[63:0]" not in content or "araddr" not in content.split("[63:0]")[0][-20:], \
+            "AXI4 wire still using hardcoded [63:0] with ADDR_W=48"
+
+    def test_axilite_wire_uses_parameterized_addr_width(self, tmp_path: Path):
+        """AXI4-Lite with ADDR_W=16 produces [15:0] wire width."""
+        content = _generate_axilite_only(tmp_path)
+        assert re.search(r"logic\s+\[15:0\]\s+\w+_araddr", content), \
+            "AXI4-Lite araddr should be [15:0] for ADDR_W=16"
+        assert re.search(r"logic\s+\[15:0\]\s+\w+_awaddr", content), \
+            "AXI4-Lite awaddr should be [15:0] for ADDR_W=16"
+
+    def test_axilite_different_addr_width(self, tmp_path: Path):
+        """AXI4-Lite with ADDR_W=12 produces [11:0] wire width."""
+        from vten.codegen.sv_generator import SVGenerator
+
+        spec = KernelSpec(
+            kernel_name="test_axilite_12",
+            rtl_top="rtl/test.sv",
+            interfaces={
+                "ctrl": InterfaceSpec(
+                    name="ctrl", rtl_port="s_axi_ctrl",
+                    protocol=Protocol.AXI4L, addr_width=12,
+                ),
+            },
+        )
+        cfgs = [BFMConfig(interface_name="ctrl", protocol=Protocol.AXI4L, data_width=32,
+                           addr_width=12, role="master")]
+        gen = SVGenerator(kernel_spec=spec, bfm_configs=cfgs, project_config=_minimal_config())
+        gen.generate(str(tmp_path))
+        content = (tmp_path / "tb_top.sv").read_text()
+        assert re.search(r"logic\s+\[11:0\]\s+\w+_araddr", content), \
+            "AXI4-Lite araddr should be [11:0] for ADDR_W=12"
+
+
+class TestBFMPortConnectionsNPU:
+    """NPU 40-BFM scale: verify port connections for all 3 protocol types."""
+
+    def test_npu_axi4_bfms_have_s_prefix_ports(self, tmp_path: Path):
+        """NPU AXI4 BFMs (DDR+HBM) have .s_araddr(, .s_awaddr( etc."""
+        content = _generate_npu(tmp_path)
+        # 34 AXI4 BFMs → should have 34 .s_araddr( occurrences
+        s_araddr_count = content.count(".s_araddr(")
+        assert s_araddr_count >= 34, (
+            f"Expected >= 34 .s_araddr( for NPU AXI4 BFMs, found {s_araddr_count}"
+        )
+
+    def test_npu_axilite_bfms_have_m_prefix_ports(self, tmp_path: Path):
+        """NPU AXI4-Lite BFMs (6 ctrl IPs) have .m_awaddr( etc."""
+        content = _generate_npu(tmp_path)
+        m_awaddr_count = content.count(".m_awaddr(")
+        assert m_awaddr_count >= 6, (
+            f"Expected >= 6 .m_awaddr( for NPU AXI4-Lite BFMs, found {m_awaddr_count}"
+        )
+
+    def test_npu_all_bfms_have_cmd_if(self, tmp_path: Path):
+        """All 40 NPU BFMs have .cmd_if(bfm_cmd[N])."""
+        content = _generate_npu(tmp_path)
+        matches = re.findall(r"\.cmd_if\(bfm_cmd\[\d+\]\)", content)
+        assert len(matches) >= 40
+
+    def test_npu_all_bfms_have_cycle_count(self, tmp_path: Path):
+        """All 40 NPU BFMs have .cycle_count(cycle_count)."""
+        content = _generate_npu(tmp_path)
+        count = content.count(".cycle_count(cycle_count)")
+        assert count >= 40

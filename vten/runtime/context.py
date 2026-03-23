@@ -208,12 +208,33 @@ class ExecutionContext:
         self._pending_ops = []
 
         if self._backend is not None:
-            backend_result = self._backend.submit(
+            self._backend.submit(
                 shm_image=compiled.shm_image,
                 bfm_configs=compiled.bfm_configs,
             )
+            backend_result = self._backend.wait()
             self._last_backend_result = backend_result
-            return BatchResult(status="DONE")
+
+            # Build BatchResult from backend stats
+            total_cycles = 0
+            per_cmd_stats = []
+            if hasattr(backend_result, "stats") and backend_result.stats:
+                per_cmd_stats = list(backend_result.stats)
+                max_cycle = max(
+                    (s.commit_cycle for s in backend_result.stats if s.commit_cycle),
+                    default=0,
+                )
+                total_cycles = max_cycle
+
+            status = "DONE"
+            if hasattr(backend_result, "error_code") and backend_result.error_code:
+                status = "ERROR"
+
+            return BatchResult(
+                status=status,
+                total_cycles=total_cycles,
+                per_command_stats=per_cmd_stats,
+            )
 
         return BatchResult(status="DONE")
 

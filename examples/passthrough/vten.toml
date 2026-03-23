@@ -1,0 +1,18 @@
+[project]
+name = "passthrough"
+
+[rtl]
+top_module = "passthrough"
+tb_module = "tb_top"
+sources = ["rtl/passthrough.sv"]
+
+[parameters]
+N = 1024
+
+[backend]
+simulator = "xsim"
+timeout_ms = 10000
+
+[backend.xsim]
+vivado_path = "/tools/Xilinx/Vivado/2023.2"
+xsim_dir = "../.."  # vten root where xsim.dir/ lives
