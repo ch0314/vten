@@ -43,13 +43,9 @@ module vten_shm_controller #(
     bfm_cmd_t cmd_cache [0:MAX_CMDS-1];
 
     // Runtime session ID: plusarg overrides parameter default.
-    // Guarded by VERILATOR define — Verilator needs commandArgs() setup
-    // which the functional test harness doesn't provide.
     string runtime_session_id;
     initial begin
-`ifndef VERILATOR
         if (!$value$plusargs("SESSION_ID=%s", runtime_session_id))
-`endif
             runtime_session_id = SESSION_ID;
     end
 

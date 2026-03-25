@@ -121,6 +121,7 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(cmd, "create") == 0) {
             ctx = new VerilatedContext;
+            ctx->commandArgs(argc, argv);
             ctx->debug(0);
             ctx->randReset(2);
             dut = new Vvten_shm_controller(ctx, "TOP");

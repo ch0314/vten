@@ -8,6 +8,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ── Return codes ── */
 #define VTEN_OK       0
 #define VTEN_TIMEOUT  1
@@ -149,5 +153,9 @@ int  vten_read_golden_byte(int buf_id, int byte_offset);
 void vten_log_mismatch(int cycle, int beat,
     int expected_hi, int expected_lo,
     int actual_hi, int actual_lo);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* VTEN_SHM_BRIDGE_H */

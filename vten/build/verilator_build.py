@@ -163,12 +163,15 @@ class VerilatorBuildPipeline(BuildPipeline):
 
         cmd = [
             self._verilator_bin,
-            "--cc", "--exe",
+            "--cc", "--exe", "--main", "--timing",
             "--top-module", "tb_top",
             f"-O{self._opt_level}",
             f"-j", str(self._threads),
             "-I" + str(self._vten_sv_dir),
             "--Mdir", str(obj_dir),
+            # Suppress common SV warnings that are safe in vTen BFMs
+            "-Wno-WIDTHEXPAND", "-Wno-WIDTHTRUNC", "-Wno-WIDTHCONCAT",
+            "-Wno-CASEINCOMPLETE", "-Wno-IGNOREDRETURN", "-Wno-MULTIDRIVEN",
         ]
 
         if self._trace:
@@ -188,8 +191,8 @@ class VerilatorBuildPipeline(BuildPipeline):
             cmd.append(str(dpi_cpp))
         cmd.append(str(self._vten_sv_dir / "vten_shm_bridge.c"))
 
-        # Link flags for POSIX SHM
-        cmd.extend(["-CFLAGS", f"-I{self._vten_sv_dir}"])
+        # Compile/link flags: C++20 coroutines for --timing, POSIX SHM
+        cmd.extend(["-CFLAGS", f"-I{self._vten_sv_dir} -fcoroutines"])
         cmd.extend(["-LDFLAGS", "-lrt -lpthread"])
 
         result = subprocess.run(
@@ -215,7 +218,11 @@ class VerilatorBuildPipeline(BuildPipeline):
             )
 
         result = subprocess.run(
-            ["make", "-C", str(obj_dir), "-f", "Vtb_top.mk", f"-j{self._threads}"],
+            [
+                "make", "-C", str(obj_dir), "-f", "Vtb_top.mk",
+                f"-j{self._threads}",
+                "VM_USER_CFLAGS=-fcoroutines",  # C++20 coroutines for --timing
+            ],
             capture_output=True,
             text=True,
         )

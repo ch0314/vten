@@ -38,10 +38,12 @@ class VerilatorBackend(SimBackend):
         The binary (Vtb_top) is expected in the kernel build directory,
         produced by the VerilatorBuildPipeline make stage.
         """
-        # Locate binary
+        # Locate binary: obj_dir/Vtb_top (Verilator output) or root Vtb_top
         kernel_build = self._config.get("_kernel_build_dir")
         if kernel_build:
-            binary = os.path.join(kernel_build, "Vtb_top")
+            obj_dir_binary = os.path.join(kernel_build, "obj_dir", "Vtb_top")
+            root_binary = os.path.join(kernel_build, "Vtb_top")
+            binary = obj_dir_binary if os.path.exists(obj_dir_binary) else root_binary
         else:
             veri_cfg = self._config.get("backend", {}).get("verilator", {})
             sim_dir = veri_cfg.get("sim_dir",
