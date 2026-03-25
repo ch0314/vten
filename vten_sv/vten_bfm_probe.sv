@@ -28,17 +28,20 @@ module vten_bfm_axi4s_probe #(
         tready      = 1'b1;  // Always ready (passive monitor)
     end
 
+    byte golden_buf [0:BYTES_PER_BEAT-1];
+
     always @(posedge clk) begin : blk_probe
-        bit [7:0] golden_data [0:BYTES_PER_BEAT-1];
         logic [DATA_W-1:0] golden_beat;
 
         cycle_count <= cycle_count + 1;
 
         if (tvalid && tready) begin
-            vten_read_golden(BUFFER_ID, beat_count, golden_data);
+            // Bulk golden read — single memcpy instead of per-byte
+            vten_read_golden_bulk(BUFFER_ID,
+                beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, golden_buf);
 
             for (int i = 0; i < BYTES_PER_BEAT; i++)
-                golden_beat[i*8 +: 8] = golden_data[i];
+                golden_beat[i*8 +: 8] = golden_buf[i];
 
             if (tdata !== golden_beat) begin
                 vten_log_mismatch(cycle_count, beat_count,

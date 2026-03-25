@@ -40,19 +40,22 @@ import "DPI-C" function void vten_read_command_deps(
     output int num_dep, output int dep_ids [0:3],
     output int num_cdep, output int cdep_ids [0:3]);
 
-// ── Data Region ──
-import "DPI-C" function void vten_read_data(
+// ── Data Region — Bulk transfer (byte[] + memcpy) ──
+// byte[] gives contiguous 1-byte stride on both Verilator and xsim,
+// enabling direct memcpy between SHM and SV array memory.
+import "DPI-C" function void vten_read_data_bulk(
     input int buf_id, input int offset, input int size,
-    output bit [7:0] dst []);
+    inout byte dst []);
 
-import "DPI-C" function void vten_write_data(
+import "DPI-C" function void vten_write_data_bulk(
     input int buf_id, input int offset, input int size,
-    input bit [7:0] src []);
+    inout byte src []);
 
-// Scalar byte access — portable across all simulators (no open array issues)
-import "DPI-C" function int  vten_read_data_byte(
-    input int buf_id, input int offset);
+import "DPI-C" function void vten_read_golden_bulk(
+    input int buf_id, input int offset, input int size,
+    inout byte dst []);
 
+// ── Data Region — Scalar byte access (used by AXI4 partial WSTRB path) ──
 import "DPI-C" function void vten_write_data_byte(
     input int buf_id, input int offset, input int value);
 
@@ -67,13 +70,6 @@ import "DPI-C" function void vten_write_cmd_status(
     input int cmd_id, input int status);
 
 // ── Probe ──
-import "DPI-C" function void vten_read_golden(
-    input int buf_id, input int beat_index,
-    output bit [7:0] dst []);
-
-import "DPI-C" function int  vten_read_golden_byte(
-    input int buf_id, input int byte_offset);
-
 import "DPI-C" function void vten_log_mismatch(
     input int cycle, input int beat,
     input int expected_hi, input int expected_lo,

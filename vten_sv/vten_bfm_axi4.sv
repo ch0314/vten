@@ -47,6 +47,10 @@ module vten_bfm_axi4 #(
 );
     localparam int BYTES_PER_BEAT = DATA_W / 8;
 
+    // Bulk transfer buffers: byte[] for cross-simulator memcpy
+    byte r_beat_buf [0:BYTES_PER_BEAT-1];
+    byte w_beat_buf [0:BYTES_PER_BEAT-1];
+
     // ── Active Table ──
     typedef struct {
         bfm_cmd_t   cmd;
@@ -206,10 +210,12 @@ module vten_bfm_axi4 #(
                     offset = (current_read.addr - active_table[idx].cmd.phys_addr)
                              + r_beat * (1 << current_read.size);
 
-                    // Use scalar byte access (portable, no open-array issues)
+                    // Bulk read from SHM → byte buffer → rdata
+                    vten_read_data_bulk(
+                        active_table[idx].cmd.buffer_id, offset,
+                        BYTES_PER_BEAT, r_beat_buf);
                     for (int i = 0; i < BYTES_PER_BEAT; i++)
-                        s_rdata[i*8 +: 8] <= vten_read_data_byte(
-                            active_table[idx].cmd.buffer_id, offset + i);
+                        s_rdata[i*8 +: 8] <= r_beat_buf[i];
 
                     s_rvalid <= 1;
                     s_rresp  <= 2'b00;
@@ -281,15 +287,24 @@ module vten_bfm_axi4 #(
                     offset = (current_write.addr - active_table[idx].cmd.phys_addr)
                              + w_beat * (1 << current_write.size);
 
-                    // WSTRB handling: byte-level selective write using scalar DPI-C
+                    // WSTRB handling: fast path (all strobes) vs slow path (partial)
                     transfer_size = 1 << current_write.size;
-                    for (int b = 0; b < transfer_size; b++) begin
-                        if (s_wstrb[b])
-                            vten_write_data_byte(
-                                active_table[idx].cmd.buffer_id,
-                                offset + b,
-                                s_wdata[b*8 +: 8]);
-                        // If wstrb[b]==0, leave existing SHM data untouched
+                    if (s_wstrb == {BYTES_PER_BEAT{1'b1}}) begin
+                        // Fast path: all bytes valid → bulk write
+                        for (int b = 0; b < transfer_size; b++)
+                            w_beat_buf[b] = s_wdata[b*8 +: 8];
+                        vten_write_data_bulk(
+                            active_table[idx].cmd.buffer_id,
+                            offset, transfer_size, w_beat_buf);
+                    end else begin
+                        // Slow path: partial WSTRB → byte-by-byte
+                        for (int b = 0; b < transfer_size; b++) begin
+                            if (s_wstrb[b])
+                                vten_write_data_byte(
+                                    active_table[idx].cmd.buffer_id,
+                                    offset + b,
+                                    s_wdata[b*8 +: 8]);
+                        end
                     end
 
                     active_table[idx].active_cycles++;
@@ -298,12 +313,15 @@ module vten_bfm_axi4 #(
                         active_table[idx].first_active = cycle_count;
                     active_table[idx].last_active = cycle_count;
 
-                    // Probe mode: byte-level golden comparison
+                    // Probe mode: bulk golden comparison
                     if (active_table[idx].cmd.probe) begin
+                        byte golden_byte_buf [0:BYTES_PER_BEAT-1];
+                        vten_read_golden_bulk(
+                            active_table[idx].cmd.golden_buf_id,
+                            (active_table[idx].total_beats - 1) * BYTES_PER_BEAT,
+                            BYTES_PER_BEAT, golden_byte_buf);
                         for (int i = 0; i < BYTES_PER_BEAT; i++)
-                            golden[i*8 +: 8] = vten_read_golden_byte(
-                                active_table[idx].cmd.golden_buf_id,
-                                (active_table[idx].total_beats - 1) * BYTES_PER_BEAT + i);
+                            golden[i*8 +: 8] = golden_byte_buf[i];
                         if (s_wdata !== golden)
                             vten_log_mismatch(cycle_count,
                                               active_table[idx].total_beats - 1,

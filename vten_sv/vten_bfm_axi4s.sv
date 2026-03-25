@@ -44,8 +44,9 @@ module vten_bfm_axi4s #(
     end
     assign cmd_if.idle = idle_r;
 
-    // Note: module-level open arrays removed — using scalar DPI-C byte access
-    // for xsim compatibility (svGetArrElemPtr1/svGetArrayPtr unreliable).
+    // Bulk transfer buffer: byte[] gives contiguous 1-byte stride on all
+    // simulators (xsim, verilator), enabling memcpy-based DPI-C transfer.
+    byte beat_buf [0:BYTES_PER_BEAT-1];
 
     // Command receive
     always_ff @(posedge clk) begin
@@ -97,20 +98,20 @@ module vten_bfm_axi4s #(
                 beat_count <= beat_count + 1;
                 finish_command();
             end else begin
-                // Drive next beat data (beat_count+1)
+                // Drive next beat data (beat_count+1) — bulk read
+                vten_read_data_bulk(current_cmd.buffer_id,
+                    (beat_count + 1) * BYTES_PER_BEAT, BYTES_PER_BEAT, beat_buf);
                 for (int i = 0; i < BYTES_PER_BEAT; i++)
-                    m_tdata[i*8 +: 8] <= vten_read_data_byte(
-                        current_cmd.buffer_id,
-                        (beat_count + 1) * BYTES_PER_BEAT + i);
+                    m_tdata[i*8 +: 8] <= beat_buf[i];
                 m_tlast <= ((beat_count + 1) == expected_beats - 1);
                 beat_count <= beat_count + 1;
             end
         end else if (!m_tvalid) begin
-            // Initial: drive first beat
+            // Initial: drive first beat — bulk read
+            vten_read_data_bulk(current_cmd.buffer_id,
+                beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, beat_buf);
             for (int i = 0; i < BYTES_PER_BEAT; i++)
-                m_tdata[i*8 +: 8] <= vten_read_data_byte(
-                    current_cmd.buffer_id,
-                    beat_count * BYTES_PER_BEAT + i);
+                m_tdata[i*8 +: 8] <= beat_buf[i];
             m_tvalid <= 1'b1;
             m_tlast  <= (expected_beats == 1);
         end else begin
@@ -123,10 +124,11 @@ module vten_bfm_axi4s #(
     task automatic execute_slave();
         s_tready <= 1'b1;
         if (s_tvalid && s_tready) begin
+            // Bulk write: pack tdata into byte buffer, then single memcpy
             for (int i = 0; i < BYTES_PER_BEAT; i++)
-                vten_write_data_byte(current_cmd.buffer_id,
-                                     beat_count * BYTES_PER_BEAT + i,
-                                     s_tdata[i*8 +: 8]);
+                beat_buf[i] = s_tdata[i*8 +: 8];
+            vten_write_data_bulk(current_cmd.buffer_id,
+                beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, beat_buf);
             beat_count <= beat_count + 1;
             active_cycles <= active_cycles + 1;
             total_beats <= total_beats + 1;
@@ -136,10 +138,11 @@ module vten_bfm_axi4s #(
             // Probe mode: beat-by-beat golden comparison
             if (current_cmd.probe) begin : probe_blk
                 logic [DATA_W-1:0] golden;
+                byte golden_buf [0:BYTES_PER_BEAT-1];
+                vten_read_golden_bulk(current_cmd.golden_buf_id,
+                    beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, golden_buf);
                 for (int i = 0; i < BYTES_PER_BEAT; i++)
-                    golden[i*8 +: 8] = vten_read_golden_byte(
-                        current_cmd.golden_buf_id,
-                        beat_count * BYTES_PER_BEAT + i);
+                    golden[i*8 +: 8] = golden_buf[i];
                 if (s_tdata !== golden)
                     vten_log_mismatch(cycle_count, beat_count,
                                       golden[DATA_W-1:DATA_W/2],

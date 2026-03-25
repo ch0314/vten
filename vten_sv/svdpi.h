@@ -3,6 +3,10 @@
  * When building with xsim/xelab, the simulator provides its own svdpi.h.
  * This stub allows gcc standalone compilation for syntax/link checking.
  * The actual simulator header takes precedence at elaboration time.
+ *
+ * NOTE: Verilator compiles .c files as C++ (via CXX). The extern "C"
+ * wrapper is required so these declarations match Verilator's
+ * verilated_dpi.cpp symbols (which also use extern "C" linkage).
  */
 
 #ifndef SVDPI_H
@@ -14,44 +18,26 @@
 typedef void* svOpenArrayHandle;
 typedef uint32_t svBitVecVal;
 
-/* Get pointer to contiguous data of an open array */
-static inline void* svGetArrayPtr(svOpenArrayHandle h) {
-    return h;
-}
+/* DPI open-array functions.
+ * Declared (not defined) here. The actual implementation is provided
+ * by the simulator at link time:
+ *   - Verilator: verilated_dpi.cpp
+ *   - xsim: simulator runtime (loaded at elaboration) */
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-/* Get size of dimension d (1-based) of an open array */
-static inline int svSize(svOpenArrayHandle h, int d) {
-    (void)h; (void)d;
-    return 0;  /* Stub: actual size determined at runtime by simulator */
-}
+extern void* svGetArrayPtr(const svOpenArrayHandle h);
+extern int svSize(const svOpenArrayHandle h, int d);
+extern int svSizeOfArray(const svOpenArrayHandle h);
+extern int svLeft(const svOpenArrayHandle h, int d);
+extern int svRight(const svOpenArrayHandle h, int d);
+extern void* svGetArrElemPtr1(const svOpenArrayHandle h, int indx1);
+extern void* svGetArrElemPtr2(const svOpenArrayHandle h, int indx1, int indx2);
+extern void* svGetArrElemPtr3(const svOpenArrayHandle h, int indx1, int indx2, int indx3);
 
-/* Get left/right index of dimension d */
-static inline int svLeft(const svOpenArrayHandle h, int d) {
-    (void)h; (void)d;
-    return 0;
+#ifdef __cplusplus
 }
-
-static inline int svRight(const svOpenArrayHandle h, int d) {
-    (void)h; (void)d;
-    return 0;
-}
-
-/* Get pointer to element at index in 1-D open array */
-static inline void* svGetArrElemPtr1(const svOpenArrayHandle h, int indx1) {
-    (void)h; (void)indx1;
-    return NULL;  /* Stub: actual implementation by simulator */
-}
-
-/* Get pointer to element at (indx1, indx2) in 2-D open array */
-static inline void* svGetArrElemPtr2(const svOpenArrayHandle h, int indx1, int indx2) {
-    (void)h; (void)indx1; (void)indx2;
-    return NULL;
-}
-
-/* Get pointer to element at (indx1, indx2, indx3) in 3-D open array */
-static inline void* svGetArrElemPtr3(const svOpenArrayHandle h, int indx1, int indx2, int indx3) {
-    (void)h; (void)indx1; (void)indx2; (void)indx3;
-    return NULL;
-}
+#endif
 
 #endif /* SVDPI_H */

@@ -115,13 +115,16 @@ class TestBridgeHeader:
     def test_read_command_deps(self):
         assert re.search(r"void\s+vten_read_command_deps\s*\(", self.text)
 
-    # ── Data Region functions ──
+    # ── Data Region functions (bulk transfer) ──
 
-    def test_read_data(self):
-        assert re.search(r"void\s+vten_read_data\s*\(", self.text)
+    def test_read_data_bulk(self):
+        assert re.search(r"void\s+vten_read_data_bulk\s*\(", self.text)
 
-    def test_write_data(self):
-        assert re.search(r"void\s+vten_write_data\s*\(", self.text)
+    def test_write_data_bulk(self):
+        assert re.search(r"void\s+vten_write_data_bulk\s*\(", self.text)
+
+    def test_write_data_byte(self):
+        assert re.search(r"void\s+vten_write_data_byte\s*\(", self.text)
 
     # ── Stats Region functions ──
 
@@ -133,8 +136,8 @@ class TestBridgeHeader:
 
     # ── Probe functions ──
 
-    def test_read_golden(self):
-        assert re.search(r"void\s+vten_read_golden\s*\(", self.text)
+    def test_read_golden_bulk(self):
+        assert re.search(r"void\s+vten_read_golden_bulk\s*\(", self.text)
 
     def test_log_mismatch(self):
         assert re.search(r"void\s+vten_log_mismatch\s*\(", self.text)
@@ -508,7 +511,7 @@ class TestSemaphoreNaming:
 
 
 class TestBufferDescriptorCache:
-    """vten_read_data must look up buffer descriptors for data_offset."""
+    """Data region functions must look up buffer descriptors for data_offset."""
 
     @pytest.fixture(autouse=True)
     def _load(self):
@@ -519,6 +522,6 @@ class TestBufferDescriptorCache:
         assert re.search(r"buf_cache|buf_desc|descriptor|data_offset", self.c_text)
 
     def test_data_offset_used_in_read(self):
-        """vten_read_data uses data_offset to locate buffer."""
+        """Bulk read uses data_offset to locate buffer."""
         # The function should compute: data_base + desc.data_offset + offset
         assert "data_offset" in self.c_text or "offset" in self.c_text

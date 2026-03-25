@@ -131,13 +131,15 @@ int  vten_read_command(int cmd_id,
     int dep_ids[4], int commit_dep_ids[4]);
 
 void vten_read_command_deps(int cmd_id,
-    int* num_dep, void* dep_ids,
-    int* num_cdep, void* cdep_ids);
+    int* num_dep, int* dep_ids,
+    int* num_cdep, int* cdep_ids);
 
-/* Data region */
-void vten_read_data(int buf_id, int offset, int size, void* dst);
-void vten_write_data(int buf_id, int offset, int size, const void* src);
-int  vten_read_data_byte(int buf_id, int offset);
+/* Data region — bulk transfer (byte[] + memcpy, cross-simulator portable) */
+void vten_read_data_bulk(int buf_id, int offset, int size, void* dst);
+void vten_write_data_bulk(int buf_id, int offset, int size, const void* src);
+void vten_read_golden_bulk(int buf_id, int offset, int size, void* dst);
+
+/* Data region — scalar byte write (AXI4 partial WSTRB path) */
 void vten_write_data_byte(int buf_id, int offset, int value);
 
 /* Stats region */
@@ -148,8 +150,6 @@ void vten_write_cmd_stats(int cmd_id, int status,
 void vten_write_cmd_status(int cmd_id, int status);
 
 /* Probe */
-void vten_read_golden(int buf_id, int beat_index, void* dst);
-int  vten_read_golden_byte(int buf_id, int byte_offset);
 void vten_log_mismatch(int cycle, int beat,
     int expected_hi, int expected_lo,
     int actual_hi, int actual_lo);

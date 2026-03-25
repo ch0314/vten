@@ -1,0 +1,23 @@
+kernel: odd24
+rtl_top: rtl/passthrough_odd24.sv
+
+interfaces:
+  input_stream:
+    rtl_port: s_axis
+    protocol: axi4_stream
+    data_width: 24
+    tensor: data_in
+    packing:
+      element_width: 8
+      elements_per_beat: 3
+      bit_order: lsb_first
+
+  output_stream:
+    rtl_port: m_axis
+    protocol: axi4_stream
+    data_width: 24
+    tensor: data_out
+    packing:
+      element_width: 8
+      elements_per_beat: 3
+      bit_order: lsb_first

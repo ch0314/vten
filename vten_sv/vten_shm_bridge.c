@@ -312,8 +312,8 @@ int vten_read_command(int cmd_id,
 }
 
 void vten_read_command_deps(int cmd_id,
-    int* num_dep, void* dep_ids_handle,
-    int* num_cdep, void* cdep_ids_handle)
+    int* num_dep, int* dep_ids,
+    int* num_cdep, int* cdep_ids)
 {
     if (cmd_base == NULL) return;
 
@@ -325,17 +325,15 @@ void vten_read_command_deps(int cmd_id,
     uint16_t* deps  = (uint16_t*)(slot + 0x2C);
     uint16_t* cdeps = (uint16_t*)(slot + 0x34);
 
-    /* DPI-C int open array: svGetArrayPtr returns int* for 'output int arr[]' */
-    int* dep_out  = (int*)svGetArrayPtr((svOpenArrayHandle)dep_ids_handle);
-    int* cdep_out = (int*)svGetArrayPtr((svOpenArrayHandle)cdep_ids_handle);
-
-    if (dep_out != NULL) {
+    /* Fixed-size array 'output int arr[0:3]' is passed as int* by both
+     * Verilator and xsim.  Do NOT use svGetArrayPtr — that's for open arrays. */
+    if (dep_ids != NULL) {
         for (int i = 0; i < 4; i++)
-            dep_out[i] = (int)deps[i];
+            dep_ids[i] = (int)deps[i];
     }
-    if (cdep_out != NULL) {
+    if (cdep_ids != NULL) {
         for (int i = 0; i < 4; i++)
-            cdep_out[i] = (int)cdeps[i];
+            cdep_ids[i] = (int)cdeps[i];
     }
 }
 
@@ -343,55 +341,57 @@ void vten_read_command_deps(int cmd_id,
  * Data Region
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Scalar byte access — portable across all simulators (no open array issues). */
-int vten_read_data_byte(int buf_id, int offset) {
-    if (data_base == NULL) return 0;
+/* ── Bulk transfer via byte[] open array + memcpy ──
+ * SV side declares: byte arr[0:size-1]
+ * svGetArrayPtr(byte[]) returns contiguous uint8_t* on both Verilator and xsim.
+ * This is the fast path — one memcpy per beat instead of per-byte DPI calls. */
+
+void vten_read_data_bulk(int buf_id, int offset, int size, void* dst_handle) {
+    if (data_base == NULL) return;
     if (!buf_cache_valid) _load_buf_cache();
     BufferDescriptor* desc = &buf_cache[buf_id];
     uint8_t* src = (uint8_t*)data_base + desc->data_offset + offset;
-    return (int)(*src);
+    uint8_t* dst = (uint8_t*)svGetArrayPtr((svOpenArrayHandle)dst_handle);
+    if (dst != NULL) {
+        memcpy(dst, src, (size_t)size);
+    }
 }
 
+void vten_write_data_bulk(int buf_id, int offset, int size, const void* src_handle) {
+    if (data_base == NULL) return;
+    if (!buf_cache_valid) _load_buf_cache();
+    BufferDescriptor* desc = &buf_cache[buf_id];
+    uint8_t* dst = (uint8_t*)data_base + desc->data_offset + offset;
+    const uint8_t* src = (const uint8_t*)svGetArrayPtr((svOpenArrayHandle)src_handle);
+    if (src != NULL) {
+        memcpy(dst, src, (size_t)size);
+    }
+}
+
+void vten_read_golden_bulk(int buf_id, int offset, int size, void* dst_handle) {
+    if (data_base == NULL) return;
+    if (!buf_cache_valid) _load_buf_cache();
+    BufferDescriptor* desc = &buf_cache[buf_id];
+    if (offset + size > (int)desc->size) {
+        fprintf(stderr, "[vten_shm_bridge] vten_read_golden_bulk: out of bounds "
+                "buf_id=%d offset=%d size=%d > buf_size=%u\n",
+                buf_id, offset, size, desc->size);
+        return;
+    }
+    uint8_t* src = (uint8_t*)data_base + desc->data_offset + offset;
+    uint8_t* dst = (uint8_t*)svGetArrayPtr((svOpenArrayHandle)dst_handle);
+    if (dst != NULL) {
+        memcpy(dst, src, (size_t)size);
+    }
+}
+
+/* Scalar byte write — used by AXI4 BFM partial WSTRB slow path. */
 void vten_write_data_byte(int buf_id, int offset, int value) {
     if (data_base == NULL) return;
     if (!buf_cache_valid) _load_buf_cache();
     BufferDescriptor* desc = &buf_cache[buf_id];
     uint8_t* dst = (uint8_t*)data_base + desc->data_offset + offset;
     *dst = (uint8_t)value;
-}
-
-/* Legacy open-array variants — kept for API compatibility but may not work
- * reliably on all simulators. BFMs should prefer the scalar byte functions. */
-void vten_read_data(int buf_id, int offset, int size, void* dst_handle) {
-    if (data_base == NULL) return;
-    if (!buf_cache_valid) _load_buf_cache();
-    BufferDescriptor* desc = &buf_cache[buf_id];
-    uint8_t* src = (uint8_t*)data_base + desc->data_offset + offset;
-    svOpenArrayHandle h = (svOpenArrayHandle)dst_handle;
-    int lo = svLeft(h, 1);
-    int hi = svRight(h, 1);
-    int step = (lo <= hi) ? 1 : -1;
-    for (int i = 0; i < size; i++) {
-        svBitVecVal* elem = (svBitVecVal*)svGetArrElemPtr1(h, lo + i * step);
-        if (elem != NULL)
-            *elem = (svBitVecVal)src[i];
-    }
-}
-
-void vten_write_data(int buf_id, int offset, int size, const void* src_handle) {
-    if (data_base == NULL) return;
-    if (!buf_cache_valid) _load_buf_cache();
-    BufferDescriptor* desc = &buf_cache[buf_id];
-    uint8_t* dst = (uint8_t*)data_base + desc->data_offset + offset;
-    svOpenArrayHandle h = (svOpenArrayHandle)src_handle;
-    int lo = svLeft(h, 1);
-    int hi = svRight(h, 1);
-    int step = (lo <= hi) ? 1 : -1;
-    for (int i = 0; i < size; i++) {
-        svBitVecVal* elem = (svBitVecVal*)svGetArrElemPtr1(h, lo + i * step);
-        if (elem != NULL)
-            dst[i] = (uint8_t)(*elem);
-    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -428,44 +428,6 @@ void vten_write_cmd_status(int cmd_id, int status) {
 /* ═══════════════════════════════════════════════════════════════════════════
  * Probe
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Scalar golden byte read — portable variant */
-int vten_read_golden_byte(int buf_id, int byte_offset) {
-    if (data_base == NULL) return 0;
-    if (!buf_cache_valid) _load_buf_cache();
-    BufferDescriptor* desc = &buf_cache[buf_id];
-    if (byte_offset >= (int)desc->size) return 0;
-    uint8_t* src = (uint8_t*)data_base + desc->data_offset + byte_offset;
-    return (int)(*src);
-}
-
-/* Legacy open-array variant */
-void vten_read_golden(int buf_id, int beat_index, void* dst_handle) {
-    if (data_base == NULL) return;
-    if (!buf_cache_valid) _load_buf_cache();
-
-    BufferDescriptor* desc = &buf_cache[buf_id];
-    int bytes_per_beat = svSize((svOpenArrayHandle)dst_handle, 1);
-    int offset = beat_index * bytes_per_beat;
-
-    if (offset + bytes_per_beat > (int)desc->size) {
-        fprintf(stderr, "[vten_shm_bridge] vten_read_golden: out of bounds "
-                "buf_id=%d beat=%d offset=%d+%d > size=%u\n",
-                buf_id, beat_index, offset, bytes_per_beat, desc->size);
-        return;
-    }
-
-    uint8_t* src = (uint8_t*)data_base + desc->data_offset + offset;
-    svOpenArrayHandle h = (svOpenArrayHandle)dst_handle;
-    int lo = svLeft(h, 1);
-    int hi = svRight(h, 1);
-    int step = (lo <= hi) ? 1 : -1;
-    for (int i = 0; i < bytes_per_beat; i++) {
-        svBitVecVal* elem = (svBitVecVal*)svGetArrElemPtr1(h, lo + i * step);
-        if (elem != NULL)
-            *elem = (svBitVecVal)src[i];
-    }
-}
 
 void vten_log_mismatch(int cycle, int beat,
     int expected_hi, int expected_lo,

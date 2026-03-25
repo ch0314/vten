@@ -1,0 +1,23 @@
+kernel: int16_x7
+rtl_top: rtl/passthrough_112.sv
+
+interfaces:
+  input_stream:
+    rtl_port: s_axis
+    protocol: axi4_stream
+    data_width: 112
+    tensor: data_in
+    packing:
+      element_width: 16
+      elements_per_beat: 7
+      bit_order: lsb_first
+
+  output_stream:
+    rtl_port: m_axis
+    protocol: axi4_stream
+    data_width: 112
+    tensor: data_out
+    packing:
+      element_width: 16
+      elements_per_beat: 7
+      bit_order: lsb_first

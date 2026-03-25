@@ -306,13 +306,11 @@ void vten_read_command_deps(int cmd_id,
     }
 }
 
-void vten_read_data(int buf_id, int offset, int size, const svOpenArrayHandle dst) {
+void vten_read_data_bulk(int buf_id, int offset, int size, const svOpenArrayHandle dst) {
     if (data_base == NULL) return;
     if (!buf_cache_valid) _load_buf_cache();
-
     if (buf_id < 0 || buf_id >= MAX_BUFFERS) return;
     BufferDescriptor* desc = &buf_cache[buf_id];
-
     uint8_t* src = data_base + (int)desc->data_offset + offset;
     void* dst_ptr = svGetArrayPtr(dst);
     if (dst_ptr != NULL) {
@@ -320,13 +318,11 @@ void vten_read_data(int buf_id, int offset, int size, const svOpenArrayHandle ds
     }
 }
 
-void vten_write_data(int buf_id, int offset, int size, const svOpenArrayHandle src) {
+void vten_write_data_bulk(int buf_id, int offset, int size, const svOpenArrayHandle src) {
     if (data_base == NULL) return;
     if (!buf_cache_valid) _load_buf_cache();
-
     if (buf_id < 0 || buf_id >= MAX_BUFFERS) return;
     BufferDescriptor* desc = &buf_cache[buf_id];
-
     uint8_t* dst = data_base + (int)desc->data_offset + offset;
     const void* src_ptr = svGetArrayPtr(src);
     if (src_ptr != NULL) {
@@ -334,12 +330,17 @@ void vten_write_data(int buf_id, int offset, int size, const svOpenArrayHandle s
     }
 }
 
-int vten_read_data_byte(int buf_id, int offset) {
-    if (data_base == NULL) return 0;
+void vten_read_golden_bulk(int buf_id, int offset, int size, const svOpenArrayHandle dst) {
+    if (data_base == NULL) return;
     if (!buf_cache_valid) _load_buf_cache();
-    if (buf_id < 0 || buf_id >= MAX_BUFFERS) return 0;
+    if (buf_id < 0 || buf_id >= MAX_BUFFERS) return;
     BufferDescriptor* desc = &buf_cache[buf_id];
-    return (int)(*(data_base + (int)desc->data_offset + offset));
+    if (offset + size > (int)desc->size) return;
+    uint8_t* src = data_base + (int)desc->data_offset + offset;
+    void* dst_ptr = svGetArrayPtr(dst);
+    if (dst_ptr != NULL) {
+        memcpy(dst_ptr, src, (size_t)size);
+    }
 }
 
 void vten_write_data_byte(int buf_id, int offset, int value) {
@@ -375,33 +376,6 @@ void vten_write_cmd_status(int cmd_id, int status) {
 
     StatsEntry* entry = (StatsEntry*)(stats_base + cmd_id * STATS_SLOT_SIZE);
     entry->status = (uint8_t)status;
-}
-
-int vten_read_golden_byte(int buf_id, int byte_offset) {
-    if (data_base == NULL) return 0;
-    if (!buf_cache_valid) _load_buf_cache();
-    if (buf_id < 0 || buf_id >= MAX_BUFFERS) return 0;
-    BufferDescriptor* desc = &buf_cache[buf_id];
-    if (byte_offset >= (int)desc->size) return 0;
-    return (int)(*(data_base + (int)desc->data_offset + byte_offset));
-}
-
-void vten_read_golden(int buf_id, int beat_index, const svOpenArrayHandle dst) {
-    if (data_base == NULL) return;
-    if (!buf_cache_valid) _load_buf_cache();
-
-    if (buf_id < 0 || buf_id >= MAX_BUFFERS) return;
-    BufferDescriptor* desc = &buf_cache[buf_id];
-
-    int bytes_per_beat = svSize(dst, 1);
-    if (bytes_per_beat <= 0) bytes_per_beat = 32; /* fallback */
-    int byte_offset = beat_index * bytes_per_beat;
-
-    uint8_t* src = data_base + (int)desc->data_offset + byte_offset;
-    void* dst_ptr = svGetArrayPtr(dst);
-    if (dst_ptr != NULL) {
-        memcpy(dst_ptr, src, (size_t)bytes_per_beat);
-    }
 }
 
 void vten_log_mismatch(int cycle, int beat,
