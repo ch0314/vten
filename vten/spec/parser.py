@@ -149,6 +149,18 @@ def _parse_interface(
             f"for axi4_lite interfaces"
         )
 
+    # XRT configuration (08_backend_abstraction.md §6.5)
+    xrt_config = None
+    if "xrt" in spec:
+        from vten.spec.models import XrtInterfaceConfig
+
+        xrt_raw = spec["xrt"]
+        xrt_config = XrtInterfaceConfig(
+            arg_index=xrt_raw.get("arg_index"),
+            arg_name=xrt_raw.get("arg_name"),
+            memory_bank=xrt_raw.get("memory_bank"),
+        )
+
     return InterfaceSpec(
         name=name,
         rtl_port=spec["rtl_port"],
@@ -163,6 +175,7 @@ def _parse_interface(
         registers=registers,
         register_banks=register_banks,
         generate_controller=generate_controller,
+        xrt=xrt_config,
     )
 
 

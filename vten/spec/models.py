@@ -207,6 +207,18 @@ class RegisterBankSpec:
     base_offset: int
 
 
+# ── XrtInterfaceConfig (08_backend_abstraction.md §6.5) ──
+
+
+@dataclass
+class XrtInterfaceConfig:
+    """XRT-specific interface configuration for FPGA deployment."""
+
+    arg_index: int | None = None
+    arg_name: str | None = None
+    memory_bank: str | None = None
+
+
 # ── InterfaceSpec (§5.7) ──
 
 
@@ -225,6 +237,7 @@ class InterfaceSpec:
     registers: list[RegisterSpec] | None = None
     register_banks: list[RegisterBankSpec] | None = None
     generate_controller: bool = False
+    xrt: XrtInterfaceConfig | None = None
 
 
 # ── KernelSpec (§5.8) ──
