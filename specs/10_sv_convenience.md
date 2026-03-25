@@ -1,7 +1,7 @@
 # SV Convenience Features: Interface, AXI-Lite Controller, Wrapper Generation
 
-**Version 0.1.0 — March 2026**
-**Status: 설계 문서 (구현 전)**
+**Version 0.5.0 — March 2026**
+**Status: 구현 완료 — SV Interface, AXI-Lite Controller, Wrapper 자동 생성 동작.**
 
 ---
 

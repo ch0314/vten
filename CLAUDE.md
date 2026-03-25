@@ -24,15 +24,16 @@ RuntimeEngine.compile()  ← 8-stage pipeline
     │  Stage 4: Address Allocation
     │  Stage 5: auto_bind Resolution
     │  Stage 6: IR Lowering → Command[]
-    │  Stage 7: SHM Packing → bytes
-    ▼
-Backend.submit(shm_image, bfm_configs)
-    │  POSIX SHM + Named Semaphore handshake
-    ▼
-xsim Process
-    │  SHM Controller → Command Scheduler → BFMs → DUT
-    ▼
-Verification (golden vs DUT output)
+    │
+    ├──[sim]── Stage 7: SHM Packing → bytes ──→ SimBackend (xsim/verilator)
+    │          BFM Config synthesis                │  SHM handshake → BFMs → DUT
+    │                                              ▼
+    │                                         Verification
+    │
+    └──[hw]── CommandInterpreter ──→ XrtBackend
+              IR Command를 XRT API로 직접 해석     │  BO alloc, DMA, MMIO
+                                                   ▼
+                                              Verification
 ```
 
 ## Spec Files (Authoritative Source)

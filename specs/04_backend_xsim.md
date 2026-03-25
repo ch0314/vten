@@ -1,9 +1,15 @@
 # vTen xsim Backend Infrastructure
 
-**Version 0.4.2 — March 2026**
+**Version 0.5.0 — March 2026**
 **참조 모델: `00_data_models.md` (SHM 상수, Command, BFMConfig)**
 **소스: 메인 스펙 §11.1-11.15**
-**관련: `05_bfm_library.md` (BFM 구현)**
+**관련: `05_bfm_library.md` (BFM 구현), `08_backend_abstraction.md` (멀티 백엔드)**
+
+> **Note (v0.5.0):** 이 스펙의 SHM 핸드셰이크 프로토콜은 `SimBackend` 공통 클래스로
+> 추출되었다 (08_backend_abstraction.md §7.2). XsimBackend와 VerilatorBackend가
+> `SimBackend`를 상속한다. 이 스펙에서 `submit_batch()`로 기술된 메서드는
+> `Backend.execute(compiled: CompiledResult) -> BackendResult`로 통합되었다.
+> 상세: `08_backend_abstraction.md` §5.
 
 ---
 
@@ -491,7 +497,7 @@ int vten_shm_init(const char* session_id) {
 |----------|--------------------------|-------------|
 | Backend `S_WAIT_HOST` (GUI 모드) | 10ms | 재시도 (GUI 이벤트 허용) |
 | Backend `S_WAIT_HOST` (배치 모드) | 10s | 경고 로그와 함께 재시도 |
-| Host `submit_batch` | 300s (설정 가능) | `TimeoutError` 발생 |
+| Host `execute()` (내부 submit) | 300s (설정 가능) | `TimeoutError` 발생 |
 | Host `wait_backend_ready` | 30s | `TimeoutError` 발생 |
 
 ---

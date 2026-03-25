@@ -1740,11 +1740,16 @@ RuntimeEngine.compile()의 최종 산출물 및 실행 관련 타입.
 @dataclass
 class CompiledResult:
     commands: list[Command]
-    shm_image: bytes
-    bfm_configs: list[BFMConfig]
+    shm_image: bytes                    # SHM 바이너리 (SIM 백엔드용)
+    bfm_configs: list[BFMConfig]        # BFM 설정 (SIM 백엔드용)
     buffer_ids: dict[str, int]          # tensor_name → buffer_id
     flattened_view: FlattenedKernelView
-    probe_reports: list[ProbePoint]
+    probe_reports: list[ProbePoint] = field(default_factory=list)
+    tensor_data: dict[int, bytes] = field(default_factory=dict)
+    # 🆕 v0.5.0: buffer_id → serialized bytes (XRT 백엔드용).
+    # SIM 경로에서는 shm_image에 데이터 포함. XRT 경로에서는 이 필드로 직접 접근.
+    iface_id_to_name: dict[int, str] = field(default_factory=dict)
+    # 🆕 v0.5.0: interface_id → interface name (reporting 용)
 
 
 @dataclass
@@ -1758,25 +1763,38 @@ class BackendResult:
     """Backend 실행 완료 후 반환.
 
     반환 정책:
-    - backend_status == DONE  → BackendResult 반환 (status=2)
-    - backend_status == ERROR → raise_backend_error() 호출 (예외 raise, 반환 없음)
-    - sem_timedwait 타임아웃  → TimeoutError raise (반환 없음)
-
-    즉, BackendResult가 반환된 경우는 항상 status == 2 (DONE) 이다.
+    - SIM 백엔드: backend_status == DONE → 반환, ERROR → 예외 raise
+    - XRT 백엔드: 정상 완료 → 반환, 에러 → 예외 raise
+    - sem_timedwait 타임아웃 (SIM)  → TimeoutError raise (반환 없음)
     """
-    status: int                # backend_status 값 (항상 2=DONE)
-    error_code: int = 0        # 항상 0 (DONE 시)
+    status: int                # backend_status 값 (SIM: 항상 2=DONE, XRT: 0=OK)
+    error_code: int = 0
     error_cmd_id: int = 0
     error_message: str = ""
-    stats: list["CmdStats"] = field(default_factory=list)  # 커맨드별 통계 (STATS_ENABLED 시)
+    stats: list["CmdStats"] = field(default_factory=list)
+
+    # 🆕 v0.5.0: 출력 텐서 데이터 (XRT 용, SIM은 SHM에서 읽음)
+    output_buffers: dict[int, bytes] = field(default_factory=dict)
+    # buffer_id → raw bytes.
+
+    # 🆕 v0.5.0: SHM 읽기 클로저 (SIM 용, 내부 구현)
+    _shm_reader: Callable[[int], bytes] | None = field(default=None, repr=False)
 
     def read_buffer(self, buffer_id: int) -> bytes:
-        """SHM Data Region에서 특정 버퍼 읽기.
+        """출력 텐서 데이터 읽기.
+
+        1. output_buffers에서 먼저 확인 (XRT 경로)
+        2. _shm_reader 폴백 (SIM 경로 — SHM에서 직접 읽기)
+        3. 둘 다 없으면 빈 bytes 반환
 
         backend_status=DONE 이후에만 호출 가능.
         ERROR 후 호출 시 동작 미정의 (결과 신뢰 불가).
         """
-        ...
+        if buffer_id in self.output_buffers:
+            return self.output_buffers[buffer_id]
+        if self._shm_reader is not None:
+            return self._shm_reader(buffer_id)
+        return b""
 
 
 @dataclass
@@ -1788,9 +1806,15 @@ class BatchResult:
     ctx.run() 반환 시점에 읽어서 이 객체에 저장된다.
     """
     status: str                           # "DONE" | "ERROR"
-    total_cycles: int                     # Backend 클럭 사이클 수
-    per_command_stats: list[CmdStats]     # 커맨드별 통계 (STATS_ENABLED 시)
+    total_cycles: int = 0                 # Backend 클럭 사이클 수
+    per_command_stats: list[CmdStats] = field(default_factory=list)
     error: BackendError | None = None     # 에러 상세 (ERROR 시)
+    # 🆕 v0.5.0
+    output_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    # D2H 텐서 자동 역직렬화 결과 (tensor_name → torch.Tensor)
+    verification_count: int = 0           # 실행된 검증 수
+    verification_results: list = field(default_factory=list)
+    # list[VerificationResult] — 개별 검증 결과
 ```
 
 ---
@@ -1926,5 +1950,6 @@ vten run --test test_conv3d --config C=32
 | BindingTable, BFMConfig | §10 | 02, 04, 05, 06 |
 | SHM 상수 및 레이아웃 | §11 | 02, 04, 05 |
 | Error Taxonomy (AliasError 포함) | §12 | 모든 파일 |
-| CompiledResult, BatchResult | §13 | 02, 06 |
+| CompiledResult, BatchResult | §13 | 02, 06, 08 |
 | TestScenario, discover_test | §14 | 06, 07 |
+| Backend ABC, BackendResult | §13 | 04, 08 |

@@ -240,16 +240,21 @@ module {{ kernel_name }} #(
     ) u_core (
         .{{ clock_name }}({{ clock_name }}),
         .{{ reset_name }}({{ reset_name }}),
+{# Collect all core ports into a flat list to handle trailing comma correctly #}
+{% set core_ports = [] %}
 {% for iface in ctrl_interfaces %}
 {% for reg in iface.registers %}
-        .reg_{{ reg.name }}(reg_{{ reg.name }}),
+{% set _ = core_ports.append("        .reg_" ~ reg.name ~ "(reg_" ~ reg.name ~ ")") %}
 {% endfor %}
 {% endfor %}
 {% for iface in stream_interfaces %}
-        .{{ iface.name }}({{ iface.name }}_if),
+{% set _ = core_ports.append("        ." ~ iface.name ~ "(" ~ iface.name ~ "_if)") %}
 {% endfor %}
 {% for iface in aximm_interfaces %}
-        .{{ iface.name }}({{ iface.name }}_if){{ "," if not loop.last else "" }}
+{% set _ = core_ports.append("        ." ~ iface.name ~ "(" ~ iface.name ~ "_if)") %}
+{% endfor %}
+{% for port in core_ports %}
+{{ port }}{{ "," if not loop.last else "" }}
 {% endfor %}
     );
 

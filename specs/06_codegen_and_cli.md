@@ -626,11 +626,20 @@ def discover_kernels(project_dir: Path) -> list[str]:
 
 ## 8. Staged Build Pipeline
 
+> **Note (v0.5.0):** 빌드 파이프라인은 `BuildPipeline` ABC로 추상화되었다
+> (`08_backend_abstraction.md` §8). 아래는 xsim 백엔드의 5-stage 파이프라인이며,
+> `--backend` 플래그로 다른 백엔드의 파이프라인을 선택할 수 있다:
+>
+> | 백엔드 | 클래스 | 스테이지 |
+> |--------|--------|---------|
+> | xsim | `XsimBuildPipeline` | project_setup → dpi_c → codegen → compile_order → compile |
+> | verilator | `VerilatorBuildPipeline` | dpi_c → codegen → verilate → make |
+> | xrt | `XrtBuildPipeline` | gen_packaging_tcl → gen_xo_tcl → gen_link_cfg → validate |
 
-### 8.1 Overview
+### 8.1 Overview (xsim)
 
 ```
-vten build
+vten build [--backend xsim]
     │
     ├── Stage 1: Project Setup     [프로젝트, 캐시됨]
     │   rtl/** + vten_sv/* + ip/*.xci → vivado create_project + generate_target
@@ -644,6 +653,7 @@ vten build
     ├──┤ Stage 3: Codegen          [커널별]                          │
     │  │   kernel_spec.yaml → SVGenerator                            │
     │  │   → kernels/<name>/build/generated/tb_top.sv                │
+    │  │     (+ axilite_ctrl.sv, wrapper.sv if generate_controller)  │
     │  │                                                             │
     ├──┤ Stage 4: Compile Order    [커널별]                          │
     │  │   tb_top.sv → Vivado get_compile_order                      │
@@ -747,7 +757,12 @@ for kernel_name in target_kernels:
                  num_commands=num_commands)
 ```
 
-**출력:** `kernels/<name>/build/generated/tb_top.sv`
+**출력:**
+- `kernels/<name>/build/generated/tb_top.sv` (항상)
+- `kernels/<name>/build/generated/<kernel>_axilite_ctrl.sv` (generate_controller: true 시)
+- `kernels/<name>/build/generated/<kernel>_wrapper.sv` (generate_controller: true 시)
+
+> 상세: `10_sv_convenience.md` §5-6
 
 ### 8.5 Stage 4: Compile Order Resolution (커널별)
 

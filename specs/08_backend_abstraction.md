@@ -1,7 +1,8 @@
 # Backend Abstraction & Multi-Backend Support
 
-**Version 0.1.0 — March 2026**
-**Role: 백엔드 추상화 리팩토링 스펙. 기존 스펙(04, 06) 반영 전 설계 문서.**
+**Version 0.5.0 — March 2026**
+**Role: 백엔드 추상화 리팩토링 스펙.**
+**Status: Phase A (Backend 추상화), Phase B (XRT), Phase C (Verilator) 구현 완료.**
 
 ---
 
@@ -545,10 +546,9 @@ class SimBackend(Backend):
 
     # 시뮬레이터 프로세스 관리 (하위 클래스 오버라이드)
     @abc.abstractmethod
-    def _start_simulator(self) -> subprocess.Popen: ...
-
-    @abc.abstractmethod
-    def _simulator_args(self) -> list[str]: ...
+    def _start_simulator(self) -> None:
+        """시뮬레이터 프로세스 기동. self._process에 Popen 할당."""
+        ...
 ```
 
 ### 7.3 VerilatorBackend
@@ -999,50 +999,41 @@ xclbin 빌드에 필요한 커널 메타데이터 XML:
 
 ## 12. 마이그레이션 계획
 
-### 12.1 Phase A: Backend 추상화 리팩토링 (기반 작업)
+> **Status: 전체 완료 (2026-03-25)**
 
-**선행 조건**: 기존 테스트 전부 통과 상태
+### 12.1 Phase A: Backend 추상화 리팩토링 ✅ 완료
 
-1. `Backend.execute(CompiledResult)` 인터페이스 도입
-2. `SimBackend` 중간 클래스 추출 (xsim.py에서 SHM 로직 분리)
-3. `XsimBackend(SimBackend)` 리팩토링
-4. `backend/registry.py` 구현
-5. `cli/run.py`, `cli/build.py`, `cli/main.py`에 `--backend` 플래그 추가
-6. `cli/init_cmd.py` 백엔드별 템플릿 분기
+1. ✅ `Backend.execute(CompiledResult)` 인터페이스 도입
+2. ✅ `SimBackend` 중간 클래스 추출 (`backend/sim_base.py`)
+3. ✅ `XsimBackend(SimBackend)` 리팩토링
+4. ✅ `backend/registry.py` 구현
+5. ✅ `cli/run.py`, `cli/build.py`, `cli/main.py`에 `--backend` 플래그 추가
+6. ✅ `cli/init_cmd.py` 백엔드별 템플릿 분기
 
-**완료 기준**: 기존 xsim 테스트 전부 통과 + `--backend xsim` 명시 시 동일 동작
+### 12.2 Phase B: XRT Backend 구현 ✅ 완료
 
-### 12.2 Phase B: XRT Backend 구현 (우선)
+1. ✅ `runtime/interpreter.py` — CommandInterpreter (OpCode별 _exec_* 메서드)
+2. ✅ `backend/xrt.py` — XrtBackend (lazy pyxrt init, execute → CommandInterpreter)
+3. ✅ `build/xrt_build.py` — XrtBuildPipeline (4-stage: gen_packaging_tcl → validate)
+4. ✅ `codegen/xrt_generator.py` — IP/XO/kernel.xml/connectivity.cfg 생성
+5. ✅ Jinja2 템플릿 (package_ip.tcl.j2, gen_xo.tcl.j2, kernel.xml.j2, connectivity.cfg.j2)
+6. ✅ `kernel_spec.yaml` xrt 섹션 (`InterfaceSpec.xrt: XrtInterfaceConfig`)
+7. ✅ 단위 테스트 (test_xrt_generator.py: 29개, test_build_xrt.py: 17개)
 
-1. `runtime/interpreter.py` — CommandInterpreter 구현
-2. `backend/xrt.py` — XrtBackend 구현
-3. `build/xrt_build.py` — TCL/config 생성 파이프라인
-4. `codegen/xrt_generator.py` — IP 패키징 TCL, kernel.xml, connectivity.cfg
-5. Jinja2 템플릿 추가 (package_ip.tcl.j2, gen_xo.tcl.j2, kernel.xml.j2, connectivity.cfg.j2)
-6. `kernel_spec.yaml` 스키마 확장 (xrt 섹션)
-7. 단위 테스트 + passthrough 예제 XRT 테스트
+### 12.3 Phase C: Verilator Backend 구현 ✅ 완료
 
-**완료 기준**: `vten build --backend xrt` → TCL 생성 성공,
-             `vten run --backend xrt` → FPGA 실 실행 (Alveo 보드 필요)
+1. ✅ `backend/verilator.py` — VerilatorBackend(SimBackend)
+2. ✅ `build/verilator_build.py` — VerilatorBuildPipeline (4-stage: dpi_c → make)
+3. ✅ DPI-C 래퍼 (`vten_sv/vten_shm_bridge_verilator.cpp`)
+4. ✅ `extern "C"` 가드 (`vten_shm_bridge.h`), `--timing --main` 빌드 플래그
+5. ✅ 단위 테스트 (test_backend_verilator.py: 14개, test_build_verilator.py: 13개)
+6. ✅ E2E 검증: 5개 예제 커널 전부 PASS (passthrough, stream_dma, stream_dma_v2, stream_scatter, vector_alu)
 
-### 12.3 Phase C: Verilator Backend 구현
+### 12.4 기존 스펙 반영 ✅ 완료
 
-1. `backend/verilator.py` — VerilatorBackend(SimBackend)
-2. `build/verilator_build.py` — Verilator 빌드 파이프라인
-3. DPI-C 래퍼 (vten_shm_bridge_verilator.cpp)
-4. Verilator용 tb_top.sv 변형 (또는 조건부 생성)
-5. 단위 테스트 + passthrough 예제 Verilator 테스트
-
-**완료 기준**: `vten build --backend verilator && vten run --backend verilator` 동작
-
-### 12.4 기존 스펙 반영
-
-리팩토링 완료 후 기존 스펙에 변경 사항 반영:
-
-- `04_backend_xsim.md` → SimBackend / XsimBackend 분리 반영
-- `06_codegen_and_cli.md` → --backend 플래그, 빌드 파이프라인 추상화 반영
-- `00_data_models.md` → BackendResult.output_buffers 추가, CompiledResult 확장
-- `03_kernel_spec_schema.md` → xrt 섹션 스키마 추가
+- ✅ `00_data_models.md` §13 — CompiledResult.tensor_data, BackendResult.output_buffers/_shm_reader, BatchResult 확장
+- ✅ `04_backend_xsim.md` — SimBackend 계층 반영, submit_batch → execute() 용어 정리
+- ✅ `06_codegen_and_cli.md` — BuildPipeline ABC 위임 패턴, 백엔드별 빌드 스테이지 표 추가
 
 ---
 
