@@ -35,6 +35,21 @@ set_property interface_mode slave [ipx::get_bus_interfaces {{ name }}]
 {% endfor %}
 
 # Register map (from kernel_spec registers)
+# Vitis reserved system registers (0x00-0x10)
+ipx::add_register CTRL -offset 0x0000 \
+    [ipx::get_address_blocks reg0 -of_objects \
+     [ipx::get_memory_maps s_axi_control -of_objects [ipx::current_core]]]
+ipx::add_register GIE -offset 0x0004 \
+    [ipx::get_address_blocks reg0 -of_objects \
+     [ipx::get_memory_maps s_axi_control -of_objects [ipx::current_core]]]
+ipx::add_register IER -offset 0x0008 \
+    [ipx::get_address_blocks reg0 -of_objects \
+     [ipx::get_memory_maps s_axi_control -of_objects [ipx::current_core]]]
+ipx::add_register ISR -offset 0x000C \
+    [ipx::get_address_blocks reg0 -of_objects \
+     [ipx::get_memory_maps s_axi_control -of_objects [ipx::current_core]]]
+
+# User registers (from {{ user_register_base | default("0x14") }})
 {% for reg in registers %}
 ipx::add_register {{ reg.name }} -offset {{ "0x%04X" | format(reg.offset) }} \
     [ipx::get_address_blocks reg0 -of_objects \

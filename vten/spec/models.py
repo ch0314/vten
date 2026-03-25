@@ -149,6 +149,15 @@ class SplitSpec:
     interleave: InterleaveSpec | None = None
 
 
+# ── ArraySpec (spec 12) ──
+
+
+@dataclass
+class ArraySpec:
+    dimensions: list[int]
+    flat_name_pattern: str | None = None  # auto: {name}_{i} or {name}_{i}_{j}
+
+
 # ── AutoBind (§5.3) ──
 
 
@@ -174,6 +183,7 @@ class RegisterSpec:
     access: str = "rw"  # rw | ro | wo | w1c
     pulse: bool = False  # 1-cycle pulse (only with access=rw)
     reset_value: int = 0
+    source: str = "software"  # "software" | "hardware"
 
     @property
     def width(self) -> int:
@@ -217,6 +227,8 @@ class XrtInterfaceConfig:
     arg_index: int | None = None
     arg_name: str | None = None
     memory_bank: str | None = None
+    ip_name: str | None = None
+    memory_bank_index: int | None = None
 
 
 # ── InterfaceSpec (§5.7) ──
@@ -237,6 +249,9 @@ class InterfaceSpec:
     registers: list[RegisterSpec] | None = None
     register_banks: list[RegisterBankSpec] | None = None
     generate_controller: bool = False
+    user_register_base: int = 0x14  # Vitis reserved: 0x00-0x13
+    array: ArraySpec | None = None
+    role: str | None = None  # "master" | "slave"
     xrt: XrtInterfaceConfig | None = None
 
 

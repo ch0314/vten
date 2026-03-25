@@ -12,6 +12,7 @@ import yaml
 
 from vten.errors import BankOverlapError, SpecValidationError
 from vten.spec.models import (
+    ArraySpec,
     AutoBindSpec,
     CustomField,
     InterfaceSpec,
@@ -97,21 +98,29 @@ def _parse_memory_region(name: str, spec: dict) -> MemoryRegion:
 def _parse_interface(
     name: str, spec: dict, memory_regions: dict[str, MemoryRegion]
 ) -> InterfaceSpec:
-    if "rtl_port" not in spec:
-        raise SpecValidationError(
-            f"Interface '{name}': missing 'rtl_port'"
-        )
     if "protocol" not in spec:
         raise SpecValidationError(
             f"Interface '{name}': missing 'protocol'"
         )
 
     protocol = _parse_protocol(spec["protocol"], name)
+    role = spec.get("role")
+
+    # rtl_port: explicit or auto-generated from protocol + role + name
+    if "rtl_port" in spec:
+        rtl_port = spec["rtl_port"]
+    elif role:
+        rtl_port = _auto_rtl_port(protocol, role, name)
+    else:
+        raise SpecValidationError(
+            f"Interface '{name}': either 'rtl_port' or 'role' must be specified"
+        )
 
     # Parse sub-structures
     packing = _parse_packing(spec.get("packing")) if "packing" in spec else None
     split = spec.get("split")  # Store as raw dict for dict-style access
-    registers = _parse_registers(spec.get("registers"), name) if "registers" in spec else None
+    user_register_base = spec.get("user_register_base", 0x14)
+    registers = _parse_registers(spec.get("registers"), name, user_register_base) if "registers" in spec else None
     register_banks = _parse_register_banks(spec.get("register_banks")) if "register_banks" in spec else None
 
     # Determine data_width and addr_width defaults
@@ -149,6 +158,9 @@ def _parse_interface(
             f"for axi4_lite interfaces"
         )
 
+    # Array spec (spec 12)
+    array = _parse_array(spec.get("array"), name) if "array" in spec else None
+
     # XRT configuration (08_backend_abstraction.md §6.5)
     xrt_config = None
     if "xrt" in spec:
@@ -159,11 +171,13 @@ def _parse_interface(
             arg_index=xrt_raw.get("arg_index"),
             arg_name=xrt_raw.get("arg_name"),
             memory_bank=xrt_raw.get("memory_bank"),
+            ip_name=xrt_raw.get("ip_name"),
+            memory_bank_index=xrt_raw.get("memory_bank_index"),
         )
 
     return InterfaceSpec(
         name=name,
-        rtl_port=spec["rtl_port"],
+        rtl_port=rtl_port,
         protocol=protocol,
         data_width=data_width,
         addr_width=addr_width,
@@ -175,8 +189,50 @@ def _parse_interface(
         registers=registers,
         register_banks=register_banks,
         generate_controller=generate_controller,
+        user_register_base=user_register_base,
+        array=array,
+        role=role,
         xrt=xrt_config,
     )
+
+
+_RTL_PORT_PREFIX = {
+    (Protocol.AXI4S, "master"): "m_axis_",
+    (Protocol.AXI4S, "slave"): "s_axis_",
+    (Protocol.AXI4, "master"): "m_axi_",
+    (Protocol.AXI4, "slave"): "s_axi_",
+    (Protocol.AXI4L, "slave"): "s_axilite_",
+    (Protocol.AXI4L, "master"): "m_axilite_",
+}
+
+
+def _auto_rtl_port(protocol: Protocol, role: str, name: str) -> str:
+    """Auto-generate rtl_port from protocol + role + name (Vitis naming)."""
+    key = (protocol, role)
+    if key not in _RTL_PORT_PREFIX:
+        raise SpecValidationError(
+            f"Interface '{name}': no default rtl_port prefix for "
+            f"protocol={protocol.value}, role={role}"
+        )
+    return _RTL_PORT_PREFIX[key] + name
+
+
+def _parse_array(raw: dict, iface_name: str) -> ArraySpec:
+    """Parse array spec from interface definition."""
+    dims = raw.get("dimensions")
+    if not dims or not isinstance(dims, list):
+        raise SpecValidationError(
+            f"Interface '{iface_name}': array.dimensions must be a non-empty list"
+        )
+    for d in dims:
+        if not isinstance(d, int) or d <= 0:
+            raise SpecValidationError(
+                f"Interface '{iface_name}': array.dimensions values must be positive integers"
+            )
+    # flat_name_pattern: optional — auto-generated from name + dimensions
+    # e.g. 1D: "{name}_{i}", 2D: "{name}_{i}_{j}"
+    pattern = raw.get("flat_name_pattern")  # None if omitted
+    return ArraySpec(dimensions=dims, flat_name_pattern=pattern)
 
 
 def _parse_protocol(value: str, iface_name: str) -> Protocol:
@@ -226,8 +282,11 @@ def _parse_split(raw: dict) -> SplitSpec:
     return SplitSpec(mode=raw["mode"], ports=ports, interleave=interleave)
 
 
-def _parse_registers(raw: list, interface_name: str) -> list[RegisterSpec]:
+def _parse_registers(
+    raw: list, interface_name: str, user_register_base: int = 0x14
+) -> list[RegisterSpec]:
     registers = []
+    next_offset = user_register_base
     for r in raw:
         auto_bind = None
         if "auto_bind" in r:
@@ -249,16 +308,35 @@ def _parse_registers(raw: list, interface_name: str) -> list[RegisterSpec]:
             raise SpecValidationError(
                 f"Register '{r['name']}': pulse is only valid with access='rw'"
             )
+        source = r.get("source", "software")
+        if source not in ("software", "hardware"):
+            raise SpecValidationError(
+                f"Register '{r['name']}': invalid source '{source}', "
+                f"must be 'software' or 'hardware'"
+            )
+        if source == "hardware" and pulse:
+            raise SpecValidationError(
+                f"Register '{r['name']}': source='hardware' and pulse=true "
+                f"are mutually exclusive"
+            )
+        # Offset: explicit or auto-assigned from user_register_base
+        if "offset" in r:
+            offset = r["offset"]
+            next_offset = offset + 4
+        else:
+            offset = next_offset
+            next_offset += 4
         registers.append(
             RegisterSpec(
                 name=r["name"],
-                offset=r["offset"],
+                offset=offset,
                 fields=r.get("fields"),
                 auto_bind=auto_bind,
                 interface_name=interface_name,
                 access=access,
                 pulse=pulse,
                 reset_value=r.get("reset_value", 0),
+                source=source,
             )
         )
     return registers

@@ -30,13 +30,20 @@ module {{ kernel_name }}_axilite_ctrl #(
 
     // Register ports
 {% for reg in registers %}
-{% if reg.access == 'ro' or reg.access == 'w1c' %}
+{% if reg.source == 'hardware' %}
+    input  logic [{{ reg.width - 1 }}:0] reg_{{ reg.name }}{{ "," if not loop.last else "" }}
+{% elif reg.access == 'ro' or reg.access == 'w1c' %}
     input  logic [{{ reg.width - 1 }}:0] reg_{{ reg.name }}{{ "," if not loop.last else "" }}
 {% else %}
     output logic [{{ reg.width - 1 }}:0] reg_{{ reg.name }}{{ "," if not loop.last else "" }}
 {% endif %}
 {% endfor %}
 );
+
+{% for reg in registers if reg.source == 'hardware' and reg.access != 'ro' %}
+    // Internal latch for hw-sourced rw register: {{ reg.name }}
+    logic [{{ reg.width - 1 }}:0] reg_{{ reg.name }}_latch;
+{% endfor %}
 
     // ── Write Path ──
     logic        aw_done, w_done;
@@ -50,8 +57,11 @@ module {{ kernel_name }}_axilite_ctrl #(
             s_bresp       <= 2'b00;
             aw_done       <= 1'b0;
             w_done        <= 1'b0;
-{% for reg in registers if reg.access in ('rw', 'wo') %}
+{% for reg in registers if reg.access in ('rw', 'wo') and reg.source != 'hardware' %}
             reg_{{ reg.name }} <= {{ reg.width }}'d{{ reg.reset_value }};
+{% endfor %}
+{% for reg in registers if reg.source == 'hardware' and reg.access != 'ro' %}
+            reg_{{ reg.name }}_latch <= {{ reg.width }}'d{{ reg.reset_value }};
 {% endfor %}
         end else begin
 {% for reg in registers if reg.pulse %}
@@ -76,11 +86,18 @@ module {{ kernel_name }}_axilite_ctrl #(
             // Write decode
             if (aw_done && w_done && !s_bvalid) begin
                 case (aw_addr_latch)
-{% for reg in registers if reg.access in ('rw', 'wo') %}
+{% for reg in registers if reg.access in ('rw', 'wo') and reg.source != 'hardware' %}
 {% if reg.width < data_width %}
                     ADDR_W'('h{{ '%04X' | format(reg.offset) }}): reg_{{ reg.name }} <= s_wdata[{{ reg.width - 1 }}:0];
 {% else %}
                     ADDR_W'('h{{ '%04X' | format(reg.offset) }}): reg_{{ reg.name }} <= s_wdata;
+{% endif %}
+{% endfor %}
+{% for reg in registers if reg.source == 'hardware' and reg.access != 'ro' %}
+{% if reg.width < data_width %}
+                    ADDR_W'('h{{ '%04X' | format(reg.offset) }}): reg_{{ reg.name }}_latch <= s_wdata[{{ reg.width - 1 }}:0];
+{% else %}
+                    ADDR_W'('h{{ '%04X' | format(reg.offset) }}): reg_{{ reg.name }}_latch <= s_wdata;
 {% endif %}
 {% endfor %}
                     default: ;
@@ -90,6 +107,13 @@ module {{ kernel_name }}_axilite_ctrl #(
                 aw_done  <= 1'b0;
                 w_done   <= 1'b0;
             end
+{% for reg in registers if reg.source == 'hardware' and reg.access != 'ro' %}
+
+            // HW-sourced: restore from core when not being written
+            if (!(aw_done && w_done && !s_bvalid &&
+                  aw_addr_latch == ADDR_W'('h{{ '%04X' | format(reg.offset) }})))
+                reg_{{ reg.name }}_latch <= reg_{{ reg.name }};
+{% endfor %}
 
             if (s_bvalid && s_bready)
                 s_bvalid <= 1'b0;
@@ -110,7 +134,13 @@ module {{ kernel_name }}_axilite_ctrl #(
                 s_rresp   <= 2'b00;
                 case (s_araddr)
 {% for reg in registers %}
-{% if reg.pulse %}
+{% if reg.source == 'hardware' %}
+{% if reg.width < data_width %}
+                    ADDR_W'('h{{ '%04X' | format(reg.offset) }}): s_rdata <= {{ "{" }}{{ data_width - reg.width }}'d0, reg_{{ reg.name }}{{ "}" }};
+{% else %}
+                    ADDR_W'('h{{ '%04X' | format(reg.offset) }}): s_rdata <= reg_{{ reg.name }};
+{% endif %}
+{% elif reg.pulse %}
                     ADDR_W'('h{{ '%04X' | format(reg.offset) }}): s_rdata <= {{ data_width }}'d0;
 {% elif reg.width < data_width %}
                     ADDR_W'('h{{ '%04X' | format(reg.offset) }}): s_rdata <= {{ "{" }}{{ data_width - reg.width }}'d0, reg_{{ reg.name }}{{ "}" }};

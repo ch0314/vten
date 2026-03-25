@@ -11,8 +11,10 @@ from pathlib import Path
 
 import jinja2
 
+from itertools import product
+
 from vten.runtime.ir import BFMConfig
-from vten.spec.models import InterfaceSpec, KernelSpec, Protocol
+from vten.spec.models import ArraySpec, InterfaceSpec, KernelSpec, Protocol
 
 
 # ── Template Context Dataclasses — 06_codegen_and_cli.md §2 ──
@@ -273,16 +275,98 @@ class SVGenerator:
     def _classify_interfaces(self) -> tuple[
         list[InterfaceSpec], list[InterfaceSpec], list[InterfaceSpec]
     ]:
-        """Classify interfaces into ctrl, stream, aximm for wrapper generation."""
+        """Classify interfaces into ctrl, stream, aximm for wrapper generation.
+
+        Array interfaces are excluded from stream/aximm lists (handled separately).
+        """
         ctrl, stream, aximm = [], [], []
         for iface in self.spec.interfaces.values():
             if iface.protocol == Protocol.AXI4L and iface.generate_controller:
                 ctrl.append(iface)
+            elif iface.array:
+                continue  # handled by _expand_array_interfaces
             elif iface.protocol == Protocol.AXI4S:
                 stream.append(iface)
             elif iface.protocol == Protocol.AXI4:
                 aximm.append(iface)
         return ctrl, stream, aximm
+
+    @staticmethod
+    def _expand_array_interfaces(
+        interfaces: dict[str, InterfaceSpec],
+    ) -> list[dict]:
+        """Expand array interfaces into flat element descriptors for the template.
+
+        Returns a list of dicts, one per array interface, each containing:
+          - iface: the InterfaceSpec
+          - sv_array_dims: "[32][2]" string for SV declaration
+          - elements: list of {flat_name, indices_str} for each element
+        """
+        result = []
+        for iface in interfaces.values():
+            if not iface.array:
+                continue
+            arr: ArraySpec = iface.array
+            dims = arr.dimensions
+
+            # SV array dimension string: [32][2]
+            sv_dims = "".join(f"[{d}]" for d in dims)
+
+            # Resolve flat_name_pattern: explicit or auto from name
+            pattern = arr.flat_name_pattern
+            if not pattern:
+                var_names = "ijklmn"
+                pattern = iface.name + "".join(
+                    f"_{{{var_names[d]}}}" for d in range(len(dims))
+                )
+
+            # Expand all index combinations
+            ranges = [range(d) for d in dims]
+            elements = []
+            for indices in product(*ranges):
+                # flat name: pattern.format(i=0, j=1, ...)
+                idx_vars = {}
+                var_names = "ijklmn"
+                for vi, val in enumerate(indices):
+                    idx_vars[var_names[vi]] = val
+                flat_name = pattern.format(**idx_vars)
+
+                # SV index string: [0][1]
+                indices_str = "".join(f"[{i}]" for i in indices)
+
+                elements.append({
+                    "flat_name": flat_name,
+                    "indices_str": indices_str,
+                })
+
+            # Determine role/direction for port generation
+            role = iface.role
+            if not role:
+                # Infer from rtl_port prefix
+                if iface.rtl_port.startswith("m_"):
+                    role = "master"
+                else:
+                    role = "slave"
+
+            # rtl_port prefix for flat ports
+            prefix_map = {
+                (Protocol.AXI4S, "master"): "m_axis_",
+                (Protocol.AXI4S, "slave"): "s_axis_",
+                (Protocol.AXI4, "master"): "m_axi_",
+                (Protocol.AXI4, "slave"): "s_axi_",
+            }
+            flat_prefix = prefix_map.get(
+                (iface.protocol, role), iface.rtl_port + "_"
+            )
+
+            result.append({
+                "iface": iface,
+                "sv_array_dims": sv_dims,
+                "elements": elements,
+                "role": role,
+                "flat_prefix": flat_prefix,
+            })
+        return result
 
     def _generate_axilite_ctrl(
         self, env: jinja2.Environment, out: Path, iface: InterfaceSpec
@@ -307,6 +391,7 @@ class SVGenerator:
         """Generate wrapper module. Returns output filename."""
         ctrl, stream, aximm = self._classify_interfaces()
         all_ifaces = list(self.spec.interfaces.values())
+        array_groups = self._expand_array_interfaces(self.spec.interfaces)
 
         tmpl = env.get_template("wrapper.sv.j2")
         rendered = tmpl.render(
@@ -319,6 +404,7 @@ class SVGenerator:
             ctrl_interfaces=ctrl,
             stream_interfaces=stream,
             aximm_interfaces=aximm,
+            array_groups=array_groups,
         )
         filename = f"{self.spec.kernel_name}_wrapper.sv"
         (out / filename).write_text(rendered)
