@@ -528,13 +528,17 @@ int  vten_read_flags();
 int  vten_read_command(int cmd_id, /* output: bfm_cmd_t 필드 (dependency 제외) */);
 void vten_read_command_deps(int cmd_id,    // (v0.4.2)
                             int* num_dep,
-                            svOpenArrayHandle dep_ids,     // uint16[4]
+                            int* dep_ids,      // int[4] (fixed-size, NOT svOpenArrayHandle)
                             int* num_cdep,
-                            svOpenArrayHandle cdep_ids);   // uint16[4]
+                            int* cdep_ids);    // int[4]
 
-// ── Data Region ──
-void vten_read_data(int buf_id, int offset, int size, svOpenArrayHandle dst);
-void vten_write_data(int buf_id, int offset, int size, svOpenArrayHandle src);
+// ── Data Region — Bulk transfer (byte[] + memcpy) ──
+// SV 측 byte arr[] → C 측 svGetArrayPtr() → memcpy. beat당 1회 호출.
+void vten_read_data_bulk(int buf_id, int offset, int size, void* dst_handle);
+void vten_write_data_bulk(int buf_id, int offset, int size, const void* src_handle);
+void vten_read_golden_bulk(int buf_id, int offset, int size, void* dst_handle);
+// Scalar byte write — AXI4 BFM partial WSTRB slow path 전용
+void vten_write_data_byte(int buf_id, int offset, int value);
 
 // ── Stats Region ──
 void vten_write_cmd_stats(int cmd_id, int status,
@@ -544,7 +548,6 @@ void vten_write_cmd_stats(int cmd_id, int status,
 void vten_write_cmd_status(int cmd_id, int status);
 
 // ── Probe ──
-void vten_read_golden(int buf_id, int beat_index, svOpenArrayHandle dst);
 void vten_log_mismatch(int cycle, int beat,
                        int expected_hi, int expected_lo,
                        int actual_hi, int actual_lo);
@@ -567,12 +570,13 @@ void vten_log_mismatch(int cycle, int beat,
 | `vten_read_flags` | shm_bridge.c | Controller | flags (STATS_ENABLED 등) 읽기 |
 | `vten_read_command` | shm_bridge.c | Scheduler (preprocess) | 64B 슬롯 → bfm_cmd_t 디코딩 |
 | `vten_read_command_deps` | shm_bridge.c | Scheduler (preprocess) | dependency 배열만 별도 추출 |
-| `vten_read_data` | shm_bridge.c | BFM (AXI4S MASTER, AXI4 Read) | Data Region에서 비트 읽기 |
-| `vten_write_data` | shm_bridge.c | BFM (AXI4S SLAVE, AXI4 Write) | Data Region에 비트 쓰기 |
+| `vten_read_data_bulk` | shm_bridge.c | BFM (AXI4S MASTER, AXI4 Read) | Data Region에서 byte[] 벌크 읽기 (memcpy) |
+| `vten_write_data_bulk` | shm_bridge.c | BFM (AXI4S SLAVE, AXI4 Write) | Data Region에 byte[] 벌크 쓰기 (memcpy) |
+| `vten_read_golden_bulk` | shm_bridge.c | BFM Probe | Probe golden 버퍼에서 byte[] 벌크 읽기 |
+| `vten_write_data_byte` | shm_bridge.c | BFM (AXI4 Write, partial WSTRB) | Data Region에 단일 바이트 쓰기 |
 | `vten_write_cmd_stats` | shm_bridge.c | BFM (finish_command) | Stats Region에 완전한 통계 기록 |
 | `vten_write_cmd_status` | shm_bridge.c | Scheduler (dispatch) | Stats Region의 status 필드만 업데이트 |
-| `vten_read_golden` | shm_bridge.c | BFM Probe | Probe golden 버퍼에서 비트 읽기 |
-| `vten_log_mismatch` | shm_bridge.c | BFM Probe | Probe 불일치 로깅 (stderr + SHM) |
+| `vten_log_mismatch` | shm_bridge.c | BFM Probe | Probe 불일치 로깅 (stderr) |
 
 **SV Import 선언 (tb_top.sv 또는 별도 include에 배치):**
 
@@ -608,16 +612,25 @@ import "DPI-C" function int  vten_read_command(
 
 import "DPI-C" function void vten_read_command_deps(
     input int cmd_id,
-    output int num_dep, output logic [15:0] dep_ids [0:3],
-    output int num_cdep, output logic [15:0] cdep_ids [0:3]);
+    output int num_dep, output int dep_ids [0:3],
+    output int num_cdep, output int cdep_ids [0:3]);
 
-import "DPI-C" function void vten_read_data(
+// ── Data Region — Bulk transfer (byte[] + memcpy) ──
+import "DPI-C" function void vten_read_data_bulk(
     input int buf_id, input int offset, input int size,
-    output bit [7:0] dst []);
+    inout byte dst []);
 
-import "DPI-C" function void vten_write_data(
+import "DPI-C" function void vten_write_data_bulk(
     input int buf_id, input int offset, input int size,
-    input bit [7:0] src []);
+    inout byte src []);
+
+import "DPI-C" function void vten_read_golden_bulk(
+    input int buf_id, input int offset, input int size,
+    inout byte dst []);
+
+// ── Data Region — Scalar byte write (AXI4 partial WSTRB) ──
+import "DPI-C" function void vten_write_data_byte(
+    input int buf_id, input int offset, input int value);
 
 import "DPI-C" function void vten_write_cmd_stats(
     input int cmd_id, input int status,
@@ -628,20 +641,21 @@ import "DPI-C" function void vten_write_cmd_stats(
 import "DPI-C" function void vten_write_cmd_status(
     input int cmd_id, input int status);
 
-import "DPI-C" function void vten_read_golden(
-    input int buf_id, input int beat_index,
-    output bit [7:0] dst []);
-
 import "DPI-C" function void vten_log_mismatch(
     input int cycle, input int beat,
     input int expected_hi, input int expected_lo,
     input int actual_hi, input int actual_lo);
 ```
 
-> **구현 주의:** `svOpenArrayHandle`(C 측)과 `bit [7:0] dst []`(SV 측)의 매핑은
-> Vivado xsim의 DPI-C 구현에 의존한다. xsim은 `svGetArrayPtr()`로 SV 동적 배열의
-> 연속 메모리에 접근 가능하다. 정적 배열(`bit [7:0] dst [0:N-1]`)도 사용 가능하며,
-> BFM에서는 `DATA_W/8` 크기의 정적 배열이 더 적합할 수 있다.
+> **Bulk Transfer 설계:** SV 측 `byte arr[]` (signed 8-bit 동적 배열)은
+> Verilator와 xsim 모두에서 `svGetArrayPtr()`로 연속 메모리 포인터를 반환한다.
+> C 측에서 `svGetArrayPtr()` + `memcpy()`로 beat당 1회 전송한다.
+> `bit [7:0] arr[]`는 시뮬레이터마다 stride가 다를 수 있으므로 `byte`를 사용한다.
+> BFM은 모듈 레벨에서 `byte beat_buf [0:BYTES_PER_BEAT-1]`를 선언하여 재사용한다.
+>
+> **Fixed-size array 주의:** `vten_read_command_deps`의 `output int dep_ids [0:3]`는
+> fixed-size array이므로 C 측에서 `int*`로 직접 접근한다 (`svOpenArrayHandle` 아님).
+> Verilator는 fixed-size array를 raw pointer로 전달한다.
 
 ### 6.2 Internal Pointer Management
 
@@ -658,12 +672,25 @@ static sem_t*         sem_b2h = NULL;
 static BufferDescriptor buf_cache[MAX_BUFFERS];
 static int buf_cache_valid = 0;
 
-void vten_read_data(int buf_id, int offset, int size, svOpenArrayHandle dst) {
+// Bulk read: SV byte[] → svGetArrayPtr → memcpy
+void vten_read_data_bulk(int buf_id, int offset, int size, void* dst_handle) {
+    if (data_base == NULL) return;
     if (!buf_cache_valid) _load_buf_cache();
     BufferDescriptor* desc = &buf_cache[buf_id];
-    assert(offset + size <= desc->size);
-    void* src = (char*)data_base + desc->data_offset + offset;
-    memcpy(svGetArrayPtr(dst), src, size);
+    uint8_t* src = (uint8_t*)data_base + desc->data_offset + offset;
+    uint8_t* dst = (uint8_t*)svGetArrayPtr((svOpenArrayHandle)dst_handle);
+    if (dst != NULL) {
+        memcpy(dst, src, (size_t)size);
+    }
+}
+
+// Scalar byte write: AXI4 partial WSTRB path
+void vten_write_data_byte(int buf_id, int offset, int value) {
+    if (data_base == NULL) return;
+    if (!buf_cache_valid) _load_buf_cache();
+    BufferDescriptor* desc = &buf_cache[buf_id];
+    uint8_t* dst = (uint8_t*)data_base + desc->data_offset + offset;
+    *dst = (uint8_t)value;
 }
 ```
 

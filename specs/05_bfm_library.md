@@ -92,26 +92,39 @@ module vten_bfm_axi4s #(
         end
     end
 
-    // MASTER mode: PUSH (SHM → DUT)
-    task automatic execute_master();
-        logic [DATA_W-1:0] beat_data;
-        vten_read_data(current_cmd.buffer_id,
-                       beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, beat_data);
-        m_tdata  <= beat_data;
-        m_tvalid <= 1'b1;
-        m_tlast  <= (beat_count == expected_beats - 1);
+    // Bulk transfer buffer: byte[] — contiguous 1-byte stride on all simulators
+    byte beat_buf [0:BYTES_PER_BEAT-1];
 
+    // MASTER mode: PUSH (SHM → DUT)
+    // NBA-aware: on handshake, drive NEXT beat; on initial, drive beat 0.
+    task automatic execute_master();
         if (m_tvalid && m_tready) begin
-            beat_count <= beat_count + 1;
             active_cycles <= active_cycles + 1;
             total_beats <= total_beats + 1;
             if (first_active == 0) first_active <= cycle_count;
             last_active <= cycle_count;
             if (beat_count == expected_beats - 1) begin
                 m_tvalid <= 1'b0;
+                beat_count <= beat_count + 1;
                 finish_command();
+            end else begin
+                // Drive next beat — bulk read
+                vten_read_data_bulk(current_cmd.buffer_id,
+                    (beat_count + 1) * BYTES_PER_BEAT, BYTES_PER_BEAT, beat_buf);
+                for (int i = 0; i < BYTES_PER_BEAT; i++)
+                    m_tdata[i*8 +: 8] <= beat_buf[i];
+                m_tlast <= ((beat_count + 1) == expected_beats - 1);
+                beat_count <= beat_count + 1;
             end
-        end else if (m_tvalid && !m_tready)
+        end else if (!m_tvalid) begin
+            // Initial: drive first beat — bulk read
+            vten_read_data_bulk(current_cmd.buffer_id,
+                beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, beat_buf);
+            for (int i = 0; i < BYTES_PER_BEAT; i++)
+                m_tdata[i*8 +: 8] <= beat_buf[i];
+            m_tvalid <= 1'b1;
+            m_tlast  <= (expected_beats == 1);
+        end else
             stall_cycles <= stall_cycles + 1;
     endtask
 
@@ -119,8 +132,11 @@ module vten_bfm_axi4s #(
     task automatic execute_slave();
         s_tready <= 1'b1;
         if (s_tvalid && s_tready) begin
-            vten_write_data(current_cmd.buffer_id,
-                            beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, s_tdata);
+            // Bulk write: pack tdata into byte buffer, then single memcpy
+            for (int i = 0; i < BYTES_PER_BEAT; i++)
+                beat_buf[i] = s_tdata[i*8 +: 8];
+            vten_write_data_bulk(current_cmd.buffer_id,
+                beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, beat_buf);
             beat_count <= beat_count + 1;
             active_cycles <= active_cycles + 1;
             total_beats <= total_beats + 1;
@@ -128,12 +144,19 @@ module vten_bfm_axi4s #(
             last_active <= cycle_count;
 
             // Probe mode: beat-by-beat golden comparison
-            if (current_cmd.probe) begin
+            if (current_cmd.probe) begin : probe_blk
                 logic [DATA_W-1:0] golden;
-                vten_read_golden(current_cmd.golden_buf_id, beat_count, golden);
+                byte golden_buf [0:BYTES_PER_BEAT-1];
+                vten_read_golden_bulk(current_cmd.golden_buf_id,
+                    beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, golden_buf);
+                for (int i = 0; i < BYTES_PER_BEAT; i++)
+                    golden[i*8 +: 8] = golden_buf[i];
                 if (s_tdata !== golden)
                     vten_log_mismatch(cycle_count, beat_count,
-                                      golden, s_tdata, golden ^ s_tdata);
+                                      golden[DATA_W-1:DATA_W/2],
+                                      golden[DATA_W/2-1:0],
+                                      s_tdata[DATA_W-1:DATA_W/2],
+                                      s_tdata[DATA_W/2-1:0]);
             end
 
             if (beat_count == expected_beats - 1) begin
@@ -342,11 +365,12 @@ always_ff @(posedge clk) begin
             int offset = (current_read.addr - entry.cmd.phys_addr)
                          + r_beat * (1 << current_read.size);
 
-            logic [DATA_W-1:0] beat_data;
-            vten_read_data(entry.cmd.buffer_id, offset,
-                          1 << current_read.size, beat_data);
-
-            s_rdata  <= beat_data;
+            int transfer_size = 1 << current_read.size;
+            byte r_beat_buf [0:BYTES_PER_BEAT-1];
+            vten_read_data_bulk(entry.cmd.buffer_id, offset,
+                               transfer_size, r_beat_buf);
+            for (int i = 0; i < transfer_size; i++)
+                s_rdata[i*8 +: 8] <= r_beat_buf[i];
             s_rvalid <= 1;
             s_rid    <= current_read.id;
             s_rresp  <= 2'b00;
@@ -403,31 +427,45 @@ always_ff @(posedge clk) begin
             int offset = (current_write.addr - entry.cmd.phys_addr)
                          + w_beat * (1 << current_write.size);
 
-            // WSTRB 처리: 바이트별 선택적 기록
-            logic [DATA_W/8-1:0] strb = s_wstrb;
-            logic [DATA_W-1:0] existing;
-            vten_read_data(entry.cmd.buffer_id, offset,
-                          1 << current_write.size, existing);
-            for (int b = 0; b < DATA_W/8; b++) begin
-                if (strb[b])
-                    existing[b*8 +: 8] = s_wdata[b*8 +: 8];
+            // WSTRB 처리: fast path (all-ones) vs slow path (partial)
+            int transfer_size = 1 << current_write.size;
+            if (s_wstrb == {BYTES_PER_BEAT{1'b1}}) begin
+                // Fast path: all bytes valid → bulk write
+                byte w_beat_buf [0:BYTES_PER_BEAT-1];
+                for (int b = 0; b < transfer_size; b++)
+                    w_beat_buf[b] = s_wdata[b*8 +: 8];
+                vten_write_data_bulk(
+                    entry.cmd.buffer_id, offset, transfer_size, w_beat_buf);
+            end else begin
+                // Slow path: partial WSTRB → scalar byte-by-byte
+                for (int b = 0; b < transfer_size; b++) begin
+                    if (s_wstrb[b])
+                        vten_write_data_byte(
+                            entry.cmd.buffer_id, offset + b,
+                            s_wdata[b*8 +: 8]);
+                end
             end
-            vten_write_data(entry.cmd.buffer_id, offset,
-                           1 << current_write.size, existing);
 
             entry.active_cycles++;
             entry.total_beats++;
             if (entry.first_active == 0) entry.first_active = cycle_count;
             entry.last_active = cycle_count;
 
-            // Probe mode
+            // Probe mode: bulk golden read
             if (entry.cmd.probe) begin
                 logic [DATA_W-1:0] golden;
-                vten_read_golden(entry.cmd.golden_buf_id,
-                                 entry.total_beats - 1, golden);
+                byte golden_buf [0:BYTES_PER_BEAT-1];
+                int golden_offset = (entry.total_beats - 1) * BYTES_PER_BEAT;
+                vten_read_golden_bulk(entry.cmd.golden_buf_id,
+                    golden_offset, BYTES_PER_BEAT, golden_buf);
+                for (int i = 0; i < BYTES_PER_BEAT; i++)
+                    golden[i*8 +: 8] = golden_buf[i];
                 if (s_wdata !== golden)
                     vten_log_mismatch(cycle_count, entry.total_beats - 1,
-                                      golden, s_wdata, golden ^ s_wdata);
+                                      golden[DATA_W-1:DATA_W/2],
+                                      golden[DATA_W/2-1:0],
+                                      s_wdata[DATA_W-1:DATA_W/2],
+                                      s_wdata[DATA_W/2-1:0]);
             end
         end
 
@@ -690,16 +728,20 @@ module vten_bfm_axi4s_probe #(parameter DATA_W = 256)(
     output logic             tready,
     input logic              tlast
 );
+    localparam BYTES_PER_BEAT = DATA_W / 8;
     int beat_count = 0, cycle_count = 0;
-    logic [DATA_W-1:0] golden_beat;
+    byte golden_buf [0:BYTES_PER_BEAT-1];
 
     always @(posedge clk) begin
         cycle_count++;
         if (tvalid && tready) begin
-            vten_read_golden(buffer_id, beat_count, golden_beat);
-            if (tdata !== golden_beat)
+            vten_read_golden_bulk(buffer_id, beat_count * BYTES_PER_BEAT,
+                                  BYTES_PER_BEAT, golden_buf);
+            if (tdata !== {>>{golden_buf}})
                 vten_log_mismatch(cycle_count, beat_count,
-                                  tdata, golden_beat, tdata ^ golden_beat);
+                                  tdata[DATA_W-1:DATA_W/2], tdata[DATA_W/2-1:0],
+                                  {>>{golden_buf}}[DATA_W-1:DATA_W/2],
+                                  {>>{golden_buf}}[DATA_W/2-1:0]);
             beat_count++;
         end
     end

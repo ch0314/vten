@@ -141,12 +141,12 @@ vten/
 | OpCode | SIM (BFM) | XRT (FPGA) |
 |--------|-----------|------------|
 | `LOAD` | Host → SHM Data Region | Host → XRT BO `write()` |
-| `PUSH` | BFM이 AXI4S로 DUT에 데이터 전달 | XRT BO `sync(TO_DEVICE)` + kernel arg 설정 |
+| `PUSH` | BFM이 AXI4S로 DUT에 데이터 전달 | XRT BO `sync(TO_DEVICE)` + (선택) `set_arg()` |
 | `PULL` | BFM이 AXI4S로 DUT 출력 캡처 | kernel 완료 후 BO `sync(FROM_DEVICE)` |
 | `STORE` | SHM Data Region → Host | XRT BO `read()` |
-| `WRITE_REG` | BFM이 AXI-Lite 트랜잭션 | `kernel.write_register(offset, value)` |
-| `READ_REG` | BFM이 AXI-Lite 읽기 | `kernel.read_register(offset)` |
-| `POLL_REG` | BFM 폴링 루프 | `while (read_register() & mask) != expected` |
+| `WRITE_REG` | BFM이 AXI-Lite 트랜잭션 | `ip.write_register(offset, value)` + addr_bindings 치환 |
+| `READ_REG` | BFM이 AXI-Lite 읽기 | `ip.read_register(offset)` |
+| `POLL_REG` | BFM 폴링 루프 | `while (ip.read_register() & mask) != expected` |
 | `BARRIER` | 스케줄러 글로벌 펜스 | Host-side fence (이전 DMA 완료 대기) |
 | `COMPARE` | SHM 내 버퍼 비교 | Host 메모리에서 직접 비교 |
 
@@ -173,36 +173,41 @@ class CommandInterpreter:
     SIM 경로에서 SHM Packer(Stage 7)가 하는 역할의 HW 대응물.
     차이점: SHM Packer는 바이너리 이미지를 만들고 HW 스케줄러가 실행하지만,
     CommandInterpreter는 Host(Python)에서 직접 실행한다.
+
+    xrt.ip (raw register access)를 사용하여 RTL 설계와 최대 호환성을 보장한다.
+    ap_ctrl_hs를 가정하지 않으므로 모든 레지스터 레이아웃의 설계를 지원한다.
     """
 
-    def __init__(self, backend: XrtBackend):
-        self._backend = backend
-        self._buffers: dict[int, object] = {}  # buffer_id → XRT BO
+    def __init__(
+        self,
+        device: Any,
+        kernel: Any,             # default xrt.ip instance
+        xrt_module: Any,         # pyxrt module
+        arg_map: dict[int, int] | None = None,
+        poll_timeout_ms: int = 10000,
+        ip_map: dict[int, Any] | None = None,        # interface_id → xrt.ip
+        mem_bank_map: dict[int, int] | None = None,   # buffer_id → memory bank index
+        addr_bindings: dict[tuple[int, int], tuple[int, str | None]] | None = None,
+            # (interface_id, reg_offset) → (buffer_id, bits_spec)
+    ):
+        ...
 
     def execute(self, commands: list[Command], tensor_data: dict[int, bytes]) -> None:
         """IR 커맨드를 순서대로 실행. Dependency는 host-side에서 관리."""
         for cmd in commands:
             self._wait_deps(cmd)
-            match cmd.op:
-                case OpCode.LOAD:
-                    self._exec_load(cmd, tensor_data)
-                case OpCode.PUSH:
-                    self._exec_push(cmd)
-                case OpCode.PULL:
-                    self._exec_pull(cmd)
-                case OpCode.STORE:
-                    self._exec_store(cmd)
-                case OpCode.WRITE_REG:
-                    self._exec_write_reg(cmd)
-                case OpCode.READ_REG:
-                    self._exec_read_reg(cmd)
-                case OpCode.POLL_REG:
-                    self._exec_poll_reg(cmd)
-                case OpCode.BARRIER:
-                    self._exec_barrier(cmd)
-                case OpCode.COMPARE:
-                    self._exec_compare(cmd)
+            self._dispatch(cmd, tensor_data)
+            self._completed.add(cmd.cmd_id)
+
+    def _get_ip(self, interface_id: int) -> Any:
+        """Get xrt.ip for a given interface_id, fallback to default."""
+        return self._ip_map.get(interface_id, self._kernel)
 ```
+
+**핵심 확장 포인트:**
+- `ip_map`: CompositeKernel에서 여러 sub-IP를 독립적으로 제어
+- `mem_bank_map`: DDR/HBM 등 메모리 뱅크별 BO 할당
+- `addr_bindings`: auto_bind로 생성된 WRITE_REG 커맨드의 SHM 오프셋을 BO 물리 주소로 치환
 
 ---
 
@@ -250,6 +255,17 @@ class Backend(abc.ABC):
     def __exit__(self, *exc) -> None:
         self.cleanup()
 
+    # ── compile_target ──
+
+    @property
+    def compile_target(self) -> str:
+        """RuntimeEngine.compile()에 전달할 타겟.
+
+        "sim": Stage 7 SHM 패킹 포함 (시뮬레이션 백엔드)
+        "hw":  Stage 7 생략 (XRT 등 HW 백엔드)
+        """
+        return "sim"
+
     # ── 선택적 세부 제어 (SIM 백엔드에서 오버라이드) ──
 
     def submit(self, compiled: CompiledResult) -> None:
@@ -259,6 +275,14 @@ class Backend(abc.ABC):
     def wait(self) -> BackendResult:
         """결과 대기 (선택). execute()의 후반부."""
         raise NotImplementedError("Use execute() for synchronous operation")
+```
+
+`ExecutionContext.run()`에서 `compile_target`을 자동 참조하여 Stage 7 실행을 결정:
+
+```python
+# context.py
+target = self._backend.compile_target if self._backend else "sim"
+compiled = engine.compile(target=target)
 ```
 
 ### 5.3 CompiledResult 확장
@@ -324,192 +348,343 @@ XrtBackend는 pyxrt (Xilinx Runtime Python 바인딩)를 사용하여 FPGA와 �
 
 ### 6.2 XRT 리소스 모델
 
+`xrt.ip`를 사용하여 raw register access를 수행한다.
+`xrt.kernel`(ap_ctrl_hs 가정)은 지원하지 않는다.
+이를 통해 vTen 자체적으로 시작/완료 제어를 수행하는 모든 RTL 설계를 지원한다.
+
 ```
 FPGA Device
 ├── xclbin (사용자가 빌드)
-├── Kernel Object (CU — Compute Unit)
-│   ├── Control Registers (AXI4-Lite) ← WRITE_REG, READ_REG, POLL_REG
-│   └── Memory Arguments (AXI4 포트) ← kernel arg로 BO 연결
+├── IP Objects (xrt.ip — raw register access, no ap_ctrl_hs)
+│   ├── default_ip: vten.toml의 kernel_name으로 생성
+│   └── per-interface IPs: kernel_spec.yaml의 xrt.ip_name으로 생성
+│       ├── Control Registers (AXI4-Lite) ← WRITE_REG, READ_REG, POLL_REG
+│       └── auto_bind 주소 레지스터 ← BO.address() 치환
 └── Buffer Objects (BO)
+    ├── Memory Bank 지정 (DDR/HBM) ← xrt.memory_bank_index
     ├── Input BO ← LOAD → PUSH (sync TO_DEVICE)
     └── Output BO ← PULL (sync FROM_DEVICE) → STORE
 ```
 
+**Multi-IP 지원**: CompositeKernel 설계에서 여러 sub-IP(예: NPU_3D의 fmapIO, wtIO, ctrl 등)를
+독립적으로 제어한다. `ip_map`이 interface_id → xrt.ip 매핑을 관리하며,
+`_get_ip(interface_id)`가 올바른 IP로 디스패치한다.
+
+**주소 치환 (addr_bindings)**: Stage 5(auto_bind)에서 생성된 WRITE_REG 커맨드의 값은
+SHM 오프셋이다. XRT에서는 이를 실제 BO 디바이스 주소(`bo.address()`)로 치환해야 한다.
+`addr_bindings` 맵이 `(interface_id, reg_offset) → (buffer_id, bits_spec)` 매핑을 제공하고,
+`_exec_write_reg()`에서 치환을 수행한다. `bits_spec`(예: "31:0", "63:32")이 있으면
+64비트 주소를 상/하위 32비트로 분할한다.
+
 ### 6.3 OpCode → XRT API 매핑 상세
+
+모든 레지스터 접근은 `xrt.ip`를 통해 수행한다.
+`_get_ip(cmd.interface_id)`로 올바른 IP 인스턴스를 선택한다.
 
 #### LOAD (Host → Device Buffer)
 
 ```python
 def _exec_load(self, cmd: Command, tensor_data: dict[int, bytes]):
     data = tensor_data[cmd.buffer_id]
-    bo = xrt.bo(self._device, len(data), xrt.bo.flags.normal, self._mem_group)
+    mem_bank = self._mem_bank_map.get(cmd.buffer_id, 0)
+    bo = self._xrt.bo(self._device, len(data), self._xrt.bo.flags.normal, mem_bank)
     bo.write(data)
     self._buffers[cmd.buffer_id] = bo
 ```
 
-#### PUSH (Device Buffer → Kernel/DUT)
+`mem_bank_map`은 XrtBackend가 `kernel_spec.yaml`의 `xrt.memory_bank_index`에서 빌드한다.
 
-AXI4-Stream과 AXI4는 FPGA에서 다르게 동작:
-- **AXI4 (Memory-Mapped)**: BO를 kernel argument로 설정 + `sync(TO_DEVICE)`
-- **AXI4-Stream**: Vitis에서는 보통 AXI4 BO를 DMA를 통해 스트림으로 변환
+#### PUSH (Device Buffer → Kernel/DUT)
 
 ```python
 def _exec_push(self, cmd: Command):
     bo = self._buffers[cmd.buffer_id]
-    bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-    # kernel arg 설정은 별도 매핑 테이블 참조
-    self._kernel.set_arg(self._arg_index(cmd), bo)
+    bo.sync(self._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+    # arg_map에 엔트리가 있는 경우에만 set_arg 호출 (HLS 커널 호환)
+    arg_index = self._arg_map.get(cmd.buffer_id)
+    if arg_index is not None:
+        ip = self._get_ip(cmd.interface_id)
+        ip.set_arg(arg_index, bo)
 ```
 
-#### WRITE_REG / READ_REG / POLL_REG
+**주**: 대부분의 RTL 설계에서는 `set_arg()`가 불필요하다.
+텐서 주소는 auto_bind를 통해 `WRITE_REG`로 레지스터에 직접 전달된다.
+`arg_map`은 향후 HLS 커널 지원을 위해 남겨둔다.
 
-XRT kernel 오브젝트의 레지스터 직접 접근:
+#### WRITE_REG — 주소 치환 포함
 
 ```python
 def _exec_write_reg(self, cmd: Command):
-    self._kernel.write_register(cmd.reg_offset, cmd.reg_value)
+    ip = self._get_ip(cmd.interface_id)
+    key = (cmd.interface_id, cmd.reg_offset)
+    if key in self._addr_bindings:
+        buffer_id, bits_spec = self._addr_bindings[key]
+        bo = self._buffers.get(buffer_id)
+        if bo is not None and hasattr(bo, "address"):
+            addr = bo.address()
+            if bits_spec:
+                hi, lo = parse_bit_range(bits_spec)
+                addr = (addr >> lo) & ((1 << (hi - lo + 1)) - 1)
+            ip.write_register(cmd.reg_offset, addr)
+            return
+    ip.write_register(cmd.reg_offset, cmd.reg_value)
+```
 
+**주소 치환 흐름:**
+1. Stage 5 (auto_bind)에서 텐서 주소를 SHM 오프셋으로 계산하여 WRITE_REG 값에 설정
+2. Stage 6에서 해당 값을 포함한 WRITE_REG Command 생성
+3. XrtBackend가 `_build_addr_bindings(compiled)`로 치환 맵 빌드
+4. CommandInterpreter의 `_exec_write_reg()`에서 SHM 오프셋 → `bo.address()` 치환
+5. `bits_spec`이 있으면 64비트 주소를 상/하위 32비트로 분할 (예: "31:0", "63:32")
+
+#### READ_REG / POLL_REG
+
+```python
 def _exec_read_reg(self, cmd: Command):
-    value = self._kernel.read_register(cmd.reg_offset)
-    cmd.reg_value = value  # 결과 저장
+    ip = self._get_ip(cmd.interface_id)
+    cmd.reg_value = ip.read_register(cmd.reg_offset)
 
 def _exec_poll_reg(self, cmd: Command):
-    timeout = self._config.get("poll_timeout_ms", 10000)
+    ip = self._get_ip(cmd.interface_id)
     start = time.monotonic()
     while True:
-        val = self._kernel.read_register(cmd.reg_offset)
+        val = ip.read_register(cmd.reg_offset)
         if (val & cmd.reg_mask) == cmd.reg_expected:
-            break
-        if (time.monotonic() - start) * 1000 > timeout:
-            raise PollTimeoutError(f"POLL_REG timeout at offset 0x{cmd.reg_offset:X}")
+            cmd.reg_value = val
+            return
+        elapsed_ms = (time.monotonic() - start) * 1000
+        if elapsed_ms > self._poll_timeout_ms:
+            raise PollTimeoutError(
+                f"POLL_REG timeout at offset 0x{cmd.reg_offset:X} "
+                f"after {self._poll_timeout_ms}ms"
+            )
+        time.sleep(0.001)  # 1ms between polls
 ```
 
 #### PULL (Kernel/DUT → Device Buffer) + STORE (Device → Host)
 
 ```python
 def _exec_pull(self, cmd: Command):
-    bo = self._buffers[cmd.buffer_id]
-    bo.sync(xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+    bo = self._buffers.get(cmd.buffer_id)
+    if bo is None:
+        # Output-only 텐서: PULL 시 BO 자동 생성
+        mem_bank = self._mem_bank_map.get(cmd.buffer_id, 0)
+        bo = self._xrt.bo(
+            self._device, cmd.size or 4096,
+            self._xrt.bo.flags.normal, mem_bank,
+        )
+        self._buffers[cmd.buffer_id] = bo
+    bo.sync(self._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
 
 def _exec_store(self, cmd: Command):
     bo = self._buffers[cmd.buffer_id]
-    data = bo.read(cmd.size)
+    size = cmd.size if cmd.size > 0 else bo.size()
+    data = bo.read(size)
     self._output_buffers[cmd.buffer_id] = bytes(data)
 ```
 
-#### BARRIER
+#### BARRIER / COMPARE
 
 ```python
 def _exec_barrier(self, cmd: Command):
-    # Host-side fence: 모든 pending DMA 완료 대기
-    self._device.sync()  # 또는 개별 BO sync 확인
+    # Host-side fence: 순차 실행이므로 이전 커맨드가 이미 완료됨
+    pass
+
+def _exec_compare(self, cmd: Command):
+    # Host-side 버퍼 비교 (현재 미구현, 추후 확장)
+    pass
 ```
 
 ### 6.4 XrtBackend 클래스
 
 ```python
 class XrtBackend(Backend):
-    """XRT/pyxrt 기반 FPGA 백엔드.
+    """XRT/pyxrt 기반 FPGA 백엔드. xrt.ip를 사용한 raw register access.
 
     vten.toml [backend.xrt] 설정:
-      xclbin_path: xclbin 파일 경로
-      device_index: FPGA 디바이스 인덱스 (기본 0)
-      kernel_name: xclbin 내 커널 이름
-      memory_bank: 메모리 뱅크 (기본 자동 탐색)
+      xclbin_path:      xclbin 파일 경로
+      device_index:     FPGA 디바이스 인덱스 (기본 0)
+      kernel_name:      기본 IP 커널 이름
+      instance_name:    기본 IP 인스턴스 이름 (선택)
+      poll_timeout_ms:  POLL_REG 타임아웃 (기본 30000)
     """
 
     def __init__(self, project_config: dict):
         xrt_cfg = project_config.get("backend", {}).get("xrt", {})
-        self._xclbin_path = xrt_cfg["xclbin_path"]
+        self._xclbin_path = xrt_cfg.get("xclbin_path", "")
         self._device_index = xrt_cfg.get("device_index", 0)
         self._kernel_name = xrt_cfg.get("kernel_name", "")
-        self._poll_timeout_ms = xrt_cfg.get("poll_timeout_ms", 10000)
+        self._instance_name = xrt_cfg.get("instance_name", "")
+        self._poll_timeout_ms = xrt_cfg.get("poll_timeout_ms", 30000)
 
-        # XRT 리소스 (lazy init)
+        # XRT 리소스 (lazy init on first execute)
         self._device = None
         self._xclbin = None
-        self._kernel = None
-        self._interpreter = None
+        self._uuid = None
+        self._xrt = None         # pyxrt module
+        self._default_ip = None  # default xrt.ip instance
+        self._ips: dict[str, Any] = {}  # ip_name → xrt.ip (캐시)
 
     def _init_device(self):
         """FPGA 디바이스 초기화. 최초 execute() 호출 시 수행."""
         import pyxrt
+        self._xrt = pyxrt
         self._device = pyxrt.device(self._device_index)
         self._xclbin = pyxrt.xclbin(self._xclbin_path)
         self._device.load_xclbin(self._xclbin)
-        self._kernel = pyxrt.kernel(
-            self._device, self._xclbin.get_uuid(), self._kernel_name
-        )
-        self._interpreter = CommandInterpreter(self)
+        self._uuid = self._xclbin.get_uuid()
+
+        # Default IP 생성 (kernel_name이 설정된 경우)
+        if self._kernel_name:
+            if self._instance_name:
+                ip_name = f"{self._kernel_name}:{{{self._instance_name}}}"
+            else:
+                ip_name = self._kernel_name
+            self._default_ip = self._get_or_create_ip(ip_name)
+
+    def _get_or_create_ip(self, ip_name: str) -> Any:
+        """Lazy IP 생성 + 캐싱."""
+        if ip_name not in self._ips:
+            self._ips[ip_name] = self._xrt.ip(
+                self._device, self._uuid, ip_name,
+            )
+        return self._ips[ip_name]
+
+    # ── 빌더 메서드: CompiledResult → interpreter 파라미터 ──
+
+    def _build_ip_map(self, compiled) -> dict[int, Any]:
+        """interface_id → xrt.ip 매핑.
+        InterfaceSpec.xrt.ip_name에서 생성, 없으면 default_ip fallback."""
+        ...
+
+    def _build_mem_bank_map(self, compiled) -> dict[int, int]:
+        """buffer_id → memory bank index 매핑.
+        InterfaceSpec.xrt.memory_bank_index에서 생성."""
+        ...
+
+    def _build_addr_bindings(self, compiled) -> dict[tuple[int, int], tuple[int, str | None]]:
+        """(interface_id, reg_offset) → (buffer_id, bits_spec) 매핑.
+        flattened_view._register_bindings에서 auto_bind.value == 'address'인 것만 추출."""
+        ...
 
     def execute(self, compiled: CompiledResult) -> BackendResult:
         if self._device is None:
             self._init_device()
 
-        # IR 커맨드에서 텐서 데이터 추출
-        tensor_data = self._extract_tensor_data(compiled)
+        from vten.runtime.interpreter import CommandInterpreter
 
-        # CommandInterpreter로 실행
-        self._interpreter.execute(compiled.commands, tensor_data)
+        ip_map = self._build_ip_map(compiled)
+        mem_bank_map = self._build_mem_bank_map(compiled)
+        addr_bindings = self._build_addr_bindings(compiled)
 
-        # 결과 수집
+        interpreter = CommandInterpreter(
+            device=self._device,
+            kernel=self._default_ip,
+            xrt_module=self._xrt,
+            arg_map={},
+            poll_timeout_ms=self._poll_timeout_ms,
+            ip_map=ip_map,
+            mem_bank_map=mem_bank_map,
+            addr_bindings=addr_bindings,
+        )
+        interpreter.execute(compiled.commands, compiled.tensor_data)
+
         return BackendResult(
-            status=0,  # success
-            output_buffers=self._interpreter.output_buffers,
+            status=0,
+            output_buffers=interpreter.output_buffers,
         )
 
+    @property
+    def compile_target(self) -> str:
+        """HW 백엔드는 Stage 7 SHM 패킹을 생략."""
+        return "hw"
+
     def cleanup(self):
-        # XRT 리소스 해제 (BO 등)
-        self._interpreter = None
-        self._kernel = None
+        self._default_ip = None
+        self._ips.clear()
         self._device = None
+        self._xclbin = None
+        self._uuid = None
 ```
 
 ### 6.5 kernel_spec.yaml의 XRT 확장
 
-인터페이스와 XRT kernel argument 사이의 매핑이 필요하다:
-
-```yaml
-# kernels/conv3d/kernel_spec.yaml
-kernel: conv3d
-rtl_top: rtl/conv3d_wrapper.sv
-
-interfaces:
-  s_ifm:
-    protocol: axi4_stream
-    data_width: 256
-    tensor: ifm
-    # 🆕 XRT 매핑
-    xrt:
-      arg_index: 0          # kernel.set_arg(0, bo)
-      # 또는
-      arg_name: "ifm"       # xclbin 메타데이터에서 이름으로 매핑
-
-  m_ofm:
-    protocol: axi4_stream
-    data_width: 256
-    tensor: ofm
-    xrt:
-      arg_index: 1
-
-  s_axi_control:
-    protocol: axi4_lite
-    registers: { ... }
-    xrt:
-      # AXI4-Lite는 별도 매핑 불필요 — XRT kernel.write_register()가 직접 접근
-      # register offset은 기존 spec과 동일
-```
-
-### 6.6 Interface ↔ XRT Argument 자동 매핑
-
-대부분의 경우 xclbin의 XML 메타데이터에서 자동 매핑 가능:
+#### XrtInterfaceConfig 필드
 
 ```python
-def _auto_map_arguments(self, xclbin, kernel_spec):
-    """xclbin 메타데이터에서 interface → kernel arg 자동 매핑."""
-    xclbin_args = self._parse_xclbin_metadata(xclbin)
-    # xclbin의 각 arg에 대해 kernel_spec.interfaces와 이름 매칭
-    # 매칭 실패 시 kernel_spec.yaml의 xrt.arg_index 사용
+@dataclass
+class XrtInterfaceConfig:
+    arg_index: int | None = None           # HLS 커널 set_arg() 인덱스 (향후)
+    arg_name: str | None = None            # HLS 커널 argument 이름 (향후)
+    memory_bank: str | None = None         # codegen용 뱅크 이름 ("DDR[0]", "HBM[0]" 등)
+    ip_name: str | None = None             # xrt.ip 이름, e.g. "fmapIO_kernel:{fmapIO_1}"
+    memory_bank_index: int | None = None   # xrt.bo() 숫자 인덱스, e.g. 33
+```
+
+- `ip_name`: `xrt.ip(device, uuid, ip_name)`에 사용. 지정하지 않으면 vten.toml의 default IP 사용.
+- `memory_bank_index`: `xrt.bo(device, size, flags, bank_index)`에 사용. 지정하지 않으면 bank 0.
+- `memory_bank`: v++ connectivity.cfg 생성에 사용 (런타임에는 사용하지 않음).
+- `arg_index`/`arg_name`: HLS 커널 호환을 위해 예약. RTL 설계에서는 불필요.
+
+#### 예시: NPU_3D 스타일 커널
+
+```yaml
+kernel: npu_3d
+rtl_top: rtl/NPU_3D_top.sv
+
+interfaces:
+  ctrl:
+    protocol: axi4_lite
+    rtl_port: s_axilite
+    xrt:
+      ip_name: "NPU_3D_top:{NPU_3D_top_1}"    # AXI4-Lite 제어 레지스터 접근 IP
+    registers:
+      - name: ifm_addr_lo
+        offset: 0x038
+        auto_bind: { tensor: ifm, value: address, bits: "31:0" }
+      - name: ifm_addr_hi
+        offset: 0x03C
+        auto_bind: { tensor: ifm, value: address, bits: "63:32" }
+      - name: vsync
+        offset: 0x050
+
+  ddr_ifm:
+    protocol: axi4
+    rtl_port: m_axi_ifm
+    data_width: 256
+    xrt:
+      memory_bank: "DDR[0]"        # codegen/connectivity.cfg용
+      memory_bank_index: 32        # 런타임 BO 할당용
+
+  hbm_weight:
+    protocol: axi4
+    rtl_port: m_axi_wt
+    data_width: 256
+    xrt:
+      memory_bank: "HBM[0]"
+      memory_bank_index: 0
+```
+
+### 6.6 주소 치환 흐름 (auto_bind → XRT)
+
+auto_bind 메커니즘(Stage 5)이 텐서 주소를 레지스터에 자동 매핑한다.
+SIM 경로에서는 SHM 오프셋이 정확한 값이지만,
+XRT 경로에서는 BO의 디바이스 물리 주소로 치환이 필요하다.
+
+```
+kernel_spec.yaml                 Stage 5 (binder.py)           Stage 6 (ir.py)
+  auto_bind:                       RegisterBindingEntry         WRITE_REG Command
+    tensor: ifm               →      resolved_value =       →    reg_offset=0x038
+    value: address                    shm_offset               reg_value=shm_offset
+    bits: "31:0"                      bits="31:0"
+
+                                                              ↓
+
+XrtBackend._build_addr_bindings()                    CommandInterpreter._exec_write_reg()
+  flattened_view._register_bindings    →               key = (iface_id, 0x038) in addr_bindings?
+  auto_bind.value == "address"                         → Yes: ip.write_register(0x038, bo.address() & 0xFFFFFFFF)
+  → addr_bindings[(iface_id, 0x038)]                   → No:  ip.write_register(0x038, cmd.reg_value)
+    = (buffer_id, "31:0")
 ```
 
 ---
@@ -733,6 +908,7 @@ default_backend = "xrt"
 xclbin_path = "build/kernel.xclbin"
 device_index = 0
 kernel_name = ""
+instance_name = ""
 poll_timeout_ms = 30000
 
 [rtl]
@@ -787,6 +963,7 @@ submit_timeout_s = 300
 xclbin_path = "build/kernel.xclbin"
 device_index = 0
 kernel_name = ""
+instance_name = ""
 poll_timeout_ms = 30000
 """,
     "verilator": """\
@@ -860,10 +1037,15 @@ To = 32
 [backend.xrt]
 xclbin_path = "build/conv3d.xclbin"     # xclbin 경로 (PROJECT_ROOT 기준)
 device_index = 0                         # FPGA 디바이스 인덱스
-kernel_name = "conv3d_top"               # xclbin 내 커널 이름 (자동 탐색 가능)
-memory_bank = "HBM[0]"                   # 메모리 뱅크 (선택, 자동 탐색 가능)
+kernel_name = "NPU_3D_top"              # xclbin 내 기본 IP 커널 이름
+instance_name = "NPU_3D_top_1"          # 기본 IP 인스턴스 이름 (선택)
 poll_timeout_ms = 30000                  # POLL_REG 타임아웃
 ```
+
+- `kernel_name` + `instance_name`으로 기본 `xrt.ip` 생성:
+  `xrt.ip(device, uuid, "NPU_3D_top:{NPU_3D_top_1}")`
+- `instance_name` 생략 시: `xrt.ip(device, uuid, "NPU_3D_top")`
+- 인터페이스별 IP는 `kernel_spec.yaml`의 `xrt.ip_name`으로 개별 지정
 
 ### 10.3 Verilator 백엔드 설정
 
@@ -1012,13 +1194,16 @@ xclbin 빌드에 필요한 커널 메타데이터 XML:
 
 ### 12.2 Phase B: XRT Backend 구현 ✅ 완료
 
-1. ✅ `runtime/interpreter.py` — CommandInterpreter (OpCode별 _exec_* 메서드)
-2. ✅ `backend/xrt.py` — XrtBackend (lazy pyxrt init, execute → CommandInterpreter)
-3. ✅ `build/xrt_build.py` — XrtBuildPipeline (4-stage: gen_packaging_tcl → validate)
-4. ✅ `codegen/xrt_generator.py` — IP/XO/kernel.xml/connectivity.cfg 생성
-5. ✅ Jinja2 템플릿 (package_ip.tcl.j2, gen_xo.tcl.j2, kernel.xml.j2, connectivity.cfg.j2)
-6. ✅ `kernel_spec.yaml` xrt 섹션 (`InterfaceSpec.xrt: XrtInterfaceConfig`)
-7. ✅ 단위 테스트 (test_xrt_generator.py: 29개, test_build_xrt.py: 17개)
+1. ✅ `runtime/interpreter.py` — CommandInterpreter (xrt.ip 기반, multi-IP, addr_bindings, mem_bank)
+2. ✅ `backend/xrt.py` — XrtBackend (xrt.ip, lazy init, _build_ip_map/_build_mem_bank_map/_build_addr_bindings)
+3. ✅ `backend/base.py` — Backend.compile_target property 추가 ("sim"/"hw")
+4. ✅ `runtime/context.py` — compile_target 자동 전달
+5. ✅ `spec/models.py` — XrtInterfaceConfig에 ip_name, memory_bank_index 추가
+6. ✅ `spec/parser.py` — 새 필드 파싱
+7. ✅ `build/xrt_build.py` — XrtBuildPipeline (4-stage: gen_packaging_tcl → validate)
+8. ✅ `codegen/xrt_generator.py` — IP/XO/kernel.xml/connectivity.cfg 생성
+9. ✅ Jinja2 템플릿 (package_ip.tcl.j2, gen_xo.tcl.j2, kernel.xml.j2, connectivity.cfg.j2)
+10. ✅ 단위 테스트 (test_backend_xrt.py: multi-IP, addr_translation, mem_bank 포함)
 
 ### 12.3 Phase C: Verilator Backend 구현 ✅ 완료
 
