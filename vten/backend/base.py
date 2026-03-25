@@ -1,6 +1,7 @@
 """Backend base: ABC, error codes, result types.
 
-Spec reference: 00_data_models.md §10.13, §13, 06_codegen_and_cli.md §5
+Spec reference: 00_data_models.md §10.13, §13, 06_codegen_and_cli.md §5,
+                08_backend_abstraction.md §5
 """
 
 from __future__ import annotations
@@ -9,9 +10,13 @@ import abc
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
+from typing import TYPE_CHECKING
 
 from vten.errors import BackendError, BFMError, PollTimeoutError
 from vten.errors import TimeoutError as VTenTimeoutError
+
+if TYPE_CHECKING:
+    from vten.runtime.engine import CompiledResult
 
 
 # ── BackendErrorCode — 00_data_models.md §10.13 ──
@@ -98,16 +103,21 @@ class BackendResult:
     error_cmd_id: int = 0
     error_message: str = ""
     stats: list[CmdStats] = field(default_factory=list)
+    output_buffers: dict[int, bytes] = field(default_factory=dict)
     _shm_reader: Callable[[int], bytes] | None = field(
         default=None, repr=False
     )
 
     def read_buffer(self, buffer_id: int) -> bytes:
-        """Read buffer data from SHM Data Region.
+        """Read buffer data by buffer_id.
 
-        Must be called before cleanup() destroys the SHM segment.
-        Returns raw bytes for the given buffer_id, or b"" if no reader.
+        Checks output_buffers first (XRT path), then falls back to
+        _shm_reader closure (SIM path). Must be called before cleanup()
+        destroys the SHM segment when using _shm_reader.
+        Returns raw bytes for the given buffer_id, or b"" if unavailable.
         """
+        if buffer_id in self.output_buffers:
+            return self.output_buffers[buffer_id]
         if self._shm_reader is not None:
             return self._shm_reader(buffer_id)
         return b""
@@ -124,24 +134,48 @@ class BatchResult:
     error: BackendError | None = None
 
 
-# ── Backend ABC ──
+# ── Backend ABC — 08_backend_abstraction.md §5 ──
 
 
 class Backend(abc.ABC):
-    """Abstract backend interface."""
+    """Abstract backend interface.
+
+    All backends must implement execute() and cleanup().
+    SIM backends may additionally override submit()/wait()/shutdown()
+    for fine-grained lifecycle control.
+    """
 
     @abc.abstractmethod
-    def submit(self, shm_image: bytes, bfm_configs: list) -> None:
-        ...
+    def execute(self, compiled: CompiledResult) -> BackendResult:
+        """Execute compiled result and return backend result.
 
-    @abc.abstractmethod
-    def wait(self) -> BackendResult:
-        ...
-
-    @abc.abstractmethod
-    def shutdown(self) -> None:
+        This is the primary entry point. Internally:
+          - SIM: SHM image write → simulator start → handshake → result read
+          - HW:  IR command interpretation → XRT API calls → result collect
+        """
         ...
 
     @abc.abstractmethod
     def cleanup(self) -> None:
+        """Release resources. Idempotent."""
         ...
+
+    def __enter__(self) -> Backend:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.cleanup()
+
+    # ── Optional fine-grained control (SimBackend overrides) ──
+
+    def submit(self, compiled: CompiledResult) -> None:
+        """Async submit (optional). First half of execute()."""
+        raise NotImplementedError("Use execute() for synchronous operation")
+
+    def wait(self) -> BackendResult:
+        """Wait for result (optional). Second half of execute()."""
+        raise NotImplementedError("Use execute() for synchronous operation")
+
+    def shutdown(self) -> None:
+        """Send shutdown signal (optional)."""
+        pass

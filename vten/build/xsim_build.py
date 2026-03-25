@@ -1,0 +1,350 @@
+"""XsimBuildPipeline — Vivado xsim 5-stage build pipeline.
+
+Spec reference: 06_codegen_and_cli.md §4.3, §7, §8
+
+Pipeline stages:
+  Stage 1: project_setup  — Vivado project creation (cached)
+  Stage 2: dpi_c          — gcc shared library (cached)
+  Stage 3: codegen        — Jinja2 → generated SV (per-kernel)
+  Stage 4: compile_order  — Vivado get_compile_order (per-kernel)
+  Stage 5: compile        — xvlog + xelab (per-kernel)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+from pathlib import Path
+
+from vten.build.base import BuildPipeline
+from vten.build.common import (
+    cache_valid,
+    dir_hash,
+    expand_globs,
+    load_cache,
+    render_template,
+    run_vivado,
+    save_cache,
+    update_cache,
+)
+from vten.codegen.sv_generator import SVGenerator
+from vten.errors import BuildError
+from vten.runtime.ir import BFMConfig
+from vten.spec.models import InterfaceSpec, KernelSpec, Protocol
+from vten.spec.parser import parse_kernel_spec
+
+
+# ── Split interface expansion ──
+
+
+def _expand_split_interfaces(spec: KernelSpec) -> KernelSpec:
+    """Expand split interfaces into individual port interfaces."""
+    has_split = False
+    for iface in spec.interfaces.values():
+        if iface.split and isinstance(iface.split, dict) and "ports" in iface.split:
+            has_split = True
+            break
+    if not has_split:
+        return spec
+
+    from dataclasses import replace
+
+    expanded: dict[str, InterfaceSpec] = {}
+    for name, iface in spec.interfaces.items():
+        if iface.split and isinstance(iface.split, dict) and "ports" in iface.split:
+            for port in iface.split["ports"]:
+                port_name = port["name"]
+                expanded[port_name] = InterfaceSpec(
+                    name=port_name,
+                    rtl_port=port_name,
+                    protocol=iface.protocol,
+                    data_width=iface.data_width,
+                    addr_width=iface.addr_width,
+                    memory_region=iface.memory_region,
+                    tensor=iface.tensor,
+                    tensors=iface.tensors,
+                    packing=iface.packing,
+                )
+        else:
+            expanded[name] = iface
+    return replace(spec, interfaces=expanded)
+
+
+# ── BFM inference ──
+
+
+def _infer_bfm_role(iface: InterfaceSpec) -> str:
+    """Infer BFM role from protocol and interface conventions."""
+    if iface.protocol == Protocol.AXI4L:
+        return "master"
+    if iface.protocol == Protocol.AXI4:
+        return "slave"
+    if iface.rtl_port and iface.rtl_port.startswith("s_"):
+        return "master"
+    return "slave"
+
+
+def _derive_bfm_configs(spec: KernelSpec) -> list[BFMConfig]:
+    """Derive BFMConfig list from KernelSpec interfaces."""
+    configs: list[BFMConfig] = []
+    for name, iface in spec.interfaces.items():
+        cfg = BFMConfig(
+            interface_name=name,
+            protocol=iface.protocol,
+            data_width=iface.data_width or 256,
+            addr_width=iface.addr_width or 64,
+            role=_infer_bfm_role(iface),
+        )
+        configs.append(cfg)
+    return configs
+
+
+# ── XsimBuildPipeline ──
+
+
+class XsimBuildPipeline(BuildPipeline):
+    """Vivado xsim 5-stage build pipeline."""
+
+    _STAGES = ["project_setup", "dpi_c", "codegen", "compile_order", "compile"]
+    _PROJECT_STAGES = {"project_setup", "dpi_c"}
+
+    def __init__(self, project: Path, config: dict) -> None:
+        super().__init__(project, config)
+        xsim_cfg = config.get("backend", {}).get("xsim", {})
+        self._vivado_path = xsim_cfg.get("vivado_path", "")
+        self._vten_root = Path(__file__).resolve().parent.parent.parent
+        self._vten_sv_dir = self._vten_root / "vten_sv"
+        self._cache = load_cache(project / "build" / ".cache.json")
+
+    def stages(self) -> list[str]:
+        return list(self._STAGES)
+
+    def project_level_stages(self) -> list[str]:
+        return list(self._PROJECT_STAGES)
+
+    def run_stage(
+        self,
+        stage: str,
+        kernel_name: str | None,
+        kernel_dir: Path | None,
+        force: bool,
+    ) -> None:
+        if stage == "project_setup":
+            self._stage_project_setup(force)
+        elif stage == "dpi_c":
+            self._stage_dpi_c(force)
+        elif stage == "codegen":
+            assert kernel_dir is not None
+            self._stage_codegen(kernel_dir)
+        elif stage == "compile_order":
+            assert kernel_dir is not None
+            self._stage_compile_order(kernel_dir)
+        elif stage == "compile":
+            assert kernel_dir is not None
+            self._stage_compile(kernel_dir)
+        else:
+            raise BuildError(f"Unknown stage: {stage}")
+
+    def build(self, **kwargs) -> None:
+        """Override to save cache after build."""
+        try:
+            super().build(**kwargs)
+        finally:
+            save_cache(self._project / "build" / ".cache.json", self._cache)
+
+    # ── Stage implementations ──
+
+    def _project_setup_hash(self) -> str:
+        h = hashlib.sha256()
+        h.update(json.dumps(self._config.get("rtl", {}), sort_keys=True).encode())
+        h.update(json.dumps(self._config.get("ip", {}), sort_keys=True).encode())
+        h.update(
+            self._config.get("backend", {}).get("xsim", {}).get("part", "").encode()
+        )
+        for p in sorted(self._vten_sv_dir.glob("*.sv")) + sorted(
+            self._vten_sv_dir.glob("*.svh")
+        ):
+            h.update(p.read_bytes())
+        for glob_pat in self._config.get("rtl", {}).get("sources", []):
+            for p in sorted(self._project.glob(glob_pat)):
+                h.update(p.read_bytes())
+        for glob_pat in self._config.get("ip", {}).get("sources", []):
+            for p in sorted(self._project.glob(glob_pat)):
+                h.update(p.read_bytes())
+        return h.hexdigest()
+
+    def _stage_project_setup(self, force: bool) -> None:
+        print("[Stage 1] project_setup")
+        current = self._project_setup_hash()
+        if not force and cache_valid(self._cache, "project_setup", current):
+            print("  cached, skip")
+            return
+
+        rtl_patterns = self._config.get("rtl", {}).get("sources", [])
+        rtl_files = expand_globs(self._project, rtl_patterns)
+
+        tcl = render_template("project_setup.tcl.j2", {
+            "rtl_files": rtl_files,
+            "include_dirs": self._config.get("rtl", {}).get("include_dirs", []),
+            "ip_sources": expand_globs(
+                self._project, self._config.get("ip", {}).get("sources", []),
+            ),
+        })
+        tcl_path = self._project / "build" / "project_setup.tcl"
+        tcl_path.parent.mkdir(parents=True, exist_ok=True)
+        tcl_path.write_text(tcl)
+
+        part = self._config.get("backend", {}).get("xsim", {}).get("part", "")
+        proj_dir = self._project / "build" / "vivado_proj"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+
+        run_vivado(self._vivado_path, tcl_path, proj_dir, part, self._vten_sv_dir, self._project)
+
+        update_cache(self._cache, "project_setup", current)
+        print("  done")
+
+    def _stage_dpi_c(self, force: bool) -> None:
+        print("[Stage 2] dpi_c")
+        src_c = self._vten_sv_dir / "vten_shm_bridge.c"
+        src_h = self._vten_sv_dir / "vten_shm_bridge.h"
+        current = dir_hash([p for p in [src_c, src_h] if p.exists()])
+
+        if not force and cache_valid(self._cache, "dpi_c", current):
+            print("  cached, skip")
+            return
+
+        so_path = self._project / "build" / "lib" / "libvten_shm.so"
+        so_path.parent.mkdir(parents=True, exist_ok=True)
+
+        include_args: list[str] = []
+        if self._vivado_path:
+            xsim_include = Path(self._vivado_path) / "data" / "xsim" / "include"
+            if xsim_include.exists():
+                include_args += ["-I", str(xsim_include)]
+        include_args += ["-I", str(self._vten_sv_dir)]
+
+        result = subprocess.run(
+            [
+                "gcc", "-shared", "-fPIC",
+                *include_args,
+                "-o", str(so_path),
+                str(src_c),
+                "-lrt", "-lpthread",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise BuildError(f"gcc failed:\n{result.stderr}")
+
+        update_cache(self._cache, "dpi_c", current)
+        print("  done")
+
+    def _stage_codegen(self, kernel_dir: Path) -> None:
+        print(f"[Stage 3] codegen: {kernel_dir.name}")
+        spec_path = kernel_dir / "kernel_spec.yaml"
+        spec = parse_kernel_spec(spec_path)
+        spec = _expand_split_interfaces(spec)
+        bfm_configs = _derive_bfm_configs(spec)
+
+        gen = SVGenerator(
+            kernel_spec=spec,
+            bfm_configs=bfm_configs,
+            project_config=self._config,
+        )
+
+        output = kernel_dir / "build" / "generated"
+        output.mkdir(parents=True, exist_ok=True)
+        gen.generate(str(output), num_commands=256)
+        print("  done")
+
+    def _stage_compile_order(self, kernel_dir: Path) -> None:
+        print(f"[Stage 4] compile_order: {kernel_dir.name}")
+        tb_top = kernel_dir / "build" / "generated" / "tb_top.sv"
+        prj_out = kernel_dir / "build" / "compile.prj"
+
+        if not tb_top.exists():
+            raise BuildError(
+                f"tb_top.sv not found: {tb_top}. Run codegen first."
+            )
+
+        xpr_path = self._project / "build" / "vivado_proj" / "vten_sim.xpr"
+        if not xpr_path.exists():
+            raise BuildError(
+                f"Vivado project not found: {xpr_path}. Run project_setup first."
+            )
+
+        tcl = self._vten_root / "templates" / "resolve_order.tcl"
+        run_vivado(self._vivado_path, tcl, xpr_path, tb_top, prj_out)
+        print("  done")
+
+    def _stage_compile(self, kernel_dir: Path) -> None:
+        print(f"[Stage 5] compile: {kernel_dir.name}")
+        prj = kernel_dir / "build" / "compile.prj"
+        dpi_lib = self._project / "build" / "lib" / "libvten_shm"
+
+        if not prj.exists():
+            raise BuildError(
+                f"compile.prj not found: {prj}. Run compile_order first."
+            )
+
+        build_dir = kernel_dir / "build"
+
+        # xvlog
+        result = subprocess.run(
+            [
+                f"{self._vivado_path}/bin/xvlog", "--sv",
+                "--include", str(self._vten_sv_dir),
+                "--prj", str(prj),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(build_dir),
+        )
+        if result.returncode != 0:
+            raise BuildError(f"xvlog failed:\n{result.stderr[-500:]}")
+
+        # Determine elab top from compile.prj
+        elab_top = "tb_top"
+        prj_text = prj.read_text()
+        for line in prj_text.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[2].endswith("/tb_top.sv"):
+                lib = parts[1]
+                if lib != "work":
+                    elab_top = f"{lib}.tb_top"
+                break
+
+        # Collect library names for -L flags
+        prj_libs = set()
+        for line in prj_text.splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                prj_libs.add(parts[1])
+        lib_args: list[str] = []
+        for lib in sorted(prj_libs):
+            if lib != "work":
+                lib_args += ["-L", lib]
+
+        # xelab
+        result = subprocess.run(
+            [
+                f"{self._vivado_path}/bin/xelab", elab_top,
+                *lib_args,
+                "--sv_lib", dpi_lib.name,
+                "--sv_root", str(dpi_lib.parent),
+                "--timescale", "1ns/1ps",
+                "--debug", "typical",
+                "--snapshot", "tb_top",
+                "--relax",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(build_dir),
+        )
+        if result.returncode != 0:
+            detail = result.stdout[-500:] if result.stdout else result.stderr[-500:]
+            raise BuildError(f"xelab failed:\n{detail}")
+
+        print("  done")

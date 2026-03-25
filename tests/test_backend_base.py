@@ -190,38 +190,40 @@ class TestBackendABC:
 
         assert abc.ABC in Backend.__mro__
 
-    def test_submit_is_abstract(self):
+    def test_execute_is_abstract(self):
         from vten.backend.base import Backend
 
-        assert "submit" in Backend.__abstractmethods__
-
-    def test_wait_is_abstract(self):
-        from vten.backend.base import Backend
-
-        assert "wait" in Backend.__abstractmethods__
-
-    def test_shutdown_is_abstract(self):
-        from vten.backend.base import Backend
-
-        assert "shutdown" in Backend.__abstractmethods__
+        assert "execute" in Backend.__abstractmethods__
 
     def test_cleanup_is_abstract(self):
         from vten.backend.base import Backend
 
         assert "cleanup" in Backend.__abstractmethods__
 
+    def test_submit_not_abstract(self):
+        """submit() is optional (non-abstract), raises NotImplementedError by default."""
+        from vten.backend.base import Backend
+
+        assert "submit" not in Backend.__abstractmethods__
+
+    def test_wait_not_abstract(self):
+        """wait() is optional (non-abstract), raises NotImplementedError by default."""
+        from vten.backend.base import Backend
+
+        assert "wait" not in Backend.__abstractmethods__
+
+    def test_shutdown_not_abstract(self):
+        """shutdown() is optional (non-abstract), default is pass."""
+        from vten.backend.base import Backend
+
+        assert "shutdown" not in Backend.__abstractmethods__
+
     def test_concrete_subclass_instantiates(self):
         """A complete concrete subclass can be instantiated."""
         from vten.backend.base import Backend
 
         class StubBackend(Backend):
-            def submit(self, shm_image, bfm_configs):
-                pass
-
-            def wait(self):
-                pass
-
-            def shutdown(self):
+            def execute(self, compiled):
                 pass
 
             def cleanup(self):
@@ -229,6 +231,52 @@ class TestBackendABC:
 
         b = StubBackend()
         assert isinstance(b, Backend)
+
+    def test_context_manager(self):
+        """Backend supports with-statement via __enter__/__exit__."""
+        from vten.backend.base import Backend
+
+        class StubBackend(Backend):
+            def __init__(self):
+                self.cleaned = False
+
+            def execute(self, compiled):
+                pass
+
+            def cleanup(self):
+                self.cleaned = True
+
+        with StubBackend() as b:
+            assert isinstance(b, Backend)
+        assert b.cleaned
+
+    def test_submit_raises_not_implemented(self):
+        from vten.backend.base import Backend
+
+        class StubBackend(Backend):
+            def execute(self, compiled):
+                pass
+
+            def cleanup(self):
+                pass
+
+        b = StubBackend()
+        with pytest.raises(NotImplementedError):
+            b.submit(None)
+
+    def test_wait_raises_not_implemented(self):
+        from vten.backend.base import Backend
+
+        class StubBackend(Backend):
+            def execute(self, compiled):
+                pass
+
+            def cleanup(self):
+                pass
+
+        b = StubBackend()
+        with pytest.raises(NotImplementedError):
+            b.wait()
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -208,16 +208,15 @@ class TestCompiledResultToBackend:
         min_size = CONTROL_SIZE + len(result.commands) * CMD_SLOT_SIZE
         assert len(result.shm_image) >= min_size
 
-    def test_backend_submit_signature_compatible(self):
-        """Backend.submit accepts (shm_image: bytes, bfm_configs: list[BFMConfig])."""
+    def test_backend_execute_signature_compatible(self):
+        """Backend.execute accepts (compiled: CompiledResult)."""
         import inspect
 
         from vten.backend.xsim import XsimBackend
 
-        sig = inspect.signature(XsimBackend.submit)
+        sig = inspect.signature(XsimBackend.execute)
         params = list(sig.parameters.keys())
-        assert "shm_image" in params
-        assert "bfm_configs" in params
+        assert "compiled" in params
 
     def test_compiled_bfm_configs_are_bfmconfig_instances(self):
         """All bfm_configs entries are BFMConfig dataclass instances."""
@@ -616,16 +615,15 @@ class TestMultiBatchLifecycle:
         ids = [backend._generate_session_id() for _ in range(100)]
         assert len(set(ids)) == 100, "Session IDs must be unique"
 
-    def test_backend_submit_signature_includes_all_params(self):
-        """submit() accepts shm_image and bfm_configs positionally."""
+    def test_backend_execute_signature_includes_compiled(self):
+        """execute() accepts compiled parameter."""
         import inspect
         from vten.backend.xsim import XsimBackend
 
-        sig = inspect.signature(XsimBackend.submit)
+        sig = inspect.signature(XsimBackend.execute)
         params = list(sig.parameters.keys())
         assert "self" in params
-        assert "shm_image" in params
-        assert "bfm_configs" in params
+        assert "compiled" in params
 
     def test_npu_scale_shm_image_256_commands(self):
         """256-command SHM image (NPU batch size) has correct size."""

@@ -5,6 +5,7 @@ __pycache__/
 *.egg
 dist/
 build/
+!vten/build/
 
 # Virtual environment
 .venv/
@@ -45,3 +46,4 @@ docs/
 
 # Project build output
 build/
+!vten/build/

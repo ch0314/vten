@@ -1,6 +1,6 @@
 """vten init: project skeleton creation.
 
-Spec reference: 06_codegen_and_cli.md §4.1
+Spec reference: 06_codegen_and_cli.md §4.1, 08_backend_abstraction.md §9.3
 """
 
 from __future__ import annotations
@@ -8,64 +8,128 @@ from __future__ import annotations
 from pathlib import Path
 
 
-_VTEN_TOML_TEMPLATE = """\
-[project]
-name = "{name}"
-version = "0.1.0"
+# ── Backend-specific TOML templates (08_backend_abstraction.md §9.3) ──
 
-[parameters]
-
+_BACKEND_TOML_TEMPLATES: dict[str, str] = {
+    "xsim": """\
 [backend.xsim]
 vivado_path = "/tools/Xilinx/Vivado/2023.2"
 part = "xcu250-figd2104-2L-e"
 compile_options = ["-timescale", "1ns/1ps"]
 timeout_ms = 0
 submit_timeout_s = 300
+""",
+    "xrt": """\
+[backend.xrt]
+xclbin_path = "build/kernel.xclbin"
+device_index = 0
+kernel_name = ""
+poll_timeout_ms = 30000
+""",
+    "verilator": """\
+[backend.verilator]
+verilator_path = ""
+threads = 4
+trace = false
+opt_level = 3
+""",
+}
 
+_BACKEND_DIRS: dict[str, list[str]] = {
+    "xsim":      ["build/vivado_proj", "build/lib", "ip"],
+    "verilator": ["build/lib"],
+    "xrt":       ["build", "ip"],
+}
+
+_COMMON_DIRS = ["rtl", "kernels", "results"]
+
+
+def _make_toml_content(name: str, backend: str) -> str:
+    """Generate vten.toml content for a specific backend."""
+    header = f"""\
+[project]
+name = "{name}"
+version = "0.1.0"
+default_backend = "{backend}"
+
+[parameters]
+
+"""
+    backend_section = _BACKEND_TOML_TEMPLATES.get(backend, _BACKEND_TOML_TEMPLATES["xsim"])
+    footer = """
 [rtl]
 sources = ["rtl/**/*.sv", "rtl/**/*.v"]
 include_dirs = ["rtl/include"]
-
-[ip]
-sources = ["ip/**/*.xci"]
 
 [test]
 default_seed = 42
 waveform = false
 waveform_on_fail = true
 """
+    return header + backend_section + footer
 
 
-def init_project(project_dir: str, kernel_name: str | None = None) -> None:
-    """Create a new vten project skeleton, or add a kernel to existing project."""
+def init_project(
+    project_dir: str,
+    kernel_name: str | None = None,
+    backend: str | None = None,
+    add_backend: str | None = None,
+) -> None:
+    """Create a new vten project skeleton, or add a kernel/backend to existing project."""
     root = Path(project_dir)
 
     if kernel_name:
-        # Add kernel directory to existing project
         _init_kernel(root, kernel_name)
+        return
+
+    if add_backend:
+        _add_backend(root, add_backend)
         return
 
     # Full project initialization
     if root.exists():
         raise FileExistsError(f"Directory already exists: {project_dir}")
 
+    target_backend = backend or "xsim"
+
     root.mkdir(parents=True)
 
-    dirs = [
-        "rtl",
-        "ip",
-        "kernels",
-        "build/vivado_proj",
-        "build/lib",
-        "results",
-    ]
+    # Create common + backend-specific directories
+    dirs = list(_COMMON_DIRS)
+    dirs.extend(_BACKEND_DIRS.get(target_backend, []))
     for d in dirs:
         (root / d).mkdir(parents=True, exist_ok=True)
 
     # vten.toml
     toml_path = root / "vten.toml"
     if not toml_path.exists():
-        toml_path.write_text(_VTEN_TOML_TEMPLATE.format(name=root.name))
+        toml_path.write_text(_make_toml_content(root.name, target_backend))
+
+
+def _add_backend(root: Path, backend_name: str) -> None:
+    """Add a backend section to an existing project's vten.toml."""
+    toml_path = root / "vten.toml"
+    if not toml_path.exists():
+        raise FileNotFoundError(f"vten.toml not found in {root}")
+
+    content = toml_path.read_text()
+    section_header = f"[backend.{backend_name}]"
+    if section_header in content:
+        raise ValueError(f"{section_header} section already exists in vten.toml")
+
+    template = _BACKEND_TOML_TEMPLATES.get(backend_name)
+    if template is None:
+        raise ValueError(f"Unknown backend: {backend_name}")
+
+    # Append backend section
+    if not content.endswith("\n"):
+        content += "\n"
+    content += "\n" + template
+    toml_path.write_text(content)
+
+    # Create backend-specific directories
+    for d in _BACKEND_DIRS.get(backend_name, []):
+        (root / d).mkdir(parents=True, exist_ok=True)
 
 
 def _init_kernel(root: Path, kernel_name: str) -> None:

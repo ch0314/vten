@@ -69,14 +69,18 @@ class TestMainInitDispatch:
         from vten.cli.main import main
 
         main(["init", "/tmp/my_project"])
-        mock_init.assert_called_once_with("/tmp/my_project", kernel_name=None)
+        mock_init.assert_called_once_with(
+            "/tmp/my_project", kernel_name=None, backend=None, add_backend=None,
+        )
 
     @patch("vten.cli.init_cmd.init_project")
     def test_init_with_kernel_flag(self, mock_init):
         from vten.cli.main import main
 
         main(["init", "/tmp/my_project", "--kernel", "conv3d"])
-        mock_init.assert_called_once_with("/tmp/my_project", kernel_name="conv3d")
+        mock_init.assert_called_once_with(
+            "/tmp/my_project", kernel_name="conv3d", backend=None, add_backend=None,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -95,6 +99,7 @@ class TestMainBuildDispatch:
         mock_build.assert_called_once_with(
             project_dir=".",
             kernel_name=None,
+            backend=None,
             stage=None,
             upto=None,
             force=False,
@@ -146,12 +151,12 @@ class TestMainBuildDispatch:
         assert mock_build.call_args.kwargs["skip_compile"] is True
 
     @patch("vten.cli.build.build_project")
-    def test_build_invalid_stage_rejected(self, mock_build):
-        """Invalid --stage value rejected by argparse."""
+    def test_build_stage_passed_through(self, mock_build):
+        """--stage value is passed through to build_project (validated by pipeline)."""
         from vten.cli.main import main
 
-        with pytest.raises(SystemExit):
-            main(["build", "--stage", "invalid_stage"])
+        main(["build", "--stage", "codegen"])
+        assert mock_build.call_args.kwargs["stage"] == "codegen"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -238,6 +243,7 @@ class TestMainRunDispatch:
             project_dir=".",
             kernel_name="conv3d",
             test_name="TestConv3D",
+            backend=None,
             waveform=False,
             gui=False,
             config_overrides=None,

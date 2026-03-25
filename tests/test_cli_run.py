@@ -363,11 +363,10 @@ class TestSimple(TestScenario):
 """)
 
         # Mock backend to avoid needing real xsim
-        with patch("vten.cli.run.XsimBackend", autospec=True) as mock_backend_cls:
+        with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
-            mock_backend_cls.return_value = mock_backend
-            mock_backend.submit.return_value = None
-            mock_backend.wait.return_value = MagicMock(status=2)  # DONE
+            mock_get_backend.return_value = mock_backend
+            mock_backend.execute.return_value = MagicMock(status=2, stats=[])  # DONE
 
             run_test(str(project), kernel_name="passthrough", test_name="TestSimple")
 
@@ -388,11 +387,10 @@ class TestPass(TestScenario):
         pass
 """)
 
-        with patch("vten.cli.run.XsimBackend", autospec=True) as mock_backend_cls:
+        with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
-            mock_backend_cls.return_value = mock_backend
-            mock_backend.submit.return_value = None
-            mock_backend.wait.return_value = MagicMock(status=2)
+            mock_get_backend.return_value = mock_backend
+            mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             run_test(str(project), kernel_name="passthrough", test_name="TestPass")
 
@@ -415,11 +413,10 @@ class TestStats(TestScenario):
         pass
 """)
 
-        with patch("vten.cli.run.XsimBackend", autospec=True) as mock_backend_cls:
+        with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
-            mock_backend_cls.return_value = mock_backend
-            mock_backend.submit.return_value = None
-            mock_backend.wait.return_value = MagicMock(status=2)
+            mock_get_backend.return_value = mock_backend
+            mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             run_test(str(project), kernel_name="passthrough", test_name="TestStats")
 
@@ -656,11 +653,10 @@ class {class_name}(TestScenario):
             '        raise RuntimeError("Intentional test failure")',
         )
 
-        with patch("vten.cli.run.XsimBackend", autospec=True) as mock_cls:
+        with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
-            mock_cls.return_value = mock_backend
-            mock_backend.submit.return_value = None
-            mock_backend.wait.return_value = MagicMock(status=2)
+            mock_get_backend.return_value = mock_backend
+            mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             # run_test should catch the error and write FAIL, or re-raise
             try:
@@ -684,11 +680,10 @@ class {class_name}(TestScenario):
             "        pass  # run itself succeeds",
         )
 
-        with patch("vten.cli.run.XsimBackend", autospec=True) as mock_cls:
+        with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
-            mock_cls.return_value = mock_backend
-            mock_backend.submit.return_value = None
-            mock_backend.wait.side_effect = BackendError("error_code=1, DECERR")
+            mock_get_backend.return_value = mock_backend
+            mock_backend.execute.side_effect = BackendError("error_code=1, DECERR")
 
             try:
                 run_test(str(project), kernel_name="passthrough", test_name="TestBackendFail")
@@ -710,11 +705,10 @@ class {class_name}(TestScenario):
             "        pass",
         )
 
-        with patch("vten.cli.run.XsimBackend", autospec=True) as mock_cls:
+        with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
-            mock_cls.return_value = mock_backend
-            mock_backend.submit.return_value = None
-            mock_backend.wait.side_effect = VTenTimeoutError("300s exceeded")
+            mock_get_backend.return_value = mock_backend
+            mock_backend.execute.side_effect = VTenTimeoutError("300s exceeded")
 
             try:
                 run_test(str(project), kernel_name="passthrough", test_name="TestTimeout")
@@ -804,38 +798,33 @@ class TestOK(TestScenario):
 
         project = self._setup_passing_project(tmp_path)
 
-        with patch("vten.cli.run.XsimBackend", autospec=True) as mock_cls:
+        with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
-            mock_cls.return_value = mock_backend
-            mock_backend.submit.return_value = None
-            mock_backend.wait.return_value = MagicMock(status=2)
+            mock_get_backend.return_value = mock_backend
+            mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             run_test(str(project), kernel_name="passthrough", test_name="TestOK")
 
-        # Verify lifecycle call order on the mock
+        # Verify lifecycle calls on the mock
         method_names = [c[0] for c in mock_backend.method_calls]
-        assert "submit" in method_names
-        assert "wait" in method_names
+        assert "execute" in method_names
         # shutdown and/or cleanup should be called
         has_shutdown = "shutdown" in method_names
         has_cleanup = "cleanup" in method_names
         assert has_shutdown or has_cleanup, (
             f"Neither shutdown nor cleanup called. Calls: {method_names}"
         )
-        # submit must precede wait
-        assert method_names.index("submit") < method_names.index("wait")
 
     def test_cleanup_called_on_backend_error(self, tmp_path: Path):
-        """Backend.cleanup() called even when wait() raises."""
+        """Backend.cleanup() called even when execute() raises."""
         from vten.cli.run import run_test
 
         project = self._setup_passing_project(tmp_path)
 
-        with patch("vten.cli.run.XsimBackend", autospec=True) as mock_cls:
+        with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
-            mock_cls.return_value = mock_backend
-            mock_backend.submit.return_value = None
-            mock_backend.wait.side_effect = Exception("sim crashed")
+            mock_get_backend.return_value = mock_backend
+            mock_backend.execute.side_effect = Exception("sim crashed")
 
             try:
                 run_test(str(project), kernel_name="passthrough", test_name="TestOK")
@@ -854,11 +843,10 @@ class TestOK(TestScenario):
 
         project = self._setup_passing_project(tmp_path)
 
-        with patch("vten.cli.run.XsimBackend", autospec=True) as mock_cls:
+        with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
-            mock_cls.return_value = mock_backend
-            mock_backend.submit.return_value = None
-            mock_backend.wait.return_value = MagicMock(status=2)
+            mock_get_backend.return_value = mock_backend
+            mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             run_test(str(project), kernel_name="passthrough", test_name="TestOK")
 

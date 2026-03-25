@@ -70,6 +70,7 @@ class CompiledResult:
     buffer_ids: dict[str, int]
     flattened_view: FlattenedKernelView
     probe_reports: list[ProbePoint] = field(default_factory=list)
+    tensor_data: dict[int, bytes] = field(default_factory=dict)
 
 
 # ── RuntimeEngine ──
@@ -90,7 +91,13 @@ class RuntimeEngine:
         self._project_params = project_params
         self._alias_registry = alias_registry
 
-    def compile(self) -> CompiledResult:
+    def compile(self, target: str = "sim") -> CompiledResult:
+        """Run the 8-stage compile pipeline.
+
+        Args:
+            target: "sim" for SIM backends (includes Stage 7 SHM packing),
+                    "hw" for HW backends (skips SHM packing).
+        """
         kernel = self._get_primary_kernel()
 
         # Stage 0: Flatten or wrap
@@ -127,8 +134,19 @@ class RuntimeEngine:
         # Stage 6b: BFM configuration synthesis
         bfm_configs = self._synthesize_bfm_configs(view, commands, buffer_ids)
 
-        # Stage 7: SHM packing
-        shm_image = self._pack_shm(view, commands, buffer_ids)
+        # Stage 7: SHM packing (SIM path only)
+        if target == "sim":
+            shm_image = self._pack_shm(view, commands, buffer_ids)
+        else:
+            shm_image = b""
+
+        # Collect serialized tensor data (used by HW path / CommandInterpreter)
+        tensor_data: dict[int, bytes] = {}
+        for name, exposed in view.exposed_tensors.items():
+            if exposed._serialized is not None:
+                bid = buffer_ids.get(name)
+                if bid is not None:
+                    tensor_data[bid] = exposed._serialized
 
         return CompiledResult(
             commands=commands,
@@ -137,6 +155,7 @@ class RuntimeEngine:
             buffer_ids=buffer_ids,
             flattened_view=view,
             probe_reports=view.probe_points,
+            tensor_data=tensor_data,
         )
 
     def _get_primary_kernel(self) -> KernelInstance:

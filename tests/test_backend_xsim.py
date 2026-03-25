@@ -198,24 +198,18 @@ class TestXsimBackendSHMManagement:
 
 
 class TestXsimBackendSubmit:
-    """Submit: SHM write → host_status=CMD_READY → sem_post(h2b) → sem_wait(b2h)."""
+    """Execute: SHM write → host_status=CMD_READY → sem_post(h2b) → sem_wait(b2h)."""
 
-    def test_submit_accepts_shm_image_and_bfm_configs(self):
-        """submit() takes shm_image bytes and bfm_configs list."""
+    def test_execute_accepts_compiled_result(self):
+        """execute() takes a CompiledResult parameter."""
         from vten.backend.xsim import XsimBackend
 
         backend = XsimBackend(project_config=_xsim_config())
-        assert hasattr(backend, "submit")
+        assert hasattr(backend, "execute")
         import inspect
-        sig = inspect.signature(backend.submit)
+        sig = inspect.signature(backend.execute)
         params = list(sig.parameters.keys())
-        assert "shm_image" in params or len(params) >= 2
-
-    def test_wait_method_exists(self):
-        from vten.backend.xsim import XsimBackend
-
-        backend = XsimBackend(project_config=_xsim_config())
-        assert callable(getattr(backend, "wait", None))
+        assert "compiled" in params
 
     def test_shutdown_method_exists(self):
         from vten.backend.xsim import XsimBackend
@@ -229,27 +223,32 @@ class TestXsimBackendSubmit:
         backend = XsimBackend(project_config=_xsim_config())
         assert callable(getattr(backend, "cleanup", None))
 
-    def test_submit_signature_complete(self):
-        """submit() has shm_image and bfm_configs parameters."""
+    def test_execute_signature(self):
+        """execute() has compiled parameter."""
         import inspect
 
         from vten.backend.xsim import XsimBackend
 
         backend = XsimBackend(project_config=_xsim_config())
-        sig = inspect.signature(backend.submit)
+        sig = inspect.signature(backend.execute)
         params = list(sig.parameters.keys())
-        assert "shm_image" in params
-        assert "bfm_configs" in params
+        assert "compiled" in params
 
-    def test_wait_returns_backend_result(self):
-        """wait() return type annotation is BackendResult."""
+    def test_execute_returns_backend_result(self):
+        """execute() return type annotation is BackendResult."""
         import inspect
 
         from vten.backend.xsim import XsimBackend
 
-        sig = inspect.signature(XsimBackend.wait)
-        # Should have a return annotation
+        sig = inspect.signature(XsimBackend.execute)
         assert sig.return_annotation is not inspect.Parameter.empty or True
+
+    def test_is_sim_backend_subclass(self):
+        """XsimBackend inherits from SimBackend."""
+        from vten.backend.sim_base import SimBackend
+        from vten.backend.xsim import XsimBackend
+
+        assert issubclass(XsimBackend, SimBackend)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -327,11 +326,11 @@ class TestXsimBackendErrorHandling:
 class TestXsimBackendProcessManagement:
     """xsim subprocess lifecycle."""
 
-    def test_start_xsim_method_exists(self):
+    def test_start_simulator_method_exists(self):
         from vten.backend.xsim import XsimBackend
 
         backend = XsimBackend(project_config=_xsim_config())
-        assert hasattr(backend, "_start_xsim") or hasattr(backend, "submit")
+        assert hasattr(backend, "_start_simulator")
 
     def test_shutdown_sets_host_status_shutdown(self):
         """Shutdown sends host_status=SHUTDOWN (3) before terminating."""

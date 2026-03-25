@@ -323,11 +323,7 @@ class ExecutionContext:
         self._pending_ops = []
 
         if self._backend is not None:
-            self._backend.submit(
-                shm_image=compiled.shm_image,
-                bfm_configs=compiled.bfm_configs,
-            )
-            backend_result = self._backend.wait()
+            backend_result = self._backend.execute(compiled)
             self._last_backend_result = backend_result
 
             # Build BatchResult from backend stats

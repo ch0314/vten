@@ -10,7 +10,7 @@ import json
 import sys
 from pathlib import Path
 
-from vten.backend.xsim import XsimBackend
+from vten.backend.registry import get_backend, resolve_backend_name
 from vten.cli.config import load_project_config
 from vten.errors import VTenError, VerificationError
 
@@ -156,6 +156,7 @@ def run_test(
     project_dir: str = ".",
     kernel_name: str = "",
     test_name: str = "",
+    backend: str | None = None,
     waveform: bool = False,
     gui: bool = False,
     config_overrides: dict | None = None,
@@ -200,16 +201,17 @@ def run_test(
     if gui:
         config["_gui"] = True
 
-    backend = XsimBackend(config)
+    backend_name = resolve_backend_name(config, cli_backend=backend)
+    backend_inst = get_backend(backend_name, config)
     try:
         for cfg in run_cfgs:
             try:
                 # Create ExecutionContext with backend so ctx.run() drives
-                # the full lifecycle: compile → submit → wait → verify
+                # the full lifecycle: compile → execute → verify
                 from vten.runtime.context import ExecutionContext
 
                 ctx = ExecutionContext(
-                    backend=backend,
+                    backend=backend_inst,
                     project_params=cfg,
                 )
                 scenario.run(ctx, cfg)
@@ -244,10 +246,17 @@ def run_test(
                     verification_passed += batch_result.verification_count
                 else:
                     # No DSL ops — fall back to pre-built SHM image
+                    from vten.runtime.engine import CompiledResult
                     shm_image = _build_shm_image(kernel_dir)
                     bfm_configs = _build_bfm_configs(kernel_dir)
-                    backend.submit(shm_image, bfm_configs)
-                    result = backend.wait()
+                    compiled = CompiledResult(
+                        commands=[],
+                        shm_image=shm_image or b"",
+                        bfm_configs=bfm_configs,
+                        buffer_ids={},
+                        flattened_view=None,
+                    )
+                    result = backend_inst.execute(compiled)
                     configs_passed += 1
                     if result.stats:
                         max_cycle = max(
@@ -278,11 +287,11 @@ def run_test(
             status = "FAIL"
     finally:
         try:
-            backend.shutdown()
+            backend_inst.shutdown()
         except Exception:
             pass
         try:
-            backend.cleanup()
+            backend_inst.cleanup()
         except Exception:
             pass
 
