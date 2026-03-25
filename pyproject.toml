@@ -21,6 +21,9 @@ dev = [
     "pytest-cov>=4.0",
 ]
 
+[project.scripts]
+vten = "vten.cli.main:main"
+
 [tool.setuptools.packages.find]
 include = ["vten*"]
 

@@ -29,7 +29,7 @@ def _xsim_config() -> dict:
         "project": {"name": "test_proj", "version": "0.1.0"},
         "backend": {
             "xsim": {
-                "vivado_path": "/tools/Xilinx/Vivado/2024.1",
+                "vivado_path": "/tools/Xilinx/Vivado/2023.2",
                 "compile_options": ["-timescale", "1ns/1ps"],
                 "timeout_ms": 10000,
                 "submit_timeout_s": 300,
@@ -94,7 +94,7 @@ class TestXsimBackendInit:
         from vten.backend.xsim import XsimBackend
 
         backend = XsimBackend(project_config=_xsim_config())
-        assert backend._vivado_path == "/tools/Xilinx/Vivado/2024.1"
+        assert backend._vivado_path == "/tools/Xilinx/Vivado/2023.2"
 
     def test_is_backend_subclass(self):
         from vten.backend.base import Backend

@@ -325,17 +325,17 @@ void vten_read_command_deps(int cmd_id,
     uint16_t* deps  = (uint16_t*)(slot + 0x2C);
     uint16_t* cdeps = (uint16_t*)(slot + 0x34);
 
-    /* svOpenArrayHandle → contiguous uint16_t array */
-    uint16_t* dep_out  = (uint16_t*)svGetArrayPtr((svOpenArrayHandle)dep_ids_handle);
-    uint16_t* cdep_out = (uint16_t*)svGetArrayPtr((svOpenArrayHandle)cdep_ids_handle);
+    /* DPI-C int open array: svGetArrayPtr returns int* for 'output int arr[]' */
+    int* dep_out  = (int*)svGetArrayPtr((svOpenArrayHandle)dep_ids_handle);
+    int* cdep_out = (int*)svGetArrayPtr((svOpenArrayHandle)cdep_ids_handle);
 
     if (dep_out != NULL) {
         for (int i = 0; i < 4; i++)
-            dep_out[i] = deps[i];
+            dep_out[i] = (int)deps[i];
     }
     if (cdep_out != NULL) {
         for (int i = 0; i < 4; i++)
-            cdep_out[i] = cdeps[i];
+            cdep_out[i] = (int)cdeps[i];
     }
 }
 

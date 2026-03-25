@@ -32,6 +32,32 @@
 
 파싱 결과는 `KernelSpec` dataclass (`00_data_models.md` §5.8)로 변환된다.
 
+### 1.1 파일 위치
+
+**v0.5.0부터 커널별 디렉토리 구조 사용:**
+
+```
+PROJECT_ROOT/kernels/<kernel_name>/kernel_spec.yaml
+```
+
+예시:
+```
+my_npu/
+├── kernels/
+│   ├── conv3d/
+│   │   └── kernel_spec.yaml      # Conv3D 커널 인터페이스 사양
+│   ├── dma_ifm/
+│   │   └── kernel_spec.yaml
+│   └── npu_top/
+│       └── kernel_spec.yaml      # CompositeKernel 사양
+```
+
+`kernel_spec.yaml`은 반드시 `kernels/<name>/` 디렉토리에 위치해야 한다. `vten build`는 이 경로만 탐색한다:
+
+```
+kernels/<kernel_name>/kernel_spec.yaml
+```
+
 ---
 
 ## 2. Top-Level Structure
@@ -46,6 +72,13 @@ parameters:                # OPTIONAL. 커널 레벨 파라미터
 memory_regions:            # OPTIONAL. 메모리 영역 정의 (AXI4 인터페이스용)
   <region_name>: { ... }
 
+clock:                     # OPTIONAL. 클럭 설정
+  name: <string>           # 기본값: "clk"
+
+reset:                     # OPTIONAL. 리셋 설정
+  name: <string>           # 기본값: "rst_n"
+  active_low: <bool>       # 기본값: true
+
 interfaces:                # REQUIRED. 인터페이스 정의
   <interface_name>: { ... }
 ```
@@ -56,7 +89,11 @@ interfaces:                # REQUIRED. 인터페이스 정의
 | `rtl_top` | string | ✓ | — | RTL 탑 모듈 파일 경로 |
 | `parameters` | dict | — | {} | 파라미터 키-값 |
 | `memory_regions` | dict | — | {} | 메모리 영역 |
+| `clock` | dict | — | `{name: "clk"}` | 클럭 신호 설정 |
+| `reset` | dict | — | `{name: "rst_n", active_low: true}` | 리셋 신호 설정 |
 | `interfaces` | dict | ✓ | — | 인터페이스 (최소 1개) |
+
+> **예시 (NPU_3D):** `clock: {name: ap_clk}`, `reset: {name: ap_aresetn, active_low: true}`
 
 ---
 

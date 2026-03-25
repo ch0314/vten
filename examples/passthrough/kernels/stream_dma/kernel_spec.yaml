@@ -1,0 +1,55 @@
+kernel: stream_dma
+rtl_top: rtl/stream_dma.sv
+
+memory_regions:
+  ddr:
+    base: 0x10000000
+    size: 0x10000000
+    alignment: 4096
+
+interfaces:
+  ctrl:
+    rtl_port: s_axilite
+    protocol: axi4_lite
+    addr_width: 16
+    data_width: 32
+    registers:
+      - name: dst_addr_lo
+        offset: 0x00
+        fields: { value: "31:0" }
+        auto_bind: { tensor: data_out, value: address, bits: "31:0" }
+      - name: dst_addr_hi
+        offset: 0x04
+        fields: { value: "31:0" }
+        auto_bind: { tensor: data_out, value: address, bits: "63:32" }
+      - name: length
+        offset: 0x08
+        fields: { value: "31:0" }
+        auto_bind: { tensor: data_out, value: size_beats }
+      - name: ctrl
+        offset: 0x0C
+        fields: { start: "0:0" }
+      - name: status
+        offset: 0x10
+        fields: { done: "0:0" }
+
+  input_stream:
+    rtl_port: s_axis
+    protocol: axi4_stream
+    tensor: data_in
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first
+
+  dma_port:
+    rtl_port: m_axi
+    protocol: axi4
+    data_width: 256
+    addr_width: 64
+    memory_region: ddr
+    tensor: data_out
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first

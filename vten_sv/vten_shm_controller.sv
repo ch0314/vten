@@ -68,9 +68,9 @@ module vten_shm_controller #(
             case (state)
                 // ── Init: SHM connection ──
                 S_INIT: begin
-                    if (vten_shm_init(runtime_session_id) == 0)
+                    if (vten_shm_init(runtime_session_id) == 0) begin
                         state <= S_WAIT_HOST;
-                    else
+                    end else
                         state <= S_ERROR;
                 end
 
@@ -82,12 +82,13 @@ module vten_shm_controller #(
                     );
                     if (result == 0) begin  // VTEN_OK
                         case (vten_read_host_status())
-                            1: state <= S_LOAD_BATCH;   // CMD_READY
-                            3: state <= S_SHUTDOWN;      // SHUTDOWN
-                            default: ;                   // retry
+                            1: begin
+                                state <= S_LOAD_BATCH;
+                            end
+                            3: state <= S_SHUTDOWN;
+                            default: ;
                         endcase
                     end
-                    // TIMEOUT → stay in S_WAIT_HOST (allow GUI events)
                 end
 
                 // ── Batch load: SHM → local cache ──
@@ -131,7 +132,7 @@ module vten_shm_controller #(
                 // ── Feed commands to Scheduler sequentially ──
                 S_FEED: begin
                     if (feed_idx >= num_commands) begin
-                        feed_done <= 1;    // Notify Scheduler "batch complete"
+                        feed_done <= 1;
                         state     <= S_EXECUTE;
                     end else if (feed_ready) begin
                         feed_valid <= 1;

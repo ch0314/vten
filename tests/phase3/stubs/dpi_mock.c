@@ -283,8 +283,8 @@ int vten_read_command(int cmd_id,
 }
 
 void vten_read_command_deps(int cmd_id,
-    int* num_dep, svLogicVecVal* dep_ids,
-    int* num_cdep, svLogicVecVal* cdep_ids)
+    int* num_dep, int* dep_ids,
+    int* num_cdep, int* cdep_ids)
 {
     if (cmd_base == NULL) return;
 
@@ -296,12 +296,13 @@ void vten_read_command_deps(int cmd_id,
     uint16_t* deps  = (uint16_t*)(slot + 0x2C);
     uint16_t* cdeps = (uint16_t*)(slot + 0x34);
 
-    /* svLogicVecVal: aval holds the value bits, bval=0 for known values */
-    for (int i = 0; i < 4; i++) {
-        dep_ids[i].aval  = (unsigned int)deps[i];
-        dep_ids[i].bval  = 0;
-        cdep_ids[i].aval = (unsigned int)cdeps[i];
-        cdep_ids[i].bval = 0;
+    if (dep_ids != NULL) {
+        for (int i = 0; i < 4; i++)
+            dep_ids[i] = (int)deps[i];
+    }
+    if (cdep_ids != NULL) {
+        for (int i = 0; i < 4; i++)
+            cdep_ids[i] = (int)cdeps[i];
     }
 }
 

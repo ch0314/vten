@@ -559,6 +559,153 @@ class TestRegisterBanks:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# §7.1  V3: Register bank overlap validation (BankOverlapError)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestBankOverlapValidation:
+    """V3: register_banks base_offsets must not overlap."""
+
+    def test_distinct_offsets_pass(self, tmp_path):
+        """Banks with distinct base_offsets parse successfully."""
+        data = {
+            "kernel": "npu",
+            "rtl_top": "rtl/npu.sv",
+            "interfaces": {
+                "ctrl": {
+                    "rtl_port": "s_axilite_ctrl",
+                    "protocol": "axi4_lite",
+                    "register_banks": {
+                        "fmapio": {"base_offset": 0x000},
+                        "mac": {"base_offset": 0x100},
+                        "dma": {"base_offset": 0x200},
+                    },
+                    "registers": [
+                        {"name": "status", "offset": 0x00},
+                    ],
+                },
+            },
+        }
+        spec = parse_kernel_spec(str(_write_spec(tmp_path, data)))
+        assert len(spec.get_interface("ctrl").register_banks) == 3
+
+    def test_duplicate_offsets_raise_bank_overlap(self, tmp_path):
+        """Two banks with same base_offset → BankOverlapError."""
+        from vten.errors import BankOverlapError
+
+        data = {
+            "kernel": "npu",
+            "rtl_top": "rtl/npu.sv",
+            "interfaces": {
+                "ctrl": {
+                    "rtl_port": "s_axilite_ctrl",
+                    "protocol": "axi4_lite",
+                    "register_banks": {
+                        "fmapio": {"base_offset": 0x100},
+                        "mac": {"base_offset": 0x100},
+                    },
+                    "registers": [
+                        {"name": "status", "offset": 0x00},
+                    ],
+                },
+            },
+        }
+        with pytest.raises(BankOverlapError, match="same base_offset"):
+            parse_kernel_spec(str(_write_spec(tmp_path, data)))
+
+    def test_single_bank_no_validation_needed(self, tmp_path):
+        """Single bank never overlaps."""
+        data = {
+            "kernel": "k",
+            "rtl_top": "r.sv",
+            "interfaces": {
+                "ctrl": {
+                    "rtl_port": "s_axilite",
+                    "protocol": "axi4_lite",
+                    "register_banks": {
+                        "only": {"base_offset": 0x000},
+                    },
+                    "registers": [
+                        {"name": "reg0", "offset": 0x00},
+                    ],
+                },
+            },
+        }
+        spec = parse_kernel_spec(str(_write_spec(tmp_path, data)))
+        assert len(spec.get_interface("ctrl").register_banks) == 1
+
+    def test_error_message_includes_bank_names(self, tmp_path):
+        """Error message names both conflicting banks."""
+        from vten.errors import BankOverlapError
+
+        data = {
+            "kernel": "npu",
+            "rtl_top": "rtl/npu.sv",
+            "interfaces": {
+                "ctrl": {
+                    "rtl_port": "s_axilite_ctrl",
+                    "protocol": "axi4_lite",
+                    "register_banks": {
+                        "alpha": {"base_offset": 0x200},
+                        "beta": {"base_offset": 0x200},
+                    },
+                    "registers": [
+                        {"name": "r", "offset": 0x00},
+                    ],
+                },
+            },
+        }
+        with pytest.raises(BankOverlapError) as exc_info:
+            parse_kernel_spec(str(_write_spec(tmp_path, data)))
+        msg = str(exc_info.value)
+        assert "alpha" in msg or "beta" in msg
+
+    def test_six_banks_distinct_offsets_pass(self, tmp_path):
+        """NPU 3D: 6 banks with well-separated offsets succeed."""
+        data = {
+            "kernel": "npu",
+            "rtl_top": "rtl/npu.sv",
+            "interfaces": {
+                "ctrl": {
+                    "rtl_port": "s_axilite_ctrl",
+                    "protocol": "axi4_lite",
+                    "register_banks": {
+                        "fmapio": {"base_offset": 0x000},
+                        "bias": {"base_offset": 0x100},
+                        "wgt": {"base_offset": 0x200},
+                        "mac": {"base_offset": 0x400},
+                        "psum": {"base_offset": 0x600},
+                        "act": {"base_offset": 0x700},
+                    },
+                    "registers": [
+                        {"name": "r", "offset": 0x00},
+                    ],
+                },
+            },
+        }
+        spec = parse_kernel_spec(str(_write_spec(tmp_path, data)))
+        assert len(spec.get_interface("ctrl").register_banks) == 6
+
+    def test_no_register_banks_skips_validation(self, tmp_path):
+        """Interface without register_banks skips validation."""
+        data = {
+            "kernel": "k",
+            "rtl_top": "r.sv",
+            "interfaces": {
+                "ctrl": {
+                    "rtl_port": "s_axilite",
+                    "protocol": "axi4_lite",
+                    "registers": [
+                        {"name": "reg0", "offset": 0x00},
+                    ],
+                },
+            },
+        }
+        spec = parse_kernel_spec(str(_write_spec(tmp_path, data)))
+        assert spec.get_interface("ctrl").register_banks is None
+
+
+# ═══════════════════════════════════════════════════════════════════
 # §8  PackingScheme — NPU 3D bus widths
 # ═══════════════════════════════════════════════════════════════════
 

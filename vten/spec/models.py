@@ -171,6 +171,20 @@ class RegisterSpec:
     fields: dict[str, str] | None = None
     auto_bind: AutoBindSpec | None = None
     interface_name: str = ""
+    access: str = "rw"  # rw | ro | wo | w1c
+    pulse: bool = False  # 1-cycle pulse (only with access=rw)
+    reset_value: int = 0
+
+    @property
+    def width(self) -> int:
+        """Register width in bits, inferred from fields or default 32."""
+        if self.fields:
+            max_bit = 0
+            for bit_range in self.fields.values():
+                hi, _lo = bit_range.split(":")
+                max_bit = max(max_bit, int(hi))
+            return max_bit + 1
+        return 32
 
 
 # ── MemoryRegion (§5.5) ──
@@ -210,6 +224,7 @@ class InterfaceSpec:
     split: dict | SplitSpec | None = None
     registers: list[RegisterSpec] | None = None
     register_banks: list[RegisterBankSpec] | None = None
+    generate_controller: bool = False
 
 
 # ── KernelSpec (§5.8) ──
@@ -222,6 +237,9 @@ class KernelSpec:
     parameters: dict[str, str | int] = field(default_factory=dict)
     memory_regions: dict[str, MemoryRegion] = field(default_factory=dict)
     interfaces: dict[str, InterfaceSpec] = field(default_factory=dict)
+    clock_name: str = "clk"
+    reset_name: str = "rst_n"
+    reset_active_low: bool = True
 
     def get_interface(self, name: str) -> InterfaceSpec:
         if name not in self.interfaces:

@@ -160,6 +160,17 @@ static uint32_t captured_awaddr = 0;
 static uint32_t captured_wdata = 0;
 
 static void slave_respond() {
+    /* ── Write Response Channel — clear FIRST ──
+     * Must process B clearance before AW/W acceptance so that when
+     * a new command's AW/W arrive in the same cycle as the old B
+     * response clearance, aw_done/w_done are properly reset before
+     * being set again by the new AW/W handshakes. */
+    if (dut->m_bvalid && dut->m_bready) {
+        dut->m_bvalid = 0;
+        aw_done = 0;
+        w_done = 0;
+    }
+
     /* ── Write Address Channel ── */
     if (dut->m_awvalid && !dut->m_awready) {
         /* Assert ready → handshake completes at upcoming posedge */
@@ -179,14 +190,8 @@ static void slave_respond() {
         dut->m_wready = 0;
     }
 
-    /* ── Write Response Channel ──
-     * Check B handshake first (clear), then set bvalid if needed.
-     * This ensures bvalid stays high for at least one tick. */
-    if (dut->m_bvalid && dut->m_bready) {
-        dut->m_bvalid = 0;
-        aw_done = 0;
-        w_done = 0;
-    } else if (aw_done && w_done && !dut->m_bvalid) {
+    /* ── Write Response — assert if AW+W both done ── */
+    if (aw_done && w_done && !dut->m_bvalid) {
         /* Commit write and assert response */
         if (captured_awaddr < REG_MEM_SIZE) {
             reg_mem[captured_awaddr / 4] = captured_wdata;
@@ -195,10 +200,18 @@ static void slave_respond() {
         dut->m_bresp = 0;  // OKAY
     }
 
-    /* ── Read Address Channel ── */
+    /* ── Read channels ── */
     static uint32_t read_addr = 0;
     static int ar_pending = 0;
 
+    /* R handshake clearance FIRST — so a stale R completion does not
+     * clobber an AR acceptance that happens in the same cycle. */
+    if (dut->m_rvalid && dut->m_rready) {
+        dut->m_rvalid = 0;
+        ar_pending = 0;
+    }
+
+    /* Read Address Channel */
     if (dut->m_arvalid && !dut->m_arready) {
         dut->m_arready = 1;
         read_addr = dut->m_araddr;
@@ -207,12 +220,8 @@ static void slave_respond() {
         dut->m_arready = 0;
     }
 
-    /* ── Read Data Channel ──
-     * Check R handshake first, then assert rvalid if pending. */
-    if (dut->m_rvalid && dut->m_rready) {
-        dut->m_rvalid = 0;
-        ar_pending = 0;
-    } else if (ar_pending && !dut->m_rvalid) {
+    /* Read Data Channel — assert rvalid if a new AR was accepted. */
+    if (ar_pending && !dut->m_rvalid) {
         dut->m_rvalid = 1;
         dut->m_rresp = 0;  // OKAY
         if (read_addr < REG_MEM_SIZE) {

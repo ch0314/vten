@@ -18,8 +18,10 @@ from vten.errors import (
     ValidationError,
 )
 from vten.kernel.composite import Internal
+from vten.kernel.tensor import Tensor
 from vten.spec.models import (
     Direction,
+    KernelSpec,
     MappingType,
     OpCode,
     Protocol,
@@ -92,7 +94,10 @@ class RuntimeEngine:
         kernel = self._get_primary_kernel()
 
         # Stage 0: Flatten or wrap
-        view = self._wrap_unit_as_flat(kernel)
+        if self._is_composite(kernel):
+            view = self._flatten_composite(kernel)
+        else:
+            view = self._wrap_unit_as_flat(kernel)
 
         # Stage 1: Parameter resolution (re-validate)
         self._resolve_parameters(view)
@@ -176,6 +181,224 @@ class RuntimeEngine:
             probe_points=[],
             connections=[],
         )
+
+    def _is_composite(self, kernel: KernelInstance) -> bool:
+        """Check if a KernelInstance wraps a CompositeKernel."""
+        return hasattr(kernel.kernel_class, "_sub_kernel_bindings") and bool(
+            kernel.kernel_class._sub_kernel_bindings
+        )
+
+    def _flatten_composite(self, kernel: KernelInstance) -> FlattenedKernelView:
+        """Flatten a CompositeKernel into FlattenedKernelView.
+
+        Spec reference: 02_runtime_engine.md §5 (5-phase algorithm).
+        """
+        from vten.kernel.composite import CompositeKernel, Connect, Internal
+        from vten.spec.parser import load_kernel_spec
+
+        composite_instance = kernel.kernel_class_instance
+        top_spec = kernel.spec
+
+        # ── Phase A: Sub-kernel instantiation ──
+        sub_kernels: dict[str, KernelInstance] = {}
+        bindings_map: dict[str, object] = {}  # name → SubKernelBinding
+
+        for bind_name, binding in composite_instance.bindings():
+            # Load sub-kernel spec
+            sub_spec_path = binding.kernel_class.spec
+            sub_spec = load_kernel_spec(sub_spec_path)
+
+            sub_ki = KernelInstance(
+                name=bind_name,
+                spec=sub_spec,
+                kernel_class=binding.kernel_class,
+                runtime_params=binding.params or {},
+            )
+            sub_ki.initialize(self._project_params)
+            sub_kernels[bind_name] = sub_ki
+            bindings_map[bind_name] = binding
+
+        # ── Phase B: Interface mapping construction ──
+        mappings: list[InterfaceMapping] = []
+
+        for bind_name, binding in composite_instance.bindings():
+            sub_spec = sub_kernels[bind_name].spec
+            for sub_iface_name in sub_spec.interface_names():
+                if sub_iface_name not in binding.interface_map:
+                    raise ValidationError(
+                        f"CompositeKernel '{kernel.name}': sub-kernel "
+                        f"'{bind_name}' interface '{sub_iface_name}' "
+                        f"has no mapping in interface_map."
+                    )
+                mapping_value = binding.interface_map[sub_iface_name]
+                mappings.append(
+                    self._parse_mapping(
+                        bind_name, sub_iface_name, mapping_value, top_spec
+                    )
+                )
+
+        # ── Phase C: Exposed tensor collection ──
+        exposed: dict[str, ExposedTensor] = {}
+
+        for tensor_attr, tensor_def in composite_instance.exposed_tensor_defs():
+            origin_sub = tensor_def.origin_sub_kernel
+            origin_name = tensor_def.origin_name
+
+            if origin_sub not in sub_kernels:
+                raise ValidationError(
+                    f"ExposedTensor '{tensor_attr}' references sub-kernel "
+                    f"'{origin_sub}' which does not exist."
+                )
+
+            origin_tensor = sub_kernels[origin_sub].get_tensor(origin_name)
+            direction = self._infer_direction_composite(
+                origin_sub, origin_tensor, mappings, sub_kernels[origin_sub].spec
+            )
+
+            exposed[tensor_attr] = ExposedTensor(
+                name=tensor_attr,
+                origin_path=f"{origin_sub}.{origin_name}",
+                origin_tensor=origin_tensor,
+                top_interface=tensor_def.top_interface,
+                direction=direction,
+            )
+
+        # ── Phase D: Probe point collection ──
+        probe_points: list[ProbePoint] = []
+        connections = composite_instance._connections or []
+
+        for m in mappings:
+            if m.mapping_type == MappingType.INTERNAL_PROBE:
+                conn = self._find_connection_for_interface(
+                    connections, m.sub_kernel, m.sub_interface
+                )
+                if conn is not None:
+                    probe_points.append(
+                        ProbePoint(connection=conn, interface_mapping=m)
+                    )
+
+        # ── Phase E: Validation ──
+        self._validate_flattened(mappings, exposed, connections, top_spec)
+
+        return FlattenedKernelView(
+            name=kernel.name,
+            top_spec=top_spec,
+            sub_kernels=sub_kernels,
+            interface_mappings=mappings,
+            exposed_tensors=exposed,
+            probe_points=probe_points,
+            connections=connections,
+        )
+
+    def _parse_mapping(
+        self,
+        sub_kernel_name: str,
+        sub_iface_name: str,
+        mapping_value: object,
+        top_spec: KernelSpec,
+    ) -> InterfaceMapping:
+        """Parse a single interface_map entry into InterfaceMapping.
+
+        Handles three mapping forms:
+          - Internal() / Internal(probe=True)
+          - "top_interface_name" (string → EXTERNAL)
+          - ("top_interface_name", "bank_name") (tuple → EXTERNAL_BANK)
+        """
+        if isinstance(mapping_value, Internal):
+            mtype = (
+                MappingType.INTERNAL_PROBE
+                if mapping_value.probe
+                else MappingType.INTERNAL
+            )
+            return InterfaceMapping(
+                sub_kernel=sub_kernel_name,
+                sub_interface=sub_iface_name,
+                mapping_type=mtype,
+                top_interface=None,
+                bank_name=None,
+                bank_offset=0,
+            )
+
+        if isinstance(mapping_value, str):
+            return InterfaceMapping(
+                sub_kernel=sub_kernel_name,
+                sub_interface=sub_iface_name,
+                mapping_type=MappingType.EXTERNAL,
+                top_interface=mapping_value,
+                bank_name=None,
+                bank_offset=0,
+            )
+
+        if isinstance(mapping_value, tuple) and len(mapping_value) == 2:
+            top_iface, bank_name = mapping_value
+            bank_offset = top_spec.get_bank_offset(top_iface, bank_name)
+            return InterfaceMapping(
+                sub_kernel=sub_kernel_name,
+                sub_interface=sub_iface_name,
+                mapping_type=MappingType.EXTERNAL_BANK,
+                top_interface=top_iface,
+                bank_name=bank_name,
+                bank_offset=bank_offset,
+            )
+
+        raise ValidationError(
+            f"Invalid interface_map value for '{sub_kernel_name}."
+            f"{sub_iface_name}': {mapping_value!r}. "
+            f"Expected Internal(), string, or (string, string) tuple."
+        )
+
+    def _infer_direction_composite(
+        self,
+        sub_kernel_name: str,
+        tensor: Tensor,
+        mappings: list[InterfaceMapping],
+        sub_spec: KernelSpec,
+    ) -> Direction:
+        """Infer tensor direction for CompositeKernel exposed tensors."""
+        if tensor.direction is not None:
+            return tensor.direction
+        # Fall back to unit inference using sub-kernel spec
+        return self._infer_direction_unit(tensor, sub_spec)
+
+    def _find_connection_for_interface(
+        self,
+        connections: list,
+        sub_kernel_name: str,
+        sub_interface_name: str,
+    ) -> object | None:
+        """Find a Connect involving the given sub-kernel interface."""
+        for conn in connections:
+            if conn.source_sub == sub_kernel_name and conn.source_interface == sub_interface_name:
+                return conn
+            if conn.dest_sub == sub_kernel_name:
+                from vten.kernel.tensor import Tensor
+
+                dest_tensor = getattr(conn._dest_proxy.kernel_class, conn.dest_name, None)
+                if isinstance(dest_tensor, Tensor) and dest_tensor.interface == sub_interface_name:
+                    return conn
+        return None
+
+    def _validate_flattened(
+        self,
+        mappings: list[InterfaceMapping],
+        exposed: dict[str, ExposedTensor],
+        connections: list,
+        top_spec: KernelSpec,
+    ) -> None:
+        """Build-time validation of flattened view."""
+        # Validate all exposed tensors reference valid top interfaces
+        external_ifaces = {
+            m.top_interface
+            for m in mappings
+            if m.mapping_type in (MappingType.EXTERNAL, MappingType.EXTERNAL_BANK)
+            and m.top_interface is not None
+        }
+        for name, exp in exposed.items():
+            if exp.top_interface not in external_ifaces:
+                raise ValidationError(
+                    f"ExposedTensor '{name}' maps to top_interface "
+                    f"'{exp.top_interface}' which has no EXTERNAL mapping."
+                )
 
     def _infer_direction_unit(self, tensor, spec) -> Direction:
         """Resolve tensor direction: explicit value first, then protocol inference.

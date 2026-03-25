@@ -44,8 +44,19 @@ module vten_bfm_axilite #(
     int poll_count;
     int issue_cycle;
 
-    // v0.4.1: idle signal
-    assign cmd_if.idle = !cmd_active && (cmd_queue.size() == 0);
+    // Write handshake phase tracking
+    logic aw_accepted;
+    logic w_accepted;
+
+    // v0.4.1: idle signal — registered to avoid xsim continuous-assign issue
+    logic idle_r;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            idle_r <= 1'b1;
+        else
+            idle_r <= !cmd_active && (cmd_queue.size() == 0);
+    end
+    assign cmd_if.idle = idle_r;
 
     // Command receive
     always_ff @(posedge clk) begin
@@ -62,14 +73,24 @@ module vten_bfm_axilite #(
             m_bready     <= 0;
             m_arvalid    <= 0;
             m_rready     <= 0;
+            aw_accepted  <= 0;
+            w_accepted   <= 0;
         end else begin
             cmd_if.done_valid <= 0;
+            // Default: deassert AXI-Lite master outputs when not driven by a command
+            m_awvalid <= 0;
+            m_wvalid  <= 0;
+            m_bready  <= 0;
+            m_arvalid <= 0;
+            m_rready  <= 0;
 
             if (!cmd_active && cmd_queue.size() > 0) begin
                 current_cmd = cmd_queue.pop_front();
                 cmd_active  <= 1;
                 poll_count  <= 0;
                 issue_cycle <= cycle_count;
+                aw_accepted <= 0;
+                w_accepted  <= 0;
             end
 
             if (cmd_active) begin
@@ -88,16 +109,27 @@ module vten_bfm_axilite #(
 
     // ── WRITE_REG ──
     task automatic do_write();
-        // Drive AW + W simultaneously
-        m_awaddr  <= current_cmd.reg_offset[ADDR_W-1:0];
-        m_awvalid <= 1;
-        m_wdata   <= current_cmd.reg_value[DATA_W-1:0];
-        m_wstrb   <= {(DATA_W/8){1'b1}};
-        m_wvalid  <= 1;
-        m_bready  <= 1;
-
-        if (m_awready) m_awvalid <= 0;
-        if (m_wready)  m_wvalid  <= 0;
+        // Drive AW channel until accepted
+        if (!aw_accepted) begin
+            m_awaddr  <= current_cmd.reg_offset[ADDR_W-1:0];
+            m_awvalid <= 1;
+            if (m_awready) begin
+                m_awvalid   <= 0;
+                aw_accepted <= 1;
+            end
+        end
+        // Drive W channel until accepted
+        if (!w_accepted) begin
+            m_wdata  <= current_cmd.reg_value[DATA_W-1:0];
+            m_wstrb  <= {(DATA_W/8){1'b1}};
+            m_wvalid <= 1;
+            if (m_wready) begin
+                m_wvalid   <= 0;
+                w_accepted <= 1;
+            end
+        end
+        // Wait for B response
+        m_bready <= 1;
         if (m_bvalid && m_bready) begin
             m_bready <= 0;
             finish_cmd(m_bresp != 2'b00);
@@ -106,11 +138,15 @@ module vten_bfm_axilite #(
 
     // ── READ_REG ──
     task automatic do_read();
-        m_araddr  <= current_cmd.reg_offset[ADDR_W-1:0];
-        m_arvalid <= 1;
-        m_rready  <= 1;
-
-        if (m_arready) m_arvalid <= 0;
+        if (!aw_accepted) begin  // reuse aw_accepted as "ar_accepted"
+            m_araddr  <= current_cmd.reg_offset[ADDR_W-1:0];
+            m_arvalid <= 1;
+            if (m_arready) begin
+                m_arvalid   <= 0;
+                aw_accepted <= 1;
+            end
+        end
+        m_rready <= 1;
         if (m_rvalid && m_rready) begin
             m_rready <= 0;
             // Write read value to Stats
@@ -123,17 +159,23 @@ module vten_bfm_axilite #(
 
     // ── POLL_REG ──
     task automatic do_poll();
-        // Configurable interval polling
-        if (poll_count % POLL_INTERVAL == 0) begin
+        // Always ready to receive read data while polling
+        m_rready <= 1;
+
+        // Drive AR on polling interval when no outstanding read
+        if (poll_count % POLL_INTERVAL == 0 && !aw_accepted) begin
             m_araddr  <= current_cmd.reg_offset[ADDR_W-1:0];
             m_arvalid <= 1;
-            m_rready  <= 1;
         end
 
-        if (m_arready) m_arvalid <= 0;
+        if (m_arvalid && m_arready) begin
+            m_arvalid   <= 0;
+            aw_accepted <= 1;
+        end
 
         if (m_rvalid && m_rready) begin
-            m_rready <= 0;
+            m_rready    <= 0;
+            aw_accepted <= 0;  // reset for next poll iteration
             if ((m_rdata & current_cmd.reg_mask[DATA_W-1:0]) ==
                 current_cmd.reg_expected[DATA_W-1:0]) begin
                 finish_cmd(0);

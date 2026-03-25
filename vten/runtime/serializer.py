@@ -116,6 +116,56 @@ class StreamSerializer:
         return coords
 
 
+class CustomFieldSerializer:
+    """Serialize/deserialize using custom field bit positions.
+
+    Custom packing maps named fields to specific bit ranges within a beat.
+    Each beat is a dict of {field_name: int_value}.
+    """
+
+    def __init__(self, packing: PackingScheme) -> None:
+        if packing.mode != "custom" or not packing.custom_fields:
+            raise ValueError("CustomFieldSerializer requires mode='custom' with fields")
+        self.packing = packing
+        self._fields = packing.custom_fields
+
+    def serialize_beat(self, field_values: dict[str, int]) -> bytes:
+        """Pack a single beat from field name→value dict."""
+        beat_val = 0
+        for cf in self._fields:
+            value = field_values.get(cf.name, 0)
+            lo, hi = cf.bits
+            width = hi - lo + 1
+            mask = (1 << width) - 1
+            beat_val |= (int(value) & mask) << lo
+        num_bytes = (self.packing.bus_width + 7) // 8
+        return beat_val.to_bytes(num_bytes, byteorder=self.packing.byte_order)
+
+    def serialize_beats(self, beats: list[dict[str, int]]) -> bytes:
+        """Pack multiple beats into a byte stream."""
+        return b"".join(self.serialize_beat(b) for b in beats)
+
+    def deserialize_beat(self, raw_bytes: bytes) -> dict[str, int]:
+        """Unpack a single beat into field name→value dict."""
+        beat_val = int.from_bytes(raw_bytes, byteorder=self.packing.byte_order)
+        result: dict[str, int] = {}
+        for cf in self._fields:
+            lo, hi = cf.bits
+            width = hi - lo + 1
+            mask = (1 << width) - 1
+            result[cf.name] = (beat_val >> lo) & mask
+        return result
+
+    def deserialize_beats(self, raw_bytes: bytes, num_beats: int) -> list[dict[str, int]]:
+        """Unpack multiple beats from a byte stream."""
+        bytes_per_beat = (self.packing.bus_width + 7) // 8
+        beats: list[dict[str, int]] = []
+        for i in range(num_beats):
+            chunk = raw_bytes[i * bytes_per_beat : (i + 1) * bytes_per_beat]
+            beats.append(self.deserialize_beat(chunk))
+        return beats
+
+
 class MultiPortSerializer:
     """Split serialized data across multiple ports."""
 

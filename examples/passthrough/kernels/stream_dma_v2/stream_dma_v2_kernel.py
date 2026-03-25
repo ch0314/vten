@@ -1,16 +1,13 @@
-"""Passthrough kernel — minimal E2E pipeline test.
-
-Spec reference: 07_e2e_examples.md §1.3
-"""
-
 import torch
 
-from vten.kernel.base import Kernel
+from vten.kernel.base import Kernel, register
 from vten.kernel.tensor import Tensor
 
 
-class PassthroughKernel(Kernel):
-    spec = "specs/passthrough.yaml"
+class StreamDmaV2Kernel(Kernel):
+    spec = "kernels/stream_dma_v2/kernel_spec.yaml"
+
+    ctrl = register("ctrl")
 
     data_in = Tensor(
         shape=("${N}",),
@@ -20,7 +17,7 @@ class PassthroughKernel(Kernel):
     data_out = Tensor(
         shape=("${N}",),
         dtype=torch.int8,
-        interface="output_stream",
+        interface="dma_port",
     )
 
     def generate_inputs(self, seed=None):

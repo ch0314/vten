@@ -467,3 +467,120 @@ class TestBusWidth:
         p = _make_packing(packing_cls, element_width=8,
                           elements_per_beat=4)
         assert p.bus_width == 32
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §9  CustomFieldSerializer — custom packing mode
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestCustomFieldSerializer:
+    """Custom packing: named fields at specific bit positions."""
+
+    @staticmethod
+    def _custom_packing():
+        from vten.spec.models import CustomField, PackingScheme
+        return PackingScheme(
+            element_width=0, elements_per_beat=0,
+            mode="custom",
+            custom_fields=[
+                CustomField(name="data_a", bits=(0, 23)),    # 24 bits
+                CustomField(name="data_b", bits=(24, 47)),   # 24 bits
+                CustomField(name="valid_mask", bits=(48, 49)),  # 2 bits
+                CustomField(name="reserved", bits=(50, 63)),    # 14 bits
+            ],
+        )
+
+    @staticmethod
+    def _simple_packing():
+        from vten.spec.models import CustomField, PackingScheme
+        return PackingScheme(
+            element_width=0, elements_per_beat=0,
+            mode="custom",
+            custom_fields=[
+                CustomField(name="lo", bits=(0, 7)),
+                CustomField(name="hi", bits=(8, 15)),
+            ],
+        )
+
+    def test_serialize_single_beat(self):
+        from vten.runtime.serializer import CustomFieldSerializer
+        ser = CustomFieldSerializer(self._simple_packing())
+        result = ser.serialize_beat({"lo": 0xAB, "hi": 0xCD})
+        assert len(result) == 2
+        val = int.from_bytes(result, "little")
+        assert val & 0xFF == 0xAB
+        assert (val >> 8) & 0xFF == 0xCD
+
+    def test_deserialize_single_beat(self):
+        from vten.runtime.serializer import CustomFieldSerializer
+        ser = CustomFieldSerializer(self._simple_packing())
+        raw = (0xCD << 8 | 0xAB).to_bytes(2, "little")
+        fields = ser.deserialize_beat(raw)
+        assert fields["lo"] == 0xAB
+        assert fields["hi"] == 0xCD
+
+    def test_round_trip_single_beat(self):
+        from vten.runtime.serializer import CustomFieldSerializer
+        ser = CustomFieldSerializer(self._simple_packing())
+        original = {"lo": 42, "hi": 200}
+        raw = ser.serialize_beat(original)
+        restored = ser.deserialize_beat(raw)
+        assert restored == original
+
+    def test_64bit_custom_fields(self):
+        """64-bit bus with 4 named fields."""
+        from vten.runtime.serializer import CustomFieldSerializer
+        ser = CustomFieldSerializer(self._custom_packing())
+        beat = {"data_a": 0x123456, "data_b": 0xABCDEF, "valid_mask": 3, "reserved": 0}
+        raw = ser.serialize_beat(beat)
+        assert len(raw) == 8  # 64 bits = 8 bytes
+        restored = ser.deserialize_beat(raw)
+        assert restored["data_a"] == 0x123456
+        assert restored["data_b"] == 0xABCDEF
+        assert restored["valid_mask"] == 3
+
+    def test_serialize_multiple_beats(self):
+        from vten.runtime.serializer import CustomFieldSerializer
+        ser = CustomFieldSerializer(self._simple_packing())
+        beats = [{"lo": 1, "hi": 2}, {"lo": 3, "hi": 4}]
+        raw = ser.serialize_beats(beats)
+        assert len(raw) == 4  # 2 beats × 2 bytes
+
+    def test_deserialize_multiple_beats(self):
+        from vten.runtime.serializer import CustomFieldSerializer
+        ser = CustomFieldSerializer(self._simple_packing())
+        beats = [{"lo": 10, "hi": 20}, {"lo": 30, "hi": 40}]
+        raw = ser.serialize_beats(beats)
+        restored = ser.deserialize_beats(raw, num_beats=2)
+        assert restored == beats
+
+    def test_missing_field_defaults_to_zero(self):
+        """Missing fields in input dict default to 0."""
+        from vten.runtime.serializer import CustomFieldSerializer
+        ser = CustomFieldSerializer(self._simple_packing())
+        result = ser.serialize_beat({"lo": 0xFF})
+        fields = ser.deserialize_beat(result)
+        assert fields["lo"] == 0xFF
+        assert fields["hi"] == 0  # default
+
+    def test_field_value_masking(self):
+        """Values exceeding field width are masked."""
+        from vten.runtime.serializer import CustomFieldSerializer
+        ser = CustomFieldSerializer(self._simple_packing())
+        result = ser.serialize_beat({"lo": 0x1FF, "hi": 0})  # 9 bits → mask to 8
+        fields = ser.deserialize_beat(result)
+        assert fields["lo"] == 0xFF  # masked to 8 bits
+
+    def test_requires_custom_mode(self):
+        """Non-custom packing raises ValueError."""
+        from vten.runtime.serializer import CustomFieldSerializer
+        from vten.spec.models import PackingScheme
+        packing = PackingScheme(element_width=8, elements_per_beat=4)
+        with pytest.raises(ValueError, match="custom"):
+            CustomFieldSerializer(packing)
+
+    def test_bus_width_matches_field_range(self):
+        """bus_width computed from custom fields' max bit position."""
+        packing = self._custom_packing()
+        assert packing.bus_width == 64  # bits 0-63

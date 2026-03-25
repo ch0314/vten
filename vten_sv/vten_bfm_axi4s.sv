@@ -33,8 +33,16 @@ module vten_bfm_axi4s #(
     int issue_cycle, first_active, last_active;
     int active_cycles, stall_cycles, total_beats;
 
-    // v0.4.1: idle signal — used by Scheduler for all_drained
-    assign cmd_if.idle = !cmd_active && (cmd_queue.size() == 0);
+    // v0.4.1: idle signal — registered to avoid xsim continuous-assign issue
+    // with queue.size() not re-evaluating in assign/always_comb.
+    logic idle_r;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            idle_r <= 1'b1;
+        else
+            idle_r <= !cmd_active && (cmd_queue.size() == 0);
+    end
+    assign cmd_if.idle = idle_r;
 
     // Note: module-level open arrays removed — using scalar DPI-C byte access
     // for xsim compatibility (svGetArrElemPtr1/svGetArrayPtr unreliable).
@@ -149,9 +157,6 @@ module vten_bfm_axi4s #(
     endtask
 
     task automatic finish_command();
-        // NBA timing: total_beats/active_cycles increments are scheduled via
-        // NBA in the same cycle — the final increment is not yet visible here.
-        // Stats intentionally report the pre-NBA values (N-1).
         cmd_active <= 0;
         cmd_if.done_valid  <= 1'b1;
         cmd_if.done_cmd_id <= current_cmd.cmd_id;

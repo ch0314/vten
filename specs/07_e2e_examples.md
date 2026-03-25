@@ -1,6 +1,6 @@
 # vTen E2E Examples & Implementation Roadmap
 
-**Version 0.4.2 — March 2026**
+**Version 0.5.0 — March 2026**
 **소스: 서플리먼트 §22, 메인 스펙 §14**
 
 ---
@@ -48,11 +48,31 @@ endmodule
 > (`_tdata`, `_tvalid`, `_tready`, `_tlast`)를 붙인다. Codegen의 RTL Port Matching
 > (06_codegen_and_cli.md §3.2)이 이 규칙에 따라 DUT 포트와 BFM 와이어를 자동 연결한다.
 
-### 1.2 kernel_spec.yaml
+### 1.2 디렉토리 구조
+
+```
+my_project/
+├── vten.toml
+├── rtl/
+│   └── passthrough.sv
+└── kernels/
+    └── passthrough/
+        ├── kernel_spec.yaml
+        ├── passthrough_kernel.py
+        ├── tests/
+        │   └── test_passthrough.py
+        └── build/                   # vten build 후 생성
+            ├── generated/tb_top.sv
+            ├── xsim.dir/
+            └── shm/
+```
+
+### 1.3 kernel_spec.yaml
 
 ```yaml
+# kernels/passthrough/kernel_spec.yaml
 kernel: passthrough
-rtl_top: rtl/passthrough.sv
+rtl_top: rtl/passthrough.sv          # PROJECT_ROOT 기준
 
 interfaces:
   input_stream:
@@ -74,11 +94,12 @@ interfaces:
       bit_order: lsb_first
 ```
 
-### 1.3 Kernel
+### 1.4 Kernel
 
 ```python
+# kernels/passthrough/passthrough_kernel.py
 class PassthroughKernel(Kernel):
-    spec = "specs/passthrough.yaml"
+    spec = "kernels/passthrough/kernel_spec.yaml"
 
     data_in = Tensor(
         shape=("${N}",),
@@ -100,9 +121,10 @@ class PassthroughKernel(Kernel):
         return self.data_in.data.clone()
 ```
 
-### 1.4 Test
+### 1.5 Test
 
 ```python
+# kernels/passthrough/tests/test_passthrough.py
 class TestPassthrough(TestScenario):
     kernel = "passthrough"
 
@@ -115,14 +137,22 @@ class TestPassthrough(TestScenario):
         ctx.verify(pull1, k.forward())
 ```
 
-### 1.5 Expected IR
+### 1.6 Build & Run
+
+```bash
+$ cd my_project
+$ vten build --kernel passthrough          # Stage 1-5
+$ vten run --kernel passthrough --test test_passthrough
+```
+
+### 1.7 Expected IR
 
 ```
 cmd 0: PUSH(iface=0, buf=0, proto=AXI4S, size=1024, role=MASTER)  dep=[]
 cmd 1: PULL(iface=1, buf=1, proto=AXI4S, size=1024, role=SLAVE)   dep=[0]
 ```
 
-### 1.6 Expected SHM
+### 1.8 Expected SHM
 
 ```
 Control:     256 B
@@ -334,20 +364,32 @@ Total            ~4.1 MB
 
 **Phase 3:** C 라이브러리 컴파일 성공. SV 모듈 xvlog 구문 검사 통과. 개별 BFM 테스트벤치 동작.
 
-**Phase 4:** `vten build` → SV/TCL 파일 생성 → `vten run` → 시뮬레이터 기동 → 결과 수집 파이프라인 동작 (Passthrough E2E).
+**Phase 4:** Staged build pipeline 동작. `vten build --kernel passthrough` → 5-stage 빌드 (project_setup → dpi_c → codegen → compile_order → compile) 성공. `vten run --kernel passthrough --test test_passthrough` → xsim 기동 → SHM 핸드셰이크 → 결과 수집 파이프라인 동작. Passthrough E2E xsim 실행 PASS.
 
-**Phase 5:** Passthrough E2E pass. Conv3D golden match. NPU Top composed test pass with probe.
+**Phase 5:** Conv3D golden match. NPU Top composed multi-kernel test pass with probe. Multi-kernel 프로젝트 전체 빌드 및 실행.
 
 ### 4.3 Minimal End-to-End Target
 
-Phase 5 첫 마일스톤: 가장 단순한 파이프라인.
+Phase 4 마일스톤: 가장 단순한 파이프라인으로 전체 흐름을 검증.
 
 1. **DUT**: AXI4-Stream passthrough (data in → same data out)
 2. **Kernel**: 단일 push_tensor + pull_tensor. output == input 검증.
 3. **Backend**: xsim with DPI-C SHM bridge.
 4. **Serialization**: 8비트 원소 패킹, 256비트 버스.
+5. **Build**: `vten build --kernel passthrough` (5-stage 빌드 파이프라인)
+6. **Run**: `vten run --kernel passthrough --test test_passthrough`
 
 이것으로 전체 파이프라인(DSL → IR → SHM → BFM → DUT → BFM → SHM → verify)을 검증한 후 복잡도를 추가한다.
+
+### 4.4 Multi-Kernel E2E Target
+
+Phase 5 마일스톤: 다중 커널 프로젝트에서 공유 빌드 + 커널별 테스트.
+
+1. **프로젝트**: `my_npu/` 아래 `conv3d`, `dma_ifm`, `npu_top` 커널 3개
+2. **공유 빌드**: Vivado project setup + DPI-C (한 번만)
+3. **커널별 빌드**: 각 커널 codegen → compile_order → compile (독립적)
+4. **CompositeKernel**: `npu_top`이 `conv3d` + `dma_ifm` 합성
+5. **전체 빌드**: `vten build` (모든 커널 빌드, Vivado 프로젝트 캐시 활용)
 
 ---
 

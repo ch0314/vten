@@ -6,6 +6,7 @@ Spec reference: 00_data_models.md §10.13, §13, 06_codegen_and_cli.md §5
 from __future__ import annotations
 
 import abc
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -97,9 +98,18 @@ class BackendResult:
     error_cmd_id: int = 0
     error_message: str = ""
     stats: list[CmdStats] = field(default_factory=list)
+    _shm_reader: Callable[[int], bytes] | None = field(
+        default=None, repr=False
+    )
 
     def read_buffer(self, buffer_id: int) -> bytes:
-        """Read from SHM Data Region (only after DONE)."""
+        """Read buffer data from SHM Data Region.
+
+        Must be called before cleanup() destroys the SHM segment.
+        Returns raw bytes for the given buffer_id, or b"" if no reader.
+        """
+        if self._shm_reader is not None:
+            return self._shm_reader(buffer_id)
         return b""
 
 

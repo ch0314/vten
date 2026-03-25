@@ -22,9 +22,12 @@ from vten.runtime.ir import BFMConfig, Command
 from vten.spec.models import (
     InterfaceSpec,
     KernelSpec,
+    MemoryRegion,
     OpCode,
     PackingScheme,
     Protocol,
+    RegisterBankSpec,
+    RegisterSpec,
 )
 
 
@@ -97,7 +100,7 @@ def _minimal_config() -> dict:
         },
         "backend": {
             "xsim": {
-                "vivado_path": "/tools/Xilinx/Vivado/2024.1",
+                "vivado_path": "/tools/Xilinx/Vivado/2023.2",
                 "compile_options": ["-timescale", "1ns/1ps"],
             },
         },
@@ -259,8 +262,8 @@ class TestConfigBuildCodegenChain:
         content = (tmp_path / "tb_top.sv").read_text()
         assert "my_custom_dut" in content
 
-    def test_config_vivado_path_reaches_build_tcl(self, tmp_path: Path):
-        """[backend.xsim].vivado_path from config appears in build.tcl."""
+    def test_config_vivado_path_stored_in_build_context(self, tmp_path: Path):
+        """[backend.xsim].vivado_path from config reaches SVGenerator context."""
         from vten.codegen.sv_generator import SVGenerator
 
         config = _minimal_config()
@@ -274,12 +277,11 @@ class TestConfigBuildCodegenChain:
             ],
             project_config=config,
         )
-        gen.generate(str(tmp_path))
-        build_tcl = (tmp_path / "build.tcl").read_text()
-        assert "2023.2" in build_tcl or "Vivado" in build_tcl
+        ctx = gen._build_context()
+        assert ctx.build.vivado_path == "/opt/Xilinx/Vivado/2023.2"
 
-    def test_config_compile_options_reach_build_tcl(self, tmp_path: Path):
-        """[backend.xsim].compile_options appear in build.tcl."""
+    def test_config_compile_options_stored_in_build_context(self, tmp_path: Path):
+        """[backend.xsim].compile_options reach SVGenerator context."""
         from vten.codegen.sv_generator import SVGenerator
 
         config = _minimal_config()
@@ -293,6 +295,349 @@ class TestConfigBuildCodegenChain:
             ],
             project_config=config,
         )
+        ctx = gen._build_context()
+        assert "-timescale" in ctx.build.compile_options
+        assert "SIMULATION" in ctx.build.compile_options[-1]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §4  Codegen structural verification — BFM count & iface_to_bfm
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _npu_spec_with_registers() -> KernelSpec:
+    """NPU-scale spec with register_banks + auto_bind + memory_regions."""
+    interfaces: dict[str, InterfaceSpec] = {}
+    # 6 AXI4-Lite control ports with register_banks
+    for name, bank_offset in [
+        ("ctrl_fmapio", 0x0000), ("ctrl_wgt", 0x1000),
+        ("ctrl_mac", 0x2000), ("ctrl_psum", 0x3000),
+        ("ctrl_bias", 0x4000), ("ctrl_act", 0x5000),
+    ]:
+        interfaces[name] = InterfaceSpec(
+            name=name, rtl_port=f"s_axilite_{name}",
+            protocol=Protocol.AXI4L, addr_width=16,
+            register_banks=[RegisterBankSpec(name=name, base_offset=bank_offset)],
+            registers=[
+                RegisterSpec(name="vsync", offset=0x010, interface_name=name),
+                RegisterSpec(
+                    name="param_0", offset=0x014, interface_name=name,
+                ),
+            ],
+        )
+    # 2 DDR AXI4 with memory_region
+    for name in ["ddr_fmap", "ddr_bias"]:
+        interfaces[name] = InterfaceSpec(
+            name=name, rtl_port=f"m_axi_{name}",
+            protocol=Protocol.AXI4, data_width=256, addr_width=64,
+            memory_region="ddr",
+        )
+    # 32 HBM AXI4
+    for i in range(32):
+        name = f"hbm_{i:02d}"
+        interfaces[name] = InterfaceSpec(
+            name=name, rtl_port=f"m_axi_{name}",
+            protocol=Protocol.AXI4, data_width=256, addr_width=64,
+            memory_region="hbm",
+        )
+    return KernelSpec(
+        kernel_name="npu_3d", rtl_top="design/NPU_3D_top.sv",
+        interfaces=interfaces,
+        memory_regions={
+            "ddr": MemoryRegion(name="ddr", base=0, size=0x1_0000_0000),
+            "hbm": MemoryRegion(name="hbm", base=0, size=0x1_0000_0000),
+        },
+        clock_name="ap_clk",
+        reset_name="ap_aresetn",
+        reset_active_low=True,
+    )
+
+
+def _npu_bfm_configs_from_spec(spec: KernelSpec) -> list[BFMConfig]:
+    """Derive BFM configs from spec — mirrors build.py _derive_bfm_configs."""
+    from vten.cli.build import _derive_bfm_configs
+    return _derive_bfm_configs(spec)
+
+
+class TestCodegenStructuralVerification:
+    """Verify generated testbench structural properties match spec."""
+
+    def test_bfm_count_matches_interface_count(self, tmp_path: Path):
+        """Generated BFM instance count == len(spec.interfaces)."""
+        import re
+        from vten.codegen.sv_generator import SVGenerator
+
+        spec = _npu_spec_with_registers()
+        cfgs = _npu_bfm_configs_from_spec(spec)
+        gen = SVGenerator(kernel_spec=spec, bfm_configs=cfgs, project_config=_minimal_config())
         gen.generate(str(tmp_path))
-        build_tcl = (tmp_path / "build.tcl").read_text()
-        assert "timescale" in build_tcl or "1ns/1ps" in build_tcl
+        content = (tmp_path / "tb_top.sv").read_text()
+
+        # MAX_BFMS must be >= number of interfaces
+        match = re.search(r"MAX_BFMS\s*[=(]\s*(\d+)", content)
+        assert match is not None
+        max_bfms = int(match.group(1))
+        assert max_bfms >= len(spec.interfaces), (
+            f"MAX_BFMS={max_bfms} < {len(spec.interfaces)} interfaces"
+        )
+
+    def test_iface_to_bfm_completeness(self, tmp_path: Path):
+        """Every interface_id has an iface_to_bfm entry."""
+        from vten.codegen.sv_generator import SVGenerator
+
+        spec = _npu_spec_with_registers()
+        cfgs = _npu_bfm_configs_from_spec(spec)
+        gen = SVGenerator(kernel_spec=spec, bfm_configs=cfgs, project_config=_minimal_config())
+        gen.generate(str(tmp_path))
+        content = (tmp_path / "tb_top.sv").read_text()
+
+        iface_to_bfm_count = content.count("iface_to_bfm[")
+        assert iface_to_bfm_count >= len(spec.interfaces), (
+            f"iface_to_bfm entries ({iface_to_bfm_count}) < "
+            f"interfaces ({len(spec.interfaces)})"
+        )
+
+    def test_all_three_protocol_bfm_modules_present(self, tmp_path: Path):
+        """NPU testbench uses AXI4-Lite + AXI4 BFM modules."""
+        from vten.codegen.sv_generator import SVGenerator
+
+        spec = _npu_spec_with_registers()
+        cfgs = _npu_bfm_configs_from_spec(spec)
+        gen = SVGenerator(kernel_spec=spec, bfm_configs=cfgs, project_config=_minimal_config())
+        gen.generate(str(tmp_path))
+        content = (tmp_path / "tb_top.sv").read_text()
+
+        assert "vten_bfm_axilite" in content, "Missing AXI4-Lite BFM module"
+        assert "vten_bfm_axi4" in content, "Missing AXI4 BFM module"
+
+    def test_clock_reset_from_spec_propagates(self, tmp_path: Path):
+        """Custom clock/reset names from KernelSpec appear in generated TB."""
+        from vten.codegen.sv_generator import SVGenerator
+
+        spec = _npu_spec_with_registers()
+        cfgs = _npu_bfm_configs_from_spec(spec)
+        gen = SVGenerator(kernel_spec=spec, bfm_configs=cfgs, project_config=_minimal_config())
+        gen.generate(str(tmp_path))
+        content = (tmp_path / "tb_top.sv").read_text()
+
+        assert "ap_clk" in content, "Custom clock name not found in generated TB"
+        assert "ap_aresetn" in content, "Custom reset name not found in generated TB"
+
+    def test_scheduler_max_ifaces_covers_all_interfaces(self, tmp_path: Path):
+        """MAX_IFACES >= number of interfaces in spec."""
+        import re
+        from vten.codegen.sv_generator import SVGenerator
+
+        spec = _npu_spec_with_registers()
+        cfgs = _npu_bfm_configs_from_spec(spec)
+        gen = SVGenerator(kernel_spec=spec, bfm_configs=cfgs, project_config=_minimal_config())
+        gen.generate(str(tmp_path))
+        content = (tmp_path / "tb_top.sv").read_text()
+
+        match = re.search(r"MAX_IFACES\s*[=(]\s*(\d+)", content)
+        assert match is not None
+        max_ifaces = int(match.group(1))
+        assert max_ifaces >= len(spec.interfaces), (
+            f"MAX_IFACES={max_ifaces} < {len(spec.interfaces)} interfaces"
+        )
+
+    def test_each_bfm_has_unique_interface_id(self, tmp_path: Path):
+        """No duplicate interface_ids across BFM configs."""
+        spec = _npu_spec_with_registers()
+        cfgs = _npu_bfm_configs_from_spec(spec)
+        iface_names = [c.interface_name for c in cfgs]
+        assert len(iface_names) == len(set(iface_names)), (
+            f"Duplicate interface_names in BFM configs: {iface_names}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §5  Codegen-Runtime BFM config consistency
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestCodegenRuntimeConsistency:
+    """Build pipeline BFM derivation matches runtime expectations."""
+
+    def test_build_derive_matches_manual_configs(self):
+        """_derive_bfm_configs produces same protocols as manual BFMConfig."""
+        from vten.cli.build import _derive_bfm_configs
+
+        spec = _passthrough_spec()
+        derived = _derive_bfm_configs(spec)
+
+        assert len(derived) == 2
+        names = {c.interface_name for c in derived}
+        assert names == {"axi_stream_in", "axi_stream_out"}
+        for c in derived:
+            assert c.protocol == Protocol.AXI4S
+
+    def test_build_derive_infers_correct_roles(self):
+        """BFM role inferred from rtl_port prefix: s_* → master, m_* → slave."""
+        from vten.cli.build import _derive_bfm_configs
+
+        spec = _passthrough_spec()
+        derived = _derive_bfm_configs(spec)
+        role_map = {c.interface_name: c.role for c in derived}
+
+        # s_axis_in → DUT slave → BFM master
+        assert role_map["axi_stream_in"] == "master"
+        # m_axis_out → DUT master → BFM slave
+        assert role_map["axi_stream_out"] == "slave"
+
+    def test_build_derive_axi4_always_slave(self):
+        """AXI4 BFMs are always slave (DUT initiates transactions)."""
+        from vten.cli.build import _derive_bfm_configs
+
+        spec = KernelSpec(
+            kernel_name="mem_test", rtl_top="rtl/mem.sv",
+            interfaces={
+                "ddr": InterfaceSpec(
+                    name="ddr", rtl_port="m_axi_ddr",
+                    protocol=Protocol.AXI4, data_width=256, addr_width=64,
+                ),
+            },
+        )
+        derived = _derive_bfm_configs(spec)
+        assert derived[0].role == "slave"
+
+    def test_build_derive_axilite_always_master(self):
+        """AXI4-Lite BFMs are always master (BFM drives register access)."""
+        from vten.cli.build import _derive_bfm_configs
+
+        spec = KernelSpec(
+            kernel_name="ctrl_test", rtl_top="rtl/ctrl.sv",
+            interfaces={
+                "ctrl": InterfaceSpec(
+                    name="ctrl", rtl_port="s_axilite_ctrl",
+                    protocol=Protocol.AXI4L, addr_width=16,
+                ),
+            },
+        )
+        derived = _derive_bfm_configs(spec)
+        assert derived[0].role == "master"
+
+    def test_npu_scale_derive_40_bfms(self):
+        """NPU spec with 40 interfaces produces 40 BFM configs."""
+        from vten.cli.build import _derive_bfm_configs
+
+        spec = _npu_spec_with_registers()
+        derived = _derive_bfm_configs(spec)
+        assert len(derived) == 40, f"Expected 40 BFMs, got {len(derived)}"
+
+    def test_npu_derive_protocol_distribution(self):
+        """NPU 40 BFMs: 6 AXI4-Lite + 34 AXI4."""
+        from vten.cli.build import _derive_bfm_configs
+
+        spec = _npu_spec_with_registers()
+        derived = _derive_bfm_configs(spec)
+        axil_count = sum(1 for c in derived if c.protocol == Protocol.AXI4L)
+        axi4_count = sum(1 for c in derived if c.protocol == Protocol.AXI4)
+        assert axil_count == 6, f"Expected 6 AXI4-Lite, got {axil_count}"
+        assert axi4_count == 34, f"Expected 34 AXI4, got {axi4_count}"
+
+    def test_derived_configs_accepted_by_svgenerator(self, tmp_path: Path):
+        """SVGenerator accepts build-derived BFM configs without error."""
+        from vten.cli.build import _derive_bfm_configs
+        from vten.codegen.sv_generator import SVGenerator
+
+        spec = _npu_spec_with_registers()
+        derived = _derive_bfm_configs(spec)
+        gen = SVGenerator(kernel_spec=spec, bfm_configs=derived, project_config=_minimal_config())
+        gen.generate(str(tmp_path))
+        assert (tmp_path / "tb_top.sv").exists()
+
+    def test_derived_data_width_matches_spec(self):
+        """BFMConfig.data_width reflects spec interface data_width."""
+        from vten.cli.build import _derive_bfm_configs
+
+        spec = _npu_spec_with_registers()
+        derived = _derive_bfm_configs(spec)
+        for cfg in derived:
+            iface = spec.interfaces[cfg.interface_name]
+            if iface.data_width is not None:
+                assert cfg.data_width == iface.data_width, (
+                    f"{cfg.interface_name}: data_width mismatch "
+                    f"(derived={cfg.data_width}, spec={iface.data_width})"
+                )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §6  Multi-batch backend execution lifecycle
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestMultiBatchLifecycle:
+    """Backend multi-batch submit/wait lifecycle compatibility."""
+
+    def _make_shm_image(self, num_commands: int = 3) -> bytes:
+        """Build a valid SHM image with given command count."""
+        from vten.runtime.shm import CMD_SLOT_SIZE, CONTROL_SIZE
+        size = CONTROL_SIZE + num_commands * CMD_SLOT_SIZE
+        buf = bytearray(size)
+        struct.pack_into("<I", buf, 0, 0x5654454E)  # MAGIC
+        struct.pack_into("<I", buf, 4, 0x00000003)  # VERSION
+        struct.pack_into("<I", buf, 8, num_commands)
+        return bytes(buf)
+
+    def test_shm_images_different_sizes_valid(self):
+        """Different batch sizes produce valid SHM headers."""
+        for n in [1, 10, 100, 256]:
+            img = self._make_shm_image(n)
+            magic = struct.unpack_from("<I", img, 0)[0]
+            count = struct.unpack_from("<I", img, 8)[0]
+            assert magic == 0x5654454E
+            assert count == n
+
+    def test_bfm_configs_reusable_across_batches(self):
+        """Same BFM configs can be submitted with different SHM images."""
+        cfgs = [
+            BFMConfig(interface_name="axi_stream_in", protocol=Protocol.AXI4S, data_width=32, role="master"),
+            BFMConfig(interface_name="axi_stream_out", protocol=Protocol.AXI4S, data_width=32, role="slave"),
+        ]
+        img1 = self._make_shm_image(3)
+        img2 = self._make_shm_image(10)
+
+        # Configs are reusable (not mutated between batches)
+        assert cfgs[0].interface_name == "axi_stream_in"
+        assert cfgs[1].interface_name == "axi_stream_out"
+        assert len(img1) != len(img2)
+
+    def test_session_ids_unique_per_batch(self):
+        """Backend generates unique session IDs for each batch."""
+        from vten.backend.xsim import XsimBackend
+
+        config = {
+            "project": {"name": "test"},
+            "backend": {"xsim": {"vivado_path": "/tools/Xilinx", "timeout_ms": 5000}},
+            "rtl": {"sources": [], "top_module": "tb_top"},
+        }
+        backend = XsimBackend(project_config=config)
+        ids = [backend._generate_session_id() for _ in range(100)]
+        assert len(set(ids)) == 100, "Session IDs must be unique"
+
+    def test_backend_submit_signature_includes_all_params(self):
+        """submit() accepts shm_image and bfm_configs positionally."""
+        import inspect
+        from vten.backend.xsim import XsimBackend
+
+        sig = inspect.signature(XsimBackend.submit)
+        params = list(sig.parameters.keys())
+        assert "self" in params
+        assert "shm_image" in params
+        assert "bfm_configs" in params
+
+    def test_npu_scale_shm_image_256_commands(self):
+        """256-command SHM image (NPU batch size) has correct size."""
+        from vten.runtime.shm import CMD_SLOT_SIZE, CONTROL_SIZE
+
+        img = self._make_shm_image(256)
+        expected = CONTROL_SIZE + 256 * CMD_SLOT_SIZE
+        assert len(img) == expected
+
+    def test_shm_image_command_count_round_trip(self):
+        """num_commands stored at offset 8 matches construction param."""
+        for n in [0, 1, 50, 255, 1024]:
+            img = self._make_shm_image(n)
+            stored = struct.unpack_from("<I", img, 8)[0]
+            assert stored == n

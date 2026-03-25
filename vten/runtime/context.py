@@ -8,12 +8,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import torch
+
 from vten.dsl.operations import Operation, OperationHandle
-from vten.spec.models import OpKind
+from vten.errors import VerificationError
+from vten.spec.models import Direction, OpKind
 
 if TYPE_CHECKING:
-    import torch
-
     from vten.kernel.tensor import Tensor
     from vten.runtime.flattener import KernelInstance
 
@@ -67,6 +68,8 @@ class BatchResult:
     total_cycles: int = 0
     per_command_stats: list = field(default_factory=list)
     error: object = None
+    output_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    verification_count: int = 0
 
 
 # ── ExecutionContext ──
@@ -182,14 +185,126 @@ class ExecutionContext:
     # ── Verification ──
 
     def verify(self, op_handle, golden) -> None:
-        self._verifications.append(
-            VerificationTask(op_handle=op_handle, golden=golden)
-        )
+        """Register or execute verification.
+
+        Before run(): deferred — stored as VerificationTask, executed after run().
+        After run(): eager — immediately compares HW output vs golden.
+        """
+        if self._last_compiled is not None:
+            self._verify_immediate(op_handle, golden)
+        else:
+            self._verifications.append(
+                VerificationTask(op_handle=op_handle, golden=golden)
+            )
 
     # ── Buffer Aliasing ──
 
     def alias(self, src, dst) -> None:
         self._alias_registry.register(src, dst)
+
+    # ── Output tensor reading ──
+
+    def _read_output_tensors(
+        self, compiled: object, backend_result: object,
+    ) -> dict[str, torch.Tensor]:
+        """Deserialize DEV_TO_HOST tensors from backend SHM data."""
+        from vten.runtime.serializer import StreamSerializer
+
+        output_tensors: dict[str, torch.Tensor] = {}
+        for name, exposed in compiled.flattened_view.exposed_tensors.items():
+            if exposed.direction != Direction.DEV_TO_HOST:
+                continue
+            buffer_id = compiled.buffer_ids[name]
+            raw_bytes = backend_result.read_buffer(buffer_id)
+            if not raw_bytes:
+                continue
+            try:
+                iface = compiled.flattened_view.top_spec.get_interface(
+                    exposed.top_interface
+                )
+            except KeyError:
+                continue
+            if iface.packing is None:
+                continue
+            serializer = StreamSerializer(iface.packing)
+            output_tensors[name] = serializer.deserialize(
+                raw_bytes,
+                exposed.origin_tensor._element_count,
+                exposed.origin_tensor._resolved_shape,
+                dtype=exposed.origin_tensor.dtype,
+            )
+        return output_tensors
+
+    # ── Verification internals ──
+
+    def _verify_immediate(self, op_handle, golden) -> None:
+        """Eager verification: read HW output from SHM and compare to golden."""
+        from vten.runtime.serializer import StreamSerializer
+
+        compiled = self._last_compiled
+        backend_result = self._last_backend_result
+
+        tensor_name = op_handle.op.tensor.name
+        buffer_id = compiled.buffer_ids[tensor_name]
+
+        raw_bytes = backend_result.read_buffer(buffer_id)
+        if not raw_bytes:
+            raise VerificationError(
+                f"No data returned for tensor '{tensor_name}' "
+                f"(buffer_id={buffer_id}). SHM may have been cleaned up.",
+                tensor=tensor_name,
+            )
+
+        exposed = compiled.flattened_view.exposed_tensors[tensor_name]
+        iface = compiled.flattened_view.top_spec.get_interface(
+            exposed.top_interface
+        )
+        packing = iface.packing
+        if packing is None:
+            raise VerificationError(
+                f"No packing scheme for interface '{exposed.top_interface}'",
+                tensor=tensor_name,
+            )
+
+        serializer = StreamSerializer(packing)
+        hw_output = serializer.deserialize(
+            raw_bytes,
+            exposed.origin_tensor._element_count,
+            exposed.origin_tensor._resolved_shape,
+            dtype=golden.dtype if golden is not None else None,
+        )
+
+        if not self._compare(hw_output, golden):
+            raise VerificationError(
+                tensor=tensor_name,
+                shape=exposed.origin_tensor._resolved_shape,
+                max_diff=self._max_diff(hw_output, golden),
+            )
+
+    def _run_deferred_verifications(self) -> int:
+        """Execute all deferred VerificationTasks after run().
+
+        Returns count of verifications executed.
+        """
+        count = len(self._verifications)
+        for task in self._verifications:
+            self._verify_immediate(task.op_handle, task.golden)
+        self._verifications.clear()
+        return count
+
+    @staticmethod
+    def _compare(hw_output: torch.Tensor, golden: torch.Tensor) -> bool:
+        """Element-wise comparison with tolerance."""
+        if hw_output.shape != golden.shape:
+            return False
+        if golden.is_floating_point():
+            return torch.allclose(hw_output.float(), golden.float(), atol=1e-6, rtol=1e-5)
+        return torch.equal(hw_output, golden)
+
+    @staticmethod
+    def _max_diff(hw_output: torch.Tensor, golden: torch.Tensor) -> float:
+        """Maximum element-wise absolute difference."""
+        return (hw_output.float() - golden.float()).abs().max().item()
 
     # ── Execution ──
 
@@ -230,10 +345,20 @@ class ExecutionContext:
             if hasattr(backend_result, "error_code") and backend_result.error_code:
                 status = "ERROR"
 
+            # Read output tensors from backend
+            output_tensors = self._read_output_tensors(compiled, backend_result)
+
+            # Run deferred verifications before returning
+            verification_count = 0
+            if self._verifications:
+                verification_count = self._run_deferred_verifications()
+
             return BatchResult(
+                verification_count=verification_count,
                 status=status,
                 total_cycles=total_cycles,
                 per_command_stats=per_cmd_stats,
+                output_tensors=output_tensors,
             )
 
         return BatchResult(status="DONE")

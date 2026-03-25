@@ -41,7 +41,7 @@ H = 32
 W = 32
 
 [backend.xsim]
-vivado_path = "/tools/Xilinx/Vivado/2024.1"
+vivado_path = "/tools/Xilinx/Vivado/2023.2"
 compile_options = ["-timescale", "1ns/1ps"]
 timeout_ms = 0
 submit_timeout_s = 300
@@ -89,7 +89,7 @@ BIAS_SHIFT = 8
 IS_RELU = 1
 
 [backend.xsim]
-vivado_path = "/tools/Xilinx/Vivado/2024.1"
+vivado_path = "/tools/Xilinx/Vivado/2023.2"
 compile_options = ["-timescale", "1ns/1ps"]
 timeout_ms = 0
 submit_timeout_s = 300
@@ -159,7 +159,7 @@ class TestVtenTomlParsing:
         _write_toml(tmp_path, FULL_TOML)
         config = load_project_config(tmp_path)
         xsim = config["backend"]["xsim"]
-        assert xsim["vivado_path"] == "/tools/Xilinx/Vivado/2024.1"
+        assert xsim["vivado_path"] == "/tools/Xilinx/Vivado/2023.2"
         assert xsim["compile_options"] == ["-timescale", "1ns/1ps"]
         assert xsim["timeout_ms"] == 0
         assert xsim["submit_timeout_s"] == 300

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from vten.errors import SpecValidationError
+from vten.errors import BankOverlapError, SpecValidationError
 from vten.spec.models import (
     AutoBindSpec,
     CustomField,
@@ -50,17 +50,25 @@ def load_kernel_spec(yaml_path: str | Path) -> KernelSpec:
         for name, spec in raw["interfaces"].items()
     }
 
+    # Clock/reset config (optional, defaults in KernelSpec)
+    clock_cfg = raw.get("clock", {}) or {}
+    reset_cfg = raw.get("reset", {}) or {}
+
     spec = KernelSpec(
         kernel_name=raw["kernel"],
         rtl_top=raw["rtl_top"],
         parameters=parameters,
         memory_regions=memory_regions,
         interfaces=interfaces,
+        clock_name=clock_cfg.get("name", "clk"),
+        reset_name=reset_cfg.get("name", "rst_n"),
+        reset_active_low=reset_cfg.get("active_low", True),
     )
 
     # Post-parse validation
     for iface in interfaces.values():
         _validate_packing(iface)
+        _validate_register_banks(iface)
 
     return spec
 
@@ -134,6 +142,13 @@ def _parse_interface(
                 f"not defined in memory_regions"
             )
 
+    generate_controller = spec.get("generate_controller", False)
+    if generate_controller and protocol != Protocol.AXI4L:
+        raise SpecValidationError(
+            f"Interface '{name}': generate_controller is only valid "
+            f"for axi4_lite interfaces"
+        )
+
     return InterfaceSpec(
         name=name,
         rtl_port=spec["rtl_port"],
@@ -147,6 +162,7 @@ def _parse_interface(
         split=split,
         registers=registers,
         register_banks=register_banks,
+        generate_controller=generate_controller,
     )
 
 
@@ -210,6 +226,16 @@ def _parse_registers(raw: list, interface_name: str) -> list[RegisterSpec]:
                 param=ab.get("param"),
                 expr=ab.get("expr"),
             )
+        access = r.get("access", "rw")
+        if access not in ("rw", "ro", "wo", "w1c"):
+            raise SpecValidationError(
+                f"Register '{r['name']}': invalid access '{access}'"
+            )
+        pulse = r.get("pulse", False)
+        if pulse and access != "rw":
+            raise SpecValidationError(
+                f"Register '{r['name']}': pulse is only valid with access='rw'"
+            )
         registers.append(
             RegisterSpec(
                 name=r["name"],
@@ -217,6 +243,9 @@ def _parse_registers(raw: list, interface_name: str) -> list[RegisterSpec]:
                 fields=r.get("fields"),
                 auto_bind=auto_bind,
                 interface_name=interface_name,
+                access=access,
+                pulse=pulse,
+                reset_value=r.get("reset_value", 0),
             )
         )
     return registers
@@ -229,6 +258,22 @@ def _parse_register_banks(raw: dict) -> list[RegisterBankSpec]:
             RegisterBankSpec(name=name, base_offset=spec["base_offset"])
         )
     return banks
+
+
+def _validate_register_banks(iface: InterfaceSpec) -> None:
+    """V3: Register bank base_offsets must not overlap."""
+    if not iface.register_banks or len(iface.register_banks) < 2:
+        return
+
+    seen: dict[int, str] = {}
+    for bank in iface.register_banks:
+        if bank.base_offset in seen:
+            raise BankOverlapError(
+                f"Interface '{iface.name}': register banks "
+                f"'{seen[bank.base_offset]}' and '{bank.name}' "
+                f"have the same base_offset 0x{bank.base_offset:X}"
+            )
+        seen[bank.base_offset] = bank.name
 
 
 def _validate_packing(iface: InterfaceSpec) -> None:

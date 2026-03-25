@@ -119,7 +119,7 @@ module vten_command_scheduler #(
         // 1. Load dependencies from SHM via DPI-C
         for (int i = 0; i < n; i++) begin
             int nd, ncd;
-            logic [15:0] d [0:3], cd [0:3];
+            int d [0:3], cd [0:3];
             vten_read_command_deps(i, nd, d, ncd, cd);
             cmd_num_dep[i]        <= nd[1:0];
             cmd_num_commit_dep[i] <= ncd[1:0];
@@ -294,11 +294,13 @@ module vten_command_scheduler #(
             for (int i = 0; i < num_commands; i++) begin
                 if ((bfm_done[i] || cur_done[i]) && !committed[i]) begin
                     all_commit_deps = 1'b1;
-                    for (int d = 0; d < cmd_num_commit_dep[i]; d++)
+                    for (int d = 0; d < cmd_num_commit_dep[i]; d++) begin
                         if (!committed[cmd_commit_dep[i][d]])
                             all_commit_deps = 1'b0;
-                    if (all_commit_deps)
+                    end
+                    if (all_commit_deps) begin
                         committed[i] <= 1'b1;
+                    end
                 end
             end
         end
@@ -321,12 +323,11 @@ module vten_command_scheduler #(
     // ════════════════════════════════════════════════════════════════
     logic all_cmds_committed;
     always_comb begin
-        all_cmds_committed = 1'b1;
-        if (num_commands > 0 && batch_active) begin
+        all_cmds_committed = 1'b0;
+        if (batch_active) begin
+            all_cmds_committed = 1'b1;
             for (int i = 0; i < num_commands; i++)
                 if (!committed[i]) all_cmds_committed = 1'b0;
-        end else begin
-            all_cmds_committed = 1'b0;
         end
     end
     assign all_committed = all_cmds_committed;
@@ -339,6 +340,5 @@ module vten_command_scheduler #(
             if (!bfm_idle_w[b]) all_bfm_idle = 1'b0;
     end
     assign all_drained = all_committed && all_bfm_idle;
-
 
 endmodule

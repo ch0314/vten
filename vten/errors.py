@@ -22,6 +22,15 @@ class VTenError(Exception):
         self.context = context or {}
 
 
+# ── Build errors (CLI build pipeline) ──
+
+
+class BuildError(VTenError):
+    """Build pipeline error (codegen, compile, etc.)."""
+
+    pass
+
+
 # ── Validation errors (Stage 0, build time) ──
 
 
@@ -113,4 +122,29 @@ class PollTimeoutError(BackendError):
 
 
 class VerificationError(VTenError):
-    pass
+    """Raised when HW output does not match golden reference.
+
+    Attributes:
+        tensor: Name of the tensor that failed verification.
+        shape: Resolved shape of the tensor.
+        max_diff: Maximum element-wise difference.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        tensor: str = "",
+        shape: tuple[int, ...] | None = None,
+        max_diff: float = 0.0,
+        **kwargs,
+    ) -> None:
+        if not message and tensor:
+            message = (
+                f"Verification failed for tensor '{tensor}': "
+                f"shape={shape}, max_diff={max_diff}"
+            )
+        super().__init__(message, **kwargs)
+        self.tensor = tensor
+        self.shape = shape
+        self.max_diff = max_diff

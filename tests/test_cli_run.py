@@ -276,7 +276,19 @@ class TestVtenRun:
     """vten run --test <name>: run_test() function and results."""
 
     def _setup_project(self, tmp_path: Path) -> Path:
-        """Create minimal project directory for run_test()."""
+        """Create minimal project directory for run_test() — multi-kernel layout.
+
+        Layout (§7.1):
+            proj/
+            ├── vten.toml
+            ├── rtl/passthrough.sv
+            ├── kernels/passthrough/
+            │   ├── kernel_spec.yaml
+            │   ├── build/generated/   (pretend codegen was done)
+            │   └── tests/
+            ├── build/
+            └── results/
+        """
         project = tmp_path / "proj"
         project.mkdir()
         (project / "vten.toml").write_text("""\
@@ -290,14 +302,44 @@ top_module = "passthrough"
 include_dirs = []
 
 [backend.xsim]
-vivado_path = "/tools/Xilinx/Vivado/2024.1"
+vivado_path = "/tools/Xilinx/Vivado/2023.2"
+part = "xcu250-figd2104-2L-e"
 compile_options = ["-timescale", "1ns/1ps"]
 """)
         (project / "rtl").mkdir()
         (project / "rtl" / "passthrough.sv").write_text("module passthrough; endmodule")
-        (project / "tests").mkdir()
-        (project / "specs").mkdir()
         (project / "build").mkdir()
+        (project / "results").mkdir()
+
+        # Kernel directory structure
+        kernel_dir = project / "kernels" / "passthrough"
+        kernel_dir.mkdir(parents=True)
+        import yaml
+        spec = {
+            "kernel": "passthrough",
+            "rtl_top": "rtl/passthrough.sv",
+            "parameters": {"SIZE": "${SIZE}"},
+            "interfaces": {
+                "axi_stream_in": {
+                    "rtl_port": "s_axis_in",
+                    "protocol": "axi4_stream",
+                    "tensor": "data_in",
+                    "packing": {"element_width": 8, "elements_per_beat": 4},
+                },
+                "axi_stream_out": {
+                    "rtl_port": "m_axis_out",
+                    "protocol": "axi4_stream",
+                    "tensor": "data_out",
+                    "packing": {"element_width": 8, "elements_per_beat": 4},
+                },
+            },
+        }
+        (kernel_dir / "kernel_spec.yaml").write_text(
+            yaml.dump(spec, default_flow_style=False, sort_keys=False)
+        )
+        (kernel_dir / "tests").mkdir()
+        (kernel_dir / "build").mkdir()
+        (kernel_dir / "build" / "generated").mkdir()
         return project
 
     def test_run_test_function_exists(self):
@@ -307,12 +349,12 @@ compile_options = ["-timescale", "1ns/1ps"]
         assert callable(run_test)
 
     def test_run_test_creates_results_directory(self, tmp_path: Path):
-        """run_test() creates results/<test_name>/ directory."""
+        """run_test() creates results/<kernel>/<test_name>/ directory."""
         from vten.cli.run import run_test
 
         project = self._setup_project(tmp_path)
-        # Create a test scenario file
-        (project / "tests" / "test_simple.py").write_text("""\
+        # Create a test scenario file in kernel's tests/ dir
+        (project / "kernels" / "passthrough" / "tests" / "test_simple.py").write_text("""\
 from vten.cli.run import TestScenario
 class TestSimple(TestScenario):
     kernel = "passthrough"
@@ -327,19 +369,18 @@ class TestSimple(TestScenario):
             mock_backend.submit.return_value = None
             mock_backend.wait.return_value = MagicMock(status=2)  # DONE
 
-            run_test(str(project), test_name="TestSimple")
+            run_test(str(project), kernel_name="passthrough", test_name="TestSimple")
 
-        results_dir = project / "results" / "TestSimple"
-        # Results should exist (possibly with slightly different naming)
-        results_dirs = list((project / "results").iterdir()) if (project / "results").exists() else []
+        # Results should exist under results/passthrough/
+        results_dirs = list((project / "results").rglob("*")) if (project / "results").exists() else []
         assert len(results_dirs) >= 1
 
     def test_run_test_produces_summary_json(self, tmp_path: Path):
-        """results/<test>/summary.json is created with status."""
+        """results/<kernel>/<test>/summary.json is created with status."""
         from vten.cli.run import run_test
 
         project = self._setup_project(tmp_path)
-        (project / "tests" / "test_pass.py").write_text("""\
+        (project / "kernels" / "passthrough" / "tests" / "test_pass.py").write_text("""\
 from vten.cli.run import TestScenario
 class TestPass(TestScenario):
     kernel = "passthrough"
@@ -353,7 +394,7 @@ class TestPass(TestScenario):
             mock_backend.submit.return_value = None
             mock_backend.wait.return_value = MagicMock(status=2)
 
-            run_test(str(project), test_name="TestPass")
+            run_test(str(project), kernel_name="passthrough", test_name="TestPass")
 
         # Find summary.json somewhere under results/
         summary_files = list(project.rglob("summary.json"))
@@ -362,11 +403,11 @@ class TestPass(TestScenario):
         assert "status" in content
 
     def test_run_test_produces_stats_json(self, tmp_path: Path):
-        """results/<test>/stats.json is created with command stats."""
+        """results/<kernel>/<test>/stats.json is created with command stats."""
         from vten.cli.run import run_test
 
         project = self._setup_project(tmp_path)
-        (project / "tests" / "test_stats.py").write_text("""\
+        (project / "kernels" / "passthrough" / "tests" / "test_stats.py").write_text("""\
 from vten.cli.run import TestScenario
 class TestStats(TestScenario):
     kernel = "passthrough"
@@ -380,7 +421,7 @@ class TestStats(TestScenario):
             mock_backend.submit.return_value = None
             mock_backend.wait.return_value = MagicMock(status=2)
 
-            run_test(str(project), test_name="TestStats")
+            run_test(str(project), kernel_name="passthrough", test_name="TestStats")
 
         stats_files = list(project.rglob("stats.json"))
         assert len(stats_files) >= 1
@@ -392,7 +433,7 @@ class TestStats(TestScenario):
         project = self._setup_project(tmp_path)
 
         with pytest.raises(Exception):
-            run_test(str(project), test_name="nonexistent_test")
+            run_test(str(project), kernel_name="passthrough", test_name="nonexistent_test")
 
     def test_run_summary_json_fields_schema(self):
         """summary.json schema per spec §4.4."""
@@ -412,7 +453,7 @@ class TestStats(TestScenario):
         from vten.cli.run import run_test
 
         project = self._setup_project(tmp_path)
-        (project / "tests" / "test_wave.py").write_text("""\
+        (project / "kernels" / "passthrough" / "tests" / "test_wave.py").write_text("""\
 from vten.cli.run import TestScenario
 class TestWave(TestScenario):
     kernel = "passthrough"
@@ -542,7 +583,9 @@ class TestVtenRunErrors:
 
     def _setup_project_with_scenario(self, tmp_path: Path, class_name: str,
                                      run_body: str) -> Path:
-        """Helper: create project with custom TestScenario."""
+        """Helper: create project with custom TestScenario — multi-kernel layout."""
+        import yaml
+
         project = tmp_path / "proj"
         project.mkdir()
         (project / "vten.toml").write_text("""\
@@ -556,16 +599,44 @@ top_module = "passthrough"
 include_dirs = []
 
 [backend.xsim]
-vivado_path = "/tools/Xilinx/Vivado/2024.1"
+vivado_path = "/tools/Xilinx/Vivado/2023.2"
+part = "xcu250-figd2104-2L-e"
 compile_options = ["-timescale", "1ns/1ps"]
 """)
         (project / "rtl").mkdir()
         (project / "rtl" / "passthrough.sv").write_text("module passthrough; endmodule")
-        (project / "tests").mkdir()
-        (project / "specs").mkdir()
         (project / "build").mkdir()
+        (project / "results").mkdir()
 
-        (project / "tests" / "test_scenario.py").write_text(f"""\
+        # Kernel directory
+        kernel_dir = project / "kernels" / "passthrough"
+        kernel_dir.mkdir(parents=True)
+        spec = {
+            "kernel": "passthrough",
+            "rtl_top": "rtl/passthrough.sv",
+            "interfaces": {
+                "axi_stream_in": {
+                    "rtl_port": "s_axis_in",
+                    "protocol": "axi4_stream",
+                    "tensor": "data_in",
+                    "packing": {"element_width": 8, "elements_per_beat": 4},
+                },
+                "axi_stream_out": {
+                    "rtl_port": "m_axis_out",
+                    "protocol": "axi4_stream",
+                    "tensor": "data_out",
+                    "packing": {"element_width": 8, "elements_per_beat": 4},
+                },
+            },
+        }
+        (kernel_dir / "kernel_spec.yaml").write_text(
+            yaml.dump(spec, default_flow_style=False, sort_keys=False)
+        )
+        (kernel_dir / "tests").mkdir()
+        (kernel_dir / "build").mkdir()
+        (kernel_dir / "build" / "generated").mkdir()
+
+        (kernel_dir / "tests" / "test_scenario.py").write_text(f"""\
 from vten.cli.run import TestScenario
 
 class {class_name}(TestScenario):
@@ -593,7 +664,7 @@ class {class_name}(TestScenario):
 
             # run_test should catch the error and write FAIL, or re-raise
             try:
-                run_test(str(project), test_name="TestFailing")
+                run_test(str(project), kernel_name="passthrough", test_name="TestFailing")
             except (RuntimeError, Exception):
                 pass  # Framework may re-raise after writing summary
 
@@ -620,7 +691,7 @@ class {class_name}(TestScenario):
             mock_backend.wait.side_effect = BackendError("error_code=1, DECERR")
 
             try:
-                run_test(str(project), test_name="TestBackendFail")
+                run_test(str(project), kernel_name="passthrough", test_name="TestBackendFail")
             except (BackendError, Exception):
                 pass
 
@@ -646,7 +717,7 @@ class {class_name}(TestScenario):
             mock_backend.wait.side_effect = VTenTimeoutError("300s exceeded")
 
             try:
-                run_test(str(project), test_name="TestTimeout")
+                run_test(str(project), kernel_name="passthrough", test_name="TestTimeout")
             except (VTenTimeoutError, Exception):
                 pass
 
@@ -665,7 +736,9 @@ class TestVtenRunBackendLifecycle:
     """Backend lifecycle verified via run_test() with mocked backend."""
 
     def _setup_passing_project(self, tmp_path: Path) -> Path:
-        """Helper: project with a passing scenario."""
+        """Helper: project with a passing scenario — multi-kernel layout."""
+        import yaml
+
         project = tmp_path / "proj"
         project.mkdir()
         (project / "vten.toml").write_text("""\
@@ -679,16 +752,44 @@ top_module = "passthrough"
 include_dirs = []
 
 [backend.xsim]
-vivado_path = "/tools/Xilinx/Vivado/2024.1"
+vivado_path = "/tools/Xilinx/Vivado/2023.2"
+part = "xcu250-figd2104-2L-e"
 compile_options = ["-timescale", "1ns/1ps"]
 """)
         (project / "rtl").mkdir()
         (project / "rtl" / "passthrough.sv").write_text("module passthrough; endmodule")
-        (project / "tests").mkdir()
-        (project / "specs").mkdir()
         (project / "build").mkdir()
+        (project / "results").mkdir()
 
-        (project / "tests" / "test_ok.py").write_text("""\
+        # Kernel directory
+        kernel_dir = project / "kernels" / "passthrough"
+        kernel_dir.mkdir(parents=True)
+        spec = {
+            "kernel": "passthrough",
+            "rtl_top": "rtl/passthrough.sv",
+            "interfaces": {
+                "axi_stream_in": {
+                    "rtl_port": "s_axis_in",
+                    "protocol": "axi4_stream",
+                    "tensor": "data_in",
+                    "packing": {"element_width": 8, "elements_per_beat": 4},
+                },
+                "axi_stream_out": {
+                    "rtl_port": "m_axis_out",
+                    "protocol": "axi4_stream",
+                    "tensor": "data_out",
+                    "packing": {"element_width": 8, "elements_per_beat": 4},
+                },
+            },
+        }
+        (kernel_dir / "kernel_spec.yaml").write_text(
+            yaml.dump(spec, default_flow_style=False, sort_keys=False)
+        )
+        (kernel_dir / "tests").mkdir()
+        (kernel_dir / "build").mkdir()
+        (kernel_dir / "build" / "generated").mkdir()
+
+        (kernel_dir / "tests" / "test_ok.py").write_text("""\
 from vten.cli.run import TestScenario
 class TestOK(TestScenario):
     kernel = "passthrough"
@@ -709,7 +810,7 @@ class TestOK(TestScenario):
             mock_backend.submit.return_value = None
             mock_backend.wait.return_value = MagicMock(status=2)
 
-            run_test(str(project), test_name="TestOK")
+            run_test(str(project), kernel_name="passthrough", test_name="TestOK")
 
         # Verify lifecycle call order on the mock
         method_names = [c[0] for c in mock_backend.method_calls]
@@ -737,7 +838,7 @@ class TestOK(TestScenario):
             mock_backend.wait.side_effect = Exception("sim crashed")
 
             try:
-                run_test(str(project), test_name="TestOK")
+                run_test(str(project), kernel_name="passthrough", test_name="TestOK")
             except Exception:
                 pass
 
@@ -759,7 +860,7 @@ class TestOK(TestScenario):
             mock_backend.submit.return_value = None
             mock_backend.wait.return_value = MagicMock(status=2)
 
-            run_test(str(project), test_name="TestOK")
+            run_test(str(project), kernel_name="passthrough", test_name="TestOK")
 
         summary_files = list(project.rglob("summary.json"))
         assert len(summary_files) >= 1

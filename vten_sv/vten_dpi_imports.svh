@@ -37,8 +37,8 @@ import "DPI-C" function int  vten_read_command(
 
 import "DPI-C" function void vten_read_command_deps(
     input int cmd_id,
-    output int num_dep, output logic [15:0] dep_ids [0:3],
-    output int num_cdep, output logic [15:0] cdep_ids [0:3]);
+    output int num_dep, output int dep_ids [0:3],
+    output int num_cdep, output int cdep_ids [0:3]);
 
 // ── Data Region ──
 import "DPI-C" function void vten_read_data(

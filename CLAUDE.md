@@ -49,6 +49,8 @@ Verification (golden vs DUT output)
 | `specs/05_bfm_library.md` | AXI4-Stream / AXI4 / AXI4-Lite BFM | Phase 3 |
 | `specs/06_codegen_and_cli.md` | Jinja2 코드 생성, CLI 워크플로우 | Phase 4 |
 | `specs/07_e2e_examples.md` | E2E 예제, 구현 Phase 계획 | Phase 5 |
+| `specs/08_backend_abstraction.md` | Backend ABC, XRT 지원 설계 | Phase 4+ |
+| `specs/09_user_api.md` | 사용자 API 레벨 구조, 워크플로우 | **항상** — 사용법 참조 |
 
 ## Project Structure
 
@@ -92,8 +94,7 @@ vten/
 │   │   └── xsim.py            # xsim backend
 │   ├── codegen/               # Phase 4: Jinja2 code generation
 │   │   ├── __init__.py
-│   │   ├── sv_generator.py
-│   │   └── script_gen.py
+│   │   └── sv_generator.py
 │   └── cli/                   # Phase 4: CLI commands
 │       ├── __init__.py
 │       ├── main.py
@@ -117,9 +118,8 @@ vten/
 │   ├── tb_top.sv.j2
 │   ├── bfm_instantiation.sv.j2
 │   ├── wire_declarations.sv.j2
-│   ├── build_xsim.tcl.j2
-│   ├── run_xsim.tcl.j2
-│   └── Makefile.j2
+│   ├── project_setup.tcl.j2
+│   └── resolve_order.tcl
 ├── tests/                     # pytest 테스트
 │   ├── conftest.py
 │   ├── test_tensor.py
@@ -289,7 +289,7 @@ RTL 소스가 크기 때문에 vten/ 안으로 옮기지 않는다.
     ├── vten.toml
     ├── rtl/              # 공유 RTL (대용량, 이동 불가)
     ├── ip/               # Vivado IP 정의 (.xci)
-    ├── build/            # 프로젝트 레벨 빌드 (ip_gen, lib, sv_lib)
+    ├── build/            # 프로젝트 레벨 빌드 (vivado_proj, lib)
     ├── kernels/          # 커널별 디렉토리
     │   ├── conv3d/
     │   │   ├── kernel_spec.yaml
@@ -311,5 +311,5 @@ RTL 소스가 크기 때문에 vten/ 안으로 옮기지 않는다.
 - 절대 경로를 하드코딩하지 않는다
 - `kernel_spec.yaml`의 `rtl_top`은 PROJECT_ROOT 기준
 - `vten.toml`의 `[rtl].sources`도 PROJECT_ROOT 기준
-- `kernel_spec.yaml`은 `kernels/<name>/` 디렉토리에 위치 (레거시: `specs/`)
+- `kernel_spec.yaml`은 반드시 `kernels/<name>/` 디렉토리에 위치
 - 커널별 빌드 출력은 `kernels/<name>/build/`에 분리

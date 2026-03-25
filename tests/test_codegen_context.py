@@ -168,7 +168,7 @@ def _minimal_project_config() -> dict:
         },
         "backend": {
             "xsim": {
-                "vivado_path": "/tools/Xilinx/Vivado/2024.1",
+                "vivado_path": "/tools/Xilinx/Vivado/2023.2",
                 "compile_options": ["-timescale", "1ns/1ps"],
             },
         },
@@ -383,7 +383,7 @@ class TestBuildContext:
         from vten.codegen.sv_generator import BuildContext
 
         ctx = BuildContext(
-            vivado_path="/tools/Xilinx/Vivado/2024.1",
+            vivado_path="/tools/Xilinx/Vivado/2023.2",
             rtl_sources=["rtl/passthrough.sv"],
             include_dirs=[],
             generated_sv=["build/generated/tb_top.sv"],
@@ -391,7 +391,7 @@ class TestBuildContext:
             dpi_c_source="/home/user/vten/vten_sv/vten_shm_bridge.c",
             compile_options=["-timescale", "1ns/1ps"],
         )
-        assert ctx.vivado_path == "/tools/Xilinx/Vivado/2024.1"
+        assert ctx.vivado_path == "/tools/Xilinx/Vivado/2023.2"
         assert len(ctx.rtl_sources) == 1
 
     def test_defaults(self):

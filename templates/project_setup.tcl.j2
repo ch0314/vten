@@ -1,0 +1,40 @@
+# project_setup.tcl — vten build Stage 1
+# Jinja2 렌더링 후 vivado -mode batch로 실행
+# args: <project_dir> <part> <vten_sv_dir>
+
+set proj_dir  [lindex $argv 0]
+set part      [lindex $argv 1]
+set vten_sv   [lindex $argv 2]
+set project_root [lindex $argv 3]
+
+# 1) 프로젝트 생성
+if {$part ne ""} {
+    create_project vten_sim $proj_dir -part $part -force
+} else {
+    create_project vten_sim $proj_dir -force
+}
+set_property target_simulator XSim [current_project]
+
+# 2) vten_sv 라이브러리 등록
+add_files -fileset sim_1 [glob $vten_sv/*.svh $vten_sv/*.sv]
+
+# 3) 사용자 RTL 등록 (Python에서 glob 확장된 절대 경로)
+{% for src in rtl_files %}
+add_files -fileset sim_1 {{ src }}
+{% endfor %}
+
+# 4) include 경로 설정
+{% if include_dirs %}
+set_property include_dirs { {% for d in include_dirs %}$project_root/{{ d }} {% endfor %}} [get_filesets sim_1]
+{% endif %}
+
+# 5) IP 등록 + 시뮬레이션 소스 생성
+{% for xci in ip_sources %}
+add_files {{ xci }}
+{% endfor %}
+{% if ip_sources %}
+generate_target simulation [get_ips *]
+{% endif %}
+
+# 6) 종료
+close_project

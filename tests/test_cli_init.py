@@ -52,12 +52,13 @@ class TestVtenInit:
         init_project(str(project_dir))
         assert (project_dir / "rtl").is_dir()
 
-    def test_creates_specs_directory(self, tmp_path: Path):
+    def test_creates_ip_directory(self, tmp_path: Path):
+        """ip/ directory for Vivado IP definitions (§4.1)."""
         from vten.cli.init_cmd import init_project
 
         project_dir = tmp_path / "my_npu"
         init_project(str(project_dir))
-        assert (project_dir / "specs").is_dir()
+        assert (project_dir / "ip").is_dir()
 
     def test_creates_kernels_directory(self, tmp_path: Path):
         from vten.cli.init_cmd import init_project
@@ -66,13 +67,6 @@ class TestVtenInit:
         init_project(str(project_dir))
         assert (project_dir / "kernels").is_dir()
 
-    def test_creates_tests_directory(self, tmp_path: Path):
-        from vten.cli.init_cmd import init_project
-
-        project_dir = tmp_path / "my_npu"
-        init_project(str(project_dir))
-        assert (project_dir / "tests").is_dir()
-
     def test_creates_build_directory(self, tmp_path: Path):
         from vten.cli.init_cmd import init_project
 
@@ -80,22 +74,23 @@ class TestVtenInit:
         init_project(str(project_dir))
         assert (project_dir / "build").is_dir()
 
-    def test_creates_example_kernel(self, tmp_path: Path):
+    def test_creates_results_directory(self, tmp_path: Path):
+        """results/ directory for test outputs (§4.1)."""
         from vten.cli.init_cmd import init_project
 
         project_dir = tmp_path / "my_npu"
         init_project(str(project_dir))
-        # kernels/ should contain an example .py file
-        kernel_files = list((project_dir / "kernels").glob("*.py"))
-        assert len(kernel_files) >= 1
+        assert (project_dir / "results").is_dir()
 
-    def test_creates_example_test(self, tmp_path: Path):
+    def test_kernels_dir_is_empty(self, tmp_path: Path):
+        """kernels/ is empty — kernels added via vten init --kernel <name>."""
         from vten.cli.init_cmd import init_project
 
         project_dir = tmp_path / "my_npu"
         init_project(str(project_dir))
-        test_files = list((project_dir / "tests").glob("test_*.py"))
-        assert len(test_files) >= 1
+        # No kernel subdirectories created by default
+        kernel_contents = list((project_dir / "kernels").iterdir())
+        assert len(kernel_contents) == 0
 
     def test_toml_has_project_name(self, tmp_path: Path):
         """vten.toml [project].name matches the directory name."""
@@ -132,7 +127,7 @@ class TestVtenInit:
         project_dir = tmp_path / "my_npu"
         init_project(str(project_dir))
 
-        expected_dirs = ["rtl", "specs", "kernels", "tests", "build"]
+        expected_dirs = ["rtl", "ip", "kernels", "build", "results"]
         for d in expected_dirs:
             assert (project_dir / d).is_dir(), f"Missing directory: {d}"
         assert (project_dir / "vten.toml").exists()

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from vten.backend.xsim import XsimBackend
 from vten.cli.config import load_project_config
+from vten.errors import VTenError, VerificationError
 
 
 class TestScenario:
@@ -24,7 +25,7 @@ class TestScenario:
         raise NotImplementedError
 
 
-def discover_test(name: str, tests_dir: str) -> TestScenario:
+def discover_test(name: str, tests_dir: str | Path) -> TestScenario:
     """Find and instantiate a TestScenario by name.
 
     Matches by: exact class name, case-insensitive class name,
@@ -96,29 +97,25 @@ def merge_configs(base: dict, override: dict | None) -> dict:
     return {**base, **override}
 
 
-def _build_shm_image(project: Path, config: dict) -> bytes | None:
-    """Try to load pre-built SHM image from build/shm/."""
-    shm_path = project / "build" / "shm" / "kernel_task.bin"
+def _build_shm_image(kernel_dir: Path) -> bytes | None:
+    """Try to load pre-built SHM image from kernel build/shm/."""
+    shm_path = kernel_dir / "build" / "shm" / "kernel_task.bin"
     if shm_path.exists():
         return shm_path.read_bytes()
     return None
 
 
-def _build_bfm_configs(project: Path) -> list:
+def _build_bfm_configs(kernel_dir: Path) -> list:
     """Try to derive BFM configs from kernel_spec.yaml."""
     from vten.runtime.ir import BFMConfig
     from vten.spec.parser import parse_kernel_spec
 
-    specs_dir = project / "specs"
-    if not specs_dir.exists():
-        return []
-
-    yaml_files = list(specs_dir.glob("*.yaml")) + list(specs_dir.glob("*.yml"))
-    if not yaml_files:
+    spec_path = kernel_dir / "kernel_spec.yaml"
+    if not spec_path.exists():
         return []
 
     try:
-        spec = parse_kernel_spec(yaml_files[0])
+        spec = parse_kernel_spec(spec_path)
         configs = []
         for name, iface in spec.interfaces.items():
             configs.append(BFMConfig(
@@ -156,17 +153,26 @@ def _compile_from_context(ctx) -> tuple[bytes | None, list]:
 
 
 def run_test(
-    project_dir: str,
-    test_name: str,
+    project_dir: str = ".",
+    kernel_name: str = "",
+    test_name: str = "",
     waveform: bool = False,
+    gui: bool = False,
     config_overrides: dict | None = None,
 ) -> None:
     """Discover, execute, and record results for a test scenario."""
-    project = Path(project_dir)
+    project = Path(project_dir).resolve()
     config = load_project_config(project)
+    kernel_dir = project / "kernels" / kernel_name
 
-    tests_dir = project / "tests"
-    scenario = discover_test(test_name, str(tests_dir))
+    # Validate kernel directory
+    spec_path = kernel_dir / "kernel_spec.yaml"
+    if not spec_path.exists():
+        raise VTenError(f"kernel_spec.yaml not found: {spec_path}")
+
+    # Test discovery from kernel tests dir
+    tests_dir = kernel_dir / "tests"
+    scenario = discover_test(test_name, tests_dir)
 
     base_params = config.get("parameters", {})
     if config_overrides:
@@ -177,47 +183,94 @@ def run_test(
     else:
         run_cfgs = [base_params]
 
-    results_dir = project / "results" / test_name
+    # Results under results/<kernel>/<test>/
+    results_dir = project / "results" / kernel_name / test_name
     results_dir.mkdir(parents=True, exist_ok=True)
 
     configs_passed = 0
     total_cycles = 0
+    all_cmd_stats: list[dict] = []
+    verification_count = 0
+    verification_passed = 0
     status = "PASS"
 
+    # Inject kernel-level paths into config
     config["_project_dir"] = str(project)
+    config["_kernel_build_dir"] = str(kernel_dir / "build")
+    if gui:
+        config["_gui"] = True
+
     backend = XsimBackend(config)
     try:
         for cfg in run_cfgs:
             try:
-                # Create ExecutionContext for scenario to record ops
+                # Create ExecutionContext with backend so ctx.run() drives
+                # the full lifecycle: compile → submit → wait → verify
                 from vten.runtime.context import ExecutionContext
 
                 ctx = ExecutionContext(
-                    backend=None,  # don't auto-submit; we drive lifecycle
+                    backend=backend,
                     project_params=cfg,
                 )
                 scenario.run(ctx, cfg)
 
-                # Compile ops → real SHM image if scenario recorded any
-                compiled_shm, compiled_bfm_configs = _compile_from_context(ctx)
+                if ctx._pending_ops:
+                    # Scenario recorded DSL ops — ctx.run() handles everything
+                    # including deferred verifications
+                    batch_result = ctx.run()
+                    configs_passed += 1
 
-                if compiled_shm is not None:
-                    shm_image = compiled_shm
-                    bfm_configs = compiled_bfm_configs
+                    if batch_result.per_command_stats:
+                        max_cycle = max(
+                            (s.commit_cycle for s in batch_result.per_command_stats
+                             if s.commit_cycle),
+                            default=0,
+                        )
+                        total_cycles = max(total_cycles, max_cycle)
+                        for s in batch_result.per_command_stats:
+                            all_cmd_stats.append({
+                                "cmd_id": s.cmd_id,
+                                "status": s.status,
+                                "issue_cycle": s.issue_cycle,
+                                "commit_cycle": s.commit_cycle,
+                                "active_cycles": s.active_cycles,
+                                "stall_cycles": s.stall_cycles,
+                                "total_beats": s.total_beats,
+                                "latency_cycles": s.latency_cycles,
+                            })
+
+                    # Count verifications that passed (no VerificationError raised)
+                    verification_count += batch_result.verification_count
+                    verification_passed += batch_result.verification_count
                 else:
-                    # Fall back to pre-built SHM image
-                    shm_image = _build_shm_image(project, config)
-                    bfm_configs = _build_bfm_configs(project)
-
-                backend.submit(shm_image, bfm_configs)
-                result = backend.wait()
-                configs_passed += 1
-                if result.stats:
-                    max_cycle = max(
-                        (s.commit_cycle for s in result.stats if s.commit_cycle),
-                        default=0,
-                    )
-                    total_cycles = max(total_cycles, max_cycle)
+                    # No DSL ops — fall back to pre-built SHM image
+                    shm_image = _build_shm_image(kernel_dir)
+                    bfm_configs = _build_bfm_configs(kernel_dir)
+                    backend.submit(shm_image, bfm_configs)
+                    result = backend.wait()
+                    configs_passed += 1
+                    if result.stats:
+                        max_cycle = max(
+                            (s.commit_cycle for s in result.stats
+                             if s.commit_cycle),
+                            default=0,
+                        )
+                        total_cycles = max(total_cycles, max_cycle)
+                        for s in result.stats:
+                            all_cmd_stats.append({
+                                "cmd_id": s.cmd_id,
+                                "status": s.status,
+                                "issue_cycle": s.issue_cycle,
+                                "commit_cycle": s.commit_cycle,
+                                "active_cycles": s.active_cycles,
+                                "stall_cycles": s.stall_cycles,
+                                "total_beats": s.total_beats,
+                                "latency_cycles": s.latency_cycles,
+                            })
+            except VerificationError as ve:
+                status = "FAIL"
+                verification_count += 1
+                # verification_passed not incremented
             except Exception:
                 status = "FAIL"
 
@@ -235,12 +288,15 @@ def run_test(
 
     (results_dir / "summary.json").write_text(json.dumps({
         "test_name": test_name,
+        "kernel": kernel_name,
         "status": status,
         "total_cycles": total_cycles,
         "configs_run": len(run_cfgs),
         "configs_passed": configs_passed,
+        "verification_count": verification_count,
+        "verification_passed": verification_passed,
     }))
 
     (results_dir / "stats.json").write_text(json.dumps({
-        "commands": [],
+        "commands": all_cmd_stats,
     }))

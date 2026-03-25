@@ -12,7 +12,7 @@ from pathlib import Path
 import jinja2
 
 from vten.runtime.ir import BFMConfig
-from vten.spec.models import KernelSpec, Protocol
+from vten.spec.models import InterfaceSpec, KernelSpec, Protocol
 
 
 # ── Template Context Dataclasses — 06_codegen_and_cli.md §2 ──
@@ -197,7 +197,15 @@ class SVGenerator:
             ))
 
         rtl_cfg = self.config.get("rtl", {})
-        top_module = rtl_cfg.get("top_module", self.spec.kernel_name)
+        # DUT module name resolution priority:
+        # 1. rtl.top_module from config (explicit)
+        # 2. Derived from spec.rtl_top filename stem
+        # 3. spec.kernel_name as fallback
+        top_module = rtl_cfg.get("top_module", "")
+        if not top_module and self.spec.rtl_top:
+            top_module = Path(self.spec.rtl_top).stem
+        if not top_module:
+            top_module = self.spec.kernel_name or ""
 
         # Derive DUT ports from BFM signal topology
         dut_ports = self._derive_dut_ports(bfms)
@@ -208,6 +216,9 @@ class SVGenerator:
             session_id=uuid.uuid4().hex[:16],
             dut_ports=dut_ports,
             bfms=bfms,
+            clock_name=self.spec.clock_name,
+            reset_name=self.spec.reset_name,
+            reset_active_low=self.spec.reset_active_low,
         )
 
         xsim_cfg = self.config.get("backend", {}).get("xsim", {})
@@ -248,8 +259,72 @@ class SVGenerator:
                 mapping[iface_id] = bfm_idx_map[name]
         return mapping
 
-    def generate(self, output_dir: str, num_commands: int = 0) -> None:
-        """Generate testbench, build scripts, run scripts to output_dir."""
+    def _has_generate_controller(self) -> bool:
+        """Check if any interface requires controller generation."""
+        return any(
+            iface.generate_controller
+            for iface in self.spec.interfaces.values()
+        )
+
+    def _classify_interfaces(self) -> tuple[
+        list[InterfaceSpec], list[InterfaceSpec], list[InterfaceSpec]
+    ]:
+        """Classify interfaces into ctrl, stream, aximm for wrapper generation."""
+        ctrl, stream, aximm = [], [], []
+        for iface in self.spec.interfaces.values():
+            if iface.protocol == Protocol.AXI4L and iface.generate_controller:
+                ctrl.append(iface)
+            elif iface.protocol == Protocol.AXI4S:
+                stream.append(iface)
+            elif iface.protocol == Protocol.AXI4:
+                aximm.append(iface)
+        return ctrl, stream, aximm
+
+    def _generate_axilite_ctrl(
+        self, env: jinja2.Environment, out: Path, iface: InterfaceSpec
+    ) -> str:
+        """Generate AXI-Lite controller module. Returns output filename."""
+        tmpl = env.get_template("axilite_ctrl.sv.j2")
+        rendered = tmpl.render(
+            kernel_name=self.spec.kernel_name,
+            iface_name=iface.name,
+            addr_width=iface.addr_width or 32,
+            data_width=iface.data_width or 32,
+            registers=iface.registers or [],
+            clock_name=self.spec.clock_name,
+            reset_name=self.spec.reset_name,
+            reset_active_low=self.spec.reset_active_low,
+        )
+        filename = f"{self.spec.kernel_name}_axilite_ctrl.sv"
+        (out / filename).write_text(rendered)
+        return filename
+
+    def _generate_wrapper(self, env: jinja2.Environment, out: Path) -> str:
+        """Generate wrapper module. Returns output filename."""
+        ctrl, stream, aximm = self._classify_interfaces()
+        all_ifaces = list(self.spec.interfaces.values())
+
+        tmpl = env.get_template("wrapper.sv.j2")
+        rendered = tmpl.render(
+            kernel_name=self.spec.kernel_name,
+            parameters=self.spec.parameters,
+            clock_name=self.spec.clock_name,
+            reset_name=self.spec.reset_name,
+            reset_active_low=self.spec.reset_active_low,
+            all_interfaces=all_ifaces,
+            ctrl_interfaces=ctrl,
+            stream_interfaces=stream,
+            aximm_interfaces=aximm,
+        )
+        filename = f"{self.spec.kernel_name}_wrapper.sv"
+        (out / filename).write_text(rendered)
+        return filename
+
+    def generate(self, output_dir: str, num_commands: int = 0) -> list[str]:
+        """Generate testbench and optional controller/wrapper to output_dir.
+
+        Returns list of generated filenames.
+        """
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
@@ -295,14 +370,21 @@ class SVGenerator:
             "lib_dir": str(out.parent / "lib") if out.parent.exists() else "build/lib",
         }
 
-        file_map = {
-            "tb_top.sv.j2": "tb_top.sv",
-            "build_xsim.tcl.j2": "build.tcl",
-            "run_xsim.tcl.j2": "run.tcl",
-            "Makefile.j2": "Makefile",
-        }
+        generated_files = []
 
-        for template_name, output_name in file_map.items():
-            tmpl = env.get_template(template_name)
-            rendered = tmpl.render(**template_vars)
-            (out / output_name).write_text(rendered)
+        # Testbench
+        tmpl = env.get_template("tb_top.sv.j2")
+        rendered = tmpl.render(**template_vars)
+        (out / "tb_top.sv").write_text(rendered)
+        generated_files.append("tb_top.sv")
+
+        # Controller + Wrapper (if any interface has generate_controller)
+        if self._has_generate_controller():
+            for iface in self.spec.interfaces.values():
+                if iface.generate_controller:
+                    fname = self._generate_axilite_ctrl(env, out, iface)
+                    generated_files.append(fname)
+            fname = self._generate_wrapper(env, out)
+            generated_files.append(fname)
+
+        return generated_files

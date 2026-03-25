@@ -21,6 +21,7 @@ from vten.runtime.shm import (
     BACKEND_STATUS_DONE,
     BACKEND_STATUS_ERROR,
     BACKEND_STATUS_IDLE,
+    BUF_DESC_SIZE,
     HOST_STATUS_ACK,
     HOST_STATUS_CMD_READY,
     HOST_STATUS_IDLE,
@@ -195,26 +196,32 @@ class XsimBackend(Backend):
         else:
             xsim_bin = "xsim"
 
-        rtl_cfg = self._config.get("rtl", {})
-        top_module = rtl_cfg.get("tb_module", "tb_top")
+        snapshot = "tb_top"  # Stage 5 uses --snapshot tb_top
 
-        # xsim must run from directory containing xsim.dir/
-        # Priority: config key > [backend.xsim].xsim_dir > _project_dir > cwd
-        xsim_cfg = self._config.get("backend", {}).get("xsim", {})
-        xsim_cwd = self._config.get("_xsim_dir",
-                       xsim_cfg.get("xsim_dir",
-                           self._config.get("_project_dir", ".")))
+        # xsim working directory: kernel build dir > xsim_dir config > project dir
+        kernel_build = self._config.get("_kernel_build_dir")
+        if kernel_build:
+            xsim_cwd = kernel_build
+        else:
+            xsim_cfg = self._config.get("backend", {}).get("xsim", {})
+            xsim_cwd = self._config.get("_xsim_dir",
+                           xsim_cfg.get("xsim_dir",
+                               self._config.get("_project_dir", ".")))
         # Resolve relative paths against project dir
         project_dir = self._config.get("_project_dir", ".")
         if not os.path.isabs(xsim_cwd):
             xsim_cwd = os.path.normpath(os.path.join(project_dir, xsim_cwd))
 
         cmd = [
-            xsim_bin, top_module,
-            "--runall",
+            xsim_bin, snapshot,
             "--testplusarg", f"SESSION_ID={self._session_id}",
             "--testplusarg", f"TIMEOUT_MS={self._timeout_ms}",
         ]
+
+        if self._config.get("_gui"):
+            cmd.append("--gui")
+        else:
+            cmd.extend(["--runall", "--onerror", "quit"])
 
         self._process = subprocess.Popen(
             cmd,
@@ -230,6 +237,44 @@ class XsimBackend(Backend):
     def _write_shm_u32(self, offset: int, value: int) -> None:
         """Write uint32 to SHM control region."""
         struct.pack_into("<I", self._shm.buf, offset, value)
+
+    def _make_buffer_reader(self):
+        """Create a closure that reads buffer data from the live SHM segment.
+
+        Parses buffer descriptors from the SHM to find the data_offset and size
+        for a given buffer_id, then reads from the data region.
+
+        The closure captures self._shm so it must be called before cleanup().
+        """
+        shm = self._shm
+        if shm is None:
+            return None
+
+        buf = shm.buf
+        num_buffers = struct.unpack_from("<I", buf, 0x14)[0]
+        buf_desc_offset = struct.unpack_from("<Q", buf, 0x28)[0]
+        data_region_offset = struct.unpack_from("<Q", buf, 0x30)[0]
+
+        # Pre-parse all buffer descriptors: buffer_id → (data_offset, size)
+        desc_map: dict[int, tuple[int, int]] = {}
+        for i in range(num_buffers):
+            base = buf_desc_offset + i * BUF_DESC_SIZE
+            bid = struct.unpack_from("<H", buf, base + 0x00)[0]
+            size = struct.unpack_from("<I", buf, base + 0x04)[0]
+            data_offset = struct.unpack_from("<Q", buf, base + 0x08)[0]
+            desc_map[bid] = (data_offset, size)
+
+        def _read(buffer_id: int) -> bytes:
+            if buffer_id not in desc_map:
+                return b""
+            data_offset, size = desc_map[buffer_id]
+            start = data_region_offset + data_offset
+            end = start + size
+            if end > len(shm.buf):
+                return b""
+            return bytes(shm.buf[start:end])
+
+        return _read
 
     def _read_stats_from_shm(self) -> list[CmdStats]:
         """Parse per-command stats from SHM Stats Region."""
@@ -332,13 +377,15 @@ class XsimBackend(Backend):
             self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_ACK)
             self._raise_backend_error(error_code, error_cmd_id, error_msg)
 
-        # DONE: read stats, send ACK
+        # DONE: read stats, build buffer reader, send ACK
         stats = self._read_stats_from_shm()
+        buffer_reader = self._make_buffer_reader()
         self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_ACK)
 
         return BackendResult(
             status=backend_status,
             stats=stats,
+            _shm_reader=buffer_reader,
         )
 
     def shutdown(self) -> None:

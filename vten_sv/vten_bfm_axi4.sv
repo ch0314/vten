@@ -97,13 +97,27 @@ module vten_bfm_axi4 #(
     int r_beat;
     int w_beat;
 
-    // v0.4.1: idle signal
-    assign cmd_if.idle = (active_table.size() == 0)
-                      && (read_pending.size() == 0)
-                      && (write_pending.size() == 0)
-                      && (b_queue.size() == 0)
-                      && (done_queue.size() == 0)
-                      && !r_active && !w_active;
+    // v0.4.1: idle signal — registered, not continuous assign.
+    // xsim doesn't re-evaluate assign/always_comb when queue sizes change,
+    // but always_ff evaluates .size() procedurally every posedge clk.
+    logic idle_r;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            idle_r <= 1'b1;
+        end else begin : blk_idle_eval
+            logic has_active;
+            has_active = 1'b0;
+            foreach (active_table[i])
+                if (active_table[i].active) has_active = 1'b1;
+            idle_r <= !has_active
+                   && (read_pending.size() == 0)
+                   && (write_pending.size() == 0)
+                   && (b_queue.size() == 0)
+                   && (done_queue.size() == 0)
+                   && !r_active && !w_active;
+        end
+    end
+    assign cmd_if.idle = idle_r;
 
     // ── Address matching ──
     function automatic int find_entry(logic [ADDR_W-1:0] addr, opcode_t op);
@@ -188,16 +202,14 @@ module vten_bfm_axi4 #(
                 end else begin : blk_r_serve
                     int idx;
                     int offset;
-                    bit [7:0] beat_data [0:BYTES_PER_BEAT-1];
                     idx = current_read.entry_idx;
                     offset = (current_read.addr - active_table[idx].cmd.phys_addr)
                              + r_beat * (1 << current_read.size);
 
-                    vten_read_data(active_table[idx].cmd.buffer_id, offset,
-                                  1 << current_read.size, beat_data);
-
+                    // Use scalar byte access (portable, no open-array issues)
                     for (int i = 0; i < BYTES_PER_BEAT; i++)
-                        s_rdata[i*8 +: 8] <= beat_data[i];
+                        s_rdata[i*8 +: 8] <= vten_read_data_byte(
+                            active_table[idx].cmd.buffer_id, offset + i);
 
                     s_rvalid <= 1;
                     s_rresp  <= 2'b00;
@@ -262,9 +274,6 @@ module vten_bfm_axi4 #(
                 int idx;
                 int offset;
                 int transfer_size;
-                bit [7:0] existing [0:BYTES_PER_BEAT-1];
-                bit [7:0] wr_data [0:BYTES_PER_BEAT-1];
-                bit [7:0] golden_data [0:BYTES_PER_BEAT-1];
                 logic [DATA_W-1:0] golden;
 
                 if (current_write.entry_idx >= 0) begin
@@ -272,18 +281,16 @@ module vten_bfm_axi4 #(
                     offset = (current_write.addr - active_table[idx].cmd.phys_addr)
                              + w_beat * (1 << current_write.size);
 
-                    // WSTRB handling: byte-level selective write
+                    // WSTRB handling: byte-level selective write using scalar DPI-C
                     transfer_size = 1 << current_write.size;
-                    vten_read_data(active_table[idx].cmd.buffer_id, offset,
-                                  transfer_size, existing);
-                    for (int b = 0; b < DATA_W/8; b++) begin
+                    for (int b = 0; b < transfer_size; b++) begin
                         if (s_wstrb[b])
-                            existing[b] = s_wdata[b*8 +: 8];
+                            vten_write_data_byte(
+                                active_table[idx].cmd.buffer_id,
+                                offset + b,
+                                s_wdata[b*8 +: 8]);
+                        // If wstrb[b]==0, leave existing SHM data untouched
                     end
-                    for (int b = 0; b < BYTES_PER_BEAT; b++)
-                        wr_data[b] = existing[b];
-                    vten_write_data(active_table[idx].cmd.buffer_id, offset,
-                                   transfer_size, wr_data);
 
                     active_table[idx].active_cycles++;
                     active_table[idx].total_beats++;
@@ -291,13 +298,12 @@ module vten_bfm_axi4 #(
                         active_table[idx].first_active = cycle_count;
                     active_table[idx].last_active = cycle_count;
 
-                    // Probe mode
+                    // Probe mode: byte-level golden comparison
                     if (active_table[idx].cmd.probe) begin
-                        vten_read_golden(active_table[idx].cmd.golden_buf_id,
-                                         active_table[idx].total_beats - 1,
-                                         golden_data);
                         for (int i = 0; i < BYTES_PER_BEAT; i++)
-                            golden[i*8 +: 8] = golden_data[i];
+                            golden[i*8 +: 8] = vten_read_golden_byte(
+                                active_table[idx].cmd.golden_buf_id,
+                                (active_table[idx].total_beats - 1) * BYTES_PER_BEAT + i);
                         if (s_wdata !== golden)
                             vten_log_mismatch(cycle_count,
                                               active_table[idx].total_beats - 1,
@@ -318,9 +324,11 @@ module vten_bfm_axi4 #(
                         check_completion(idx);
                     end
                     // B channel response
-                    b_queue.push_back('{
-                        resp: (current_write.entry_idx >= 0) ? 2'b00 : 2'b11
-                    });
+                    begin : blk_b_resp
+                        logic [1:0] resp_val;
+                        resp_val = (current_write.entry_idx >= 0) ? 2'b00 : 2'b11;
+                        b_queue.push_back('{resp: resp_val});
+                    end
                     // DECERR for unmatched write
                     if (current_write.entry_idx < 0) begin
                         done_queue.push_back('{
@@ -353,17 +361,18 @@ module vten_bfm_axi4 #(
     // ── Completion tracking ──
     task automatic check_completion(int idx);
         if (active_table[idx].transferred_bytes >= active_table[idx].expected_bytes) begin
+            // Extract locals to avoid xsim hierarchical reference limitations
+            automatic logic [15:0] cid         = active_table[idx].cmd.cmd_id;
+            automatic int          iss_cycle   = active_table[idx].issue_cycle;
+            automatic int          first_act   = active_table[idx].first_active;
+            automatic int          last_act    = active_table[idx].last_active;
+            automatic int          act_cycles  = active_table[idx].active_cycles;
+            automatic int          tot_beats   = active_table[idx].total_beats;
+            automatic int          stl_cycles  = active_table[idx].stall_cycles;
             active_table[idx].active = 0;
-            done_queue.push_back('{
-                cmd_id:     active_table[idx].cmd.cmd_id,
-                error:      1'b0,
-                error_code: 16'd0
-            });
-            vten_write_cmd_stats(active_table[idx].cmd.cmd_id,
-                CMD_COMMITTED, active_table[idx].issue_cycle, cycle_count,
-                active_table[idx].first_active, active_table[idx].last_active,
-                active_table[idx].active_cycles, active_table[idx].total_beats,
-                active_table[idx].stall_cycles);
+            done_queue.push_back('{cmd_id: cid, error: 1'b0, error_code: 16'd0});
+            vten_write_cmd_stats(cid, CMD_COMMITTED, iss_cycle, cycle_count,
+                first_act, last_act, act_cycles, tot_beats, stl_cycles);
         end
     endtask
 

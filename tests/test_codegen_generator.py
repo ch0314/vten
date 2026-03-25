@@ -63,7 +63,7 @@ def _minimal_config() -> dict:
         },
         "backend": {
             "xsim": {
-                "vivado_path": "/tools/Xilinx/Vivado/2024.1",
+                "vivado_path": "/tools/Xilinx/Vivado/2023.2",
                 "compile_options": ["-timescale", "1ns/1ps"],
             },
         },
@@ -107,7 +107,7 @@ def _npu_config() -> dict:
         },
         "backend": {
             "xsim": {
-                "vivado_path": "/tools/Xilinx/Vivado/2024.1",
+                "vivado_path": "/tools/Xilinx/Vivado/2023.2",
                 "compile_options": ["-timescale", "1ns/1ps"],
             },
             "scheduler": {
@@ -194,7 +194,8 @@ class TestSVGeneratorGenerate:
         gen.generate(str(tmp_path))
         assert (tmp_path / "tb_top.sv").exists()
 
-    def test_generate_creates_build_tcl(self, tmp_path: Path):
+    def test_generate_does_not_create_build_tcl(self, tmp_path: Path):
+        """build.tcl is NOT generated (§8.9: removed in v0.5.0)."""
         from vten.codegen.sv_generator import SVGenerator
 
         gen = SVGenerator(
@@ -203,9 +204,10 @@ class TestSVGeneratorGenerate:
             project_config=_minimal_config(),
         )
         gen.generate(str(tmp_path))
-        assert (tmp_path / "build.tcl").exists()
+        assert not (tmp_path / "build.tcl").exists()
 
-    def test_generate_creates_run_tcl(self, tmp_path: Path):
+    def test_generate_does_not_create_run_tcl(self, tmp_path: Path):
+        """run.tcl is NOT generated (§8.9: removed in v0.5.0)."""
         from vten.codegen.sv_generator import SVGenerator
 
         gen = SVGenerator(
@@ -214,9 +216,10 @@ class TestSVGeneratorGenerate:
             project_config=_minimal_config(),
         )
         gen.generate(str(tmp_path))
-        assert (tmp_path / "run.tcl").exists()
+        assert not (tmp_path / "run.tcl").exists()
 
-    def test_generate_creates_makefile(self, tmp_path: Path):
+    def test_generate_does_not_create_makefile(self, tmp_path: Path):
+        """Makefile is NOT generated (§8.9: removed in v0.5.0)."""
         from vten.codegen.sv_generator import SVGenerator
 
         gen = SVGenerator(
@@ -225,7 +228,23 @@ class TestSVGeneratorGenerate:
             project_config=_minimal_config(),
         )
         gen.generate(str(tmp_path))
-        assert (tmp_path / "Makefile").exists()
+        assert not (tmp_path / "Makefile").exists()
+
+    def test_generate_only_produces_tb_top(self, tmp_path: Path):
+        """generate() only produces tb_top.sv — no scripts (§8.9)."""
+        from vten.codegen.sv_generator import SVGenerator
+
+        gen = SVGenerator(
+            kernel_spec=_passthrough_spec(),
+            bfm_configs=_passthrough_bfm_configs(),
+            project_config=_minimal_config(),
+        )
+        gen.generate(str(tmp_path))
+        generated_files = [f.name for f in tmp_path.iterdir() if f.is_file()]
+        assert "tb_top.sv" in generated_files
+        assert "build.tcl" not in generated_files
+        assert "run.tcl" not in generated_files
+        assert "Makefile" not in generated_files
 
     def test_tb_top_contains_dut_instance(self, tmp_path: Path):
         """tb_top.sv contains the DUT module instantiation."""
@@ -283,80 +302,6 @@ class TestSVGeneratorGenerate:
         # Match pattern like: vten_bfm_axi4s #( or vten_bfm_axi4s bfm_
         count = len(re.findall(r"vten_bfm_axi4s\b", content))
         assert count >= 2, f"Expected >= 2 AXI4-Stream BFM instances, found {count}"
-
-    def test_build_tcl_contains_xvlog(self, tmp_path: Path):
-        from vten.codegen.sv_generator import SVGenerator
-
-        gen = SVGenerator(
-            kernel_spec=_passthrough_spec(),
-            bfm_configs=_passthrough_bfm_configs(),
-            project_config=_minimal_config(),
-        )
-        gen.generate(str(tmp_path))
-        content = (tmp_path / "build.tcl").read_text()
-        assert "xvlog" in content
-
-    def test_build_tcl_contains_xelab(self, tmp_path: Path):
-        from vten.codegen.sv_generator import SVGenerator
-
-        gen = SVGenerator(
-            kernel_spec=_passthrough_spec(),
-            bfm_configs=_passthrough_bfm_configs(),
-            project_config=_minimal_config(),
-        )
-        gen.generate(str(tmp_path))
-        content = (tmp_path / "build.tcl").read_text()
-        assert "xelab" in content
-
-    def test_build_tcl_contains_rtl_sources(self, tmp_path: Path):
-        from vten.codegen.sv_generator import SVGenerator
-
-        gen = SVGenerator(
-            kernel_spec=_passthrough_spec(),
-            bfm_configs=_passthrough_bfm_configs(),
-            project_config=_minimal_config(),
-        )
-        gen.generate(str(tmp_path))
-        content = (tmp_path / "build.tcl").read_text()
-        assert "passthrough" in content
-
-    def test_build_tcl_contains_sv_lib(self, tmp_path: Path):
-        """build.tcl references DPI-C shared library (sv_lib)."""
-        from vten.codegen.sv_generator import SVGenerator
-
-        gen = SVGenerator(
-            kernel_spec=_passthrough_spec(),
-            bfm_configs=_passthrough_bfm_configs(),
-            project_config=_minimal_config(),
-        )
-        gen.generate(str(tmp_path))
-        content = (tmp_path / "build.tcl").read_text()
-        assert "sv_lib" in content or "libvten_shm" in content
-
-    def test_build_tcl_vivado_path(self, tmp_path: Path):
-        """build.tcl uses vivado_path from config."""
-        from vten.codegen.sv_generator import SVGenerator
-
-        gen = SVGenerator(
-            kernel_spec=_passthrough_spec(),
-            bfm_configs=_passthrough_bfm_configs(),
-            project_config=_minimal_config(),
-        )
-        gen.generate(str(tmp_path))
-        content = (tmp_path / "build.tcl").read_text()
-        assert "Vivado" in content or "vivado" in content
-
-    def test_run_tcl_contains_xsim(self, tmp_path: Path):
-        from vten.codegen.sv_generator import SVGenerator
-
-        gen = SVGenerator(
-            kernel_spec=_passthrough_spec(),
-            bfm_configs=_passthrough_bfm_configs(),
-            project_config=_minimal_config(),
-        )
-        gen.generate(str(tmp_path))
-        content = (tmp_path / "run.tcl").read_text()
-        assert "xsim" in content
 
     def test_tb_top_includes_vten_types(self, tmp_path: Path):
         """tb_top.sv includes vten_types.svh."""
