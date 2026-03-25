@@ -198,14 +198,18 @@ class SVGenerator:
 
         rtl_cfg = self.config.get("rtl", {})
         # DUT module name resolution priority:
+        # 0. If wrapper is generated, DUT is the wrapper (kernel_name)
         # 1. rtl.top_module from config (explicit)
         # 2. Derived from spec.rtl_top filename stem
         # 3. spec.kernel_name as fallback
-        top_module = rtl_cfg.get("top_module", "")
-        if not top_module and self.spec.rtl_top:
-            top_module = Path(self.spec.rtl_top).stem
-        if not top_module:
-            top_module = self.spec.kernel_name or ""
+        if self._has_generate_controller():
+            top_module = self.spec.kernel_name
+        else:
+            top_module = rtl_cfg.get("top_module", "")
+            if not top_module and self.spec.rtl_top:
+                top_module = Path(self.spec.rtl_top).stem
+            if not top_module:
+                top_module = self.spec.kernel_name or ""
 
         # Derive DUT ports from BFM signal topology
         dut_ports = self._derive_dut_ports(bfms)

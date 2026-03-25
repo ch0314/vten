@@ -2,6 +2,7 @@ import torch
 
 from vten.kernel.base import Kernel, register
 from vten.kernel.tensor import Tensor
+from vten.spec.models import Direction
 
 
 class StreamDmaV2Kernel(Kernel):
@@ -18,6 +19,7 @@ class StreamDmaV2Kernel(Kernel):
         shape=("${N}",),
         dtype=torch.int8,
         interface="dma_port",
+        direction=Direction.DEV_TO_HOST,
     )
 
     def generate_inputs(self, seed=None):
