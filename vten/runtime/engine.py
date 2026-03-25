@@ -71,6 +71,7 @@ class CompiledResult:
     flattened_view: FlattenedKernelView
     probe_reports: list[ProbePoint] = field(default_factory=list)
     tensor_data: dict[int, bytes] = field(default_factory=dict)
+    iface_id_to_name: dict[int, str] = field(default_factory=dict)
 
 
 # ── RuntimeEngine ──
@@ -131,6 +132,11 @@ class RuntimeEngine:
         lowering = IRLowering(view, self._alias_registry)
         commands, buffer_ids = lowering.lower(self._ops)
 
+        # Capture interface_id reverse map for reporting
+        iface_id_to_name: dict[int, str] = {
+            v: k for k, v in lowering._iface_id_map.items()
+        }
+
         # Stage 6b: BFM configuration synthesis
         bfm_configs = self._synthesize_bfm_configs(view, commands, buffer_ids)
 
@@ -156,6 +162,7 @@ class RuntimeEngine:
             flattened_view=view,
             probe_reports=view.probe_points,
             tensor_data=tensor_data,
+            iface_id_to_name=iface_id_to_name,
         )
 
     def _get_primary_kernel(self) -> KernelInstance:

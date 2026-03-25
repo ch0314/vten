@@ -152,6 +152,37 @@ def _compile_from_context(ctx) -> tuple[bytes | None, list]:
     return compiled.shm_image, compiled.bfm_configs
 
 
+def _enrich_stats(
+    stats: list,
+    compiled: object | None,
+) -> list[dict]:
+    """Build enriched command stats dicts from CmdStats + CompiledResult."""
+    from vten.reporting import build_command_metadata, merge_stats_with_metadata
+
+    if compiled is not None and compiled.commands:
+        metadata = build_command_metadata(compiled)
+        enriched = merge_stats_with_metadata(stats, metadata)
+        return [e.to_dict() for e in enriched]
+
+    # Fallback: no CompiledResult available (pre-built SHM path)
+    from vten.reporting import _status_name
+
+    return [
+        {
+            "cmd_id": s.cmd_id,
+            "status": s.status,
+            "status_name": _status_name(s.status),
+            "issue_cycle": s.issue_cycle,
+            "commit_cycle": s.commit_cycle,
+            "latency_cycles": s.latency_cycles,
+            "active_cycles": s.active_cycles,
+            "stall_cycles": s.stall_cycles,
+            "total_beats": s.total_beats,
+        }
+        for s in stats
+    ]
+
+
 def run_test(
     project_dir: str = ".",
     kernel_name: str = "",
@@ -193,6 +224,7 @@ def run_test(
     all_cmd_stats: list[dict] = []
     verification_count = 0
     verification_passed = 0
+    all_verification_results: list[dict] = []
     status = "PASS"
 
     # Inject kernel-level paths into config
@@ -203,6 +235,11 @@ def run_test(
 
     backend_name = resolve_backend_name(config, cli_backend=backend)
     backend_inst = get_backend(backend_name, config)
+
+    # Change to project directory so relative paths in kernel specs resolve correctly
+    import os
+    prev_cwd = os.getcwd()
+    os.chdir(str(project))
     try:
         for cfg in run_cfgs:
             try:
@@ -229,21 +266,22 @@ def run_test(
                             default=0,
                         )
                         total_cycles = max(total_cycles, max_cycle)
-                        for s in batch_result.per_command_stats:
-                            all_cmd_stats.append({
-                                "cmd_id": s.cmd_id,
-                                "status": s.status,
-                                "issue_cycle": s.issue_cycle,
-                                "commit_cycle": s.commit_cycle,
-                                "active_cycles": s.active_cycles,
-                                "stall_cycles": s.stall_cycles,
-                                "total_beats": s.total_beats,
-                                "latency_cycles": s.latency_cycles,
-                            })
+                        all_cmd_stats.extend(
+                            _enrich_stats(
+                                batch_result.per_command_stats,
+                                ctx._last_compiled,
+                            )
+                        )
 
                     # Count verifications that passed (no VerificationError raised)
                     verification_count += batch_result.verification_count
                     verification_passed += batch_result.verification_count
+                    for vr in batch_result.verification_results:
+                        all_verification_results.append({
+                            "tensor": vr.tensor_name,
+                            "passed": vr.passed,
+                            "max_diff": vr.max_diff,
+                        })
                 else:
                     # No DSL ops — fall back to pre-built SHM image
                     from vten.runtime.engine import CompiledResult
@@ -265,27 +303,35 @@ def run_test(
                             default=0,
                         )
                         total_cycles = max(total_cycles, max_cycle)
-                        for s in result.stats:
-                            all_cmd_stats.append({
-                                "cmd_id": s.cmd_id,
-                                "status": s.status,
-                                "issue_cycle": s.issue_cycle,
-                                "commit_cycle": s.commit_cycle,
-                                "active_cycles": s.active_cycles,
-                                "stall_cycles": s.stall_cycles,
-                                "total_beats": s.total_beats,
-                                "latency_cycles": s.latency_cycles,
-                            })
+                        all_cmd_stats.extend(
+                            _enrich_stats(result.stats, None)
+                        )
             except VerificationError as ve:
                 status = "FAIL"
-                verification_count += 1
-                # verification_passed not incremented
+                # Collect verification results from the error context
+                vr_list = ve.context.get("verification_results", [])
+                verification_count += len(vr_list) if vr_list else 1
+                for vr in vr_list:
+                    all_verification_results.append({
+                        "tensor": vr.tensor_name,
+                        "passed": vr.passed,
+                        "max_diff": vr.max_diff,
+                    })
+                    if vr.passed:
+                        verification_passed += 1
+                if not vr_list:
+                    all_verification_results.append({
+                        "tensor": ve.tensor,
+                        "passed": False,
+                        "max_diff": ve.max_diff,
+                    })
             except Exception:
                 status = "FAIL"
 
         if configs_passed < len(run_cfgs):
             status = "FAIL"
     finally:
+        os.chdir(prev_cwd)
         try:
             backend_inst.shutdown()
         except Exception:
@@ -295,7 +341,7 @@ def run_test(
         except Exception:
             pass
 
-    (results_dir / "summary.json").write_text(json.dumps({
+    summary: dict = {
         "test_name": test_name,
         "kernel": kernel_name,
         "status": status,
@@ -304,8 +350,12 @@ def run_test(
         "configs_passed": configs_passed,
         "verification_count": verification_count,
         "verification_passed": verification_passed,
-    }))
+    }
+    if all_verification_results:
+        summary["verification_results"] = all_verification_results
 
-    (results_dir / "stats.json").write_text(json.dumps({
-        "commands": all_cmd_stats,
-    }))
+    (results_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+
+    (results_dir / "stats.json").write_text(json.dumps(
+        {"commands": all_cmd_stats}, indent=2,
+    ))

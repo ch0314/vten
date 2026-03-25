@@ -70,6 +70,7 @@ class BatchResult:
     error: object = None
     output_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     verification_count: int = 0
+    verification_results: list = field(default_factory=list)  # list[VerificationResult]
 
 
 # ── ExecutionContext ──
@@ -281,16 +282,44 @@ class ExecutionContext:
                 max_diff=self._max_diff(hw_output, golden),
             )
 
-    def _run_deferred_verifications(self) -> int:
+    def _run_deferred_verifications(self) -> tuple[int, list]:
         """Execute all deferred VerificationTasks after run().
 
-        Returns count of verifications executed.
+        Collects all results before raising on failure.
+        Returns (count, list[VerificationResult]).
         """
+        from vten.reporting import VerificationResult
+
         count = len(self._verifications)
+        results: list[VerificationResult] = []
+        first_error: VerificationError | None = None
+
         for task in self._verifications:
-            self._verify_immediate(task.op_handle, task.golden)
+            tensor_name = task.op_handle.op.tensor.name
+            try:
+                self._verify_immediate(task.op_handle, task.golden)
+                results.append(VerificationResult(
+                    tensor_name=tensor_name,
+                    passed=True,
+                ))
+            except VerificationError as e:
+                results.append(VerificationResult(
+                    tensor_name=tensor_name,
+                    passed=False,
+                    max_diff=e.max_diff,
+                    shape=e.shape,
+                ))
+                if first_error is None:
+                    first_error = e
+
         self._verifications.clear()
-        return count
+
+        if first_error is not None:
+            # Attach all results to the error for reporting
+            first_error.context["verification_results"] = results
+            raise first_error
+
+        return count, results
 
     @staticmethod
     def _compare(hw_output: torch.Tensor, golden: torch.Tensor) -> bool:
@@ -346,11 +375,24 @@ class ExecutionContext:
 
             # Run deferred verifications before returning
             verification_count = 0
+            verification_results: list = []
             if self._verifications:
-                verification_count = self._run_deferred_verifications()
+                try:
+                    verification_count, verification_results = (
+                        self._run_deferred_verifications()
+                    )
+                except VerificationError as e:
+                    verification_count = len(
+                        e.context.get("verification_results", [])
+                    )
+                    verification_results = e.context.get(
+                        "verification_results", []
+                    )
+                    raise
 
             return BatchResult(
                 verification_count=verification_count,
+                verification_results=verification_results,
                 status=status,
                 total_cycles=total_cycles,
                 per_command_stats=per_cmd_stats,

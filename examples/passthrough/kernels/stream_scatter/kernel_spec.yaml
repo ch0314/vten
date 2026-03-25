@@ -1,0 +1,82 @@
+kernel: stream_scatter
+rtl_top: rtl/stream_scatter_core.sv
+
+memory_regions:
+  hbm:
+    base: 0x20000000
+    size: 0x10000000
+    alignment: 4096
+
+interfaces:
+  ctrl:
+    rtl_port: s_axilite
+    protocol: axi4_lite
+    addr_width: 16
+    data_width: 32
+    generate_controller: true
+    registers:
+      - name: dst0_addr_lo
+        offset: 0x00
+        access: rw
+        auto_bind: { tensor: result_0, value: address, bits: "31:0" }
+      - name: dst0_addr_hi
+        offset: 0x04
+        access: rw
+        auto_bind: { tensor: result_0, value: address, bits: "63:32" }
+      - name: dst1_addr_lo
+        offset: 0x08
+        access: rw
+        auto_bind: { tensor: result_1, value: address, bits: "31:0" }
+      - name: dst1_addr_hi
+        offset: 0x0C
+        access: rw
+        auto_bind: { tensor: result_1, value: address, bits: "63:32" }
+      - name: length
+        offset: 0x10
+        access: rw
+      - name: ctrl
+        offset: 0x14
+        access: rw
+        pulse: true
+        fields: { start: "0:0" }
+      - name: status
+        offset: 0x18
+        access: ro
+        fields: { done: "0:0" }
+      - name: beat_count
+        offset: 0x1C
+        access: ro
+        fields: { count: "31:0" }
+
+  input_stream:
+    rtl_port: s_axis
+    protocol: axi4_stream
+    tensor: data_in
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first
+
+  hbm_0:
+    rtl_port: m_axi0
+    protocol: axi4
+    data_width: 256
+    addr_width: 64
+    memory_region: hbm
+    tensor: result_0
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first
+
+  hbm_1:
+    rtl_port: m_axi1
+    protocol: axi4
+    data_width: 256
+    addr_width: 64
+    memory_region: hbm
+    tensor: result_1
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first

@@ -131,6 +131,10 @@ class VerilatorBuildPipeline(BuildPipeline):
         )
 
         output = kernel_dir / "build" / "generated"
+        # Clean stale generated files to avoid module conflicts
+        if output.exists():
+            for f in output.glob("*.sv"):
+                f.unlink()
         output.mkdir(parents=True, exist_ok=True)
         gen.generate(str(output), num_commands=256)
         print("  done")
@@ -150,7 +154,6 @@ class VerilatorBuildPipeline(BuildPipeline):
 
         # Collect all SV source files
         sv_files = sorted(self._vten_sv_dir.glob("*.sv"))
-        svh_files = sorted(self._vten_sv_dir.glob("*.svh"))
 
         # RTL sources from project config
         rtl_patterns = self._config.get("rtl", {}).get("sources", [])
@@ -172,6 +175,7 @@ class VerilatorBuildPipeline(BuildPipeline):
             # Suppress common SV warnings that are safe in vTen BFMs
             "-Wno-WIDTHEXPAND", "-Wno-WIDTHTRUNC", "-Wno-WIDTHCONCAT",
             "-Wno-CASEINCOMPLETE", "-Wno-IGNOREDRETURN", "-Wno-MULTIDRIVEN",
+            "-Wno-TIMESCALEMOD",
         ]
 
         if self._trace:
@@ -179,8 +183,10 @@ class VerilatorBuildPipeline(BuildPipeline):
 
         cmd.extend(self._extra_args)
 
-        # Add source files
-        cmd.append(str(tb_top))
+        # Add source files: all generated SV (tb_top, wrapper, controller)
+        gen_dir = kernel_dir / "build" / "generated"
+        for f in sorted(gen_dir.glob("*.sv")):
+            cmd.append(str(f))
         for f in sv_files:
             cmd.append(str(f))
         for f in rtl_files:
@@ -202,7 +208,7 @@ class VerilatorBuildPipeline(BuildPipeline):
             cwd=str(build_dir),
         )
         if result.returncode != 0:
-            detail = result.stderr[-500:] if result.stderr else result.stdout[-500:]
+            detail = result.stderr[-1000:] if result.stderr else result.stdout[-1000:]
             raise BuildError(f"verilator failed:\n{detail}")
 
         print("  done")

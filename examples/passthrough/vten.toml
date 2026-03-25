@@ -10,9 +10,12 @@ vivado_path = "/tools/Xilinx/Vivado/2023.2"
 timeout_ms = 10000
 submit_timeout_s = 300
 
+[backend.verilator]
+threads = 4
+trace = false
+
 [rtl]
 sources = ["rtl/**/*.sv", "rtl/**/*.v"]
-top_module = "passthrough"
 tb_module = "tb_top"
 
 [ip]
