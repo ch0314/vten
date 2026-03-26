@@ -143,16 +143,54 @@ def render_template(name: str, context: dict) -> str:
     return env.get_template(name).render(context)
 
 
-def run_vivado(vivado_path: str, tcl_script: Path, *args: str | Path) -> None:
-    """Run Vivado in batch mode with a TCL script."""
+def run_vivado(
+    vivado_path: str,
+    tcl_script: Path,
+    *args: str | Path,
+    log_dir: Path | None = None,
+    label: str = "vivado",
+) -> None:
+    """Run Vivado in batch mode with a TCL script.
+
+    Args:
+        vivado_path: Path to Vivado installation (e.g. /tools/Xilinx/Vivado/2023.2).
+        tcl_script: TCL script to execute.
+        *args: Additional arguments passed via -tclargs.
+        log_dir: If set, redirect journal/log and clean up stray files.
+        label: Label for log file naming (e.g. "project_setup").
+    """
+    import shutil
+
     cmd = [
         f"{vivado_path}/bin/vivado", "-mode", "batch",
         "-source", str(tcl_script),
+        "-notrace",
     ]
+    if log_dir is not None:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        cmd += [
+            "-journal", str(log_dir / f"{label}.jou"),
+            "-log", str(log_dir / f"{label}.log"),
+        ]
     if args:
         cmd += ["-tclargs"] + [str(a) for a in args]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    cwd = tcl_script.parent
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(cwd))
+
+    # Clean up stray vivado files from CWD
+    if log_dir is not None:
+        xil_dir = cwd / ".Xil"
+        if xil_dir.exists():
+            shutil.rmtree(xil_dir, ignore_errors=True)
+        # Move any stray .log/.jou files vivado dropped in CWD
+        for pattern in ("*.log", "*.jou", "*.backup.log", "*.backup.jou"):
+            for f in cwd.glob(pattern):
+                if f.is_file() and f.parent == cwd:
+                    f.rename(log_dir / f.name)
+
     if result.returncode != 0:
+        err_tail = result.stderr[-500:] if result.stderr else result.stdout[-500:]
         raise BuildError(
-            f"Vivado failed (exit {result.returncode}):\n{result.stderr[-500:]}"
+            f"Vivado failed (exit {result.returncode}):\n{err_tail}"
         )

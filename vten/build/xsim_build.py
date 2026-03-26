@@ -224,7 +224,12 @@ class XsimBuildPipeline(BuildPipeline):
         proj_dir = self._project / "build" / "vivado_proj"
         proj_dir.mkdir(parents=True, exist_ok=True)
 
-        run_vivado(self._vivado_path, tcl_path, proj_dir, part, self._vten_sv_dir, self._project)
+        log_dir = self._project / "build" / "logs"
+        run_vivado(
+            self._vivado_path, tcl_path, proj_dir, part,
+            self._vten_sv_dir, self._project,
+            log_dir=log_dir, label="project_setup",
+        )
 
         update_cache(self._cache, "project_setup", current)
         print("  done")
@@ -490,7 +495,11 @@ class XsimBuildPipeline(BuildPipeline):
             )
 
         tcl = self._vten_root / "templates" / "resolve_order.tcl"
-        run_vivado(self._vivado_path, tcl, xpr_path, tb_top, prj_out)
+        log_dir = kernel_dir / "build" / "logs"
+        run_vivado(
+            self._vivado_path, tcl, xpr_path, tb_top, prj_out,
+            log_dir=log_dir, label="compile_order",
+        )
 
         # For composite kernels, prepend sub-kernel generated files
         from vten.build.composite import (
@@ -551,6 +560,8 @@ class XsimBuildPipeline(BuildPipeline):
             )
 
         build_dir = kernel_dir / "build"
+        log_dir = build_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
 
         # xvlog
         result = subprocess.run(
@@ -558,6 +569,7 @@ class XsimBuildPipeline(BuildPipeline):
                 f"{self._vivado_path}/bin/xvlog", "--sv",
                 "--include", str(self._vten_sv_dir),
                 "--prj", str(prj),
+                "--log", str(log_dir / "xvlog.log"),
             ],
             capture_output=True,
             text=True,
@@ -599,6 +611,7 @@ class XsimBuildPipeline(BuildPipeline):
                 "--debug", "typical",
                 "--snapshot", "tb_top",
                 "--relax",
+                "--log", str(log_dir / "xelab.log"),
             ],
             capture_output=True,
             text=True,
@@ -607,5 +620,18 @@ class XsimBuildPipeline(BuildPipeline):
         if result.returncode != 0:
             detail = result.stdout[-500:] if result.stdout else result.stderr[-500:]
             raise BuildError(f"xelab failed:\n{detail}")
+
+        # Clean up stray vivado/xsim files from build dir
+        import shutil
+        xil_dir = build_dir / ".Xil"
+        if xil_dir.exists():
+            shutil.rmtree(xil_dir, ignore_errors=True)
+        webtalk_dir = build_dir / "webtalk"
+        if webtalk_dir.exists():
+            shutil.rmtree(webtalk_dir, ignore_errors=True)
+        for pattern in ("*.log", "*.jou", "*.pb"):
+            for f in build_dir.glob(pattern):
+                if f.is_file():
+                    f.rename(log_dir / f.name)
 
         print("  done")
