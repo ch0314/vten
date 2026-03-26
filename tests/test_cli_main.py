@@ -105,7 +105,6 @@ class TestMainBuildDispatch:
             force=False,
             skip_compile=False,
             config_overrides=None,
-            run_vivado=False,
         )
 
     @patch("vten.cli.build.build_project")

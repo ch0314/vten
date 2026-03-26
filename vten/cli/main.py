@@ -35,8 +35,6 @@ def main(argv: list[str] | None = None) -> None:
     build_parser.add_argument("--upto", help="Run stages up to (inclusive)")
     build_parser.add_argument("--force", action="store_true", help="Ignore cache, full rebuild")
     build_parser.add_argument("--skip-compile", action="store_true", help="Run codegen only")
-    build_parser.add_argument("--run-vivado", action="store_true",
-        help="Execute vivado/v++ build (XRT backend only)")
     build_parser.add_argument("--config", nargs="*", help="Config overrides (K=V)")
 
     # vten run
@@ -83,7 +81,6 @@ def main(argv: list[str] | None = None) -> None:
             force=args.force,
             skip_compile=args.skip_compile,
             config_overrides=overrides or None,
-            run_vivado=args.run_vivado,
         )
 
     elif args.command == "run":

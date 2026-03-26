@@ -208,13 +208,15 @@ class SVGenerator:
             elif cfg.protocol == Protocol.AXI4L:
                 params["ADDR_W"] = cfg.addr_width or 32
 
-            # For array elements, derive flat port name from the expanded data
+            # Port prefix: wrapper uses ext_port (Vitis naming), raw RTL uses rtl_port
             if iface.array and cfg.interface_name != logical_name:
-                ext_port = self._flat_ext_port_for_element(
+                port_prefix = self._flat_ext_port_for_element(
                     iface, logical_name, cfg.interface_name
                 )
+            elif self._has_generate_controller():
+                port_prefix = iface.ext_port
             else:
-                ext_port = iface.ext_port
+                port_prefix = iface.rtl_port
 
             bfms.append(BFMInstance(
                 name=f"bfm_{cfg.interface_name}",
@@ -222,7 +224,7 @@ class SVGenerator:
                 protocol=cfg.protocol.value,
                 data_width=cfg.data_width,
                 role=cfg.role,
-                rtl_port_prefix=ext_port,
+                rtl_port_prefix=port_prefix,
                 parameters=params,
                 interface_id=i,
             ))
@@ -523,6 +525,13 @@ class SVGenerator:
         )
         filename = f"{self.spec.kernel_name}_wrapper.sv"
         (out / filename).write_text(rendered)
+
+        # Clean up temporary attrs to avoid polluting shared InterfaceSpec objects
+        for iface in self.spec.interfaces.values():
+            for attr in ("_wrapper_data_w_param", "_wrapper_addr_w_param"):
+                if hasattr(iface, attr):
+                    delattr(iface, attr)
+
         return filename
 
     def generate(self, output_dir: str, num_commands: int = 0) -> list[str]:

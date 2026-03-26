@@ -75,7 +75,11 @@ class TestXrtBuildPipelineInit:
         assert issubclass(XrtBuildPipeline, BuildPipeline)
 
     def test_stages_returns_correct_list(self, pipeline: XrtBuildPipeline) -> None:
-        expected = ["gen_codegen", "gen_xrt_packaging", "validate"]
+        expected = [
+            "gen_codegen", "gen_xrt_packaging",
+            "package_ip", "gen_xo", "vpp_link",
+            "validate",
+        ]
         assert pipeline.stages() == expected
 
     def test_stages_returns_new_list(self, pipeline: XrtBuildPipeline) -> None:
@@ -164,6 +168,27 @@ class TestStageExecution:
         config = {"backend": {"xrt": {"xclbin_path": "/nonexistent/path.xclbin"}}}
         pipe = XrtBuildPipeline(tmp_path, config)
         pipe.run_stage("validate", "test_kern", kernel_dir, force=False)
+
+    def test_package_ip_no_tcl_raises(
+        self, pipeline: XrtBuildPipeline, kernel_dir: Path
+    ) -> None:
+        """package_ip raises BuildError when package_ip.tcl is missing."""
+        with pytest.raises(BuildError, match="package_ip.tcl not found"):
+            pipeline.run_stage("package_ip", "test_kern", kernel_dir, force=False)
+
+    def test_gen_xo_no_tcl_raises(
+        self, pipeline: XrtBuildPipeline, kernel_dir: Path
+    ) -> None:
+        """gen_xo raises BuildError when gen_xo.tcl is missing."""
+        with pytest.raises(BuildError, match="gen_xo.tcl not found"):
+            pipeline.run_stage("gen_xo", "test_kern", kernel_dir, force=False)
+
+    def test_vpp_link_no_xo_raises(
+        self, pipeline: XrtBuildPipeline, kernel_dir: Path
+    ) -> None:
+        """vpp_link raises BuildError when XO file is missing."""
+        with pytest.raises(BuildError, match="XO not found"):
+            pipeline.run_stage("vpp_link", "test_kern", kernel_dir, force=False)
 
     def test_unknown_stage_raises_build_error(
         self, pipeline: XrtBuildPipeline, kernel_dir: Path
