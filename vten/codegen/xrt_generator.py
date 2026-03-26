@@ -5,6 +5,7 @@ Produces:
   - gen_xo.tcl: XO creation TCL
   - kernel.xml: Kernel metadata XML
   - connectivity.cfg: v++ link configuration
+  - build_{target}.sh: Build script
 
 Spec reference: 08_backend_abstraction.md §11
 """
@@ -22,6 +23,10 @@ def _vten_templates_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "templates"
 
 
+def _vten_sv_dir() -> Path:
+    return Path(__file__).resolve().parent.parent.parent / "vten_sv"
+
+
 def _render(template_name: str, context: dict) -> str:
     env = jinja2.Environment(
         loader=jinja2.FileSystemLoader(str(_vten_templates_dir())),
@@ -29,9 +34,9 @@ def _render(template_name: str, context: dict) -> str:
     return env.get_template(template_name).render(context)
 
 
-def _interfaces_context(spec: KernelSpec) -> list[dict]:
-    """Build template-friendly interface list from KernelSpec."""
-    result = []
+def _build_interfaces_context(spec: KernelSpec) -> dict[str, dict]:
+    """Build template-friendly interfaces dict from KernelSpec."""
+    interfaces = {}
     for name, iface in spec.interfaces.items():
         entry = {
             "name": name,
@@ -39,32 +44,37 @@ def _interfaces_context(spec: KernelSpec) -> list[dict]:
             "data_width": iface.data_width or 256,
             "addr_width": iface.addr_width or 64,
             "rtl_port": iface.rtl_port,
+            "ext_port": iface.ext_port,
         }
         # Direction inference for AXI4-Stream
         if iface.protocol == Protocol.AXI4S:
-            if iface.rtl_port.startswith("s_"):
-                entry["direction"] = "input"
-            else:
-                entry["direction"] = "output"
+            role = iface.role or (
+                "master" if iface.rtl_port.startswith("m_") else "slave"
+            )
+            entry["direction"] = "output" if role == "master" else "input"
+        else:
+            entry["direction"] = "output"
 
-        # XRT memory bank
+        # Memory bank
         if iface.xrt and iface.xrt.memory_bank:
             entry["memory_bank"] = iface.xrt.memory_bank
         elif iface.memory_region:
             entry["memory_bank"] = iface.memory_region
+        else:
+            entry["memory_bank"] = "DDR[0]"
 
-        # Buffer size estimation
-        entry["buffer_size"] = 4096  # default, overridden by actual tensor size
+        # Buffer size
+        entry["buffer_size"] = 4096
 
         # AXI4-Lite address range
         if iface.protocol == Protocol.AXI4L:
             entry["addr_range"] = 2 ** (iface.addr_width or 12)
 
-        result.append(entry)
-    return result
+        interfaces[name] = entry
+    return interfaces
 
 
-def _registers_context(spec: KernelSpec) -> list[dict]:
+def _build_registers_context(spec: KernelSpec) -> list[dict]:
     """Extract register definitions for IP packaging."""
     registers = []
     for name, iface in spec.interfaces.items():
@@ -78,6 +88,51 @@ def _registers_context(spec: KernelSpec) -> list[dict]:
                     "width": reg.width,
                 })
     return registers
+
+
+def _build_args_context(spec: KernelSpec) -> list[dict]:
+    """Build kernel.xml args from interfaces with xrt.arg_index.
+
+    Each AXI4 memory interface with xrt config becomes an arg.
+    The offset is derived from the first auto_bind register with value=address
+    for the corresponding tensor.
+    """
+    args = []
+
+    # Map tensor name → first address register offset
+    tensor_addr_offsets: dict[str, int] = {}
+    for _name, iface in spec.interfaces.items():
+        if iface.protocol != Protocol.AXI4L or not iface.registers:
+            continue
+        for reg in iface.registers:
+            if (
+                reg.auto_bind
+                and reg.auto_bind.value == "address"
+                and reg.auto_bind.tensor
+                and reg.auto_bind.tensor not in tensor_addr_offsets
+            ):
+                tensor_addr_offsets[reg.auto_bind.tensor] = reg.offset
+
+    # Build args from AXI4 interfaces with xrt config
+    for name, iface in spec.interfaces.items():
+        if not iface.xrt or iface.xrt.arg_index is None:
+            continue
+
+        tensor_name = getattr(iface, "tensor", None) or name
+        offset = tensor_addr_offsets.get(tensor_name, 0x10)
+
+        args.append({
+            "name": name,
+            "address_qualifier": 4 if iface.protocol == Protocol.AXI4S else 1,
+            "id": iface.xrt.arg_index,
+            "port": iface.ext_port,
+            "size": 8,  # 64-bit address pointer
+            "offset": offset,
+            "type": "int*",
+        })
+
+    args.sort(key=lambda a: a["id"])
+    return args
 
 
 class XrtGenerator:
@@ -108,81 +163,90 @@ class XrtGenerator:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
-        # Build template contexts
-        interfaces = {}
-        for name, iface in self._spec.interfaces.items():
-            interfaces[name] = {
-                "protocol": iface.protocol.value,
-                "data_width": iface.data_width or 256,
-                "addr_width": iface.addr_width or 64,
-                "rtl_port": iface.rtl_port,
-                "direction": "input" if (
-                    iface.protocol == Protocol.AXI4S
-                    and iface.rtl_port.startswith("s_")
-                ) else "output",
-                "memory_bank": (
-                    iface.xrt.memory_bank
-                    if iface.xrt and iface.xrt.memory_bank
-                    else iface.memory_region or "HBM[0]"
-                ),
-                "buffer_size": 4096,
-                "addr_range": 2 ** (iface.addr_width or 12) if iface.protocol == Protocol.AXI4L else 0,
-            }
-
-        rtl_sources = []
-        for pat in self._config.get("rtl", {}).get("sources", []):
-            rtl_sources.append(pat)
-
-        registers = _registers_context(self._spec)
-
+        interfaces = _build_interfaces_context(self._spec)
+        registers = _build_registers_context(self._spec)
+        args = _build_args_context(self._spec)
         kernel_name = self._spec.kernel_name
+
+        # RTL sources from project config (relative to project_root)
+        rtl_sources = self._config.get("rtl", {}).get("sources", [])
+
+        # Generated codegen files — filenames only (relative to $project_dir)
+        generated_files = self._config.get("generated_files", [])
+
+        # vten_sv interface files — filenames only (relative to $vten_root)
+        vten_sv_files = self._config.get("vten_sv_files", [])
+
+        # Project root (relative path from output_dir to project root)
+        project_root = self._config.get("_project_root", "")
+
+        # vten_root (path to vten_sv directory)
+        vten_root = self._config.get("_vten_root", "")
+
+        # FPGA part
+        part = self._config.get("backend", {}).get("xrt", {}).get("part", "")
+
+        # Platform and target for build script
+        xrt_config = self._config.get("backend", {}).get("xrt", {})
+        platform = xrt_config.get("platform", "")
+        target = xrt_config.get("target", "hw_emu")
+
         generated: dict[str, Path] = {}
 
         # 1. package_ip.tcl
-        packaging_dir = out / "packaging"
-        packaging_dir.mkdir(exist_ok=True)
-
-        package_ip_tcl = _render("package_ip.tcl.j2", {
+        content = _render("package_ip.tcl.j2", {
             "kernel_name": kernel_name,
             "rtl_sources": rtl_sources,
+            "generated_files": generated_files,
+            "vten_sv_files": vten_sv_files,
+            "project_root": project_root,
+            "vten_root": vten_root,
             "interfaces": interfaces,
             "registers": registers,
+            "part": part,
         })
-        path = packaging_dir / "package_ip.tcl"
-        path.write_text(package_ip_tcl)
+        path = out / "package_ip.tcl"
+        path.write_text(content)
         generated["package_ip.tcl"] = path
 
         # 2. kernel.xml
-        kernel_xml = _render("kernel.xml.j2", {
+        content = _render("kernel.xml.j2", {
             "kernel_name": kernel_name,
             "interfaces": interfaces,
+            "args": args,
         })
-        path = packaging_dir / "kernel.xml"
-        path.write_text(kernel_xml)
+        path = out / "kernel.xml"
+        path.write_text(content)
         generated["kernel.xml"] = path
 
         # 3. gen_xo.tcl
-        xo_path = f"{kernel_name}.xo"
-        gen_xo_tcl = _render("gen_xo.tcl.j2", {
+        content = _render("gen_xo.tcl.j2", {
             "kernel_name": kernel_name,
-            "xo_path": xo_path,
-            "kernel_xml_path": "packaging/kernel.xml",
         })
-        path = packaging_dir / "xo_gen.tcl"
-        path.write_text(gen_xo_tcl)
-        generated["xo_gen.tcl"] = path
+        path = out / "gen_xo.tcl"
+        path.write_text(content)
+        generated["gen_xo.tcl"] = path
 
         # 4. connectivity.cfg
-        link_dir = out / "link"
-        link_dir.mkdir(exist_ok=True)
-
-        connectivity_cfg = _render("connectivity.cfg.j2", {
+        content = _render("connectivity.cfg.j2", {
             "kernel_name": kernel_name,
             "interfaces": interfaces,
             "stream_connections": [],
         })
-        path = link_dir / "connectivity.cfg"
-        path.write_text(connectivity_cfg)
+        path = out / "connectivity.cfg"
+        path.write_text(content)
         generated["connectivity.cfg"] = path
+
+        # 5. build script
+        content = _render("build_xrt.sh.j2", {
+            "kernel_name": kernel_name,
+            "platform": platform,
+            "target": target,
+        })
+        script_name = f"build_{target}.sh"
+        path = out / script_name
+        path.write_text(content)
+        path.chmod(0o755)
+        generated[script_name] = path
 
         return generated

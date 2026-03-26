@@ -304,20 +304,10 @@ def _parse_registers(
                 f"Register '{r['name']}': invalid access '{access}'"
             )
         pulse = r.get("pulse", False)
-        if pulse and access != "rw":
+        if pulse and access not in ("rw", "wo"):
             raise SpecValidationError(
-                f"Register '{r['name']}': pulse is only valid with access='rw'"
-            )
-        source = r.get("source", "software")
-        if source not in ("software", "hardware"):
-            raise SpecValidationError(
-                f"Register '{r['name']}': invalid source '{source}', "
-                f"must be 'software' or 'hardware'"
-            )
-        if source == "hardware" and pulse:
-            raise SpecValidationError(
-                f"Register '{r['name']}': source='hardware' and pulse=true "
-                f"are mutually exclusive"
+                f"Register '{r['name']}': pulse is only valid with "
+                f"access='rw' or 'wo'"
             )
         # Offset: explicit or auto-assigned from user_register_base
         if "offset" in r:
@@ -336,7 +326,6 @@ def _parse_registers(
                 access=access,
                 pulse=pulse,
                 reset_value=r.get("reset_value", 0),
-                source=source,
             )
         )
     return registers

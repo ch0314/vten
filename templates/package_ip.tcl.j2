@@ -3,23 +3,31 @@
 # Usage: vivado -mode batch -source package_ip.tcl
 
 set project_dir [file dirname [file normalize [info script]]]
+{% if project_root %}
+set project_root [file normalize "$project_dir/{{ project_root }}"]
+{% else %}
+set project_root $project_dir
+{% endif %}
+{% if vten_root %}
+set vten_root [file normalize "$project_dir/{{ vten_root }}"]
+{% endif %}
 
 # Create packaging project
 create_project package_ip $project_dir/package_ip_proj -force{{ " -part " ~ part if part else "" }}
 
 # Add RTL sources
 {% for src in rtl_sources %}
-add_files [glob {{ src }}]
+add_files $project_root/{{ src }}
 {% endfor %}
 
 # Add codegen-generated files (wrapper + axilite controller)
 {% for gen_file in generated_files %}
-add_files {{ gen_file }}
+add_files $project_dir/{{ gen_file }}
 {% endfor %}
 
 # Add vten SV interface definitions
 {% for sv_file in vten_sv_files %}
-add_files {{ sv_file }}
+add_files $vten_root/{{ sv_file }}
 {% endfor %}
 
 set_property top {{ kernel_name }} [current_fileset]
@@ -37,7 +45,10 @@ ipx::associate_bus_interfaces -busif {{ iface.ext_port }} -clock ap_clk [ipx::cu
 {% for name, iface in interfaces.items() if iface.protocol == "axi4" %}
 set {{ iface.ext_port }}_as [ipx::get_address_spaces -quiet {{ iface.ext_port }} -of_objects [ipx::current_core]]
 if {${{ iface.ext_port }}_as ne ""} {
-    set_property range 16E [ipx::get_address_spaces {{ iface.ext_port }} -of_objects [ipx::current_core]]
+    set_property range_format     long     [ipx::get_address_spaces {{ iface.ext_port }} -of_objects [ipx::current_core]]
+    set_property range_minimum    4096     [ipx::get_address_spaces {{ iface.ext_port }} -of_objects [ipx::current_core]]
+    set_property width            {{ iface.addr_width }}       [ipx::get_address_spaces {{ iface.ext_port }} -of_objects [ipx::current_core]]
+    set_property range            {{ 2 ** iface.addr_width }}  [ipx::get_address_spaces {{ iface.ext_port }} -of_objects [ipx::current_core]]
 }
 {% endfor %}
 

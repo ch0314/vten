@@ -9,6 +9,7 @@ Spec reference: 08_backend_abstraction.md §6
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from vten.backend.base import Backend, BackendResult
@@ -44,9 +45,29 @@ class XrtBackend(Backend):
         self._uuid: Any = None
         self._xrt: Any = None  # pyxrt module
         self._default_ip: Any = None
-        self._default_kernel: Any = None  # for group_id() queries
+        self._group_ids: dict[int, int] = {}  # arg_index → memory group
         self._ips: dict[str, Any] = {}  # ip_name → xrt.ip
         self._interpreter: Any = None
+
+    def _setup_emulation_env(self) -> None:
+        """Auto-configure emulation environment if xclbin is hw_emu."""
+        import os
+        import shutil
+
+        if not self._xclbin_path:
+            return
+
+        xclbin = Path(self._xclbin_path)
+        if "_hw_emu" in xclbin.name or "hw_emu" in str(xclbin.parent):
+            if not os.environ.get("XCL_EMULATION_MODE"):
+                os.environ["XCL_EMULATION_MODE"] = "hw_emu"
+
+            # Copy emconfig.json to CWD if not present
+            cwd_emconfig = Path.cwd() / "emconfig.json"
+            if not cwd_emconfig.exists():
+                xclbin_emconfig = xclbin.parent / "emconfig.json"
+                if xclbin_emconfig.exists():
+                    shutil.copy2(xclbin_emconfig, cwd_emconfig)
 
     def _init_device(self) -> None:
         """Initialize FPGA device and load xclbin.
@@ -54,6 +75,16 @@ class XrtBackend(Backend):
         Called lazily on first execute() to allow configuration
         without requiring actual FPGA hardware.
         """
+        # Check XRT installation
+        xrt_setup = Path("/opt/xilinx/xrt/setup.sh")
+        if not xrt_setup.exists():
+            import os
+            if not os.environ.get("XILINX_XRT"):
+                raise BackendError(
+                    "XRT not found. Install Xilinx Runtime (XRT) and "
+                    "source /opt/xilinx/xrt/setup.sh before running."
+                )
+
         try:
             import vten_xrt as pyxrt  # vTen's own XRT bindings (xrt::ip support)
         except ImportError:
@@ -63,7 +94,7 @@ class XrtBackend(Backend):
                 raise BackendError(
                     "XRT Python bindings not available. "
                     "Build vten_xrt: cd vten/xrt_binding && mkdir build "
-                    "&& cd build && cmake .. && make. "
+                    "&& cd build && cmake .. && make && pip install . "
                     "Or install XRT runtime: https://github.com/Xilinx/XRT"
                 ) from e
 
@@ -72,8 +103,17 @@ class XrtBackend(Backend):
         if not self._xclbin_path:
             raise BackendError(
                 "xclbin_path not configured in [backend.xrt]. "
-                "Build xclbin first: v++ --link ..."
+                "Build xclbin first: vten build --backend xrt"
             )
+
+        xclbin_file = Path(self._xclbin_path)
+        if not xclbin_file.exists():
+            raise BackendError(
+                f"xclbin not found: {self._xclbin_path}. "
+                "Build it first: vten build --backend xrt --run-vivado"
+            )
+
+        self._setup_emulation_env()
 
         self._device = pyxrt.device(self._device_index)
         self._xclbin = pyxrt.xclbin(self._xclbin_path)
@@ -88,14 +128,23 @@ class XrtBackend(Backend):
                 ip_name = self._kernel_name
 
             # Create xrt.kernel first for group_id() (memory bank queries),
-            # then release it before creating xrt.ip (exclusive access).
+            # then delete it before creating xrt.ip (exclusive access).
+            # xrt.kernel and xrt.ip cannot coexist for the same CU.
             if hasattr(pyxrt, "kernel"):
                 try:
-                    self._default_kernel = pyxrt.kernel(
+                    tmp_kernel = pyxrt.kernel(
                         self._device, self._uuid, ip_name,
                     )
+                    # Cache group_ids before releasing kernel
+                    self._group_ids: dict[int, int] = {}
+                    for arg_idx in range(16):
+                        try:
+                            self._group_ids[arg_idx] = tmp_kernel.group_id(arg_idx)
+                        except Exception:
+                            break
+                    del tmp_kernel
                 except Exception:
-                    self._default_kernel = None
+                    pass
 
             self._default_ip = self._get_or_create_ip(ip_name)
 
@@ -154,14 +203,8 @@ class XrtBackend(Backend):
         if compiled.flattened_view is None:
             return bank_map
 
-        # Build arg_index → runtime group_id from kernel.group_id()
-        group_ids: dict[int, int] = {}
-        if self._default_kernel is not None:
-            for arg_idx in range(16):
-                try:
-                    group_ids[arg_idx] = self._default_kernel.group_id(arg_idx)
-                except Exception:
-                    break
+        # Use cached group_ids from init (kernel was released for ip access)
+        group_ids: dict[int, int] = getattr(self, "_group_ids", {})
 
         for name, exposed in compiled.flattened_view.exposed_tensors.items():
             buffer_id = compiled.buffer_ids.get(name)
@@ -285,7 +328,7 @@ class XrtBackend(Backend):
             self._interpreter.cleanup()
             self._interpreter = None
         self._default_ip = None
-        self._default_kernel = None
+        self._group_ids = {}
         self._ips.clear()
         self._device = None
         self._xclbin = None

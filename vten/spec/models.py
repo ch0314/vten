@@ -213,9 +213,8 @@ class RegisterSpec:
     auto_bind: AutoBindSpec | None = None
     interface_name: str = ""
     access: str = "rw"  # rw | ro | wo | w1c
-    pulse: bool = False  # 1-cycle pulse (only with access=rw)
+    pulse: bool = False  # 1-cycle pulse (only with access=rw/wo)
     reset_value: int = 0
-    source: str = "software"  # "software" | "hardware"
 
     @property
     def width(self) -> int:

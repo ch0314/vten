@@ -50,6 +50,10 @@ class ConnectionShapeMismatchError(ValidationError):
     pass
 
 
+class ConnectionDtypeMismatchError(ValidationError):
+    pass
+
+
 class SpecValidationError(ValidationError):
     """Spec parsing / validation error."""
 

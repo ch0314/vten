@@ -75,7 +75,7 @@ class TestXrtBuildPipelineInit:
         assert issubclass(XrtBuildPipeline, BuildPipeline)
 
     def test_stages_returns_correct_list(self, pipeline: XrtBuildPipeline) -> None:
-        expected = ["gen_packaging", "gen_xo", "gen_link_cfg", "validate"]
+        expected = ["gen_codegen", "gen_xrt_packaging", "validate"]
         assert pipeline.stages() == expected
 
     def test_stages_returns_new_list(self, pipeline: XrtBuildPipeline) -> None:
@@ -85,11 +85,11 @@ class TestXrtBuildPipelineInit:
         assert s1 == s2
         assert s1 is not s2
 
-    def test_project_level_stages_returns_gen_link_cfg(
+    def test_project_level_stages_returns_empty(
         self, pipeline: XrtBuildPipeline
     ) -> None:
         result = pipeline.project_level_stages()
-        assert set(result) == {"gen_link_cfg"}
+        assert result == []
 
     def test_project_level_stages_returns_list(
         self, pipeline: XrtBuildPipeline
@@ -106,69 +106,55 @@ class TestXrtBuildPipelineInit:
 class TestStageExecution:
     """§2 run_stage for each stage name."""
 
-    def test_gen_packaging_creates_artifacts(
+    def test_gen_codegen_creates_wrapper(
         self, pipeline: XrtBuildPipeline, kernel_dir: Path
     ) -> None:
-        """gen_packaging should create package_ip.tcl, kernel.xml, xo_gen.tcl,
-        and connectivity.cfg under kernel_dir/build/."""
-        pipeline.run_stage("gen_packaging", "test_kern", kernel_dir, force=False)
+        """gen_codegen should create wrapper.sv under kernel_dir/build/xrt/."""
+        pipeline.run_stage("gen_codegen", "test_kern", kernel_dir, force=False)
 
-        build_dir = kernel_dir / "build"
-        packaging = build_dir / "packaging"
-        assert packaging.is_dir()
-        assert (packaging / "package_ip.tcl").exists()
-        assert (packaging / "kernel.xml").exists()
-        assert (packaging / "xo_gen.tcl").exists()
+        build_dir = kernel_dir / "build" / "xrt"
+        assert build_dir.is_dir()
+        # Should have at least the wrapper file
+        sv_files = list(build_dir.glob("*.sv"))
+        assert len(sv_files) >= 1
 
-        link = build_dir / "link"
-        assert (link / "connectivity.cfg").exists()
-
-    def test_gen_packaging_no_spec_raises(
+    def test_gen_codegen_no_spec_raises(
         self, pipeline: XrtBuildPipeline, tmp_path: Path
     ) -> None:
-        """gen_packaging raises BuildError when kernel_spec.yaml is missing."""
+        """gen_codegen raises BuildError when kernel_spec.yaml is missing."""
         empty_dir = tmp_path / "kernels" / "missing"
         empty_dir.mkdir(parents=True)
         with pytest.raises(BuildError, match="kernel_spec.yaml not found"):
-            pipeline.run_stage("gen_packaging", "missing", empty_dir, force=False)
+            pipeline.run_stage("gen_codegen", "missing", empty_dir, force=False)
 
-    def test_gen_xo_succeeds_after_packaging(
+    def test_gen_xrt_packaging_creates_artifacts(
         self, pipeline: XrtBuildPipeline, kernel_dir: Path
     ) -> None:
-        """gen_xo should succeed when xo_gen.tcl already exists."""
-        # First run gen_packaging to create xo_gen.tcl
-        pipeline.run_stage("gen_packaging", "test_kern", kernel_dir, force=False)
-        # Then gen_xo should verify it exists without error
-        pipeline.run_stage("gen_xo", "test_kern", kernel_dir, force=False)
+        """gen_xrt_packaging should create TCL/XML/CFG/build script."""
+        pipeline.run_stage("gen_xrt_packaging", "test_kern", kernel_dir, force=False)
 
-    def test_gen_xo_raises_without_packaging(
-        self, pipeline: XrtBuildPipeline, kernel_dir: Path
-    ) -> None:
-        """gen_xo raises BuildError when xo_gen.tcl does not exist."""
-        with pytest.raises(BuildError, match="xo_gen.tcl not found"):
-            pipeline.run_stage("gen_xo", "test_kern", kernel_dir, force=False)
+        build_dir = kernel_dir / "build" / "xrt"
+        assert (build_dir / "package_ip.tcl").exists()
+        assert (build_dir / "kernel.xml").exists()
+        assert (build_dir / "gen_xo.tcl").exists()
+        assert (build_dir / "connectivity.cfg").exists()
+        # Build script
+        sh_files = list(build_dir.glob("build_*.sh"))
+        assert len(sh_files) >= 1
 
-    def test_gen_link_cfg_project_level(
-        self, pipeline: XrtBuildPipeline
+    def test_gen_xrt_packaging_no_spec_raises(
+        self, pipeline: XrtBuildPipeline, tmp_path: Path
     ) -> None:
-        """gen_link_cfg runs at project level (no kernel_dir needed)."""
-        # Should not raise even with no kernels discovered
-        pipeline.run_stage("gen_link_cfg", None, None, force=False)
-
-    def test_gen_link_cfg_with_kernel(
-        self, pipeline: XrtBuildPipeline, kernel_dir: Path
-    ) -> None:
-        """gen_link_cfg discovers kernels and reports their connectivity."""
-        # First generate packaging so link cfg exists
-        pipeline.run_stage("gen_packaging", "test_kern", kernel_dir, force=False)
-        # gen_link_cfg uses project root to discover kernels
-        pipeline.run_stage("gen_link_cfg", None, None, force=False)
+        """gen_xrt_packaging raises BuildError when kernel_spec.yaml is missing."""
+        empty_dir = tmp_path / "kernels" / "missing"
+        empty_dir.mkdir(parents=True)
+        with pytest.raises(BuildError, match="kernel_spec.yaml not found"):
+            pipeline.run_stage("gen_xrt_packaging", "missing", empty_dir, force=False)
 
     def test_validate_skips_when_no_xclbin(
         self, pipeline: XrtBuildPipeline, kernel_dir: Path
     ) -> None:
         """validate should skip gracefully when no xclbin is configured."""
-        # No xclbin_path in config => skip
         pipeline.run_stage("validate", "test_kern", kernel_dir, force=False)
 
     def test_validate_skips_when_xclbin_path_missing(
@@ -177,7 +163,6 @@ class TestStageExecution:
         """validate should skip when xclbin_path points to non-existent file."""
         config = {"backend": {"xrt": {"xclbin_path": "/nonexistent/path.xclbin"}}}
         pipe = XrtBuildPipeline(tmp_path, config)
-        # Should not raise, just skip
         pipe.run_stage("validate", "test_kern", kernel_dir, force=False)
 
     def test_unknown_stage_raises_build_error(

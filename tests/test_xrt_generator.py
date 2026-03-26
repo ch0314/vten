@@ -2,7 +2,7 @@
 
 Tests cover:
   S1: Initialization — constructor stores spec and config
-  S2: File generation — generate() creates 4 files in correct subdirs
+  S2: File generation — generate() creates files in output dir
   S3: Template rendering — protocol-specific content in generated files
 """
 
@@ -12,6 +12,7 @@ import pytest
 
 from vten.codegen.xrt_generator import XrtGenerator
 from vten.spec.models import (
+    AutoBindSpec,
     InterfaceSpec,
     KernelSpec,
     Protocol,
@@ -35,7 +36,11 @@ def _make_spec() -> KernelSpec:
                 protocol=Protocol.AXI4,
                 data_width=256,
                 addr_width=64,
-                xrt=XrtInterfaceConfig(memory_bank="HBM[0]"),
+                xrt=XrtInterfaceConfig(
+                    memory_bank="HBM[0]",
+                    arg_index=0,
+                ),
+                tensor="input_data",
             ),
             "ctrl": InterfaceSpec(
                 name="ctrl",
@@ -48,6 +53,13 @@ def _make_spec() -> KernelSpec:
                         name="CONTROL",
                         offset=0x00,
                         fields={"start": "0:0", "done": "1:1"},
+                    ),
+                    RegisterSpec(
+                        name="addr_lo",
+                        offset=0x10,
+                        auto_bind=AutoBindSpec(
+                            tensor="input_data", value="address", bits="31:0"
+                        ),
                     ),
                 ],
             ),
@@ -89,62 +101,52 @@ class TestXrtGeneratorInit:
 
 
 class TestFileGeneration:
-    """generate() creates the 4 expected files in correct subdirs."""
+    """generate() creates the expected files in output dir."""
 
     @pytest.fixture()
     def result(self, tmp_path):
         gen = XrtGenerator(_make_spec())
         return gen.generate(str(tmp_path))
 
-    def test_returns_four_keys(self, result):
+    def test_returns_expected_keys(self, result):
         assert set(result.keys()) == {
             "package_ip.tcl",
             "kernel.xml",
-            "xo_gen.tcl",
+            "gen_xo.tcl",
             "connectivity.cfg",
+            "build_hw_emu.sh",
         }
 
     def test_all_files_exist(self, result):
         for path in result.values():
             assert path.exists(), f"{path} does not exist"
 
-    def test_package_ip_in_packaging_subdir(self, result):
-        assert result["package_ip.tcl"].parent.name == "packaging"
-
-    def test_kernel_xml_in_packaging_subdir(self, result):
-        assert result["kernel.xml"].parent.name == "packaging"
-
-    def test_xo_gen_in_packaging_subdir(self, result):
-        assert result["xo_gen.tcl"].parent.name == "packaging"
-
-    def test_connectivity_in_link_subdir(self, result):
-        assert result["connectivity.cfg"].parent.name == "link"
-
-    def test_package_ip_contains_interface_declarations(self, result):
-        content = result["package_ip.tcl"].read_text()
-        assert "ipx::add_bus_interface" in content
+    def test_files_in_flat_output_dir(self, result):
+        """All files should be in the same directory."""
+        parents = {path.parent for path in result.values()}
+        assert len(parents) == 1
 
     def test_kernel_xml_contains_kernel_name(self, result):
         content = result["kernel.xml"].read_text()
         assert 'name="test_kern"' in content
 
-    def test_xo_gen_contains_kernel_name(self, result):
-        content = result["xo_gen.tcl"].read_text()
+    def test_gen_xo_contains_kernel_name(self, result):
+        content = result["gen_xo.tcl"].read_text()
         assert "test_kern" in content
 
     def test_connectivity_contains_kernel_name(self, result):
         content = result["connectivity.cfg"].read_text()
         assert "test_kern" in content
 
-    def test_kernel_xml_contains_interface_names(self, result):
+    def test_kernel_xml_contains_ext_port_names(self, result):
         content = result["kernel.xml"].read_text()
-        assert "data_in" in content
-        assert "ctrl" in content
+        assert "m_axi_data_in" in content
+        assert "s_axi_ctrl" in content
 
-    def test_package_ip_contains_interface_names(self, result):
+    def test_package_ip_contains_ext_port_names(self, result):
         content = result["package_ip.tcl"].read_text()
-        assert "data_in" in content
-        assert "ctrl" in content
+        assert "m_axi_data_in" in content
+        assert "s_axi_ctrl" in content
 
     def test_output_dir_created_if_missing(self, tmp_path):
         out = tmp_path / "nested" / "deep"
@@ -153,6 +155,12 @@ class TestFileGeneration:
         assert out.exists()
         for path in result.values():
             assert path.exists()
+
+    def test_build_script_is_executable(self, result):
+        import stat
+
+        path = result["build_hw_emu.sh"]
+        assert path.stat().st_mode & stat.S_IXUSR
 
 
 # ============================================================
@@ -168,11 +176,11 @@ class TestTemplateRendering:
         gen = XrtGenerator(_make_spec())
         return gen.generate(str(tmp_path))
 
-    # -- connectivity.cfg: AXI4 interfaces produce sp= lines --
+    # -- connectivity.cfg: AXI4 interfaces produce sp= lines with ext_port --
 
     def test_connectivity_has_sp_line_for_axi4(self, generated):
         content = generated["connectivity.cfg"].read_text()
-        assert "sp=test_kern_1.data_in:HBM[0]" in content
+        assert "sp=test_kern_1.m_axi_data_in:HBM[0]" in content
 
     def test_connectivity_no_sp_line_for_axilite(self, generated):
         """AXI4-Lite interfaces should not appear as sp= entries."""
@@ -185,44 +193,66 @@ class TestTemplateRendering:
 
     def test_kernel_xml_axilite_has_addr_range(self, generated):
         content = generated["kernel.xml"].read_text()
-        # addr_width=12 => addr_range = 2^12 = 4096 = 0x1000
-        assert 'name="ctrl"' in content
+        assert 'name="s_axi_ctrl"' in content
         assert 'mode="slave"' in content
         assert "0x1000" in content
 
     def test_kernel_xml_axi4_has_master_mode(self, generated):
         content = generated["kernel.xml"].read_text()
-        assert 'name="data_in"' in content
+        assert 'name="m_axi_data_in"' in content
         assert 'mode="master"' in content
 
     def test_kernel_xml_axi4_data_width(self, generated):
         content = generated["kernel.xml"].read_text()
         assert 'dataWidth="256"' in content
 
+    def test_kernel_xml_has_vlnv(self, generated):
+        content = generated["kernel.xml"].read_text()
+        assert 'vlnv="user.org:kernel:test_kern:1.0"' in content
+
+    def test_kernel_xml_has_ip_c_language(self, generated):
+        content = generated["kernel.xml"].read_text()
+        assert 'language="ip_c"' in content
+
+    def test_kernel_xml_has_interrupt(self, generated):
+        content = generated["kernel.xml"].read_text()
+        assert 'interrupt="true"' in content
+
+    def test_kernel_xml_args_have_id_and_offset(self, generated):
+        content = generated["kernel.xml"].read_text()
+        assert 'id="0"' in content
+        assert 'offset="0x10"' in content
+        assert 'type="int*"' in content
+
     # -- package_ip.tcl: registers appear --
 
     def test_package_ip_contains_register(self, generated):
         content = generated["package_ip.tcl"].read_text()
         assert "CONTROL" in content
-        assert "0x0000" in content
 
-    def test_package_ip_axi4_bus_interface(self, generated):
+    def test_package_ip_has_sdx_kernel(self, generated):
         content = generated["package_ip.tcl"].read_text()
-        assert "aximm_rtl" in content
+        assert "sdx_kernel true" in content
+        assert "sdx_kernel_type rtl" in content
 
-    def test_package_ip_axilite_slave_mode(self, generated):
+    def test_package_ip_has_clock_association(self, generated):
         content = generated["package_ip.tcl"].read_text()
-        assert "interface_mode slave" in content
+        assert "ap_clk" in content
 
     # -- gen_xo.tcl: XO path and kernel_xml reference --
 
-    def test_xo_gen_has_xo_path(self, generated):
-        content = generated["xo_gen.tcl"].read_text()
+    def test_gen_xo_has_xo_path(self, generated):
+        content = generated["gen_xo.tcl"].read_text()
         assert "test_kern.xo" in content
 
-    def test_xo_gen_references_kernel_xml(self, generated):
-        content = generated["xo_gen.tcl"].read_text()
+    def test_gen_xo_references_kernel_xml(self, generated):
+        content = generated["gen_xo.tcl"].read_text()
         assert "kernel.xml" in content
+
+    def test_gen_xo_uses_script_dir(self, generated):
+        content = generated["gen_xo.tcl"].read_text()
+        assert "set script_dir" in content
+        assert "$script_dir" in content
 
     # -- RTL sources in package_ip.tcl --
 
@@ -248,4 +278,13 @@ class TestTemplateRendering:
         content = result["package_ip.tcl"].read_text()
         assert "CONTROL" in content
         assert "STATUS" in content
-        assert "0x0004" in content
+
+    # -- Build script --
+
+    def test_build_script_contains_kernel_name(self, generated):
+        content = generated["build_hw_emu.sh"].read_text()
+        assert "test_kern" in content
+
+    def test_build_script_references_v_plus_plus(self, generated):
+        content = generated["build_hw_emu.sh"].read_text()
+        assert "v++ -l" in content

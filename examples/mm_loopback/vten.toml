@@ -18,13 +18,16 @@ threads = 4
 trace = false
 
 [backend.xrt]
-xclbin_path = "build/xrt/mm_loopback_hw_emu.xclbin"
+xclbin_path = "kernels/mm_loopback/build/xrt/mm_loopback_hw_emu.xclbin"
 device_index = 0
-kernel_name = "mm_loopback_xrt_top"
+kernel_name = "mm_loopback"
 poll_timeout_ms = 300000
+platform = "/opt/xilinx/platforms/xilinx_u280_gen3x16_xdma_1_202211_1/xilinx_u280_gen3x16_xdma_1_202211_1.xpfm"
+part = "xcu280-fsvh2892-2L-e"
+target = "hw_emu"
 
 [rtl]
-sources = ["rtl/**/*.sv", "rtl/**/*.v"]
+sources = ["rtl/*.sv"]
 
 [test]
 default_seed = 42

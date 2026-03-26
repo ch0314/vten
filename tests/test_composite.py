@@ -450,3 +450,164 @@ class TestCompositeIsKernel:
 
     def test_has_spec(self):
         assert NPU3DKernel.spec == "npu_3d.yaml"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §7  Connection validation — protocol, dtype, coverage, duplicates
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestConnectDestInterface:
+    """Connect should capture dest_interface at construction time."""
+
+    def test_dest_interface_stored(self):
+        """Connect(fmapIO.ifm_out, mac_atu.ifm_in) → dest_interface='ifm_in'."""
+        conn = Connect(FmapIOKernel.bind(
+            interface_map={"ctrl": "c", "ddr": "d", "ifm_out": Internal(), "ofm_in": Internal()},
+        ).ifm_out, MacAtuKernel.bind(
+            interface_map={"ctrl": "c", "ifm_in": Internal(), "wgt_in": Internal(), "psum_out": Internal()},
+        ).ifm_in)
+        assert conn.dest_interface == "ifm_in"
+
+    def test_source_interface_stored(self):
+        conn = Connect(FmapIOKernel.bind(
+            interface_map={"ctrl": "c", "ddr": "d", "ifm_out": Internal(), "ofm_in": Internal()},
+        ).ifm_out, MacAtuKernel.bind(
+            interface_map={"ctrl": "c", "ifm_in": Internal(), "wgt_in": Internal(), "psum_out": Internal()},
+        ).ifm_in)
+        assert conn.source_interface == "ifm_out"
+
+
+class TestConnectionValidation:
+    """Connection validation through RuntimeEngine._validate_flattened()."""
+
+    def _make_simple_kernels(self):
+        """Create two simple stream kernels for validation testing."""
+
+        class SrcKernel(Kernel):
+            spec = "src.yaml"
+            data_out = Tensor(shape=(8,), dtype=torch.int8, interface="output_stream")
+            ctrl = register("ctrl")
+            def generate_inputs(self, seed=None): pass
+            def forward(self): return torch.zeros(8)
+
+        class DstKernel(Kernel):
+            spec = "dst.yaml"
+            data_in = Tensor(shape=(8,), dtype=torch.int8, interface="input_stream")
+            ctrl = register("ctrl")
+            def generate_inputs(self, seed=None): pass
+            def forward(self): return torch.zeros(8)
+
+        return SrcKernel, DstKernel
+
+    def _make_dtype_mismatch_kernels(self):
+        """Create kernels with mismatched dtypes."""
+
+        class SrcF32(Kernel):
+            spec = "src.yaml"
+            data_out = Tensor(shape=(8,), dtype=torch.float32, interface="output_stream")
+            ctrl = register("ctrl")
+            def generate_inputs(self, seed=None): pass
+            def forward(self): return torch.zeros(8)
+
+        class DstI8(Kernel):
+            spec = "dst.yaml"
+            data_in = Tensor(shape=(8,), dtype=torch.int8, interface="input_stream")
+            ctrl = register("ctrl")
+            def generate_inputs(self, seed=None): pass
+            def forward(self): return torch.zeros(8)
+
+        return SrcF32, DstI8
+
+    def test_dtype_mismatch_raises(self):
+        """Connecting float32 → int8 without transform should raise."""
+        from vten.errors import ConnectionDtypeMismatchError
+        from vten.runtime.engine import RuntimeEngine
+        from vten.runtime.flattener import (
+            ExposedTensor, InterfaceMapping, KernelInstance,
+        )
+        from vten.spec.models import Direction, KernelSpec, MappingType
+
+        SrcF32, DstI8 = self._make_dtype_mismatch_kernels()
+
+        # Build a minimal composite with dtype mismatch
+        class BadDtypeComposite(CompositeKernel):
+            spec = "bad.yaml"
+            src = SrcF32.bind(interface_map={
+                "ctrl": "ctrl_src",
+                "output_stream": Internal(),
+            })
+            dst = DstI8.bind(interface_map={
+                "ctrl": "ctrl_dst",
+                "input_stream": Internal(),
+            })
+            connections = [Connect(src.data_out, dst.data_in)]
+
+        conn = BadDtypeComposite.connections[0]
+
+        # Build minimal sub-kernel instances for validation
+        src_ki = KernelInstance(
+            name="src",
+            spec=KernelSpec(kernel_name="SrcF32", rtl_top="SrcF32"),
+            kernel_class=SrcF32,
+        )
+        src_ki.kernel_class_instance = SrcF32()
+        dst_ki = KernelInstance(
+            name="dst",
+            spec=KernelSpec(kernel_name="DstI8", rtl_top="DstI8"),
+            kernel_class=DstI8,
+        )
+        dst_ki.kernel_class_instance = DstI8()
+
+        # Resolve tensor shapes (trivial — no params)
+        from vten.runtime.resolver import ParameterResolver
+        for ki in (src_ki, dst_ki):
+            ki._resolver = ParameterResolver({}, {}, {})
+            import copy
+            for t in ki.kernel_class_instance.tensors():
+                inst_t = copy.copy(t)
+                setattr(ki.kernel_class_instance, t.name, inst_t)
+                inst_t._resolve_shape(ki._resolver)
+
+        sub_kernels = {"src": src_ki, "dst": dst_ki}
+
+        engine = RuntimeEngine(
+            kernels={}, ops=[], project_params={},
+        )
+
+        with pytest.raises(ConnectionDtypeMismatchError, match="dtype mismatch"):
+            engine._validate_connection_dtypes(
+                [conn], sub_kernels,
+            )
+
+    def test_duplicate_connection_source_raises(self):
+        """Same source interface in two connections should raise."""
+        from vten.runtime.engine import RuntimeEngine
+
+        SrcKernel, DstKernel = self._make_simple_kernels()
+
+        class DstKernel2(Kernel):
+            spec = "dst2.yaml"
+            data_in = Tensor(shape=(8,), dtype=torch.int8, interface="input_stream2")
+            ctrl = register("ctrl")
+            def generate_inputs(self, seed=None): pass
+            def forward(self): return torch.zeros(8)
+
+        src_binding = SrcKernel.bind(interface_map={
+            "ctrl": "c1", "output_stream": Internal(),
+        })
+        dst_binding = DstKernel.bind(interface_map={
+            "ctrl": "c2", "input_stream": Internal(),
+        })
+        dst2_binding = DstKernel2.bind(interface_map={
+            "ctrl": "c3", "input_stream2": Internal(),
+        })
+
+        conn1 = Connect(src_binding.data_out, dst_binding.data_in)
+        conn2 = Connect(src_binding.data_out, dst2_binding.data_in)
+
+        engine = RuntimeEngine(kernels={}, ops=[], project_params={})
+        with pytest.raises(Exception, match="Duplicate connection source"):
+            engine._validate_no_duplicate_connections(
+                [conn1, conn2], {},
+            )

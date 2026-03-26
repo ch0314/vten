@@ -173,8 +173,14 @@ class KernelInstance:
             sub_spec = None
             if sub_spec_path:
                 try:
+                    from pathlib import Path as _Path
                     from vten.spec.parser import load_kernel_spec
-                    sub_spec = load_kernel_spec(sub_spec_path)
+                    project_dir = project_params.get("_project_dir")
+                    if project_dir:
+                        spec_file = _Path(project_dir) / sub_spec_path
+                    else:
+                        spec_file = sub_spec_path
+                    sub_spec = load_kernel_spec(spec_file)
                 except FileNotFoundError:
                     pass
             if sub_spec is None:

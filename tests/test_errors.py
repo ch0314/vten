@@ -315,4 +315,4 @@ class TestErrorCompleteness:
             v for v in vars(mod).values()
             if isinstance(v, type) and issubclass(v, Exception) and v is not Exception
         ]
-        assert len(error_classes) == 22
+        assert len(error_classes) == 23

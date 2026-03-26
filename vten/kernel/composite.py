@@ -132,6 +132,11 @@ class Connect:
             source_tensor.interface if isinstance(source_tensor, Tensor) else None
         )
 
+        dest_tensor = getattr(dest.kernel_class, dest.tensor_name, None)
+        self.dest_interface = (
+            dest_tensor.interface if isinstance(dest_tensor, Tensor) else None
+        )
+
     @property
     def source_sub(self) -> str:
         return self._source_proxy.binding_attr_name

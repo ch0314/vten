@@ -428,16 +428,88 @@ class SVGenerator:
         (out / filename).write_text(rendered)
         return filename
 
+    @staticmethod
+    def _build_wrapper_parameters(
+        spec_params: dict[str, str | int],
+        interfaces: dict[str, "InterfaceSpec"],
+    ) -> dict[str, int]:
+        """Build wrapper module parameters from spec params + interface widths.
+
+        Auto-generates DATA_W / ADDR_W parameters for AXI4 and AXI4-Stream
+        interfaces so Vivado can infer address space ranges from parameters.
+
+        Naming: if all non-ctrl interfaces share the same width, use
+        ``DATA_W`` / ``ADDR_W``.  Otherwise, use per-interface names
+        ``<NAME>_DATA_W`` / ``<NAME>_ADDR_W`` (NAME = upper-cased iface name).
+        """
+        from vten.spec.models import Protocol
+
+        params: dict[str, int] = dict(spec_params)  # type: ignore[arg-type]
+
+        # Collect unique data/addr widths across non-ctrl interfaces
+        bus_ifaces = {
+            name: iface
+            for name, iface in interfaces.items()
+            if iface.protocol in (Protocol.AXI4, Protocol.AXI4S)
+        }
+
+        if not bus_ifaces:
+            return params
+
+        data_widths = {
+            name: iface.data_width
+            or (iface.packing.bus_width if getattr(iface, "packing", None) else 256)
+            for name, iface in bus_ifaces.items()
+        }
+        addr_widths = {
+            name: iface.addr_width or 64
+            for name, iface in bus_ifaces.items()
+            if iface.protocol == Protocol.AXI4
+        }
+
+        unique_dw = set(data_widths.values())
+        unique_aw = set(addr_widths.values())
+
+        # Assign parameter names
+        if len(unique_dw) == 1 and "DATA_W" not in params:
+            shared_dw_name = "DATA_W"
+            for name in bus_ifaces:
+                bus_ifaces[name]._wrapper_data_w_param = shared_dw_name  # type: ignore[attr-defined]
+            params[shared_dw_name] = next(iter(unique_dw))
+        else:
+            for name, dw in data_widths.items():
+                pname = f"{name.upper()}_DATA_W"
+                bus_ifaces[name]._wrapper_data_w_param = pname  # type: ignore[attr-defined]
+                params.setdefault(pname, dw)
+
+        if len(unique_aw) == 1 and "ADDR_W" not in params:
+            shared_aw_name = "ADDR_W"
+            for name in addr_widths:
+                bus_ifaces[name]._wrapper_addr_w_param = shared_aw_name  # type: ignore[attr-defined]
+            params[shared_aw_name] = next(iter(unique_aw))
+        else:
+            for name, aw in addr_widths.items():
+                pname = f"{name.upper()}_ADDR_W"
+                bus_ifaces[name]._wrapper_addr_w_param = pname  # type: ignore[attr-defined]
+                params.setdefault(pname, aw)
+
+        return params
+
     def _generate_wrapper(self, env: jinja2.Environment, out: Path) -> str:
         """Generate wrapper module. Returns output filename."""
         ctrl, stream, aximm = self._classify_interfaces()
         all_ifaces = list(self.spec.interfaces.values())
         array_groups = self._expand_array_interfaces(self.spec.interfaces)
 
+        # Build parameters with auto-generated DATA_W / ADDR_W
+        wrapper_params = self._build_wrapper_parameters(
+            self.spec.parameters, self.spec.interfaces,
+        )
+
         tmpl = env.get_template("wrapper.sv.j2")
         rendered = tmpl.render(
             kernel_name=self.spec.kernel_name,
-            parameters=self.spec.parameters,
+            parameters=wrapper_params,
             clock_name="ap_clk",
             reset_name="ap_aresetn",
             core_clock_name=self.spec.clock_name,

@@ -36,76 +36,96 @@ module {{ kernel_name }} #(
 {% set _ = lines.append("    input  logic                " ~ ' ' * (iface.ext_port | length) ~ iface.ext_port ~ "_rready") %}
 {% set _ = port_blocks.append(lines) %}
 {% elif iface.protocol.value == 'axi4_stream' %}
-{% set dw = iface.data_width or (iface.packing.bus_width if iface.packing else 256) %}
+{% set dw_param = iface._wrapper_data_w_param if iface._wrapper_data_w_param is defined else none %}
 {% set is_master = iface.ext_port.startswith('m_') %}
 {% set lines = [] %}
 {% set _ = lines.append("    // ── " ~ iface.name ~ ": AXI4-Stream (flat) ──") %}
-{% if is_master %}
-{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0] " ~ iface.ext_port ~ "_tdata") %}
-{% set _ = lines.append("    output logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tvalid") %}
-{% set _ = lines.append("    input  logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tready") %}
-{% set _ = lines.append("    output logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tlast") %}
+{% if dw_param %}
+{% set dw_expr = dw_param ~ "-1" %}
 {% else %}
-{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0] " ~ iface.ext_port ~ "_tdata") %}
-{% set _ = lines.append("    input  logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tvalid") %}
-{% set _ = lines.append("    output logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tready") %}
-{% set _ = lines.append("    input  logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tlast") %}
+{% set dw = iface.data_width or (iface.packing.bus_width if iface.packing else 256) %}
+{% set dw_expr = (dw - 1) | string %}
+{% endif %}
+{% if is_master %}
+{% set _ = lines.append("    output logic [" ~ dw_expr ~ ":0] " ~ iface.ext_port ~ "_tdata") %}
+{% set _ = lines.append("    output logic " ~ ' ' * (iface.ext_port | length + dw_expr | length + 2) ~ iface.ext_port ~ "_tvalid") %}
+{% set _ = lines.append("    input  logic " ~ ' ' * (iface.ext_port | length + dw_expr | length + 2) ~ iface.ext_port ~ "_tready") %}
+{% set _ = lines.append("    output logic " ~ ' ' * (iface.ext_port | length + dw_expr | length + 2) ~ iface.ext_port ~ "_tlast") %}
+{% else %}
+{% set _ = lines.append("    input  logic [" ~ dw_expr ~ ":0] " ~ iface.ext_port ~ "_tdata") %}
+{% set _ = lines.append("    input  logic " ~ ' ' * (iface.ext_port | length + dw_expr | length + 2) ~ iface.ext_port ~ "_tvalid") %}
+{% set _ = lines.append("    output logic " ~ ' ' * (iface.ext_port | length + dw_expr | length + 2) ~ iface.ext_port ~ "_tready") %}
+{% set _ = lines.append("    input  logic " ~ ' ' * (iface.ext_port | length + dw_expr | length + 2) ~ iface.ext_port ~ "_tlast") %}
 {% endif %}
 {% set _ = port_blocks.append(lines) %}
 {% elif iface.protocol.value == 'axi4' %}
+{% set dw_param = iface._wrapper_data_w_param if iface._wrapper_data_w_param is defined else none %}
+{% set aw_param = iface._wrapper_addr_w_param if iface._wrapper_addr_w_param is defined else none %}
+{% if dw_param %}
+{% set dw_expr = dw_param ~ "-1" %}
+{% set sw_expr = dw_param ~ "/8-1" %}
+{% else %}
 {% set dw = iface.data_width or 256 %}
+{% set dw_expr = (dw - 1) | string %}
+{% set sw_expr = (dw // 8 - 1) | string %}
+{% endif %}
+{% if aw_param %}
+{% set aw_expr = aw_param ~ "-1" %}
+{% else %}
 {% set aw = iface.addr_width or 64 %}
+{% set aw_expr = (aw - 1) | string %}
+{% endif %}
 {% set is_master = iface.ext_port.startswith('m_') %}
 {% set lines = [] %}
 {% set _ = lines.append("    // ── " ~ iface.name ~ ": AXI4 (flat) ──") %}
 {% if is_master %}
-{% set _ = lines.append("    output logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.ext_port ~ "_awaddr") %}
+{% set _ = lines.append("    output logic [" ~ aw_expr ~ ":0]    " ~ iface.ext_port ~ "_awaddr") %}
 {% set _ = lines.append("    output logic [7:0]          " ~ iface.ext_port ~ "_awlen") %}
 {% set _ = lines.append("    output logic [2:0]          " ~ iface.ext_port ~ "_awsize") %}
 {% set _ = lines.append("    output logic [1:0]          " ~ iface.ext_port ~ "_awburst") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_awvalid") %}
 {% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_awready") %}
-{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.ext_port ~ "_wdata") %}
-{% set _ = lines.append("    output logic [" ~ (dw // 8 - 1) | string ~ ":0]  " ~ iface.ext_port ~ "_wstrb") %}
+{% set _ = lines.append("    output logic [" ~ dw_expr ~ ":0]   " ~ iface.ext_port ~ "_wdata") %}
+{% set _ = lines.append("    output logic [" ~ sw_expr ~ ":0]  " ~ iface.ext_port ~ "_wstrb") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_wlast") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_wvalid") %}
 {% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_wready") %}
 {% set _ = lines.append("    input  logic [1:0]          " ~ iface.ext_port ~ "_bresp") %}
 {% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_bvalid") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_bready") %}
-{% set _ = lines.append("    output logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.ext_port ~ "_araddr") %}
+{% set _ = lines.append("    output logic [" ~ aw_expr ~ ":0]    " ~ iface.ext_port ~ "_araddr") %}
 {% set _ = lines.append("    output logic [7:0]          " ~ iface.ext_port ~ "_arlen") %}
 {% set _ = lines.append("    output logic [2:0]          " ~ iface.ext_port ~ "_arsize") %}
 {% set _ = lines.append("    output logic [1:0]          " ~ iface.ext_port ~ "_arburst") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_arvalid") %}
 {% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_arready") %}
-{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.ext_port ~ "_rdata") %}
+{% set _ = lines.append("    input  logic [" ~ dw_expr ~ ":0]   " ~ iface.ext_port ~ "_rdata") %}
 {% set _ = lines.append("    input  logic [1:0]          " ~ iface.ext_port ~ "_rresp") %}
 {% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_rlast") %}
 {% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_rvalid") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_rready") %}
 {% else %}
-{% set _ = lines.append("    input  logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.ext_port ~ "_awaddr") %}
+{% set _ = lines.append("    input  logic [" ~ aw_expr ~ ":0]    " ~ iface.ext_port ~ "_awaddr") %}
 {% set _ = lines.append("    input  logic [7:0]          " ~ iface.ext_port ~ "_awlen") %}
 {% set _ = lines.append("    input  logic [2:0]          " ~ iface.ext_port ~ "_awsize") %}
 {% set _ = lines.append("    input  logic [1:0]          " ~ iface.ext_port ~ "_awburst") %}
 {% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_awvalid") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_awready") %}
-{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.ext_port ~ "_wdata") %}
-{% set _ = lines.append("    input  logic [" ~ (dw // 8 - 1) | string ~ ":0]  " ~ iface.ext_port ~ "_wstrb") %}
+{% set _ = lines.append("    input  logic [" ~ dw_expr ~ ":0]   " ~ iface.ext_port ~ "_wdata") %}
+{% set _ = lines.append("    input  logic [" ~ sw_expr ~ ":0]  " ~ iface.ext_port ~ "_wstrb") %}
 {% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_wlast") %}
 {% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_wvalid") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_wready") %}
 {% set _ = lines.append("    output logic [1:0]          " ~ iface.ext_port ~ "_bresp") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_bvalid") %}
 {% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_bready") %}
-{% set _ = lines.append("    input  logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.ext_port ~ "_araddr") %}
+{% set _ = lines.append("    input  logic [" ~ aw_expr ~ ":0]    " ~ iface.ext_port ~ "_araddr") %}
 {% set _ = lines.append("    input  logic [7:0]          " ~ iface.ext_port ~ "_arlen") %}
 {% set _ = lines.append("    input  logic [2:0]          " ~ iface.ext_port ~ "_arsize") %}
 {% set _ = lines.append("    input  logic [1:0]          " ~ iface.ext_port ~ "_arburst") %}
 {% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_arvalid") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_arready") %}
-{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.ext_port ~ "_rdata") %}
+{% set _ = lines.append("    output logic [" ~ dw_expr ~ ":0]   " ~ iface.ext_port ~ "_rdata") %}
 {% set _ = lines.append("    output logic [1:0]          " ~ iface.ext_port ~ "_rresp") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_rlast") %}
 {% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_rvalid") %}
@@ -117,8 +137,22 @@ module {{ kernel_name }} #(
 {# Array interfaces: expand flat ports for each element #}
 {% for ag in array_groups %}
 {% set iface = ag.iface %}
+{% set dw_param = iface._wrapper_data_w_param if iface._wrapper_data_w_param is defined else none %}
+{% set aw_param = iface._wrapper_addr_w_param if iface._wrapper_addr_w_param is defined else none %}
+{% if dw_param %}
+{% set dw_expr = dw_param ~ "-1" %}
+{% set sw_expr = dw_param ~ "/8-1" %}
+{% else %}
 {% set dw = iface.data_width or (iface.packing.bus_width if iface.packing else 256) %}
+{% set dw_expr = (dw - 1) | string %}
+{% set sw_expr = (dw // 8 - 1) | string %}
+{% endif %}
+{% if aw_param %}
+{% set aw_expr = aw_param ~ "-1" %}
+{% else %}
 {% set aw = iface.addr_width or 64 %}
+{% set aw_expr = (aw - 1) | string %}
+{% endif %}
 {% set is_master = (ag.role == 'master') %}
 {% for elem in ag.elements %}
 {% set fp = ag.flat_prefix ~ elem.flat_name %}
@@ -128,65 +162,65 @@ module {{ kernel_name }} #(
 {% endif %}
 {% if iface.protocol.value == 'axi4_stream' %}
 {% if is_master %}
-{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0] " ~ fp ~ "_tdata") %}
-{% set _ = lines.append("    output logic " ~ ' ' * (fp | length + (dw - 1) | string | length + 2) ~ fp ~ "_tvalid") %}
-{% set _ = lines.append("    input  logic " ~ ' ' * (fp | length + (dw - 1) | string | length + 2) ~ fp ~ "_tready") %}
-{% set _ = lines.append("    output logic " ~ ' ' * (fp | length + (dw - 1) | string | length + 2) ~ fp ~ "_tlast") %}
+{% set _ = lines.append("    output logic [" ~ dw_expr ~ ":0] " ~ fp ~ "_tdata") %}
+{% set _ = lines.append("    output logic " ~ ' ' * (fp | length + dw_expr | length + 2) ~ fp ~ "_tvalid") %}
+{% set _ = lines.append("    input  logic " ~ ' ' * (fp | length + dw_expr | length + 2) ~ fp ~ "_tready") %}
+{% set _ = lines.append("    output logic " ~ ' ' * (fp | length + dw_expr | length + 2) ~ fp ~ "_tlast") %}
 {% else %}
-{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0] " ~ fp ~ "_tdata") %}
-{% set _ = lines.append("    input  logic " ~ ' ' * (fp | length + (dw - 1) | string | length + 2) ~ fp ~ "_tvalid") %}
-{% set _ = lines.append("    output logic " ~ ' ' * (fp | length + (dw - 1) | string | length + 2) ~ fp ~ "_tready") %}
-{% set _ = lines.append("    input  logic " ~ ' ' * (fp | length + (dw - 1) | string | length + 2) ~ fp ~ "_tlast") %}
+{% set _ = lines.append("    input  logic [" ~ dw_expr ~ ":0] " ~ fp ~ "_tdata") %}
+{% set _ = lines.append("    input  logic " ~ ' ' * (fp | length + dw_expr | length + 2) ~ fp ~ "_tvalid") %}
+{% set _ = lines.append("    output logic " ~ ' ' * (fp | length + dw_expr | length + 2) ~ fp ~ "_tready") %}
+{% set _ = lines.append("    input  logic " ~ ' ' * (fp | length + dw_expr | length + 2) ~ fp ~ "_tlast") %}
 {% endif %}
 {% elif iface.protocol.value == 'axi4' %}
 {% if is_master %}
-{% set _ = lines.append("    output logic [" ~ (aw - 1) | string ~ ":0]    " ~ fp ~ "_awaddr") %}
+{% set _ = lines.append("    output logic [" ~ aw_expr ~ ":0]    " ~ fp ~ "_awaddr") %}
 {% set _ = lines.append("    output logic [7:0]          " ~ fp ~ "_awlen") %}
 {% set _ = lines.append("    output logic [2:0]          " ~ fp ~ "_awsize") %}
 {% set _ = lines.append("    output logic [1:0]          " ~ fp ~ "_awburst") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_awvalid") %}
 {% set _ = lines.append("    input  logic                " ~ fp ~ "_awready") %}
-{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0]   " ~ fp ~ "_wdata") %}
-{% set _ = lines.append("    output logic [" ~ (dw // 8 - 1) | string ~ ":0]  " ~ fp ~ "_wstrb") %}
+{% set _ = lines.append("    output logic [" ~ dw_expr ~ ":0]   " ~ fp ~ "_wdata") %}
+{% set _ = lines.append("    output logic [" ~ sw_expr ~ ":0]  " ~ fp ~ "_wstrb") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_wlast") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_wvalid") %}
 {% set _ = lines.append("    input  logic                " ~ fp ~ "_wready") %}
 {% set _ = lines.append("    input  logic [1:0]          " ~ fp ~ "_bresp") %}
 {% set _ = lines.append("    input  logic                " ~ fp ~ "_bvalid") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_bready") %}
-{% set _ = lines.append("    output logic [" ~ (aw - 1) | string ~ ":0]    " ~ fp ~ "_araddr") %}
+{% set _ = lines.append("    output logic [" ~ aw_expr ~ ":0]    " ~ fp ~ "_araddr") %}
 {% set _ = lines.append("    output logic [7:0]          " ~ fp ~ "_arlen") %}
 {% set _ = lines.append("    output logic [2:0]          " ~ fp ~ "_arsize") %}
 {% set _ = lines.append("    output logic [1:0]          " ~ fp ~ "_arburst") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_arvalid") %}
 {% set _ = lines.append("    input  logic                " ~ fp ~ "_arready") %}
-{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0]   " ~ fp ~ "_rdata") %}
+{% set _ = lines.append("    input  logic [" ~ dw_expr ~ ":0]   " ~ fp ~ "_rdata") %}
 {% set _ = lines.append("    input  logic [1:0]          " ~ fp ~ "_rresp") %}
 {% set _ = lines.append("    input  logic                " ~ fp ~ "_rlast") %}
 {% set _ = lines.append("    input  logic                " ~ fp ~ "_rvalid") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_rready") %}
 {% else %}
-{% set _ = lines.append("    input  logic [" ~ (aw - 1) | string ~ ":0]    " ~ fp ~ "_awaddr") %}
+{% set _ = lines.append("    input  logic [" ~ aw_expr ~ ":0]    " ~ fp ~ "_awaddr") %}
 {% set _ = lines.append("    input  logic [7:0]          " ~ fp ~ "_awlen") %}
 {% set _ = lines.append("    input  logic [2:0]          " ~ fp ~ "_awsize") %}
 {% set _ = lines.append("    input  logic [1:0]          " ~ fp ~ "_awburst") %}
 {% set _ = lines.append("    input  logic                " ~ fp ~ "_awvalid") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_awready") %}
-{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0]   " ~ fp ~ "_wdata") %}
-{% set _ = lines.append("    input  logic [" ~ (dw // 8 - 1) | string ~ ":0]  " ~ fp ~ "_wstrb") %}
+{% set _ = lines.append("    input  logic [" ~ dw_expr ~ ":0]   " ~ fp ~ "_wdata") %}
+{% set _ = lines.append("    input  logic [" ~ sw_expr ~ ":0]  " ~ fp ~ "_wstrb") %}
 {% set _ = lines.append("    input  logic                " ~ fp ~ "_wlast") %}
 {% set _ = lines.append("    input  logic                " ~ fp ~ "_wvalid") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_wready") %}
 {% set _ = lines.append("    output logic [1:0]          " ~ fp ~ "_bresp") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_bvalid") %}
 {% set _ = lines.append("    input  logic                " ~ fp ~ "_bready") %}
-{% set _ = lines.append("    input  logic [" ~ (aw - 1) | string ~ ":0]    " ~ fp ~ "_araddr") %}
+{% set _ = lines.append("    input  logic [" ~ aw_expr ~ ":0]    " ~ fp ~ "_araddr") %}
 {% set _ = lines.append("    input  logic [7:0]          " ~ fp ~ "_arlen") %}
 {% set _ = lines.append("    input  logic [2:0]          " ~ fp ~ "_arsize") %}
 {% set _ = lines.append("    input  logic [1:0]          " ~ fp ~ "_arburst") %}
 {% set _ = lines.append("    input  logic                " ~ fp ~ "_arvalid") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_arready") %}
-{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0]   " ~ fp ~ "_rdata") %}
+{% set _ = lines.append("    output logic [" ~ dw_expr ~ ":0]   " ~ fp ~ "_rdata") %}
 {% set _ = lines.append("    output logic [1:0]          " ~ fp ~ "_rresp") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_rlast") %}
 {% set _ = lines.append("    output logic                " ~ fp ~ "_rvalid") %}
@@ -221,27 +255,41 @@ module {{ kernel_name }} #(
 
 {% for iface in stream_interfaces %}
     // ── SV Interface: {{ iface.name }} (AXI4-Stream) ──
+{% set dw_param = iface._wrapper_data_w_param if iface._wrapper_data_w_param is defined else none %}
+{% if dw_param %}
+    vten_axis_if #(.DATA_W({{ dw_param }})) {{ iface.name }}_if();
+{% else %}
 {% set dw = iface.data_width or (iface.packing.bus_width if iface.packing else 256) %}
     vten_axis_if #(.DATA_W({{ dw }})) {{ iface.name }}_if();
+{% endif %}
 {% endfor %}
 
 {% for iface in aximm_interfaces %}
     // ── SV Interface: {{ iface.name }} (AXI4) ──
-{% set dw = iface.data_width or 256 %}
-{% set aw = iface.addr_width or 64 %}
-    vten_aximm_if #(.DATA_W({{ dw }}), .ADDR_W({{ aw }})) {{ iface.name }}_if();
+{% set dw_param = iface._wrapper_data_w_param if iface._wrapper_data_w_param is defined else none %}
+{% set aw_param = iface._wrapper_addr_w_param if iface._wrapper_addr_w_param is defined else none %}
+{% if dw_param %}{% set dw_val = dw_param %}{% else %}{% set dw_val = iface.data_width or 256 %}{% endif %}
+{% if aw_param %}{% set aw_val = aw_param %}{% else %}{% set aw_val = iface.addr_width or 64 %}{% endif %}
+    vten_aximm_if #(.DATA_W({{ dw_val }}), .ADDR_W({{ aw_val }})) {{ iface.name }}_if();
 {% endfor %}
 
 {% for ag in array_groups %}
 {% set iface = ag.iface %}
-{% set dw = iface.data_width or (iface.packing.bus_width if iface.packing else 256) %}
-{% set aw = iface.addr_width or 64 %}
+{% set dw_param = iface._wrapper_data_w_param if iface._wrapper_data_w_param is defined else none %}
+{% set aw_param = iface._wrapper_addr_w_param if iface._wrapper_addr_w_param is defined else none %}
 {% if iface.protocol.value == 'axi4_stream' %}
     // ── SV Interface Array: {{ iface.name }} (AXI4-Stream) {{ ag.sv_array_dims }} ──
+{% if dw_param %}
+    vten_axis_if #(.DATA_W({{ dw_param }})) {{ iface.name }}_if{{ ag.sv_array_dims }}();
+{% else %}
+{% set dw = iface.data_width or (iface.packing.bus_width if iface.packing else 256) %}
     vten_axis_if #(.DATA_W({{ dw }})) {{ iface.name }}_if{{ ag.sv_array_dims }}();
+{% endif %}
 {% elif iface.protocol.value == 'axi4' %}
     // ── SV Interface Array: {{ iface.name }} (AXI4) {{ ag.sv_array_dims }} ──
-    vten_aximm_if #(.DATA_W({{ dw }}), .ADDR_W({{ aw }})) {{ iface.name }}_if{{ ag.sv_array_dims }}();
+{% if dw_param %}{% set dw_val = dw_param %}{% else %}{% set dw_val = iface.data_width or 256 %}{% endif %}
+{% if aw_param %}{% set aw_val = aw_param %}{% else %}{% set aw_val = iface.addr_width or 64 %}{% endif %}
+    vten_aximm_if #(.DATA_W({{ dw_val }}), .ADDR_W({{ aw_val }})) {{ iface.name }}_if{{ ag.sv_array_dims }}();
 {% endif %}
 {% endfor %}
 

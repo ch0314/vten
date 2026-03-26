@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from vten.errors import (
     CompilationError,
+    ConnectionDtypeMismatchError,
     ConnectionShapeMismatchError,
     ProtocolMismatchError,
     SerializationError,
@@ -258,13 +259,21 @@ class RuntimeEngine:
 
         # Synthesize top-level spec for composite kernels if missing
         if not top_spec.interfaces:
-            import os
-            from pathlib import Path as _Path
-            from vten.build.composite import synthesize_spec
-            project_dir = _Path(os.getcwd())
-            top_spec = synthesize_spec(
-                kernel.kernel_class, project_dir, kernel.name,
-            )
+            # Check class-level cache first
+            cached = getattr(kernel.kernel_class, "_synthesized_spec", None)
+            if cached is not None:
+                top_spec = cached
+            else:
+                import os
+                from pathlib import Path as _Path
+                from vten.build.composite import synthesize_spec
+                project_dir = _Path(
+                    self._project_params.get("_project_dir", os.getcwd())
+                )
+                top_spec = synthesize_spec(
+                    kernel.kernel_class, project_dir, kernel.name,
+                )
+                kernel.kernel_class._synthesized_spec = top_spec
             kernel.spec = top_spec
 
         # ── Phase B: Interface mapping construction ──
@@ -327,7 +336,9 @@ class RuntimeEngine:
                     )
 
         # ── Phase E: Validation ──
-        self._validate_flattened(mappings, exposed, connections, top_spec)
+        self._validate_flattened(
+            mappings, exposed, connections, top_spec, sub_kernels
+        )
 
         return FlattenedKernelView(
             name=kernel.name,
@@ -433,6 +444,7 @@ class RuntimeEngine:
         exposed: dict[str, ExposedTensor],
         connections: list,
         top_spec: KernelSpec,
+        sub_kernels: dict[str, KernelInstance] | None = None,
     ) -> None:
         """Build-time validation of flattened view."""
         # Validate all exposed tensors reference valid top interfaces
@@ -448,6 +460,130 @@ class RuntimeEngine:
                     f"ExposedTensor '{name}' maps to top_interface "
                     f"'{exp.top_interface}' which has no EXTERNAL mapping."
                 )
+
+        # Connection validations (composite only)
+        if not connections or not sub_kernels:
+            return
+
+        self._validate_connection_protocols(connections, sub_kernels)
+        self._validate_connection_dtypes(connections, sub_kernels)
+        self._validate_internal_coverage(mappings, connections, sub_kernels)
+        self._validate_no_duplicate_connections(connections, sub_kernels)
+
+    def _validate_connection_protocols(
+        self,
+        connections: list,
+        sub_kernels: dict[str, KernelInstance],
+    ) -> None:
+        """Validate that connected interfaces use the same protocol."""
+        for conn in connections:
+            src_ki = sub_kernels.get(conn.source_sub)
+            dst_ki = sub_kernels.get(conn.dest_sub)
+            if not src_ki or not dst_ki:
+                continue
+            src_iface = src_ki.spec.interfaces.get(conn.source_interface)
+            dest_iface_name = getattr(conn, "dest_interface", None)
+            if not dest_iface_name:
+                continue
+            dst_iface = dst_ki.spec.interfaces.get(dest_iface_name)
+            if src_iface and dst_iface and src_iface.protocol != dst_iface.protocol:
+                raise ProtocolMismatchError(
+                    f"Connection {conn.source_sub}.{conn.source_interface} "
+                    f"({src_iface.protocol.value}) → "
+                    f"{conn.dest_sub}.{dest_iface_name} "
+                    f"({dst_iface.protocol.value}): protocol mismatch"
+                )
+
+    def _validate_connection_dtypes(
+        self,
+        connections: list,
+        sub_kernels: dict[str, KernelInstance],
+    ) -> None:
+        """Validate that connected tensors have matching dtype."""
+        for conn in connections:
+            src_ki = sub_kernels.get(conn.source_sub)
+            dst_ki = sub_kernels.get(conn.dest_sub)
+            if not src_ki or not dst_ki:
+                continue
+            try:
+                src_tensor = src_ki.get_tensor(conn.source_name)
+                dst_tensor = dst_ki.get_tensor(conn.dest_name)
+            except (RuntimeError, AttributeError):
+                continue
+            if (
+                src_tensor.dtype != dst_tensor.dtype
+                and conn.transform is None
+            ):
+                raise ConnectionDtypeMismatchError(
+                    f"Connection {conn.source_sub}.{conn.source_name} "
+                    f"(dtype={src_tensor.dtype}) → "
+                    f"{conn.dest_sub}.{conn.dest_name} "
+                    f"(dtype={dst_tensor.dtype}): "
+                    f"dtype mismatch without explicit transform"
+                )
+
+    def _validate_internal_coverage(
+        self,
+        mappings: list[InterfaceMapping],
+        connections: list,
+        sub_kernels: dict[str, KernelInstance],
+    ) -> None:
+        """Validate that all Internal() interfaces are covered by connections."""
+        internal_ifaces: set[tuple[str, str]] = set()
+        for m in mappings:
+            if m.mapping_type in (MappingType.INTERNAL, MappingType.INTERNAL_PROBE):
+                internal_ifaces.add((m.sub_kernel, m.sub_interface))
+
+        # Probe interfaces don't need connections
+        probe_ifaces = {
+            (m.sub_kernel, m.sub_interface)
+            for m in mappings
+            if m.mapping_type == MappingType.INTERNAL_PROBE
+        }
+        must_connect = internal_ifaces - probe_ifaces
+
+        connected: set[tuple[str, str]] = set()
+        for conn in connections:
+            connected.add((conn.source_sub, conn.source_interface))
+            dest_iface_name = getattr(conn, "dest_interface", None)
+            if dest_iface_name:
+                connected.add((conn.dest_sub, dest_iface_name))
+
+        dangling = must_connect - connected
+        if dangling:
+            dangling_desc = ", ".join(
+                f"{sub}.{iface}" for sub, iface in sorted(dangling)
+            )
+            raise ValidationError(
+                f"Internal interfaces have no connection: {dangling_desc}"
+            )
+
+    def _validate_no_duplicate_connections(
+        self,
+        connections: list,
+        sub_kernels: dict[str, KernelInstance],
+    ) -> None:
+        """Validate no interface appears in multiple connections."""
+        seen_src: set[tuple[str, str]] = set()
+        seen_dst: set[tuple[str, str]] = set()
+        for conn in connections:
+            src_key = (conn.source_sub, conn.source_interface)
+            if src_key in seen_src:
+                raise ValidationError(
+                    f"Duplicate connection source: "
+                    f"{conn.source_sub}.{conn.source_interface}"
+                )
+            seen_src.add(src_key)
+
+            dest_iface_name = getattr(conn, "dest_interface", None)
+            if dest_iface_name:
+                dst_key = (conn.dest_sub, dest_iface_name)
+                if dst_key in seen_dst:
+                    raise ValidationError(
+                        f"Duplicate connection destination: "
+                        f"{conn.dest_sub}.{dest_iface_name}"
+                    )
+                seen_dst.add(dst_key)
 
     def _infer_direction_unit(self, tensor, spec) -> Direction:
         """Resolve tensor direction: explicit value first, then protocol inference.
