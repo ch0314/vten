@@ -1,0 +1,29 @@
+kernel: stream_array_2d
+rtl_top: rtl/stream_array_2d.sv
+
+interfaces:
+  din:
+    rtl_port: s_axis_din
+    protocol: axi4_stream
+    role: slave
+    data_width: 256
+    tensor: data_in
+    array:
+      dimensions: [2, 2]
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first
+
+  dout:
+    rtl_port: m_axis_dout
+    protocol: axi4_stream
+    role: master
+    data_width: 256
+    tensor: data_out
+    array:
+      dimensions: [2, 2]
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first
