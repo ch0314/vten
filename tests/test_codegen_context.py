@@ -502,7 +502,7 @@ class TestSVGeneratorBuildContext:
         )
         ctx = gen._build_context()
         prefixes = {b.rtl_port_prefix for b in ctx.tb.bfms}
-        assert "s_axilite_ctrl" in prefixes
+        assert "s_axi_ctrl" in prefixes
         assert "m_axi_ddr" in prefixes
 
     def test_module_for_protocol_axi4s(self):

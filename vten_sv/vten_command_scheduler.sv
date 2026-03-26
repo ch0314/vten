@@ -313,7 +313,7 @@ module vten_command_scheduler #(
             error_cmd_id <= cmd_id[15:0];
             error_code   <= code_val[15:0];
         end
-        if (stats_enabled)
+        if (stats_enabled && cmd_id < num_commands)
             vten_write_cmd_stats(cmd_id, CMD_ERROR,
                 cycle_count, cycle_count, 0, 0, 0, 0, 0);
     endtask

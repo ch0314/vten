@@ -1,0 +1,23 @@
+[project]
+name = "scale_add"
+version = "0.1.0"
+default_backend = "xsim"
+
+[parameters]
+N = 1024
+
+[backend.xsim]
+vivado_path = "/tools/Xilinx/Vivado/2023.2"
+part = "xcu250-figd2104-2L-e"
+compile_options = ["-timescale", "1ns/1ps"]
+timeout_ms = 0
+submit_timeout_s = 300
+
+[rtl]
+sources = ["rtl/**/*.sv", "rtl/**/*.v"]
+include_dirs = ["rtl/include"]
+
+[test]
+default_seed = 42
+waveform = false
+waveform_on_fail = true

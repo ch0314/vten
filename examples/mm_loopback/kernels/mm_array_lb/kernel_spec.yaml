@@ -1,0 +1,71 @@
+kernel: mm_array_lb
+rtl_top: rtl/mm_array_lb_core.sv
+
+memory_regions:
+  ddr:
+    base: 0x10000000
+    size: 0x10000000
+    alignment: 4096
+
+interfaces:
+  ctrl:
+    rtl_port: s_axilite
+    protocol: axi4_lite
+    addr_width: 12
+    data_width: 32
+    generate_controller: true
+    registers:
+      - name: ctrl
+        offset: 0x00
+        access: rw
+        fields: { start: "0:0" }
+      - name: status
+        offset: 0x04
+        access: ro
+        fields: { done: "0:0" }
+      - name: src_addr_lo
+        offset: 0x10
+        access: rw
+        auto_bind: { tensor: data_in, value: address, bits: "31:0" }
+      - name: src_addr_hi
+        offset: 0x14
+        access: rw
+        auto_bind: { tensor: data_in, value: address, bits: "63:32" }
+      - name: dst_addr_lo
+        offset: 0x18
+        access: rw
+        auto_bind: { tensor: data_out, value: address, bits: "31:0" }
+      - name: dst_addr_hi
+        offset: 0x1C
+        access: rw
+        auto_bind: { tensor: data_out, value: address, bits: "63:32" }
+      - name: length
+        offset: 0x20
+        access: rw
+        auto_bind: { tensor: data_in, value: size_beats }
+
+  mem_in:
+    rtl_port: m_axi_in
+    protocol: axi4
+    data_width: 256
+    addr_width: 64
+    tensor: data_in
+    memory_region: ddr
+    array:
+      dimensions: [4]
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+
+  mem_out:
+    rtl_port: m_axi_out
+    protocol: axi4
+    data_width: 256
+    addr_width: 64
+    tensor: data_out
+    memory_region: ddr
+    array:
+      dimensions: [4]
+    packing:
+      element_width: 8
+      elements_per_beat: 32

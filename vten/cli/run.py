@@ -106,28 +106,48 @@ def _build_shm_image(kernel_dir: Path) -> bytes | None:
 
 
 def _build_bfm_configs(kernel_dir: Path) -> list:
-    """Try to derive BFM configs from kernel_spec.yaml."""
+    """Try to derive BFM configs from kernel_spec.yaml or synthesized spec."""
     from vten.runtime.ir import BFMConfig
     from vten.spec.parser import parse_kernel_spec
 
     spec_path = kernel_dir / "kernel_spec.yaml"
-    if not spec_path.exists():
+    spec = None
+
+    if spec_path.exists():
+        try:
+            spec = parse_kernel_spec(spec_path)
+        except Exception:
+            pass
+    else:
+        # Composite kernel: synthesize spec
+        from vten.build.composite import (
+            is_composite_kernel,
+            load_composite_class,
+            synthesize_spec,
+        )
+        if is_composite_kernel(kernel_dir):
+            try:
+                project = kernel_dir.parent.parent
+                composite_cls = load_composite_class(kernel_dir)
+                spec = synthesize_spec(
+                    composite_cls, project, kernel_dir.name
+                )
+            except Exception:
+                pass
+
+    if spec is None:
         return []
 
-    try:
-        spec = parse_kernel_spec(spec_path)
-        configs = []
-        for name, iface in spec.interfaces.items():
-            configs.append(BFMConfig(
-                interface_name=name,
-                protocol=iface.protocol,
-                data_width=iface.data_width or 256,
-                addr_width=iface.addr_width or 64,
-                role="slave",
-            ))
-        return configs
-    except Exception:
-        return []
+    configs = []
+    for name, iface in spec.interfaces.items():
+        configs.append(BFMConfig(
+            interface_name=name,
+            protocol=iface.protocol,
+            data_width=iface.data_width or 256,
+            addr_width=iface.addr_width or 64,
+            role="slave",
+        ))
+    return configs
 
 
 def _compile_from_context(ctx) -> tuple[bytes | None, list]:
@@ -198,8 +218,9 @@ def run_test(
     kernel_dir = project / "kernels" / kernel_name
 
     # Validate kernel directory
+    from vten.build.composite import is_composite_kernel
     spec_path = kernel_dir / "kernel_spec.yaml"
-    if not spec_path.exists():
+    if not spec_path.exists() and not is_composite_kernel(kernel_dir):
         raise VTenError(f"kernel_spec.yaml not found: {spec_path}")
 
     # Test discovery from kernel tests dir

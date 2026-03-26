@@ -179,3 +179,12 @@ class Backend(abc.ABC):
     def shutdown(self) -> None:
         """Send shutdown signal (optional)."""
         pass
+
+    @property
+    def compile_target(self) -> str:
+        """Compile target for RuntimeEngine.compile().
+
+        Returns "sim" for simulation backends (includes SHM packing),
+        "hw" for hardware backends (skips SHM packing).
+        """
+        return "sim"

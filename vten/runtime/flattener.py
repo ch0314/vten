@@ -61,6 +61,7 @@ class ExposedTensor:
     _serialized: bytes | None = None
     _serialized_size: int = 0
     _split_buffers: dict[str, bytes] | None = None
+    _array_element_buffers: dict[str, bytes] | None = None  # flat_name → data chunk
 
     @property
     def data(self):
@@ -84,6 +85,13 @@ class ExposedTensor:
 
     def set_address(self, addr: int) -> None:
         self.origin_tensor._address = addr
+
+    def fill_random(self, generator=None) -> None:
+        self.origin_tensor.fill_random(generator=generator)
+
+    @property
+    def dtype(self):
+        return self.origin_tensor.dtype
 
 
 # ── ProbePoint ──
@@ -113,6 +121,7 @@ class KernelInstance:
     kernel_class_instance: object | None = None
     runtime_params: dict = field(default_factory=dict)
     _resolver: ParameterResolver | None = None
+    _sub_kernel_instances: dict[str, KernelInstance] | None = None
 
     def initialize(self, project_params: dict) -> None:
         """Initialize: resolve parameters + shapes, create Kernel instance."""
@@ -131,10 +140,77 @@ class KernelInstance:
             setattr(self.kernel_class_instance, tensor.name, instance_tensor)
             instance_tensor._resolve_shape(self._resolver)
 
+        # Resolve ExposedTensorDef → ExposedTensor for CompositeKernel
+        self._resolve_exposed_tensors(project_params)
+
         # Expose resolved params as instance attributes
         for key, value in self._resolver.namespace.items():
             if not hasattr(self.kernel_class_instance, key):
                 setattr(self.kernel_class_instance, key, value)
+
+    def _resolve_exposed_tensors(self, project_params: dict) -> None:
+        """For CompositeKernel: resolve ExposedTensorDef to ExposedTensor.
+
+        Creates proper KernelInstance objects for each sub-kernel and stores
+        them in self._sub_kernel_instances so _flatten_composite() can reuse
+        them instead of creating duplicates.
+        """
+        from vten.kernel.composite import ExposedTensorDef, SubKernelBinding
+
+        inst = self.kernel_class_instance
+        exposed_defs = getattr(inst.__class__, "_exposed_tensor_defs", {})
+        if not exposed_defs:
+            return
+
+        # Instantiate sub-kernels as proper KernelInstance objects
+        self._sub_kernel_instances = {}
+        bindings = getattr(inst.__class__, "_sub_kernel_bindings", {})
+        for attr_name, binding in bindings.items():
+            sub_cls = binding.kernel_class
+            sub_params = binding.params or {}
+            merged_params = {**self.runtime_params, **sub_params}
+            sub_spec_path = getattr(sub_cls, "spec", "")
+            sub_spec = None
+            if sub_spec_path:
+                try:
+                    from vten.spec.parser import load_kernel_spec
+                    sub_spec = load_kernel_spec(sub_spec_path)
+                except FileNotFoundError:
+                    pass
+            if sub_spec is None:
+                sub_spec = KernelSpec(
+                    kernel_name=sub_cls.__name__,
+                    rtl_top=sub_cls.__name__,
+                )
+            sub_ki = KernelInstance(
+                name=attr_name,
+                spec=sub_spec,
+                kernel_class=sub_cls,
+                runtime_params=merged_params,
+            )
+            sub_ki.initialize(project_params)
+            self._sub_kernel_instances[attr_name] = sub_ki
+
+        # Replace ExposedTensorDef with ExposedTensor on the instance
+        for attr_name, edef in exposed_defs.items():
+            sub_attr = edef.origin_sub_kernel
+            tensor_name = edef.origin_name
+            sub_ki = self._sub_kernel_instances.get(sub_attr)
+            if sub_ki is None:
+                continue
+            origin_tensor = sub_ki.get_tensor(tensor_name)
+            # Infer direction from origin tensor
+            direction = getattr(origin_tensor, "direction", None)
+            if direction is None:
+                direction = Direction.HOST_TO_DEV
+            exposed = ExposedTensor(
+                name=attr_name,
+                origin_path=f"{sub_attr}.{tensor_name}",
+                origin_tensor=origin_tensor,
+                top_interface=edef.top_interface,
+                direction=direction,
+            )
+            setattr(inst, attr_name, exposed)
 
     def tensors(self) -> list[Tensor]:
         if self.kernel_class_instance:

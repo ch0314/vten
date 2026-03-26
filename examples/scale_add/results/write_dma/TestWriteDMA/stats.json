@@ -1,0 +1,183 @@
+{
+  "commands": [
+    {
+      "cmd_id": 0,
+      "op": "LOAD",
+      "interface": "",
+      "protocol": "axi4_stream",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 0,
+      "commit_cycle": 0,
+      "latency_cycles": 0,
+      "active_cycles": 0,
+      "stall_cycles": 0,
+      "total_beats": 0,
+      "utilization": 0.0,
+      "bus_efficiency": 0.0,
+      "tensor": "data_in",
+      "size": 1024
+    },
+    {
+      "cmd_id": 1,
+      "op": "PUSH",
+      "interface": "input_stream",
+      "protocol": "axi4_stream",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 15,
+      "commit_cycle": 223,
+      "latency_cycles": 208,
+      "active_cycles": 31,
+      "stall_cycles": 175,
+      "total_beats": 31,
+      "utilization": 0.1658,
+      "bus_efficiency": 0.149,
+      "tensor": "data_in",
+      "size": 1024,
+      "dep": [
+        0
+      ]
+    },
+    {
+      "cmd_id": 2,
+      "op": "WRITE_REG",
+      "interface": "ctrl",
+      "protocol": "axi4_lite",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 15,
+      "commit_cycle": 19,
+      "latency_cycles": 4,
+      "active_cycles": 0,
+      "stall_cycles": 0,
+      "total_beats": 0,
+      "utilization": 0.0,
+      "bus_efficiency": 0.0,
+      "dep": [
+        0
+      ],
+      "reg_offset": 0,
+      "reg_value": 268435456
+    },
+    {
+      "cmd_id": 3,
+      "op": "WRITE_REG",
+      "interface": "ctrl",
+      "protocol": "axi4_lite",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 20,
+      "commit_cycle": 24,
+      "latency_cycles": 4,
+      "active_cycles": 0,
+      "stall_cycles": 0,
+      "total_beats": 0,
+      "utilization": 0.0,
+      "bus_efficiency": 0.0,
+      "reg_offset": 4,
+      "reg_value": 0
+    },
+    {
+      "cmd_id": 4,
+      "op": "WRITE_REG",
+      "interface": "ctrl",
+      "protocol": "axi4_lite",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 25,
+      "commit_cycle": 29,
+      "latency_cycles": 4,
+      "active_cycles": 0,
+      "stall_cycles": 0,
+      "total_beats": 0,
+      "utilization": 0.0,
+      "bus_efficiency": 0.0,
+      "reg_offset": 8,
+      "reg_value": 32
+    },
+    {
+      "cmd_id": 5,
+      "op": "PULL",
+      "interface": "mem_port",
+      "protocol": "axi4",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 15,
+      "commit_cycle": 227,
+      "latency_cycles": 212,
+      "active_cycles": 32,
+      "stall_cycles": 0,
+      "total_beats": 32,
+      "utilization": 0.1711,
+      "bus_efficiency": 0.1509,
+      "tensor": "data_out",
+      "size": 1024,
+      "dep": [
+        0
+      ]
+    },
+    {
+      "cmd_id": 6,
+      "op": "WRITE_REG",
+      "interface": "ctrl",
+      "protocol": "axi4_lite",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 32,
+      "commit_cycle": 36,
+      "latency_cycles": 4,
+      "active_cycles": 0,
+      "stall_cycles": 0,
+      "total_beats": 0,
+      "utilization": 0.0,
+      "bus_efficiency": 0.0,
+      "dep": [
+        4
+      ],
+      "reg_offset": 12,
+      "reg_value": 1
+    },
+    {
+      "cmd_id": 7,
+      "op": "POLL_REG",
+      "interface": "ctrl",
+      "protocol": "axi4_lite",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 39,
+      "commit_cycle": 231,
+      "latency_cycles": 192,
+      "active_cycles": 0,
+      "stall_cycles": 0,
+      "total_beats": 0,
+      "utilization": 0.0,
+      "bus_efficiency": 0.0,
+      "dep": [
+        6
+      ],
+      "reg_offset": 16
+    },
+    {
+      "cmd_id": 8,
+      "op": "STORE",
+      "interface": "",
+      "protocol": "axi4_stream",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 0,
+      "commit_cycle": 0,
+      "latency_cycles": 0,
+      "active_cycles": 0,
+      "stall_cycles": 0,
+      "total_beats": 0,
+      "utilization": 0.0,
+      "bus_efficiency": 0.0,
+      "tensor": "data_out",
+      "size": 1024,
+      "dep": [
+        5
+      ]
+    }
+  ]
+}

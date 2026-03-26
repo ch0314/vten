@@ -86,21 +86,18 @@ def init_project(
         _add_backend(root, add_backend)
         return
 
-    # Full project initialization
-    if root.exists():
-        raise FileExistsError(f"Directory already exists: {project_dir}")
-
+    # Full project initialization — works on both new and existing directories
     target_backend = backend or "xsim"
 
-    root.mkdir(parents=True)
+    root.mkdir(parents=True, exist_ok=True)
 
-    # Create common + backend-specific directories
+    # Create common + backend-specific directories (skip existing)
     dirs = list(_COMMON_DIRS)
     dirs.extend(_BACKEND_DIRS.get(target_backend, []))
     for d in dirs:
         (root / d).mkdir(parents=True, exist_ok=True)
 
-    # vten.toml
+    # vten.toml — only create if missing
     toml_path = root / "vten.toml"
     if not toml_path.exists():
         toml_path.write_text(_make_toml_content(root.name, target_backend))

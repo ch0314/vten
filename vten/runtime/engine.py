@@ -149,7 +149,12 @@ class RuntimeEngine:
         # Collect serialized tensor data (used by HW path / CommandInterpreter)
         tensor_data: dict[int, bytes] = {}
         for name, exposed in view.exposed_tensors.items():
-            if exposed._serialized is not None:
+            if exposed._array_element_buffers:
+                for flat_name, chunk in exposed._array_element_buffers.items():
+                    bid = buffer_ids.get(f"{name}:{flat_name}")
+                    if bid is not None and chunk:
+                        tensor_data[bid] = chunk
+            elif exposed._serialized is not None:
                 bid = buffer_ids.get(name)
                 if bid is not None:
                     tensor_data[bid] = exposed._serialized
@@ -226,23 +231,41 @@ class RuntimeEngine:
         top_spec = kernel.spec
 
         # ── Phase A: Sub-kernel instantiation ──
+        # Reuse sub-kernel instances created during initialize() if available
+        existing_subs = kernel._sub_kernel_instances
         sub_kernels: dict[str, KernelInstance] = {}
         bindings_map: dict[str, object] = {}  # name → SubKernelBinding
 
         for bind_name, binding in composite_instance.bindings():
-            # Load sub-kernel spec
-            sub_spec_path = binding.kernel_class.spec
-            sub_spec = load_kernel_spec(sub_spec_path)
-
-            sub_ki = KernelInstance(
-                name=bind_name,
-                spec=sub_spec,
-                kernel_class=binding.kernel_class,
-                runtime_params=binding.params or {},
-            )
-            sub_ki.initialize(self._project_params)
+            if existing_subs and bind_name in existing_subs:
+                sub_ki = existing_subs[bind_name]
+                # Ensure spec is fully loaded (initialize may have used fallback)
+                sub_spec_path = binding.kernel_class.spec
+                if sub_spec_path and not sub_ki.spec.interfaces:
+                    sub_ki.spec = load_kernel_spec(sub_spec_path)
+            else:
+                sub_spec_path = binding.kernel_class.spec
+                sub_spec = load_kernel_spec(sub_spec_path)
+                sub_ki = KernelInstance(
+                    name=bind_name,
+                    spec=sub_spec,
+                    kernel_class=binding.kernel_class,
+                    runtime_params=binding.params or {},
+                )
+                sub_ki.initialize(self._project_params)
             sub_kernels[bind_name] = sub_ki
             bindings_map[bind_name] = binding
+
+        # Synthesize top-level spec for composite kernels if missing
+        if not top_spec.interfaces:
+            import os
+            from pathlib import Path as _Path
+            from vten.build.composite import synthesize_spec
+            project_dir = _Path(os.getcwd())
+            top_spec = synthesize_spec(
+                kernel.kernel_class, project_dir, kernel.name,
+            )
+            kernel.spec = top_spec
 
         # ── Phase B: Interface mapping construction ──
         mappings: list[InterfaceMapping] = []
@@ -626,6 +649,29 @@ class RuntimeEngine:
                     exposed._serialized, split_spec
                 )
 
+            # Array interface: block-split data across elements
+            if iface_spec.array and not exposed._split_buffers:
+                flat_names = iface_spec.array.flat_names(exposed.top_interface)
+                n = len(flat_names)
+                if exposed._serialized is not None:
+                    # Input tensor: split actual data
+                    data = exposed._serialized
+                    chunk_size = len(data) // n
+                    remainder = len(data) % n
+                    exposed._array_element_buffers = {}
+                    offset = 0
+                    for i, fname in enumerate(flat_names):
+                        sz = chunk_size + (1 if i < remainder else 0)
+                        exposed._array_element_buffers[fname] = data[offset : offset + sz]
+                        offset += sz
+                else:
+                    # Output tensor: allocate size per element (no data yet)
+                    per_elem_size = exposed._serialized_size // n
+                    exposed._array_element_buffers = {
+                        fname: bytes(per_elem_size)
+                        for fname in flat_names
+                    }
+
     # ── Stage 3b: Probe Golden Serialization ──
 
     def _serialize_probe_golden(self, view: FlattenedKernelView) -> None:
@@ -686,13 +732,25 @@ class RuntimeEngine:
                                 buffer_ids[exposed.name],
                             )
                         )
-                bfm_configs[top_iface_name] = BFMConfig(
-                    interface_name=top_iface_name,
-                    protocol=iface_spec.protocol,
-                    data_width=iface_spec.data_width or 256,
-                    role="slave" if iface_spec.protocol == Protocol.AXI4 else "master",
-                    address_ranges=sorted(address_ranges),
-                )
+
+                if iface_spec.array:
+                    # Expand array interface into N individual BFMs
+                    for flat_name in iface_spec.array.flat_names(top_iface_name):
+                        bfm_configs[flat_name] = BFMConfig(
+                            interface_name=flat_name,
+                            protocol=iface_spec.protocol,
+                            data_width=iface_spec.data_width or 256,
+                            role="slave" if iface_spec.protocol == Protocol.AXI4 else "master",
+                            address_ranges=sorted(address_ranges),
+                        )
+                else:
+                    bfm_configs[top_iface_name] = BFMConfig(
+                        interface_name=top_iface_name,
+                        protocol=iface_spec.protocol,
+                        data_width=iface_spec.data_width or 256,
+                        role="slave" if iface_spec.protocol == Protocol.AXI4 else "master",
+                        address_ranges=sorted(address_ranges),
+                    )
             elif iface_spec.protocol == Protocol.AXI4L:
                 bfm_configs[top_iface_name] = BFMConfig(
                     interface_name=top_iface_name,
@@ -716,12 +774,19 @@ class RuntimeEngine:
         # Allocate data buffers
         allocated_buffer_ids: set[int] = set()
         for name, exposed in view.exposed_tensors.items():
-            bid = buffer_ids[name]
-            if bid in allocated_buffer_ids:
-                continue
-            allocated_buffer_ids.add(bid)
             direction = DIRECTION_ENCODING.get(exposed.direction, 0)
-            shm_alloc.allocate(bid, exposed._serialized_size, direction)
+            if exposed._array_element_buffers:
+                # Array tensor: one buffer per flat element
+                for flat_name, chunk in exposed._array_element_buffers.items():
+                    bid = buffer_ids[f"{name}:{flat_name}"]
+                    if bid not in allocated_buffer_ids:
+                        allocated_buffer_ids.add(bid)
+                        shm_alloc.allocate(bid, len(chunk), direction)
+            else:
+                bid = buffer_ids[name]
+                if bid not in allocated_buffer_ids:
+                    allocated_buffer_ids.add(bid)
+                    shm_alloc.allocate(bid, exposed._serialized_size, direction)
 
         # Probe golden buffers
         next_buffer_id = max(buffer_ids.values(), default=-1) + 1
@@ -787,7 +852,19 @@ class RuntimeEngine:
 
         # Copy input tensor data
         for name, exposed in view.exposed_tensors.items():
-            if exposed._serialized is not None:
+            if exposed._array_element_buffers:
+                # Array tensor: copy per-element data chunks
+                for flat_name, chunk in exposed._array_element_buffers.items():
+                    if not chunk or all(b == 0 for b in chunk):
+                        continue  # Skip zero-filled output placeholders
+                    bid = buffer_ids[f"{name}:{flat_name}"]
+                    try:
+                        desc = shm_alloc.get_descriptor(bid)
+                    except KeyError:
+                        continue
+                    start = data_region_offset + desc.data_offset
+                    image[start : start + len(chunk)] = chunk
+            elif exposed._serialized is not None:
                 bid = buffer_ids[name]
                 try:
                     desc = shm_alloc.get_descriptor(bid)

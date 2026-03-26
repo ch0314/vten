@@ -44,20 +44,8 @@ foreach f $ordered {
     }
 }
 
-# Append any RTL files missing from compile_order (auto-disabled by Vivado)
-foreach f [get_files -of [get_filesets sim_1]] {
-    set path [get_property NAME $f]
-    set ftype [get_property FILE_TYPE $f]
-    if {![dict exists $included $path]} {
-        if {$ftype eq "SystemVerilog"} {
-            set lib [get_property LIBRARY $f]
-            puts $fp "sv $lib $path"
-        } elseif {$ftype eq "Verilog"} {
-            set lib [get_property LIBRARY $f]
-            puts $fp "verilog $lib $path"
-        }
-    }
-}
+# NOTE: Previously appended unused files here. Removed — only compile what
+# Vivado's dependency analysis actually requires for the top module.
 close $fp
 
 # 5) 프로젝트 원복 (다음 커널을 위해 tb_top.sv 제거)

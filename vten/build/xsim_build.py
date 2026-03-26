@@ -243,6 +243,19 @@ class XsimBuildPipeline(BuildPipeline):
 
     def _stage_codegen(self, kernel_dir: Path) -> None:
         print(f"[Stage 3] codegen: {kernel_dir.name}")
+
+        from vten.build.composite import (
+            check_sub_kernels_built,
+            generate_composite_sv,
+            is_composite_kernel,
+            load_composite_class,
+            synthesize_spec,
+        )
+
+        if is_composite_kernel(kernel_dir):
+            self._stage_codegen_composite(kernel_dir)
+            return
+
         spec_path = kernel_dir / "kernel_spec.yaml"
         spec = parse_kernel_spec(spec_path)
         spec = _expand_split_interfaces(spec)
@@ -256,6 +269,49 @@ class XsimBuildPipeline(BuildPipeline):
 
         output = kernel_dir / "build" / "generated"
         output.mkdir(parents=True, exist_ok=True)
+        gen.generate(str(output), num_commands=256)
+        print("  done")
+
+    def _stage_codegen_composite(self, kernel_dir: Path) -> None:
+        """Composite kernel codegen: synthesize spec + generate wrapper-of-wrappers."""
+        from vten.build.composite import (
+            check_sub_kernels_built,
+            generate_composite_sv,
+            load_composite_class,
+            synthesize_spec,
+        )
+
+        composite_cls = load_composite_class(kernel_dir)
+        kernel_name = kernel_dir.name
+
+        # Check sub-kernel build dependency
+        unbuilt = check_sub_kernels_built(composite_cls, self._project)
+        if unbuilt:
+            raise BuildError(
+                f"Sub-kernels not built: {', '.join(unbuilt)}. "
+                f"Build them first: " +
+                " && ".join(f"vten build --kernel {n}" for n in unbuilt)
+            )
+
+        # Synthesize KernelSpec from sub-kernel specs + connectivity
+        spec = synthesize_spec(composite_cls, self._project, kernel_name)
+        bfm_configs = _derive_bfm_configs(spec)
+
+        output = kernel_dir / "build" / "generated"
+        output.mkdir(parents=True, exist_ok=True)
+
+        # Generate composite top SV (wrapper-of-wrappers)
+        generate_composite_sv(
+            composite_cls, spec, self._project, output
+        )
+
+        # Generate tb_top.sv using standard SVGenerator with synthesized spec
+        # Override top_module to use composite module name
+        gen = SVGenerator(
+            kernel_spec=spec,
+            bfm_configs=bfm_configs,
+            project_config=self._config,
+        )
         gen.generate(str(output), num_commands=256)
         print("  done")
 
@@ -277,6 +333,31 @@ class XsimBuildPipeline(BuildPipeline):
 
         tcl = self._vten_root / "templates" / "resolve_order.tcl"
         run_vivado(self._vivado_path, tcl, xpr_path, tb_top, prj_out)
+
+        # For composite kernels, prepend sub-kernel generated files
+        from vten.build.composite import (
+            get_sub_kernel_names,
+            is_composite_kernel,
+            load_composite_class,
+        )
+        if is_composite_kernel(kernel_dir):
+            composite_cls = load_composite_class(kernel_dir)
+            sub_names = get_sub_kernel_names(composite_cls)
+            sub_lines = []
+            for sname in sub_names:
+                gen_dir = self._project / "kernels" / sname / "build" / "generated"
+                for sv_file in sorted(gen_dir.glob("*.sv")):
+                    # Skip tb_top.sv (sub-kernel testbench not needed)
+                    if sv_file.name == "tb_top.sv":
+                        continue
+                    sub_lines.append(f"sv xil_defaultlib {sv_file}")
+            if sub_lines:
+                existing = prj_out.read_text()
+                # Prepend sub-kernel files before composite files
+                prj_out.write_text(
+                    "\n".join(sub_lines) + "\n" + existing
+                )
+
         print("  done")
 
     def _stage_compile(self, kernel_dir: Path) -> None:

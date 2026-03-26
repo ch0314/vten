@@ -347,7 +347,8 @@ class ExecutionContext:
             project_params=self._project_params,
             alias_registry=self._alias_registry,
         )
-        compiled = engine.compile()
+        target = self._backend.compile_target if self._backend else "sim"
+        compiled = engine.compile(target=target)
         self._last_compiled = compiled
         self._pending_ops = []
 

@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 
 # ═══════════════════════════════════════════════════════════════════
 # §1  vten init
@@ -101,14 +99,32 @@ class TestVtenInit:
         content = (project_dir / "vten.toml").read_text()
         assert "my_npu" in content
 
-    def test_existing_directory_error(self, tmp_path: Path):
-        """Error if target directory already exists."""
+    def test_existing_directory_overlay(self, tmp_path: Path):
+        """Init on existing directory creates missing structure without error."""
         from vten.cli.init_cmd import init_project
 
         project_dir = tmp_path / "my_npu"
         project_dir.mkdir()
-        with pytest.raises(Exception):  # FileExistsError or VTenError
-            init_project(str(project_dir))
+        # Place an existing file to verify it's not overwritten
+        (project_dir / "existing.txt").write_text("keep me")
+
+        init_project(str(project_dir))
+
+        assert (project_dir / "existing.txt").read_text() == "keep me"
+        assert (project_dir / "vten.toml").exists()
+        assert (project_dir / "kernels").is_dir()
+
+    def test_existing_directory_no_overwrite_toml(self, tmp_path: Path):
+        """Init on existing directory does not overwrite existing vten.toml."""
+        from vten.cli.init_cmd import init_project
+
+        project_dir = tmp_path / "my_npu"
+        project_dir.mkdir()
+        (project_dir / "vten.toml").write_text("[project]\nname = \"custom\"\n")
+
+        init_project(str(project_dir))
+
+        assert "custom" in (project_dir / "vten.toml").read_text()
 
     def test_nested_path(self, tmp_path: Path):
         """Init in a nested parent directory."""

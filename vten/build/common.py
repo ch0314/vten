@@ -20,13 +20,21 @@ from vten.errors import BuildError
 
 
 def discover_kernels(project: Path) -> list[str]:
-    """Discover kernels with kernel_spec.yaml under kernels/ directory."""
+    """Discover kernels under kernels/ directory.
+
+    Finds both unit kernels (with kernel_spec.yaml) and composite kernels
+    (with a CompositeKernel subclass in *_kernel.py, no kernel_spec.yaml).
+    """
+    from vten.build.composite import is_composite_kernel
+
     kernels_dir = project / "kernels"
     if not kernels_dir.exists():
         return []
     return sorted(
         d.name for d in kernels_dir.iterdir()
-        if d.is_dir() and (d / "kernel_spec.yaml").exists()
+        if d.is_dir() and (
+            (d / "kernel_spec.yaml").exists() or is_composite_kernel(d)
+        )
     )
 
 

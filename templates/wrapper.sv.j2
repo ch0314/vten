@@ -17,99 +17,99 @@ module {{ kernel_name }} #(
 {% if iface.protocol.value == 'axi4_lite' and iface.generate_controller %}
 {% set lines = [] %}
 {% set _ = lines.append("    // ── " ~ iface.name ~ ": AXI4-Lite Slave (flat) ──") %}
-{% set _ = lines.append("    input  logic [" ~ (iface.addr_width - 1) | string ~ ":0]         " ~ iface.rtl_port ~ "_awaddr") %}
-{% set _ = lines.append("    input  logic                " ~ ' ' * (iface.rtl_port | length) ~ iface.rtl_port ~ "_awvalid") %}
-{% set _ = lines.append("    output logic                " ~ ' ' * (iface.rtl_port | length) ~ iface.rtl_port ~ "_awready") %}
-{% set _ = lines.append("    input  logic [" ~ ((iface.data_width or 32) - 1) | string ~ ":0]         " ~ iface.rtl_port ~ "_wdata") %}
-{% set _ = lines.append("    input  logic [" ~ ((iface.data_width or 32) // 8 - 1) | string ~ ":0]           " ~ iface.rtl_port ~ "_wstrb") %}
-{% set _ = lines.append("    input  logic                " ~ ' ' * (iface.rtl_port | length) ~ iface.rtl_port ~ "_wvalid") %}
-{% set _ = lines.append("    output logic                " ~ ' ' * (iface.rtl_port | length) ~ iface.rtl_port ~ "_wready") %}
-{% set _ = lines.append("    output logic [1:0]          " ~ iface.rtl_port ~ "_bresp") %}
-{% set _ = lines.append("    output logic                " ~ ' ' * (iface.rtl_port | length) ~ iface.rtl_port ~ "_bvalid") %}
-{% set _ = lines.append("    input  logic                " ~ ' ' * (iface.rtl_port | length) ~ iface.rtl_port ~ "_bready") %}
-{% set _ = lines.append("    input  logic [" ~ (iface.addr_width - 1) | string ~ ":0]         " ~ iface.rtl_port ~ "_araddr") %}
-{% set _ = lines.append("    input  logic                " ~ ' ' * (iface.rtl_port | length) ~ iface.rtl_port ~ "_arvalid") %}
-{% set _ = lines.append("    output logic                " ~ ' ' * (iface.rtl_port | length) ~ iface.rtl_port ~ "_arready") %}
-{% set _ = lines.append("    output logic [" ~ ((iface.data_width or 32) - 1) | string ~ ":0]         " ~ iface.rtl_port ~ "_rdata") %}
-{% set _ = lines.append("    output logic [1:0]          " ~ iface.rtl_port ~ "_rresp") %}
-{% set _ = lines.append("    output logic                " ~ ' ' * (iface.rtl_port | length) ~ iface.rtl_port ~ "_rvalid") %}
-{% set _ = lines.append("    input  logic                " ~ ' ' * (iface.rtl_port | length) ~ iface.rtl_port ~ "_rready") %}
+{% set _ = lines.append("    input  logic [" ~ (iface.addr_width - 1) | string ~ ":0]         " ~ iface.ext_port ~ "_awaddr") %}
+{% set _ = lines.append("    input  logic                " ~ ' ' * (iface.ext_port | length) ~ iface.ext_port ~ "_awvalid") %}
+{% set _ = lines.append("    output logic                " ~ ' ' * (iface.ext_port | length) ~ iface.ext_port ~ "_awready") %}
+{% set _ = lines.append("    input  logic [" ~ ((iface.data_width or 32) - 1) | string ~ ":0]         " ~ iface.ext_port ~ "_wdata") %}
+{% set _ = lines.append("    input  logic [" ~ ((iface.data_width or 32) // 8 - 1) | string ~ ":0]           " ~ iface.ext_port ~ "_wstrb") %}
+{% set _ = lines.append("    input  logic                " ~ ' ' * (iface.ext_port | length) ~ iface.ext_port ~ "_wvalid") %}
+{% set _ = lines.append("    output logic                " ~ ' ' * (iface.ext_port | length) ~ iface.ext_port ~ "_wready") %}
+{% set _ = lines.append("    output logic [1:0]          " ~ iface.ext_port ~ "_bresp") %}
+{% set _ = lines.append("    output logic                " ~ ' ' * (iface.ext_port | length) ~ iface.ext_port ~ "_bvalid") %}
+{% set _ = lines.append("    input  logic                " ~ ' ' * (iface.ext_port | length) ~ iface.ext_port ~ "_bready") %}
+{% set _ = lines.append("    input  logic [" ~ (iface.addr_width - 1) | string ~ ":0]         " ~ iface.ext_port ~ "_araddr") %}
+{% set _ = lines.append("    input  logic                " ~ ' ' * (iface.ext_port | length) ~ iface.ext_port ~ "_arvalid") %}
+{% set _ = lines.append("    output logic                " ~ ' ' * (iface.ext_port | length) ~ iface.ext_port ~ "_arready") %}
+{% set _ = lines.append("    output logic [" ~ ((iface.data_width or 32) - 1) | string ~ ":0]         " ~ iface.ext_port ~ "_rdata") %}
+{% set _ = lines.append("    output logic [1:0]          " ~ iface.ext_port ~ "_rresp") %}
+{% set _ = lines.append("    output logic                " ~ ' ' * (iface.ext_port | length) ~ iface.ext_port ~ "_rvalid") %}
+{% set _ = lines.append("    input  logic                " ~ ' ' * (iface.ext_port | length) ~ iface.ext_port ~ "_rready") %}
 {% set _ = port_blocks.append(lines) %}
 {% elif iface.protocol.value == 'axi4_stream' %}
 {% set dw = iface.data_width or (iface.packing.bus_width if iface.packing else 256) %}
-{% set is_master = iface.rtl_port.startswith('m_') %}
+{% set is_master = iface.ext_port.startswith('m_') %}
 {% set lines = [] %}
 {% set _ = lines.append("    // ── " ~ iface.name ~ ": AXI4-Stream (flat) ──") %}
 {% if is_master %}
-{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0] " ~ iface.rtl_port ~ "_tdata") %}
-{% set _ = lines.append("    output logic " ~ ' ' * (iface.rtl_port | length + (dw - 1) | string | length + 2) ~ iface.rtl_port ~ "_tvalid") %}
-{% set _ = lines.append("    input  logic " ~ ' ' * (iface.rtl_port | length + (dw - 1) | string | length + 2) ~ iface.rtl_port ~ "_tready") %}
-{% set _ = lines.append("    output logic " ~ ' ' * (iface.rtl_port | length + (dw - 1) | string | length + 2) ~ iface.rtl_port ~ "_tlast") %}
+{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0] " ~ iface.ext_port ~ "_tdata") %}
+{% set _ = lines.append("    output logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tvalid") %}
+{% set _ = lines.append("    input  logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tready") %}
+{% set _ = lines.append("    output logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tlast") %}
 {% else %}
-{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0] " ~ iface.rtl_port ~ "_tdata") %}
-{% set _ = lines.append("    input  logic " ~ ' ' * (iface.rtl_port | length + (dw - 1) | string | length + 2) ~ iface.rtl_port ~ "_tvalid") %}
-{% set _ = lines.append("    output logic " ~ ' ' * (iface.rtl_port | length + (dw - 1) | string | length + 2) ~ iface.rtl_port ~ "_tready") %}
-{% set _ = lines.append("    input  logic " ~ ' ' * (iface.rtl_port | length + (dw - 1) | string | length + 2) ~ iface.rtl_port ~ "_tlast") %}
+{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0] " ~ iface.ext_port ~ "_tdata") %}
+{% set _ = lines.append("    input  logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tvalid") %}
+{% set _ = lines.append("    output logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tready") %}
+{% set _ = lines.append("    input  logic " ~ ' ' * (iface.ext_port | length + (dw - 1) | string | length + 2) ~ iface.ext_port ~ "_tlast") %}
 {% endif %}
 {% set _ = port_blocks.append(lines) %}
 {% elif iface.protocol.value == 'axi4' %}
 {% set dw = iface.data_width or 256 %}
 {% set aw = iface.addr_width or 64 %}
-{% set is_master = iface.rtl_port.startswith('m_') %}
+{% set is_master = iface.ext_port.startswith('m_') %}
 {% set lines = [] %}
 {% set _ = lines.append("    // ── " ~ iface.name ~ ": AXI4 (flat) ──") %}
 {% if is_master %}
-{% set _ = lines.append("    output logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.rtl_port ~ "_awaddr") %}
-{% set _ = lines.append("    output logic [7:0]          " ~ iface.rtl_port ~ "_awlen") %}
-{% set _ = lines.append("    output logic [2:0]          " ~ iface.rtl_port ~ "_awsize") %}
-{% set _ = lines.append("    output logic [1:0]          " ~ iface.rtl_port ~ "_awburst") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_awvalid") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_awready") %}
-{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.rtl_port ~ "_wdata") %}
-{% set _ = lines.append("    output logic [" ~ (dw // 8 - 1) | string ~ ":0]  " ~ iface.rtl_port ~ "_wstrb") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_wlast") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_wvalid") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_wready") %}
-{% set _ = lines.append("    input  logic [1:0]          " ~ iface.rtl_port ~ "_bresp") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_bvalid") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_bready") %}
-{% set _ = lines.append("    output logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.rtl_port ~ "_araddr") %}
-{% set _ = lines.append("    output logic [7:0]          " ~ iface.rtl_port ~ "_arlen") %}
-{% set _ = lines.append("    output logic [2:0]          " ~ iface.rtl_port ~ "_arsize") %}
-{% set _ = lines.append("    output logic [1:0]          " ~ iface.rtl_port ~ "_arburst") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_arvalid") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_arready") %}
-{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.rtl_port ~ "_rdata") %}
-{% set _ = lines.append("    input  logic [1:0]          " ~ iface.rtl_port ~ "_rresp") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_rlast") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_rvalid") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_rready") %}
+{% set _ = lines.append("    output logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.ext_port ~ "_awaddr") %}
+{% set _ = lines.append("    output logic [7:0]          " ~ iface.ext_port ~ "_awlen") %}
+{% set _ = lines.append("    output logic [2:0]          " ~ iface.ext_port ~ "_awsize") %}
+{% set _ = lines.append("    output logic [1:0]          " ~ iface.ext_port ~ "_awburst") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_awvalid") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_awready") %}
+{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.ext_port ~ "_wdata") %}
+{% set _ = lines.append("    output logic [" ~ (dw // 8 - 1) | string ~ ":0]  " ~ iface.ext_port ~ "_wstrb") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_wlast") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_wvalid") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_wready") %}
+{% set _ = lines.append("    input  logic [1:0]          " ~ iface.ext_port ~ "_bresp") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_bvalid") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_bready") %}
+{% set _ = lines.append("    output logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.ext_port ~ "_araddr") %}
+{% set _ = lines.append("    output logic [7:0]          " ~ iface.ext_port ~ "_arlen") %}
+{% set _ = lines.append("    output logic [2:0]          " ~ iface.ext_port ~ "_arsize") %}
+{% set _ = lines.append("    output logic [1:0]          " ~ iface.ext_port ~ "_arburst") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_arvalid") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_arready") %}
+{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.ext_port ~ "_rdata") %}
+{% set _ = lines.append("    input  logic [1:0]          " ~ iface.ext_port ~ "_rresp") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_rlast") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_rvalid") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_rready") %}
 {% else %}
-{% set _ = lines.append("    input  logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.rtl_port ~ "_awaddr") %}
-{% set _ = lines.append("    input  logic [7:0]          " ~ iface.rtl_port ~ "_awlen") %}
-{% set _ = lines.append("    input  logic [2:0]          " ~ iface.rtl_port ~ "_awsize") %}
-{% set _ = lines.append("    input  logic [1:0]          " ~ iface.rtl_port ~ "_awburst") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_awvalid") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_awready") %}
-{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.rtl_port ~ "_wdata") %}
-{% set _ = lines.append("    input  logic [" ~ (dw // 8 - 1) | string ~ ":0]  " ~ iface.rtl_port ~ "_wstrb") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_wlast") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_wvalid") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_wready") %}
-{% set _ = lines.append("    output logic [1:0]          " ~ iface.rtl_port ~ "_bresp") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_bvalid") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_bready") %}
-{% set _ = lines.append("    input  logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.rtl_port ~ "_araddr") %}
-{% set _ = lines.append("    input  logic [7:0]          " ~ iface.rtl_port ~ "_arlen") %}
-{% set _ = lines.append("    input  logic [2:0]          " ~ iface.rtl_port ~ "_arsize") %}
-{% set _ = lines.append("    input  logic [1:0]          " ~ iface.rtl_port ~ "_arburst") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_arvalid") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_arready") %}
-{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.rtl_port ~ "_rdata") %}
-{% set _ = lines.append("    output logic [1:0]          " ~ iface.rtl_port ~ "_rresp") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_rlast") %}
-{% set _ = lines.append("    output logic                " ~ iface.rtl_port ~ "_rvalid") %}
-{% set _ = lines.append("    input  logic                " ~ iface.rtl_port ~ "_rready") %}
+{% set _ = lines.append("    input  logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.ext_port ~ "_awaddr") %}
+{% set _ = lines.append("    input  logic [7:0]          " ~ iface.ext_port ~ "_awlen") %}
+{% set _ = lines.append("    input  logic [2:0]          " ~ iface.ext_port ~ "_awsize") %}
+{% set _ = lines.append("    input  logic [1:0]          " ~ iface.ext_port ~ "_awburst") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_awvalid") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_awready") %}
+{% set _ = lines.append("    input  logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.ext_port ~ "_wdata") %}
+{% set _ = lines.append("    input  logic [" ~ (dw // 8 - 1) | string ~ ":0]  " ~ iface.ext_port ~ "_wstrb") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_wlast") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_wvalid") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_wready") %}
+{% set _ = lines.append("    output logic [1:0]          " ~ iface.ext_port ~ "_bresp") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_bvalid") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_bready") %}
+{% set _ = lines.append("    input  logic [" ~ (aw - 1) | string ~ ":0]    " ~ iface.ext_port ~ "_araddr") %}
+{% set _ = lines.append("    input  logic [7:0]          " ~ iface.ext_port ~ "_arlen") %}
+{% set _ = lines.append("    input  logic [2:0]          " ~ iface.ext_port ~ "_arsize") %}
+{% set _ = lines.append("    input  logic [1:0]          " ~ iface.ext_port ~ "_arburst") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_arvalid") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_arready") %}
+{% set _ = lines.append("    output logic [" ~ (dw - 1) | string ~ ":0]   " ~ iface.ext_port ~ "_rdata") %}
+{% set _ = lines.append("    output logic [1:0]          " ~ iface.ext_port ~ "_rresp") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_rlast") %}
+{% set _ = lines.append("    output logic                " ~ iface.ext_port ~ "_rvalid") %}
+{% set _ = lines.append("    input  logic                " ~ iface.ext_port ~ "_rready") %}
 {% endif %}
 {% set _ = port_blocks.append(lines) %}
 {% endif %}
@@ -247,75 +247,75 @@ module {{ kernel_name }} #(
 
 {% for iface in stream_interfaces %}
     // ── {{ iface.name }}: flat ↔ interface ──
-{% set is_master = iface.rtl_port.startswith('m_') %}
+{% set is_master = iface.ext_port.startswith('m_') %}
 {% if is_master %}
-    assign {{ iface.rtl_port }}_tdata  = {{ iface.name }}_if.tdata;
-    assign {{ iface.rtl_port }}_tvalid = {{ iface.name }}_if.tvalid;
-    assign {{ iface.name }}_if.tready  = {{ iface.rtl_port }}_tready;
-    assign {{ iface.rtl_port }}_tlast  = {{ iface.name }}_if.tlast;
+    assign {{ iface.ext_port }}_tdata  = {{ iface.name }}_if.tdata;
+    assign {{ iface.ext_port }}_tvalid = {{ iface.name }}_if.tvalid;
+    assign {{ iface.name }}_if.tready  = {{ iface.ext_port }}_tready;
+    assign {{ iface.ext_port }}_tlast  = {{ iface.name }}_if.tlast;
 {% else %}
-    assign {{ iface.name }}_if.tdata   = {{ iface.rtl_port }}_tdata;
-    assign {{ iface.name }}_if.tvalid  = {{ iface.rtl_port }}_tvalid;
-    assign {{ iface.rtl_port }}_tready = {{ iface.name }}_if.tready;
-    assign {{ iface.name }}_if.tlast   = {{ iface.rtl_port }}_tlast;
+    assign {{ iface.name }}_if.tdata   = {{ iface.ext_port }}_tdata;
+    assign {{ iface.name }}_if.tvalid  = {{ iface.ext_port }}_tvalid;
+    assign {{ iface.ext_port }}_tready = {{ iface.name }}_if.tready;
+    assign {{ iface.name }}_if.tlast   = {{ iface.ext_port }}_tlast;
 {% endif %}
 
 {% endfor %}
 {% for iface in aximm_interfaces %}
     // ── {{ iface.name }}: flat ↔ interface ──
-{% set is_master = iface.rtl_port.startswith('m_') %}
+{% set is_master = iface.ext_port.startswith('m_') %}
 {% if is_master %}
-    assign {{ iface.rtl_port }}_awaddr  = {{ iface.name }}_if.awaddr;
-    assign {{ iface.rtl_port }}_awlen   = {{ iface.name }}_if.awlen;
-    assign {{ iface.rtl_port }}_awsize  = {{ iface.name }}_if.awsize;
-    assign {{ iface.rtl_port }}_awburst = {{ iface.name }}_if.awburst;
-    assign {{ iface.rtl_port }}_awvalid = {{ iface.name }}_if.awvalid;
-    assign {{ iface.name }}_if.awready  = {{ iface.rtl_port }}_awready;
-    assign {{ iface.rtl_port }}_wdata   = {{ iface.name }}_if.wdata;
-    assign {{ iface.rtl_port }}_wstrb   = {{ iface.name }}_if.wstrb;
-    assign {{ iface.rtl_port }}_wlast   = {{ iface.name }}_if.wlast;
-    assign {{ iface.rtl_port }}_wvalid  = {{ iface.name }}_if.wvalid;
-    assign {{ iface.name }}_if.wready   = {{ iface.rtl_port }}_wready;
-    assign {{ iface.name }}_if.bresp    = {{ iface.rtl_port }}_bresp;
-    assign {{ iface.name }}_if.bvalid   = {{ iface.rtl_port }}_bvalid;
-    assign {{ iface.rtl_port }}_bready  = {{ iface.name }}_if.bready;
-    assign {{ iface.rtl_port }}_araddr  = {{ iface.name }}_if.araddr;
-    assign {{ iface.rtl_port }}_arlen   = {{ iface.name }}_if.arlen;
-    assign {{ iface.rtl_port }}_arsize  = {{ iface.name }}_if.arsize;
-    assign {{ iface.rtl_port }}_arburst = {{ iface.name }}_if.arburst;
-    assign {{ iface.rtl_port }}_arvalid = {{ iface.name }}_if.arvalid;
-    assign {{ iface.name }}_if.arready  = {{ iface.rtl_port }}_arready;
-    assign {{ iface.name }}_if.rdata    = {{ iface.rtl_port }}_rdata;
-    assign {{ iface.name }}_if.rresp    = {{ iface.rtl_port }}_rresp;
-    assign {{ iface.name }}_if.rlast    = {{ iface.rtl_port }}_rlast;
-    assign {{ iface.name }}_if.rvalid   = {{ iface.rtl_port }}_rvalid;
-    assign {{ iface.rtl_port }}_rready  = {{ iface.name }}_if.rready;
+    assign {{ iface.ext_port }}_awaddr  = {{ iface.name }}_if.awaddr;
+    assign {{ iface.ext_port }}_awlen   = {{ iface.name }}_if.awlen;
+    assign {{ iface.ext_port }}_awsize  = {{ iface.name }}_if.awsize;
+    assign {{ iface.ext_port }}_awburst = {{ iface.name }}_if.awburst;
+    assign {{ iface.ext_port }}_awvalid = {{ iface.name }}_if.awvalid;
+    assign {{ iface.name }}_if.awready  = {{ iface.ext_port }}_awready;
+    assign {{ iface.ext_port }}_wdata   = {{ iface.name }}_if.wdata;
+    assign {{ iface.ext_port }}_wstrb   = {{ iface.name }}_if.wstrb;
+    assign {{ iface.ext_port }}_wlast   = {{ iface.name }}_if.wlast;
+    assign {{ iface.ext_port }}_wvalid  = {{ iface.name }}_if.wvalid;
+    assign {{ iface.name }}_if.wready   = {{ iface.ext_port }}_wready;
+    assign {{ iface.name }}_if.bresp    = {{ iface.ext_port }}_bresp;
+    assign {{ iface.name }}_if.bvalid   = {{ iface.ext_port }}_bvalid;
+    assign {{ iface.ext_port }}_bready  = {{ iface.name }}_if.bready;
+    assign {{ iface.ext_port }}_araddr  = {{ iface.name }}_if.araddr;
+    assign {{ iface.ext_port }}_arlen   = {{ iface.name }}_if.arlen;
+    assign {{ iface.ext_port }}_arsize  = {{ iface.name }}_if.arsize;
+    assign {{ iface.ext_port }}_arburst = {{ iface.name }}_if.arburst;
+    assign {{ iface.ext_port }}_arvalid = {{ iface.name }}_if.arvalid;
+    assign {{ iface.name }}_if.arready  = {{ iface.ext_port }}_arready;
+    assign {{ iface.name }}_if.rdata    = {{ iface.ext_port }}_rdata;
+    assign {{ iface.name }}_if.rresp    = {{ iface.ext_port }}_rresp;
+    assign {{ iface.name }}_if.rlast    = {{ iface.ext_port }}_rlast;
+    assign {{ iface.name }}_if.rvalid   = {{ iface.ext_port }}_rvalid;
+    assign {{ iface.ext_port }}_rready  = {{ iface.name }}_if.rready;
 {% else %}
-    assign {{ iface.name }}_if.awaddr   = {{ iface.rtl_port }}_awaddr;
-    assign {{ iface.name }}_if.awlen    = {{ iface.rtl_port }}_awlen;
-    assign {{ iface.name }}_if.awsize   = {{ iface.rtl_port }}_awsize;
-    assign {{ iface.name }}_if.awburst  = {{ iface.rtl_port }}_awburst;
-    assign {{ iface.name }}_if.awvalid  = {{ iface.rtl_port }}_awvalid;
-    assign {{ iface.rtl_port }}_awready = {{ iface.name }}_if.awready;
-    assign {{ iface.name }}_if.wdata    = {{ iface.rtl_port }}_wdata;
-    assign {{ iface.name }}_if.wstrb    = {{ iface.rtl_port }}_wstrb;
-    assign {{ iface.name }}_if.wlast    = {{ iface.rtl_port }}_wlast;
-    assign {{ iface.name }}_if.wvalid   = {{ iface.rtl_port }}_wvalid;
-    assign {{ iface.rtl_port }}_wready  = {{ iface.name }}_if.wready;
-    assign {{ iface.rtl_port }}_bresp   = {{ iface.name }}_if.bresp;
-    assign {{ iface.rtl_port }}_bvalid  = {{ iface.name }}_if.bvalid;
-    assign {{ iface.name }}_if.bready   = {{ iface.rtl_port }}_bready;
-    assign {{ iface.name }}_if.araddr   = {{ iface.rtl_port }}_araddr;
-    assign {{ iface.name }}_if.arlen    = {{ iface.rtl_port }}_arlen;
-    assign {{ iface.name }}_if.arsize   = {{ iface.rtl_port }}_arsize;
-    assign {{ iface.name }}_if.arburst  = {{ iface.rtl_port }}_arburst;
-    assign {{ iface.name }}_if.arvalid  = {{ iface.rtl_port }}_arvalid;
-    assign {{ iface.rtl_port }}_arready = {{ iface.name }}_if.arready;
-    assign {{ iface.rtl_port }}_rdata   = {{ iface.name }}_if.rdata;
-    assign {{ iface.rtl_port }}_rresp   = {{ iface.name }}_if.rresp;
-    assign {{ iface.rtl_port }}_rlast   = {{ iface.name }}_if.rlast;
-    assign {{ iface.rtl_port }}_rvalid  = {{ iface.name }}_if.rvalid;
-    assign {{ iface.name }}_if.rready   = {{ iface.rtl_port }}_rready;
+    assign {{ iface.name }}_if.awaddr   = {{ iface.ext_port }}_awaddr;
+    assign {{ iface.name }}_if.awlen    = {{ iface.ext_port }}_awlen;
+    assign {{ iface.name }}_if.awsize   = {{ iface.ext_port }}_awsize;
+    assign {{ iface.name }}_if.awburst  = {{ iface.ext_port }}_awburst;
+    assign {{ iface.name }}_if.awvalid  = {{ iface.ext_port }}_awvalid;
+    assign {{ iface.ext_port }}_awready = {{ iface.name }}_if.awready;
+    assign {{ iface.name }}_if.wdata    = {{ iface.ext_port }}_wdata;
+    assign {{ iface.name }}_if.wstrb    = {{ iface.ext_port }}_wstrb;
+    assign {{ iface.name }}_if.wlast    = {{ iface.ext_port }}_wlast;
+    assign {{ iface.name }}_if.wvalid   = {{ iface.ext_port }}_wvalid;
+    assign {{ iface.ext_port }}_wready  = {{ iface.name }}_if.wready;
+    assign {{ iface.ext_port }}_bresp   = {{ iface.name }}_if.bresp;
+    assign {{ iface.ext_port }}_bvalid  = {{ iface.name }}_if.bvalid;
+    assign {{ iface.name }}_if.bready   = {{ iface.ext_port }}_bready;
+    assign {{ iface.name }}_if.araddr   = {{ iface.ext_port }}_araddr;
+    assign {{ iface.name }}_if.arlen    = {{ iface.ext_port }}_arlen;
+    assign {{ iface.name }}_if.arsize   = {{ iface.ext_port }}_arsize;
+    assign {{ iface.name }}_if.arburst  = {{ iface.ext_port }}_arburst;
+    assign {{ iface.name }}_if.arvalid  = {{ iface.ext_port }}_arvalid;
+    assign {{ iface.ext_port }}_arready = {{ iface.name }}_if.arready;
+    assign {{ iface.ext_port }}_rdata   = {{ iface.name }}_if.rdata;
+    assign {{ iface.ext_port }}_rresp   = {{ iface.name }}_if.rresp;
+    assign {{ iface.ext_port }}_rlast   = {{ iface.name }}_if.rlast;
+    assign {{ iface.ext_port }}_rvalid  = {{ iface.name }}_if.rvalid;
+    assign {{ iface.name }}_if.rready   = {{ iface.ext_port }}_rready;
 {% endif %}
 
 {% endfor %}
@@ -405,23 +405,23 @@ module {{ kernel_name }} #(
     ) u_{{ iface.name }}_ctrl (
         .{{ clock_name }}({{ clock_name }}),
         .{{ reset_name }}({{ reset_name }}),
-        .s_awaddr  ({{ iface.rtl_port }}_awaddr),
-        .s_awvalid ({{ iface.rtl_port }}_awvalid),
-        .s_awready ({{ iface.rtl_port }}_awready),
-        .s_wdata   ({{ iface.rtl_port }}_wdata),
-        .s_wstrb   ({{ iface.rtl_port }}_wstrb),
-        .s_wvalid  ({{ iface.rtl_port }}_wvalid),
-        .s_wready  ({{ iface.rtl_port }}_wready),
-        .s_bresp   ({{ iface.rtl_port }}_bresp),
-        .s_bvalid  ({{ iface.rtl_port }}_bvalid),
-        .s_bready  ({{ iface.rtl_port }}_bready),
-        .s_araddr  ({{ iface.rtl_port }}_araddr),
-        .s_arvalid ({{ iface.rtl_port }}_arvalid),
-        .s_arready ({{ iface.rtl_port }}_arready),
-        .s_rdata   ({{ iface.rtl_port }}_rdata),
-        .s_rresp   ({{ iface.rtl_port }}_rresp),
-        .s_rvalid  ({{ iface.rtl_port }}_rvalid),
-        .s_rready  ({{ iface.rtl_port }}_rready),
+        .s_awaddr  ({{ iface.ext_port }}_awaddr),
+        .s_awvalid ({{ iface.ext_port }}_awvalid),
+        .s_awready ({{ iface.ext_port }}_awready),
+        .s_wdata   ({{ iface.ext_port }}_wdata),
+        .s_wstrb   ({{ iface.ext_port }}_wstrb),
+        .s_wvalid  ({{ iface.ext_port }}_wvalid),
+        .s_wready  ({{ iface.ext_port }}_wready),
+        .s_bresp   ({{ iface.ext_port }}_bresp),
+        .s_bvalid  ({{ iface.ext_port }}_bvalid),
+        .s_bready  ({{ iface.ext_port }}_bready),
+        .s_araddr  ({{ iface.ext_port }}_araddr),
+        .s_arvalid ({{ iface.ext_port }}_arvalid),
+        .s_arready ({{ iface.ext_port }}_arready),
+        .s_rdata   ({{ iface.ext_port }}_rdata),
+        .s_rresp   ({{ iface.ext_port }}_rresp),
+        .s_rvalid  ({{ iface.ext_port }}_rvalid),
+        .s_rready  ({{ iface.ext_port }}_rready),
 {% for reg in iface.registers %}
         .reg_{{ reg.name }}(reg_{{ reg.name }}){{ "," if not loop.last else "" }}
 {% endfor %}
@@ -434,8 +434,8 @@ module {{ kernel_name }} #(
         .{{ pname }}({{ pname }}){{ "," if not loop.last else "" }}
 {% endfor %}
     ) u_core (
-        .{{ clock_name }}({{ clock_name }}),
-        .{{ reset_name }}({{ reset_name }}),
+        .{{ core_clock_name }}({{ clock_name }}),
+        .{{ core_reset_name }}({{ reset_name }}),
 {# Collect all core ports into a flat list to handle trailing comma correctly #}
 {% set core_ports = [] %}
 {% for iface in ctrl_interfaces %}

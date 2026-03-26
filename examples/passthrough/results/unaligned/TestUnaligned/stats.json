@@ -1,0 +1,64 @@
+{
+  "commands": [
+    {
+      "cmd_id": 0,
+      "op": "LOAD",
+      "interface": "",
+      "protocol": "axi4_stream",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 0,
+      "commit_cycle": 0,
+      "latency_cycles": 0,
+      "active_cycles": 0,
+      "stall_cycles": 0,
+      "total_beats": 0,
+      "utilization": 0.0,
+      "bus_efficiency": 0.0,
+      "tensor": "data_in",
+      "size": 1024
+    },
+    {
+      "cmd_id": 1,
+      "op": "PUSH",
+      "interface": "input_stream",
+      "protocol": "axi4_stream",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 9,
+      "commit_cycle": 42,
+      "latency_cycles": 33,
+      "active_cycles": 31,
+      "stall_cycles": 0,
+      "total_beats": 31,
+      "utilization": 0.9688,
+      "bus_efficiency": 0.9394,
+      "tensor": "data_in",
+      "size": 1024,
+      "dep": [
+        0
+      ]
+    },
+    {
+      "cmd_id": 2,
+      "op": "PULL",
+      "interface": "output_stream",
+      "protocol": "axi4_stream",
+      "status": 3,
+      "status_name": "COMMITTED",
+      "issue_cycle": 9,
+      "commit_cycle": 42,
+      "latency_cycles": 33,
+      "active_cycles": 31,
+      "stall_cycles": 0,
+      "total_beats": 31,
+      "utilization": 0.9688,
+      "bus_efficiency": 0.9394,
+      "tensor": "data_out",
+      "size": 1024,
+      "dep": [
+        0
+      ]
+    }
+  ]
+}

@@ -502,12 +502,12 @@ class TestSVGeneratorRTLPortMatching:
         lower = content.lower()
         assert "wire" in lower or "logic" in lower, "No wire/logic declarations found"
 
-    def test_dut_port_connections_use_rtl_port_names(self, tmp_path: Path):
-        """DUT instance has .rtl_port_name(...) connections."""
+    def test_dut_port_connections_use_ext_port_names(self, tmp_path: Path):
+        """DUT instance has .ext_port_name(...) connections (Vitis naming)."""
         content = _generate_passthrough(tmp_path)
-        # Must use the rtl_port names from spec, not interface_name
-        assert "s_axis_in" in content, "DUT missing .s_axis_in port connection"
-        assert "m_axis_out" in content, "DUT missing .m_axis_out port connection"
+        # Must use Vitis ext_port names derived from protocol + interface name
+        assert "s_axis_axi_stream_in" in content, "DUT missing .s_axis_axi_stream_in port connection"
+        assert "m_axis_axi_stream_out" in content, "DUT missing .m_axis_axi_stream_out port connection"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -773,12 +773,12 @@ class TestBFMPortConnections:
     def test_axi4s_master_bfm_m_ports_connected(self, tmp_path: Path):
         """AXI4-Stream master BFM: .m_tdata(wire), .m_tvalid(wire), etc."""
         content = _generate_passthrough(tmp_path)
-        # s_axis_in is master role BFM (drives data into DUT)
-        assert ".m_tdata(s_axis_in_tdata)" in content, \
+        # s_axis_axi_stream_in is master role BFM (drives data into DUT)
+        assert ".m_tdata(s_axis_axi_stream_in_tdata)" in content, \
             "AXI4S master BFM missing .m_tdata(wire) connection"
-        assert ".m_tvalid(s_axis_in_tvalid)" in content
-        assert ".m_tready(s_axis_in_tready)" in content
-        assert ".m_tlast(s_axis_in_tlast)" in content
+        assert ".m_tvalid(s_axis_axi_stream_in_tvalid)" in content
+        assert ".m_tready(s_axis_axi_stream_in_tready)" in content
+        assert ".m_tlast(s_axis_axi_stream_in_tlast)" in content
 
     def test_axi4s_master_bfm_s_ports_tied_off(self, tmp_path: Path):
         """AXI4-Stream master BFM: .s_tdata('0), .s_tvalid(1'b0) tie-off."""
@@ -789,12 +789,12 @@ class TestBFMPortConnections:
     def test_axi4s_slave_bfm_s_ports_connected(self, tmp_path: Path):
         """AXI4-Stream slave BFM: .s_tdata(wire), .s_tvalid(wire), etc."""
         content = _generate_passthrough(tmp_path)
-        # m_axis_out is slave role BFM (receives data from DUT)
-        assert ".s_tdata(m_axis_out_tdata)" in content, \
+        # m_axis_axi_stream_out is slave role BFM (receives data from DUT)
+        assert ".s_tdata(m_axis_axi_stream_out_tdata)" in content, \
             "AXI4S slave BFM missing .s_tdata(wire) connection"
-        assert ".s_tvalid(m_axis_out_tvalid)" in content
-        assert ".s_tready(m_axis_out_tready)" in content
-        assert ".s_tlast(m_axis_out_tlast)" in content
+        assert ".s_tvalid(m_axis_axi_stream_out_tvalid)" in content
+        assert ".s_tready(m_axis_axi_stream_out_tready)" in content
+        assert ".s_tlast(m_axis_axi_stream_out_tlast)" in content
 
     def test_axi4s_slave_bfm_m_tready_tied_high(self, tmp_path: Path):
         """AXI4-Stream slave BFM: .m_tready(1'b1) tie-off."""

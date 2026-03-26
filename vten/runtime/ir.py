@@ -97,8 +97,20 @@ class IRLowering:
         self._view = view
         self._alias_registry = alias_registry
         self._buffer_ids: dict[str, int] = {}
+        # Pre-populate interface ID map using spec order so it matches
+        # codegen's iface_to_bfm mapping.
+        # Array interfaces are expanded to flat element names; the logical
+        # name maps to the first element's ID for backward compatibility.
         self._iface_id_map: dict[str, int] = {}
-        self._next_iface_id = 0
+        expanded = view.top_spec.expanded_interface_names()
+        for idx, flat_name in enumerate(expanded):
+            self._iface_id_map[flat_name] = idx
+        # Also map logical array names → first element ID
+        for name, iface in view.top_spec.interfaces.items():
+            if iface.array and name not in self._iface_id_map:
+                first_flat = iface.array.flat_names(name)[0]
+                self._iface_id_map[name] = self._iface_id_map[first_flat]
+        self._next_iface_id = len(expanded)
 
     def lower(
         self, ops: list[Operation]
@@ -127,8 +139,17 @@ class IRLowering:
                 new_cmds[-1].commit_dep = commit_dep_ids
 
             commands.extend(new_cmds)
-            last_cmd_id = next_cmd_id - 1 if new_cmds else first_cmd_id
-            op_to_cmd_range[id(op)] = (first_cmd_id, last_cmd_id)
+            if new_cmds:
+                last_cmd_id = next_cmd_id - 1
+                op_to_cmd_range[id(op)] = (first_cmd_id, last_cmd_id)
+            else:
+                # Zero-command op: inherit parent's dep targets so dependents
+                # resolve to the same commands this op depended on, avoiding
+                # self-referencing phantom cmd_ids.
+                parent_ids = self._resolve_deps(op.dep, op_to_cmd_range)
+                if parent_ids:
+                    op_to_cmd_range[id(op)] = (parent_ids[0], parent_ids[-1])
+                # else: no deps and no cmds — op effectively invisible
 
         return commands, self._buffer_ids
 
@@ -137,9 +158,17 @@ class IRLowering:
         next_id = 0
         # Two-pass: allocate non-alias tensors first, then resolve aliases
         alias_targets: list[str] = []
-        for name in self._view.exposed_tensors:
+        for name, exposed in self._view.exposed_tensors.items():
             if self._alias_registry and self._alias_registry.is_alias_target(name):
                 alias_targets.append(name)
+            elif exposed._array_element_buffers:
+                # Array tensor: one buffer_id per flat element
+                for flat_name in exposed._array_element_buffers:
+                    buffer_ids[f"{name}:{flat_name}"] = next_id
+                    next_id += 1
+                # Logical name → first element's ID (for backward compat)
+                first_key = f"{name}:{next(iter(exposed._array_element_buffers))}"
+                buffer_ids[name] = buffer_ids[first_key]
             else:
                 buffer_ids[name] = next_id
                 next_id += 1
@@ -241,10 +270,30 @@ class IRLowering:
         exposed = self._view.exposed_tensors[op.tensor.name]
         iface = self._view.top_spec.get_interface(exposed.top_interface)
 
+        # Array interface: per-element PUSH commands
+        if exposed._array_element_buffers:
+            commands: list[Command] = []
+            for flat_name, chunk in exposed._array_element_buffers.items():
+                cmd = Command(
+                    op=OpCode.PUSH,
+                    cmd_id=next_cmd_id,
+                    interface_id=self._get_iface_id(flat_name),
+                    buffer_id=self._buffer_ids[f"{exposed.name}:{flat_name}"],
+                    protocol=iface.protocol,
+                    phys_addr=exposed.address or 0,
+                    size=len(chunk),
+                    role=_determine_role(iface.protocol, OpCode.PUSH),
+                    probe=op.probe,
+                    dep=dep_ids if not commands else [],
+                )
+                commands.append(cmd)
+                next_cmd_id += 1
+            return commands, next_cmd_id
+
         if exposed._split_buffers:
             # Spec §12.3: first split cmd gets upstream deps,
             # remaining get [] (ordered implicitly by cmd_id).
-            commands: list[Command] = []
+            commands = []
             for port_name, port_data in exposed._split_buffers.items():
                 cmd = Command(
                     op=OpCode.PUSH,
@@ -283,10 +332,30 @@ class IRLowering:
         exposed = self._view.exposed_tensors[op.tensor.name]
         iface = self._view.top_spec.get_interface(exposed.top_interface)
 
+        # Array interface: per-element PULL commands
+        if exposed._array_element_buffers:
+            commands: list[Command] = []
+            for flat_name, chunk in exposed._array_element_buffers.items():
+                cmd = Command(
+                    op=OpCode.PULL,
+                    cmd_id=next_cmd_id,
+                    interface_id=self._get_iface_id(flat_name),
+                    buffer_id=self._buffer_ids[f"{exposed.name}:{flat_name}"],
+                    protocol=iface.protocol,
+                    phys_addr=exposed.address or 0,
+                    size=len(chunk),
+                    role=_determine_role(iface.protocol, OpCode.PULL),
+                    probe=op.probe,
+                    dep=dep_ids if not commands else [],
+                )
+                commands.append(cmd)
+                next_cmd_id += 1
+            return commands, next_cmd_id
+
         if exposed._split_buffers:
             # Spec §12.3: first split cmd gets upstream deps,
             # remaining get [] (ordered implicitly by cmd_id).
-            commands: list[Command] = []
+            commands = []
             for port_name in exposed._split_buffers:
                 cmd = Command(
                     op=OpCode.PULL,
@@ -437,6 +506,41 @@ class IRLowering:
             and self._alias_registry.is_alias_target(exposed.name)
         )
 
+        # Array interface: per-element LOAD + PUSH
+        if exposed._array_element_buffers:
+            for i, (flat_name, chunk) in enumerate(
+                exposed._array_element_buffers.items()
+            ):
+                bid = self._buffer_ids[f"{exposed.name}:{flat_name}"]
+                if not is_alias_target:
+                    load_cmd = Command(
+                        op=OpCode.LOAD,
+                        cmd_id=next_cmd_id,
+                        buffer_id=bid,
+                        size=len(chunk),
+                        dep=dep_ids if i == 0 else [],
+                    )
+                    commands.append(load_cmd)
+                    load_id = next_cmd_id
+                    next_cmd_id += 1
+                    push_dep = [load_id]
+                else:
+                    push_dep = dep_ids if i == 0 else []
+                push_cmd = Command(
+                    op=OpCode.PUSH,
+                    cmd_id=next_cmd_id,
+                    interface_id=self._get_iface_id(flat_name),
+                    buffer_id=bid,
+                    protocol=iface.protocol,
+                    phys_addr=exposed.address or 0,
+                    size=len(chunk),
+                    role=_determine_role(iface.protocol, OpCode.PUSH),
+                    dep=push_dep,
+                )
+                commands.append(push_cmd)
+                next_cmd_id += 1
+            return commands, next_cmd_id
+
         if not is_alias_target:
             load_cmd = Command(
                 op=OpCode.LOAD,
@@ -478,6 +582,41 @@ class IRLowering:
             self._alias_registry
             and self._alias_registry.is_alias_source(exposed.name)
         )
+
+        # Array interface: per-element PULL + STORE
+        if exposed._array_element_buffers:
+            for i, (flat_name, chunk) in enumerate(
+                exposed._array_element_buffers.items()
+            ):
+                bid = self._buffer_ids[f"{exposed.name}:{flat_name}"]
+                pull_cmd = Command(
+                    op=OpCode.PULL,
+                    cmd_id=next_cmd_id,
+                    interface_id=self._get_iface_id(flat_name),
+                    buffer_id=bid,
+                    protocol=iface.protocol,
+                    phys_addr=exposed.address or 0,
+                    size=len(chunk),
+                    role=_determine_role(iface.protocol, OpCode.PULL),
+                    dep=dep_ids if i == 0 else [],
+                )
+                commands.append(pull_cmd)
+                pull_id = next_cmd_id
+                next_cmd_id += 1
+
+                if self._alias_registry:
+                    self._alias_registry.record_write_cmd(exposed.name, pull_id)
+
+                if not is_alias_source and iface.protocol != Protocol.AXI4S:
+                    store_cmd = Command(
+                        op=OpCode.STORE,
+                        cmd_id=next_cmd_id,
+                        buffer_id=bid,
+                        dep=[pull_id],
+                    )
+                    commands.append(store_cmd)
+                    next_cmd_id += 1
+            return commands, next_cmd_id
 
         pull_cmd = Command(
             op=OpCode.PULL,

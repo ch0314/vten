@@ -1,0 +1,22 @@
+{
+  "test_name": "TestStreamScatter",
+  "kernel": "stream_scatter",
+  "status": "PASS",
+  "total_cycles": 316,
+  "configs_run": 1,
+  "configs_passed": 1,
+  "verification_count": 2,
+  "verification_passed": 2,
+  "verification_results": [
+    {
+      "tensor": "result_0",
+      "passed": true,
+      "max_diff": 0.0
+    },
+    {
+      "tensor": "result_1",
+      "passed": true,
+      "max_diff": 0.0
+    }
+  ]
+}

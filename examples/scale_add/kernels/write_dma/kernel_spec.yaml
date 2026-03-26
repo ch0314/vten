@@ -1,0 +1,56 @@
+kernel: write_dma
+rtl_top: rtl/write_dma_core.sv
+
+memory_regions:
+  ddr:
+    base: 0x10000000
+    size: 0x10000000
+    alignment: 4096
+
+interfaces:
+  ctrl:
+    rtl_port: s_axilite
+    protocol: axi4_lite
+    addr_width: 12
+    data_width: 32
+    generate_controller: true
+    registers:
+      - name: dst_addr_lo
+        offset: 0x00
+        access: rw
+        auto_bind: { tensor: data_out, value: address, bits: "31:0" }
+      - name: dst_addr_hi
+        offset: 0x04
+        access: rw
+        auto_bind: { tensor: data_out, value: address, bits: "63:32" }
+      - name: length
+        offset: 0x08
+        access: rw
+        auto_bind: { tensor: data_out, value: size_beats }
+      - name: ctrl
+        offset: 0x0C
+        access: rw
+        fields: { start: "0:0" }
+      - name: status
+        offset: 0x10
+        access: ro
+        fields: { done: "0:0" }
+
+  input_stream:
+    rtl_port: s_axis
+    protocol: axi4_stream
+    tensor: data_in
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+
+  mem_port:
+    rtl_port: m_axi
+    protocol: axi4
+    data_width: 256
+    addr_width: 64
+    tensor: data_out
+    memory_region: ddr
+    packing:
+      element_width: 8
+      elements_per_beat: 32

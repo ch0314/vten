@@ -75,7 +75,10 @@ def _compute_auto_bind_value(
         exposed = view.resolve_auto_bind_tensor(sub_kernel_name, bind_spec.tensor)
         addr = exposed.address
         if addr is None:
-            raise BindingError("Tensor has no address (stream interface?)")
+            # HW path: AXI4 MM tensors get real addresses at runtime
+            # via BO allocation. Use placeholder 0; CommandInterpreter
+            # substitutes with bo.address() through addr_bindings.
+            addr = 0
         if bind_spec.bits:
             hi, lo = parse_bit_range(bind_spec.bits)
             return (addr >> lo) & ((1 << (hi - lo + 1)) - 1)

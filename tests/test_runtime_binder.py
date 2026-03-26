@@ -265,9 +265,9 @@ class TestAutoBindAddress:
             ),
         ]
         view = _make_view_with_registers(regs)
-        # Don't set address → stays None
-        with pytest.raises(BindingError, match="no address"):
-            _compute_auto_bind_value(regs[0].auto_bind, "_self", view)
+        # Don't set address → stays None → placeholder 0 (HW path)
+        result = _compute_auto_bind_value(regs[0].auto_bind, "_self", view)
+        assert result == 0
 
     def test_address_bit_slice_zero_address(self):
         """Address 0x0 with bits='31:0' → 0."""

@@ -1,0 +1,32 @@
+[project]
+name = "mm_loopback"
+version = "0.1.0"
+default_backend = "xsim"
+
+[parameters]
+N = 1024
+
+[backend.xsim]
+vivado_path = "/tools/Xilinx/Vivado/2023.2"
+part = "xcu250-figd2104-2L-e"
+compile_options = ["-timescale", "1ns/1ps"]
+timeout_ms = 30000
+submit_timeout_s = 300
+
+[backend.verilator]
+threads = 4
+trace = false
+
+[backend.xrt]
+xclbin_path = "build/xrt/mm_loopback_hw_emu.xclbin"
+device_index = 0
+kernel_name = "mm_loopback_xrt_top"
+poll_timeout_ms = 300000
+
+[rtl]
+sources = ["rtl/**/*.sv", "rtl/**/*.v"]
+
+[test]
+default_seed = 42
+waveform = false
+waveform_on_fail = true

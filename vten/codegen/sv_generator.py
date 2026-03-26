@@ -101,6 +101,25 @@ class SVGenerator:
     def _module_for_protocol(self, protocol: Protocol) -> str:
         return _PROTOCOL_MODULE_MAP[protocol]
 
+    @staticmethod
+    def _flat_ext_port_for_element(
+        iface: InterfaceSpec, logical_name: str, flat_name: str
+    ) -> str:
+        """Derive flat Vitis-compatible port prefix for an array element.
+
+        E.g. iface.name="wgt", flat_name="wgt_0_1", protocol=AXI4S slave
+        → "s_axis_wgt_0_1"
+        """
+        prefix_map = {
+            (Protocol.AXI4S, "master"): "m_axis_",
+            (Protocol.AXI4S, "slave"): "s_axis_",
+            (Protocol.AXI4, "master"): "m_axi_",
+            (Protocol.AXI4, "slave"): "s_axi_",
+        }
+        role = iface.role or ("master" if iface.rtl_port.startswith("m_") else "slave")
+        prefix = prefix_map.get((iface.protocol, role), iface.rtl_port + "_")
+        return prefix + flat_name
+
     def _derive_dut_ports(self, bfms: list[BFMInstance]) -> list[DUTPort]:
         """Derive DUT port list from BFM signal topology."""
         ports: list[DUTPort] = []
@@ -178,7 +197,9 @@ class SVGenerator:
         """Build template context from spec and BFM configs."""
         bfms: list[BFMInstance] = []
         for i, cfg in enumerate(self.bfm_configs):
-            iface = self.spec.get_interface(cfg.interface_name)
+            iface, logical_name = self.spec.resolve_flat_interface(
+                cfg.interface_name
+            )
             params: dict = {"DATA_W": cfg.data_width}
             if cfg.protocol == Protocol.AXI4:
                 params["ADDR_W"] = cfg.addr_width
@@ -187,13 +208,21 @@ class SVGenerator:
             elif cfg.protocol == Protocol.AXI4L:
                 params["ADDR_W"] = cfg.addr_width or 32
 
+            # For array elements, derive flat port name from the expanded data
+            if iface.array and cfg.interface_name != logical_name:
+                ext_port = self._flat_ext_port_for_element(
+                    iface, logical_name, cfg.interface_name
+                )
+            else:
+                ext_port = iface.ext_port
+
             bfms.append(BFMInstance(
                 name=f"bfm_{cfg.interface_name}",
                 module_name=self._module_for_protocol(cfg.protocol),
                 protocol=cfg.protocol.value,
                 data_width=cfg.data_width,
                 role=cfg.role,
-                rtl_port_prefix=iface.rtl_port,
+                rtl_port_prefix=ext_port,
                 parameters=params,
                 interface_id=i,
             ))
@@ -222,8 +251,8 @@ class SVGenerator:
             session_id=uuid.uuid4().hex[:16],
             dut_ports=dut_ports,
             bfms=bfms,
-            clock_name=self.spec.clock_name,
-            reset_name=self.spec.reset_name,
+            clock_name="ap_clk",
+            reset_name="ap_aresetn",
             reset_active_low=self.spec.reset_active_low,
         )
 
@@ -243,7 +272,7 @@ class SVGenerator:
     def _compute_scheduler_params(self, num_commands: int) -> dict:
         """Compute Scheduler parameters from BFM topology and command count."""
         auto_bfms = max(8, len(self.bfm_configs))
-        auto_ifaces = max(16, len(self.spec.interface_names()))
+        auto_ifaces = max(16, len(self.spec.expanded_interface_names()))
         auto_cmds = max(256, num_commands)
 
         sched_cfg = self.config.get("backend", {}).get("scheduler", {})
@@ -254,9 +283,12 @@ class SVGenerator:
         }
 
     def _generate_bfm_index_mapping(self) -> dict[int, int]:
-        """Generate interface_id → BFM index lookup table."""
-        iface_names = self.spec.interface_names()
-        iface_id_map = {name: idx for idx, name in enumerate(iface_names)}
+        """Generate interface_id → BFM index lookup table.
+
+        Uses expanded_interface_names() to match IR lowering's ID assignment.
+        """
+        expanded = self.spec.expanded_interface_names()
+        iface_id_map = {name: idx for idx, name in enumerate(expanded)}
         bfm_idx_map = {cfg.interface_name: idx for idx, cfg in enumerate(self.bfm_configs)}
 
         mapping: dict[int, int] = {}
@@ -379,8 +411,8 @@ class SVGenerator:
             addr_width=iface.addr_width or 32,
             data_width=iface.data_width or 32,
             registers=iface.registers or [],
-            clock_name=self.spec.clock_name,
-            reset_name=self.spec.reset_name,
+            clock_name="ap_clk",
+            reset_name="ap_aresetn",
             reset_active_low=self.spec.reset_active_low,
         )
         filename = f"{self.spec.kernel_name}_axilite_ctrl.sv"
@@ -397,8 +429,10 @@ class SVGenerator:
         rendered = tmpl.render(
             kernel_name=self.spec.kernel_name,
             parameters=self.spec.parameters,
-            clock_name=self.spec.clock_name,
-            reset_name=self.spec.reset_name,
+            clock_name="ap_clk",
+            reset_name="ap_aresetn",
+            core_clock_name=self.spec.clock_name,
+            core_reset_name=self.spec.reset_name,
             reset_active_low=self.spec.reset_active_low,
             all_interfaces=all_ifaces,
             ctrl_interfaces=ctrl,
