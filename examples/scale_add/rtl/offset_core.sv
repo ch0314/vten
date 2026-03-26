@@ -66,7 +66,7 @@ module offset_core #(parameter DATA_W = 256)(
     generate
         for (i = 0; i < DATA_W / 8; i = i + 1) begin : offset
             wire signed [8:0] sum =
-                $signed(input_stream.tdata[i*8 +: 8]) + $signed({1'b0, reg_offset_value});
+                $signed(input_stream.tdata[i*8 +: 8]) + $signed(reg_offset_value);
             assign output_stream.tdata[i*8 +: 8] =
                 (sum > 9'sd127)  ? 8'sd127  :
                 (sum < -9'sd128) ? -8'sd128 :

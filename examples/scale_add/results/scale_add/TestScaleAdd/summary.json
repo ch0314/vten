@@ -2,12 +2,37 @@
   "test_name": "TestScaleAdd",
   "kernel": "scale_add",
   "status": "PASS",
-  "total_cycles": 71,
-  "configs_run": 1,
-  "configs_passed": 1,
-  "verification_count": 1,
-  "verification_passed": 1,
+  "total_cycles": 167,
+  "configs_run": 6,
+  "configs_passed": 6,
+  "verification_count": 6,
+  "verification_passed": 6,
   "verification_results": [
+    {
+      "tensor": "data_out",
+      "passed": true,
+      "max_diff": 0.0
+    },
+    {
+      "tensor": "data_out",
+      "passed": true,
+      "max_diff": 0.0
+    },
+    {
+      "tensor": "data_out",
+      "passed": true,
+      "max_diff": 0.0
+    },
+    {
+      "tensor": "data_out",
+      "passed": true,
+      "max_diff": 0.0
+    },
+    {
+      "tensor": "data_out",
+      "passed": true,
+      "max_diff": 0.0
+    },
     {
       "tensor": "data_out",
       "passed": true,

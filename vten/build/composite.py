@@ -259,9 +259,15 @@ def generate_composite_sv(
         data_w = 256  # default
         if src_iface and src_iface.packing:
             data_w = src_iface.packing.bus_width
+        protocol = src_iface.protocol if src_iface else Protocol.AXI4S
+        addr_w = 64  # default
+        if src_iface:
+            addr_w = src_iface.addr_width or 64
         internal_wires.append({
             "name": wire_name,
             "data_w": data_w,
+            "protocol": protocol,
+            "addr_w": addr_w,
             "source_sub": src_sub,
             "source_iface": conn.source_interface,
             "dest_sub": conn.dest_sub,
@@ -298,12 +304,9 @@ def generate_composite_sv(
     if internal_wires:
         lines.append("    // ── Internal Wires ──")
         for wire in internal_wires:
-            dw = wire["data_w"]
-            wn = wire["name"]
-            lines.append(f"    logic [{dw-1}:0] {wn}_tdata;")
-            lines.append(f"    logic           {wn}_tvalid;")
-            lines.append(f"    logic           {wn}_tready;")
-            lines.append(f"    logic           {wn}_tlast;")
+            lines.extend(
+                f"    {l}" for l in _declare_internal_wire(wire)
+            )
         lines.append("")
 
     # Sub-kernel instantiations
@@ -338,10 +341,14 @@ def _find_dest_interface(conn, bindings):
 
 
 def _generate_port_lines(iface_name: str, iface: InterfaceSpec) -> list[str]:
-    """Generate port declaration lines for a top-level interface."""
+    """Generate port declaration lines for a top-level interface.
+
+    Uses ext_port (Vitis-compatible name) so composite wrapper ports match
+    the tb_top wire naming convention (s_axi_{name}, s_axis_{name}, etc.).
+    """
     lines = []
     if iface.protocol == Protocol.AXI4L:
-        prefix = iface.rtl_port
+        prefix = iface.ext_port
         aw = iface.addr_width or 16
         dw = iface.data_width or 32
         lines.append(f"// {iface_name}: AXI4-Lite")
@@ -364,7 +371,7 @@ def _generate_port_lines(iface_name: str, iface: InterfaceSpec) -> list[str]:
         lines.append(f"input  logic          {prefix}_rready")
     elif iface.protocol == Protocol.AXI4S:
         dw = iface.packing.bus_width if iface.packing else 256
-        rp = iface.rtl_port
+        rp = iface.ext_port
         lines.append(f"// {iface_name}: AXI4-Stream")
         if rp.startswith("s_"):
             lines.append(f"input  logic [{dw-1}:0] {rp}_tdata")
@@ -379,7 +386,7 @@ def _generate_port_lines(iface_name: str, iface: InterfaceSpec) -> list[str]:
     elif iface.protocol == Protocol.AXI4:
         dw = iface.data_width or 256
         aw = iface.addr_width or 64
-        rp = iface.rtl_port
+        rp = iface.ext_port
         sw = dw // 8
         lines.append(f"// {iface_name}: AXI4 Master")
         # AR channel
@@ -430,9 +437,19 @@ def _generate_sub_kernel_instance(
     binding = sk["binding"]
     lines = []
 
+    # Sub-kernel wrappers with generate_controller use ap_clk/ap_aresetn;
+    # plain cores use clk/rst_n.
+    has_ctrl = any(
+        iface.generate_controller
+        for iface in sub_spec.interfaces.values()
+    )
     lines.append(f"{mod_name} u_{sub_name} (")
-    lines.append("    .clk(clk),")
-    lines.append("    .rst_n(rst_n),")
+    if has_ctrl:
+        lines.append("    .ap_clk(clk),")
+        lines.append("    .ap_aresetn(rst_n),")
+    else:
+        lines.append("    .clk(clk),")
+        lines.append("    .rst_n(rst_n),")
 
     port_connections = []
     for sub_iface_name, mapping in binding.interface_map.items():
@@ -447,7 +464,7 @@ def _generate_sub_kernel_instance(
             )
             if wire:
                 port_connections.extend(
-                    _wire_stream_to_internal(sub_iface, wire["name"])
+                    _wire_to_internal(sub_iface, wire)
                 )
         elif isinstance(mapping, str):
             # External mapping — connect to top-level ports
@@ -487,33 +504,139 @@ def _find_internal_wire(
     return None
 
 
-def _wire_stream_to_internal(
-    sub_iface: InterfaceSpec, wire_name: str
-) -> list[str]:
-    """Wire a sub-kernel stream port to an internal wire."""
-    rp = sub_iface.rtl_port
-    conns = []
-    if rp.startswith("m_"):
-        # Master output → internal wire (source)
-        conns.append(f".{rp}_tdata({wire_name}_tdata)")
-        conns.append(f".{rp}_tvalid({wire_name}_tvalid)")
-        conns.append(f".{rp}_tready({wire_name}_tready)")
-        conns.append(f".{rp}_tlast({wire_name}_tlast)")
+def _declare_internal_wire(wire: dict) -> list[str]:
+    """Declare internal wire signals based on protocol."""
+    from vten.errors import BuildError
+
+    wn = wire["name"]
+    dw = wire["data_w"]
+    protocol = wire.get("protocol", Protocol.AXI4S)
+
+    if protocol == Protocol.AXI4S:
+        return [
+            f"logic [{dw-1}:0] {wn}_tdata;",
+            f"logic           {wn}_tvalid;",
+            f"logic           {wn}_tready;",
+            f"logic           {wn}_tlast;",
+        ]
+    elif protocol == Protocol.AXI4:
+        aw = wire.get("addr_w", 64)
+        sw = dw // 8
+        return [
+            f"// {wn}: AXI4 internal",
+            # AR channel
+            f"logic [{aw-1}:0] {wn}_araddr;",
+            f"logic [7:0]          {wn}_arlen;",
+            f"logic [2:0]          {wn}_arsize;",
+            f"logic [1:0]          {wn}_arburst;",
+            f"logic                {wn}_arvalid;",
+            f"logic                {wn}_arready;",
+            # R channel
+            f"logic [{dw-1}:0] {wn}_rdata;",
+            f"logic [1:0]          {wn}_rresp;",
+            f"logic                {wn}_rlast;",
+            f"logic                {wn}_rvalid;",
+            f"logic                {wn}_rready;",
+            # AW channel
+            f"logic [{aw-1}:0] {wn}_awaddr;",
+            f"logic [7:0]          {wn}_awlen;",
+            f"logic [2:0]          {wn}_awsize;",
+            f"logic [1:0]          {wn}_awburst;",
+            f"logic                {wn}_awvalid;",
+            f"logic                {wn}_awready;",
+            # W channel
+            f"logic [{dw-1}:0] {wn}_wdata;",
+            f"logic [{sw-1}:0] {wn}_wstrb;",
+            f"logic                {wn}_wlast;",
+            f"logic                {wn}_wvalid;",
+            f"logic                {wn}_wready;",
+            # B channel
+            f"logic [1:0]          {wn}_bresp;",
+            f"logic                {wn}_bvalid;",
+            f"logic                {wn}_bready;",
+        ]
+    elif protocol == Protocol.AXI4L:
+        aw = wire.get("addr_w", 16)
+        dw = wire.get("data_w", 32)
+        sw = dw // 8
+        return [
+            f"// {wn}: AXI4-Lite internal",
+            f"logic [{aw-1}:0] {wn}_awaddr;",
+            f"logic           {wn}_awvalid;",
+            f"logic           {wn}_awready;",
+            f"logic [{dw-1}:0] {wn}_wdata;",
+            f"logic [{sw-1}:0] {wn}_wstrb;",
+            f"logic           {wn}_wvalid;",
+            f"logic           {wn}_wready;",
+            f"logic [1:0]    {wn}_bresp;",
+            f"logic           {wn}_bvalid;",
+            f"logic           {wn}_bready;",
+            f"logic [{aw-1}:0] {wn}_araddr;",
+            f"logic           {wn}_arvalid;",
+            f"logic           {wn}_arready;",
+            f"logic [{dw-1}:0] {wn}_rdata;",
+            f"logic [1:0]    {wn}_rresp;",
+            f"logic           {wn}_rvalid;",
+            f"logic           {wn}_rready;",
+        ]
     else:
-        # Slave input ← internal wire (sink)
-        conns.append(f".{rp}_tdata({wire_name}_tdata)")
-        conns.append(f".{rp}_tvalid({wire_name}_tvalid)")
-        conns.append(f".{rp}_tready({wire_name}_tready)")
-        conns.append(f".{rp}_tlast({wire_name}_tlast)")
-    return conns
+        raise BuildError(
+            f"Unsupported protocol for internal wire '{wn}': {protocol}"
+        )
+
+
+def _wire_to_internal(
+    sub_iface: InterfaceSpec, wire: dict
+) -> list[str]:
+    """Wire a sub-kernel port to an internal wire (protocol-aware dispatcher)."""
+    from vten.errors import BuildError
+
+    protocol = wire.get("protocol", Protocol.AXI4S)
+    wire_name = wire["name"]
+    rp = sub_iface.ext_port
+
+    if protocol == Protocol.AXI4S:
+        return [
+            f".{rp}_tdata({wire_name}_tdata)",
+            f".{rp}_tvalid({wire_name}_tvalid)",
+            f".{rp}_tready({wire_name}_tready)",
+            f".{rp}_tlast({wire_name}_tlast)",
+        ]
+    elif protocol == Protocol.AXI4:
+        sigs = [
+            "araddr", "arlen", "arsize", "arburst", "arvalid", "arready",
+            "rdata", "rresp", "rlast", "rvalid", "rready",
+            "awaddr", "awlen", "awsize", "awburst", "awvalid", "awready",
+            "wdata", "wstrb", "wlast", "wvalid", "wready",
+            "bresp", "bvalid", "bready",
+        ]
+        return [f".{rp}_{sig}({wire_name}_{sig})" for sig in sigs]
+    elif protocol == Protocol.AXI4L:
+        sigs = [
+            "awaddr", "awvalid", "awready",
+            "wdata", "wstrb", "wvalid", "wready",
+            "bresp", "bvalid", "bready",
+            "araddr", "arvalid", "arready",
+            "rdata", "rresp", "rvalid", "rready",
+        ]
+        return [f".{rp}_{sig}({wire_name}_{sig})" for sig in sigs]
+    else:
+        raise BuildError(
+            f"Unsupported protocol for internal connection: {protocol}"
+        )
 
 
 def _wire_to_top(
     sub_iface: InterfaceSpec, top_iface: InterfaceSpec
 ) -> list[str]:
-    """Wire a sub-kernel port to the corresponding top-level port."""
-    sub_rp = sub_iface.rtl_port
-    top_rp = top_iface.rtl_port
+    """Wire a sub-kernel port to the corresponding top-level port.
+
+    Both sides use ext_port (Vitis-compatible naming):
+    - sub_rp: sub-kernel wrapper port (e.g., "s_axi_ctrl")
+    - top_rp: composite top-level port (e.g., "s_axi_scale_ctrl")
+    """
+    sub_rp = sub_iface.ext_port
+    top_rp = top_iface.ext_port
     conns = []
 
     if sub_iface.protocol == Protocol.AXI4L:
