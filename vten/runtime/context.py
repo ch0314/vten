@@ -215,8 +215,9 @@ class ExecutionContext:
         for name, exposed in compiled.flattened_view.exposed_tensors.items():
             if exposed.direction != Direction.DEV_TO_HOST:
                 continue
-            buffer_id = compiled.buffer_ids[name]
-            raw_bytes = backend_result.read_buffer(buffer_id)
+            raw_bytes = self._read_tensor_bytes(
+                name, exposed, compiled, backend_result,
+            )
             if not raw_bytes:
                 continue
             try:
@@ -236,6 +237,25 @@ class ExecutionContext:
             )
         return output_tensors
 
+    @staticmethod
+    def _read_tensor_bytes(
+        name: str, exposed, compiled, backend_result,
+    ) -> bytes:
+        """Read raw bytes for a tensor, reassembling array element chunks."""
+        if exposed._array_element_buffers:
+            chunks = []
+            for flat_name in exposed._array_element_buffers:
+                key = f"{name}:{flat_name}"
+                bid = compiled.buffer_ids.get(key)
+                if bid is None:
+                    continue
+                chunk = backend_result.read_buffer(bid)
+                if chunk:
+                    chunks.append(chunk)
+            return b"".join(chunks)
+        buffer_id = compiled.buffer_ids[name]
+        return backend_result.read_buffer(buffer_id)
+
     # ── Verification internals ──
 
     def _verify_immediate(self, op_handle, golden) -> None:
@@ -246,17 +266,17 @@ class ExecutionContext:
         backend_result = self._last_backend_result
 
         tensor_name = op_handle.op.tensor.name
-        buffer_id = compiled.buffer_ids[tensor_name]
-
-        raw_bytes = backend_result.read_buffer(buffer_id)
+        exposed = compiled.flattened_view.exposed_tensors[tensor_name]
+        raw_bytes = self._read_tensor_bytes(
+            tensor_name, exposed, compiled, backend_result,
+        )
         if not raw_bytes:
             raise VerificationError(
-                f"No data returned for tensor '{tensor_name}' "
-                f"(buffer_id={buffer_id}). SHM may have been cleaned up.",
+                f"No data returned for tensor '{tensor_name}'. "
+                f"SHM may have been cleaned up.",
                 tensor=tensor_name,
             )
 
-        exposed = compiled.flattened_view.exposed_tensors[tensor_name]
         iface = compiled.flattened_view.top_spec.get_interface(
             exposed.top_interface
         )

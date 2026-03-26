@@ -86,17 +86,30 @@ def _infer_bfm_role(iface: InterfaceSpec) -> str:
 
 
 def _derive_bfm_configs(spec: KernelSpec) -> list[BFMConfig]:
-    """Derive BFMConfig list from KernelSpec interfaces."""
+    """Derive BFMConfig list from KernelSpec interfaces.
+
+    Array interfaces are expanded into per-element BFMConfigs using
+    ArraySpec.flat_names(), so each array element gets its own BFM.
+    """
     configs: list[BFMConfig] = []
     for name, iface in spec.interfaces.items():
-        cfg = BFMConfig(
-            interface_name=name,
-            protocol=iface.protocol,
-            data_width=iface.data_width or 256,
-            addr_width=iface.addr_width or 64,
-            role=_infer_bfm_role(iface),
-        )
-        configs.append(cfg)
+        if iface.array:
+            for flat_name in iface.array.flat_names(name):
+                configs.append(BFMConfig(
+                    interface_name=flat_name,
+                    protocol=iface.protocol,
+                    data_width=iface.data_width or 256,
+                    addr_width=iface.addr_width or 64,
+                    role=_infer_bfm_role(iface),
+                ))
+        else:
+            configs.append(BFMConfig(
+                interface_name=name,
+                protocol=iface.protocol,
+                data_width=iface.data_width or 256,
+                addr_width=iface.addr_width or 64,
+                role=_infer_bfm_role(iface),
+            ))
     return configs
 
 
@@ -343,17 +356,39 @@ class XsimBuildPipeline(BuildPipeline):
         if is_composite_kernel(kernel_dir):
             composite_cls = load_composite_class(kernel_dir)
             sub_names = get_sub_kernel_names(composite_cls)
+            existing = prj_out.read_text()
+            existing_files = {
+                line.split()[-1]
+                for line in existing.splitlines()
+                if line.strip()
+            }
             sub_lines = []
             for sname in sub_names:
-                gen_dir = self._project / "kernels" / sname / "build" / "generated"
-                for sv_file in sorted(gen_dir.glob("*.sv")):
-                    # Skip tb_top.sv (sub-kernel testbench not needed)
-                    if sv_file.name == "tb_top.sv":
-                        continue
-                    sub_lines.append(f"sv xil_defaultlib {sv_file}")
+                # Include files from sub-kernel's compile.prj (RTL + deps)
+                sub_prj = self._project / "kernels" / sname / "build" / "compile.prj"
+                if sub_prj.exists():
+                    for line in sub_prj.read_text().splitlines():
+                        if not line.strip():
+                            continue
+                        fpath = line.split()[-1]
+                        # Skip sub-kernel's tb_top.sv and already-included files
+                        if Path(fpath).name == "tb_top.sv":
+                            continue
+                        if fpath not in existing_files:
+                            sub_lines.append(line)
+                            existing_files.add(fpath)
+                else:
+                    # Fallback: include generated files only
+                    gen_dir = self._project / "kernels" / sname / "build" / "generated"
+                    for sv_file in sorted(gen_dir.glob("*.sv")):
+                        if sv_file.name == "tb_top.sv":
+                            continue
+                        fpath = str(sv_file)
+                        if fpath not in existing_files:
+                            sub_lines.append(f"sv xil_defaultlib {sv_file}")
+                            existing_files.add(fpath)
             if sub_lines:
-                existing = prj_out.read_text()
-                # Prepend sub-kernel files before composite files
+                # Prepend sub-kernel files (with RTL + deps) before composite files
                 prj_out.write_text(
                     "\n".join(sub_lines) + "\n" + existing
                 )

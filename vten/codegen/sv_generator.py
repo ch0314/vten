@@ -245,14 +245,23 @@ class SVGenerator:
         # Derive DUT ports from BFM signal topology
         dut_ports = self._derive_dut_ports(bfms)
 
+        # When wrapper is generated, tb_top connects to wrapper using ap_clk/ap_aresetn.
+        # When no wrapper, tb_top connects directly to DUT using its native clock/reset names.
+        if self._has_generate_controller():
+            tb_clock = "ap_clk"
+            tb_reset = "ap_aresetn"
+        else:
+            tb_clock = self.spec.clock_name
+            tb_reset = self.spec.reset_name
+
         tb = TestbenchContext(
             project_name=self.config.get("project", {}).get("name", ""),
             top_module=top_module,
             session_id=uuid.uuid4().hex[:16],
             dut_ports=dut_ports,
             bfms=bfms,
-            clock_name="ap_clk",
-            reset_name="ap_aresetn",
+            clock_name=tb_clock,
+            reset_name=tb_reset,
             reset_active_low=self.spec.reset_active_low,
         )
 
