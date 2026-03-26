@@ -5,15 +5,16 @@ Spec reference: 06_codegen_and_cli.md §4.3, §7, §8
 Pipeline stages:
   Stage 1: project_setup  — Vivado project creation (cached)
   Stage 2: dpi_c          — gcc shared library (cached)
-  Stage 3: codegen        — Jinja2 → generated SV (per-kernel)
-  Stage 4: compile_order  — Vivado get_compile_order (per-kernel)
-  Stage 5: compile        — xvlog + xelab (per-kernel)
+  Stage 3: codegen        — Jinja2 → generated SV (per-kernel, cached)
+  Stage 4: compile_order  — Vivado get_compile_order (per-kernel, cached)
+  Stage 5: compile        — xvlog + xelab (per-kernel, cached)
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from vten.build.common import (
     cache_valid,
     dir_hash,
     expand_globs,
+    file_hash,
     load_cache,
     render_template,
     run_vivado,
@@ -33,6 +35,8 @@ from vten.errors import BuildError
 from vten.runtime.ir import BFMConfig
 from vten.spec.models import InterfaceSpec, KernelSpec, Protocol
 from vten.spec.parser import parse_kernel_spec
+
+logger = logging.getLogger(__name__)
 
 
 # ── Split interface expansion ──
@@ -147,15 +151,23 @@ class XsimBuildPipeline(BuildPipeline):
             self._stage_project_setup(force)
         elif stage == "dpi_c":
             self._stage_dpi_c(force)
-        elif stage == "codegen":
-            assert kernel_dir is not None
-            self._stage_codegen(kernel_dir)
-        elif stage == "compile_order":
-            assert kernel_dir is not None
-            self._stage_compile_order(kernel_dir)
-        elif stage == "compile":
-            assert kernel_dir is not None
-            self._stage_compile(kernel_dir)
+        elif stage in ("codegen", "compile_order", "compile"):
+            assert kernel_name is not None and kernel_dir is not None
+            # Per-kernel cache check
+            if force:
+                self._invalidate_kernel_cache(kernel_name)
+            if self._kernel_cache_valid(kernel_name, stage, kernel_dir):
+                print(f"[{stage}] {kernel_name}: cached, skip")
+                return
+            # Run stage
+            if stage == "codegen":
+                self._stage_codegen(kernel_dir, force=force)
+            elif stage == "compile_order":
+                self._stage_compile_order(kernel_dir)
+            elif stage == "compile":
+                self._stage_compile(kernel_dir)
+            # Update cache after successful execution
+            self._update_kernel_cache(kernel_name, stage, kernel_dir)
         else:
             raise BuildError(f"Unknown stage: {stage}")
 
@@ -254,19 +266,159 @@ class XsimBuildPipeline(BuildPipeline):
         update_cache(self._cache, "dpi_c", current)
         print("  done")
 
-    def _stage_codegen(self, kernel_dir: Path) -> None:
-        print(f"[Stage 3] codegen: {kernel_dir.name}")
+    # ── Per-kernel cache system ──
 
+    def _kernel_stage_hash(
+        self, kernel_name: str, stage: str, kernel_dir: Path,
+    ) -> str:
+        """Compute SHA256 hash for a per-kernel stage's inputs."""
         from vten.build.composite import (
-            check_sub_kernels_built,
-            generate_composite_sv,
+            get_sub_kernel_names,
             is_composite_kernel,
             load_composite_class,
-            synthesize_spec,
         )
 
+        h = hashlib.sha256()
+        is_composite = is_composite_kernel(kernel_dir)
+
+        if stage == "codegen":
+            if is_composite:
+                # Composite codegen depends on: *_kernel.py + sub-kernel specs + params
+                for py_file in sorted(kernel_dir.glob("*_kernel.py")):
+                    h.update(py_file.read_bytes())
+                composite_cls = load_composite_class(kernel_dir)
+                for sname in get_sub_kernel_names(composite_cls):
+                    sub_spec = self._project / "kernels" / sname / "kernel_spec.yaml"
+                    if sub_spec.exists():
+                        h.update(sub_spec.read_bytes())
+                    # Include sub-kernel codegen hash for dependency chaining
+                    sub_entry = self._cache.get(f"{sname}:codegen", {})
+                    h.update(sub_entry.get("hash", "").encode())
+            else:
+                # Unit codegen depends on: kernel_spec.yaml + params
+                spec_path = kernel_dir / "kernel_spec.yaml"
+                if spec_path.exists():
+                    h.update(spec_path.read_bytes())
+            # Common: parameters from config
+            params = self._config.get("parameters", {})
+            h.update(json.dumps(params, sort_keys=True).encode())
+
+        elif stage == "compile_order":
+            # Depends on: generated/*.sv + project_setup hash
+            gen_dir = kernel_dir / "build" / "generated"
+            if gen_dir.exists():
+                for sv in sorted(gen_dir.glob("*.sv")):
+                    h.update(sv.read_bytes())
+            ps_entry = self._cache.get("project_setup", {})
+            h.update(ps_entry.get("hash", "").encode())
+            if is_composite:
+                composite_cls = load_composite_class(kernel_dir)
+                for sname in get_sub_kernel_names(composite_cls):
+                    sub_entry = self._cache.get(f"{sname}:compile_order", {})
+                    h.update(sub_entry.get("hash", "").encode())
+
+        elif stage == "compile":
+            # Depends on: compile.prj content + all referenced sources + dpi_c hash
+            prj_path = kernel_dir / "build" / "compile.prj"
+            if prj_path.exists():
+                prj_text = prj_path.read_text()
+                h.update(prj_text.encode())
+                for line in prj_text.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        src = Path(parts[-1])
+                        if src.exists():
+                            h.update(src.read_bytes())
+            dpi_entry = self._cache.get("dpi_c", {})
+            h.update(dpi_entry.get("hash", "").encode())
+
+        return h.hexdigest()
+
+    def _kernel_artifacts_exist(
+        self, stage: str, kernel_dir: Path,
+    ) -> bool:
+        """Check that stage output artifacts actually exist on disk."""
+        if stage == "codegen":
+            gen_dir = kernel_dir / "build" / "generated"
+            return gen_dir.exists() and any(gen_dir.glob("*.sv"))
+        elif stage == "compile_order":
+            return (kernel_dir / "build" / "compile.prj").exists()
+        elif stage == "compile":
+            return (kernel_dir / "build" / "xsim.dir").exists()
+        return False
+
+    def _kernel_cache_valid(
+        self, kernel_name: str, stage: str, kernel_dir: Path,
+    ) -> bool:
+        """Check if a per-kernel stage can be skipped (hash match + artifacts exist)."""
+        cache_key = f"{kernel_name}:{stage}"
+        current = self._kernel_stage_hash(kernel_name, stage, kernel_dir)
+        return (
+            cache_valid(self._cache, cache_key, current)
+            and self._kernel_artifacts_exist(stage, kernel_dir)
+        )
+
+    def _update_kernel_cache(
+        self, kernel_name: str, stage: str, kernel_dir: Path,
+    ) -> None:
+        """Update cache entry for a per-kernel stage."""
+        cache_key = f"{kernel_name}:{stage}"
+        current = self._kernel_stage_hash(kernel_name, stage, kernel_dir)
+        update_cache(self._cache, cache_key, current)
+
+    def _invalidate_kernel_cache(self, kernel_name: str) -> None:
+        """Remove all cache entries for a kernel (used by --force)."""
+        for stage in ("codegen", "compile_order", "compile"):
+            self._cache.pop(f"{kernel_name}:{stage}", None)
+
+    def _ensure_sub_kernels_built(
+        self, kernel_dir: Path, force: bool,
+    ) -> None:
+        """Auto-build sub-kernels if needed (replaces check_sub_kernels_built)."""
+        from vten.build.composite import (
+            get_sub_kernel_names,
+            load_composite_class,
+        )
+
+        composite_cls = load_composite_class(kernel_dir)
+        sub_names = get_sub_kernel_names(composite_cls)
+
+        for sname in sub_names:
+            sub_dir = self._project / "kernels" / sname
+            if not sub_dir.exists():
+                raise BuildError(
+                    f"Sub-kernel directory not found: {sub_dir}"
+                )
+
+            if force:
+                self._invalidate_kernel_cache(sname)
+
+            needs_build = False
+            for stage in ("codegen", "compile_order", "compile"):
+                if not self._kernel_cache_valid(sname, stage, sub_dir):
+                    needs_build = True
+                    break
+
+            if needs_build:
+                print(f"\n  --- Auto-building sub-kernel: {sname} ---")
+                for stage in ("codegen", "compile_order", "compile"):
+                    if not self._kernel_cache_valid(sname, stage, sub_dir):
+                        self.run_stage(
+                            stage,
+                            kernel_name=sname,
+                            kernel_dir=sub_dir,
+                            force=False,  # individual cache already checked
+                        )
+
+    # ── Stage implementations ──
+
+    def _stage_codegen(self, kernel_dir: Path, force: bool = False) -> None:
+        print(f"[Stage 3] codegen: {kernel_dir.name}")
+
+        from vten.build.composite import is_composite_kernel
+
         if is_composite_kernel(kernel_dir):
-            self._stage_codegen_composite(kernel_dir)
+            self._stage_codegen_composite(kernel_dir, force=force)
             return
 
         spec_path = kernel_dir / "kernel_spec.yaml"
@@ -285,10 +437,9 @@ class XsimBuildPipeline(BuildPipeline):
         gen.generate(str(output), num_commands=256)
         print("  done")
 
-    def _stage_codegen_composite(self, kernel_dir: Path) -> None:
-        """Composite kernel codegen: synthesize spec + generate wrapper-of-wrappers."""
+    def _stage_codegen_composite(self, kernel_dir: Path, force: bool = False) -> None:
+        """Composite kernel codegen: auto-build sub-kernels + synthesize spec + generate wrapper."""
         from vten.build.composite import (
-            check_sub_kernels_built,
             generate_composite_sv,
             load_composite_class,
             synthesize_spec,
@@ -297,14 +448,8 @@ class XsimBuildPipeline(BuildPipeline):
         composite_cls = load_composite_class(kernel_dir)
         kernel_name = kernel_dir.name
 
-        # Check sub-kernel build dependency
-        unbuilt = check_sub_kernels_built(composite_cls, self._project)
-        if unbuilt:
-            raise BuildError(
-                f"Sub-kernels not built: {', '.join(unbuilt)}. "
-                f"Build them first: " +
-                " && ".join(f"vten build --kernel {n}" for n in unbuilt)
-            )
+        # Auto-build sub-kernels if needed (replaces check_sub_kernels_built)
+        self._ensure_sub_kernels_built(kernel_dir, force)
 
         # Synthesize KernelSpec from sub-kernel specs + connectivity
         spec = synthesize_spec(composite_cls, self._project, kernel_name)
