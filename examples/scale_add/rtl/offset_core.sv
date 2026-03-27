@@ -38,7 +38,7 @@ module offset_core #(parameter DATA_W = 256)(
             S_IDLE: if (reg_ctrl[0]) state_next = S_RUN;
             S_RUN:  if (handshake && (beat_count + 1 >= reg_length))
                         state_next = S_DONE;
-            S_DONE: state_next = S_DONE;  // Sticky — stays done until reset
+            S_DONE: if (reg_ctrl[0]) state_next = S_RUN;  // Restart directly into RUN
             default: state_next = S_IDLE;
         endcase
     end
@@ -47,7 +47,7 @@ module offset_core #(parameter DATA_W = 256)(
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             beat_count <= 0;
-        else if (state == S_IDLE)
+        else if (state == S_IDLE || state == S_DONE)
             beat_count <= 0;
         else if (handshake)
             beat_count <= beat_count + 1;

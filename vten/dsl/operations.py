@@ -34,6 +34,10 @@ class Operation:
     sync: bool = False
     golden: torch.Tensor | None = None
     verify: bool = False
+    chunk_index: int | None = None
+    chunk_total: int | None = None
+    chunks_spec: int | list[int] | None = None  # original chunks arg
+    config_group: int = 0  # multi-config group index (set by config_boundary)
 
 
 @dataclass

@@ -209,11 +209,14 @@ class SVGenerator:
                 params["ADDR_W"] = cfg.addr_width or 32
 
             # Port prefix: wrapper uses ext_port (Vitis naming), raw RTL uses rtl_port
+            # Composite kernels have no generate_controller but DO have a wrapper
+            # (rtl_top="" indicates auto-generated composite wrapper)
+            has_wrapper = self._has_generate_controller() or not self.spec.rtl_top
             if iface.array and cfg.interface_name != logical_name:
                 port_prefix = self._flat_ext_port_for_element(
                     iface, logical_name, cfg.interface_name
                 )
-            elif self._has_generate_controller():
+            elif has_wrapper:
                 port_prefix = iface.ext_port
             else:
                 port_prefix = iface.rtl_port
@@ -235,7 +238,7 @@ class SVGenerator:
         # 1. rtl.top_module from config (explicit)
         # 2. Derived from spec.rtl_top filename stem
         # 3. spec.kernel_name as fallback
-        if self._has_generate_controller():
+        if has_wrapper:
             top_module = self.spec.kernel_name
         else:
             top_module = rtl_cfg.get("top_module", "")
