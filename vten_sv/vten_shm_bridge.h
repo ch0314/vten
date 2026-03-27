@@ -105,6 +105,7 @@ typedef struct {
 
 /* Lifecycle */
 int  vten_shm_init(const char* session_id);
+int  vten_shm_remap(void);  /* Re-mmap if SHM was resized by host (ftruncate) */
 void vten_cleanup(void);
 
 /* Host/Backend synchronization */

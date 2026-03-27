@@ -185,6 +185,11 @@ int vten_shm_init(const char* session_id) {
     return 0;  /* VTEN_OK */
 }
 
+int vten_shm_remap(void) {
+    /* Mock: heap memory, no resize needed */
+    return 0;  /* VTEN_OK */
+}
+
 void vten_cleanup(void) {
     /* Don't free memory — Python may inspect it after simulation */
 }

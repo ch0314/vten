@@ -7,6 +7,7 @@
 
 // ── Lifecycle ──
 import "DPI-C" function int  vten_shm_init(input string session_id);
+import "DPI-C" function int  vten_shm_remap();  // Re-mmap if SHM was resized
 import "DPI-C" function void vten_cleanup();
 
 // ── Host/Backend Synchronization ──

@@ -4,6 +4,9 @@
 // Design: Single always_ff block ensures DPI-C calls execute exactly once
 // per posedge. All DPI-C calls in S_LOAD_BATCH happen in one cycle;
 // S_FEED is pure SV handshake (no DPI-C).
+//
+// Diagnostics: run with +VTEN_VERBOSE for state transition logs (xsim),
+//              or compile with +define+VTEN_VERBOSE (verilator).
 
 `include "vten_types.svh"
 `include "vten_dpi_imports.svh"
@@ -19,6 +22,8 @@ module vten_shm_controller #(
     output bfm_cmd_t    feed_data,
     input  logic        feed_ready,
     output logic        feed_done,     // S_FEED complete → Scheduler starts execution
+    // → Scheduler: batch lifecycle
+    output logic        batch_init,    // Asserted in S_LOAD_BATCH to reset scheduler state
     // ← Scheduler: status report
     input  logic        sched_all_committed,
     input  logic        sched_all_drained,
@@ -44,9 +49,20 @@ module vten_shm_controller #(
 
     // Runtime session ID: plusarg overrides parameter default.
     string runtime_session_id;
+    // Runtime verbose: +VTEN_VERBOSE plusarg (xsim) or +define+VTEN_VERBOSE (verilator)
+    bit verbose;
     initial begin
         if (!$value$plusargs("SESSION_ID=%s", runtime_session_id))
             runtime_session_id = SESSION_ID;
+`ifdef VTEN_VERBOSE
+        verbose = 1;
+`else
+  `ifndef VERILATOR
+        verbose = $test$plusargs("VTEN_VERBOSE");
+  `else
+        verbose = 0;
+  `endif
+`endif
     end
 
     // ── Single always_ff: state transitions + datapath + DPI-C ──
@@ -56,18 +72,25 @@ module vten_shm_controller #(
             feed_valid <= 0;
             feed_done  <= 0;
             feed_idx   <= 0;
+            batch_init <= 0;
         end else begin
             // Default: deassert every cycle
             feed_valid <= 0;
             feed_done  <= 0;
+            batch_init <= 0;
 
             case (state)
                 // ── Init: SHM connection ──
                 S_INIT: begin
                     if (vten_shm_init(runtime_session_id) == 0) begin
+                        if (verbose)
+                            $display("[CTRL %0t] INIT ok → WAIT_HOST (session=%s)", $time, runtime_session_id);
                         state <= S_WAIT_HOST;
-                    end else
+                    end else begin
+                        if (verbose)
+                            $display("[CTRL %0t] INIT failed → ERROR", $time);
                         state <= S_ERROR;
+                    end
                 end
 
                 // ── Wait for host signal (timed wait for GUI responsiveness) ──
@@ -79,9 +102,15 @@ module vten_shm_controller #(
                     if (result == 0) begin  // VTEN_OK
                         case (vten_read_host_status())
                             1: begin
+                                if (verbose)
+                                    $display("[CTRL %0t] CMD_READY → LOAD_BATCH", $time);
                                 state <= S_LOAD_BATCH;
                             end
-                            3: state <= S_SHUTDOWN;
+                            3: begin
+                                if (verbose)
+                                    $display("[CTRL %0t] SHUTDOWN signal → SHUTDOWN", $time);
+                                state <= S_SHUTDOWN;
+                            end
                             default: ;
                         endcase
                     end
@@ -89,40 +118,51 @@ module vten_shm_controller #(
 
                 // ── Batch load: SHM → local cache ──
                 S_LOAD_BATCH: begin
-                    num_commands <= vten_read_num_commands();
-                    timeout_ms   <= vten_read_timeout_ms();
-                    vten_set_backend_status(BACKEND_RUNNING);
+                    // Re-mmap if host grew the SHM (dynamic resize)
+                    if (vten_shm_remap() != 0) begin
+                        if (verbose)
+                            $display("[CTRL %0t] LOAD_BATCH: remap failed → ERROR", $time);
+                        state <= S_ERROR;
+                    end else begin
+                        batch_init   <= 1;  // Reset scheduler for new batch
+                        num_commands <= vten_read_num_commands();
+                        timeout_ms   <= vten_read_timeout_ms();
+                        vten_set_backend_status(BACKEND_RUNNING);
+                        if (verbose)
+                            $display("[CTRL %0t] LOAD_BATCH: %0d commands, timeout=%0d ms",
+                                     $time, vten_read_num_commands(), vten_read_timeout_ms());
 
-                    // Bulk copy all commands to local cache in one cycle
-                    for (int i = 0; i < vten_read_num_commands(); i++) begin
-                        int op, iface, proto, rl, bufid, prb, flg, sz;
-                        longint pa;
-                        int ro, rv, rm, re, gbid;
-                        int nd, ncd;
-                        int d [0:3], cd [0:3];
-                        vten_read_command(i, op, iface, proto, rl,
-                                          bufid, prb, flg, sz, pa,
-                                          ro, rv, rm, re, gbid,
-                                          nd, ncd, d, cd);
-                        cmd_cache[i].opcode       <= opcode_t'(op[3:0]);
-                        cmd_cache[i].cmd_id       <= i[15:0];
-                        cmd_cache[i].interface_id <= iface[15:0];
-                        cmd_cache[i].protocol     <= protocol_t'(proto[7:0]);
-                        cmd_cache[i].role         <= rl[0];
-                        cmd_cache[i].buffer_id    <= bufid[15:0];
-                        cmd_cache[i].probe        <= prb[0];
-                        cmd_cache[i].sync         <= flg[0];
-                        cmd_cache[i].size         <= sz;
-                        cmd_cache[i].phys_addr    <= pa;
-                        cmd_cache[i].reg_offset   <= ro;
-                        cmd_cache[i].reg_value    <= rv;
-                        cmd_cache[i].reg_mask     <= rm;
-                        cmd_cache[i].reg_expected <= re;
-                        cmd_cache[i].golden_buf_id <= gbid[15:0];
+                        // Bulk copy all commands to local cache in one cycle
+                        for (int i = 0; i < vten_read_num_commands(); i++) begin
+                            int op, iface, proto, rl, bufid, prb, flg, sz;
+                            longint pa;
+                            int ro, rv, rm, re, gbid;
+                            int nd, ncd;
+                            int d [0:3], cd [0:3];
+                            vten_read_command(i, op, iface, proto, rl,
+                                              bufid, prb, flg, sz, pa,
+                                              ro, rv, rm, re, gbid,
+                                              nd, ncd, d, cd);
+                            cmd_cache[i].opcode       <= opcode_t'(op[3:0]);
+                            cmd_cache[i].cmd_id       <= i[15:0];
+                            cmd_cache[i].interface_id <= iface[15:0];
+                            cmd_cache[i].protocol     <= protocol_t'(proto[7:0]);
+                            cmd_cache[i].role         <= rl[0];
+                            cmd_cache[i].buffer_id    <= bufid[15:0];
+                            cmd_cache[i].probe        <= prb[0];
+                            cmd_cache[i].sync         <= flg[0];
+                            cmd_cache[i].size         <= sz;
+                            cmd_cache[i].phys_addr    <= pa;
+                            cmd_cache[i].reg_offset   <= ro;
+                            cmd_cache[i].reg_value    <= rv;
+                            cmd_cache[i].reg_mask     <= rm;
+                            cmd_cache[i].reg_expected <= re;
+                            cmd_cache[i].golden_buf_id <= gbid[15:0];
+                        end
+
+                        feed_idx <= 0;
+                        state    <= S_FEED;
                     end
-
-                    feed_idx <= 0;
-                    state    <= S_FEED;
                 end
 
                 // ── Feed commands to Scheduler sequentially ──
@@ -139,28 +179,44 @@ module vten_shm_controller #(
 
                 // ── Monitor Scheduler execution ──
                 S_EXECUTE: begin
-                    if (sched_error)
+                    if (sched_error) begin
+                        if (verbose)
+                            $display("[CTRL %0t] EXECUTE → ERROR (cmd=%0d, code=%0d)",
+                                     $time, sched_error_cmd_id, sched_error_code);
                         state <= S_ERROR;
-                    else if (sched_all_drained)
+                    end else if (sched_all_drained) begin
+                        if (verbose)
+                            $display("[CTRL %0t] EXECUTE → COMPLETE (all drained)", $time);
                         state <= S_COMPLETE;  // Skip S_DRAIN
-                    else if (sched_all_committed)
+                    end else if (sched_all_committed) begin
+                        if (verbose)
+                            $display("[CTRL %0t] EXECUTE → DRAIN (all committed, waiting BFM idle)", $time);
                         state <= S_DRAIN;
+                    end
                 end
 
                 // ── Drain BFM in-flight responses ──
                 S_DRAIN: begin
-                    if (sched_all_drained)
+                    if (sched_all_drained) begin
+                        if (verbose)
+                            $display("[CTRL %0t] DRAIN → COMPLETE", $time);
                         state <= S_COMPLETE;
+                    end
                 end
 
                 // ── Complete → notify host ──
                 S_COMPLETE: begin
                     vten_signal_complete();  // backend_status=DONE + sem_post
+                    if (verbose)
+                        $display("[CTRL %0t] COMPLETE → WAIT_HOST", $time);
                     state <= S_WAIT_HOST;
                 end
 
                 // ── Error → notify host ──
                 S_ERROR: begin
+                    if (verbose)
+                        $display("[CTRL %0t] ERROR: cmd=%0d code=%0d → WAIT_HOST",
+                                 $time, sched_error_cmd_id, sched_error_code);
                     vten_signal_error(
                         sched_error_code,
                         $sformatf("[Scheduler] error at cmd_id=%0d",
@@ -171,6 +227,8 @@ module vten_shm_controller #(
 
                 // ── Shutdown ──
                 S_SHUTDOWN: begin
+                    if (verbose)
+                        $display("[CTRL %0t] SHUTDOWN → $finish", $time);
                     vten_cleanup();
                     $finish;
                 end

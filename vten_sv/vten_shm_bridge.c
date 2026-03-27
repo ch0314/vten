@@ -36,6 +36,7 @@ static void*            data_base     = NULL;
 static sem_t*           sem_h2b       = NULL;
 static sem_t*           sem_b2h       = NULL;
 static size_t           shm_size      = 0;
+static char             shm_name_buf[256] = {0};  /* saved for remap */
 
 static BufferDescriptor buf_cache[MAX_BUFFERS];
 static int              buf_cache_valid = 0;
@@ -73,9 +74,10 @@ static void _drain_semaphore(sem_t* sem) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 int vten_shm_init(const char* session_id) {
-    /* Build SHM name: /vten_{session_id} */
+    /* Build SHM name: /vten_{session_id} — also save for remap */
     char shm_name[256];
     snprintf(shm_name, sizeof(shm_name), "/vten_%s", session_id);
+    snprintf(shm_name_buf, sizeof(shm_name_buf), "%s", shm_name);
 
     /* Open existing SHM (created by Python host) */
     int fd = shm_open(shm_name, O_RDWR, 0);
@@ -163,6 +165,61 @@ int vten_shm_init(const char* session_id) {
 
     fprintf(stderr, "[vten_shm_bridge] init OK: shm=%s size=%zu cmds=%u bufs=%u\n",
             shm_name, shm_size, ctrl->num_commands, ctrl->num_buffers);
+
+    return VTEN_OK;
+}
+
+int vten_shm_remap(void) {
+    /* Check if host grew the SHM via ftruncate. If so, munmap + mmap at new size.
+     * Called from S_LOAD_BATCH before reading new batch metadata. */
+    if (shm_base == NULL || shm_name_buf[0] == '\0') return VTEN_ERROR;
+
+    int fd = shm_open(shm_name_buf, O_RDWR, 0);
+    if (fd < 0) {
+        fprintf(stderr, "[vten_shm_bridge] remap: shm_open failed: %s\n", strerror(errno));
+        return VTEN_ERROR;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        fprintf(stderr, "[vten_shm_bridge] remap: fstat failed: %s\n", strerror(errno));
+        close(fd);
+        return VTEN_ERROR;
+    }
+
+    size_t new_size = (size_t)st.st_size;
+    if (new_size == shm_size) {
+        /* No resize needed */
+        close(fd);
+        return VTEN_OK;
+    }
+
+    fprintf(stderr, "[vten_shm_bridge] remap: %zu → %zu bytes\n", shm_size, new_size);
+
+    /* munmap old mapping */
+    munmap(shm_base, shm_size);
+
+    /* mmap at new size */
+    shm_base = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (shm_base == MAP_FAILED) {
+        fprintf(stderr, "[vten_shm_bridge] remap: mmap failed: %s\n", strerror(errno));
+        shm_base = NULL;
+        ctrl = NULL;
+        return VTEN_ERROR;
+    }
+
+    shm_size = new_size;
+
+    /* Re-derive all region pointers from new mapping */
+    ctrl         = (ControlHeader*)shm_base;
+    cmd_base     = (uint8_t*)shm_base + ctrl->cmd_region_offset;
+    stats_base   = (uint8_t*)shm_base + ctrl->stats_region_offset;
+    bufdesc_base = (uint8_t*)shm_base + ctrl->buf_desc_offset;
+    data_base    = (uint8_t*)shm_base + ctrl->data_region_offset;
+
+    /* Invalidate buffer cache */
+    buf_cache_valid = 0;
 
     return VTEN_OK;
 }
