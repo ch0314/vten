@@ -995,7 +995,11 @@ class ExposedTensor:
     # ── 컴파일 중 설정되는 변경 가능 상태 ──
     _serialized: bytes | None = None
     _serialized_size: int = 0
-    _split_buffers: dict[str, bytes] | None = None  # 멀티포트 분할 시
+
+    # 멀티포트 (array 또는 split) — 통합 버퍼
+    _port_buffers: dict[str, bytes] | None = None  # port_name → data chunk
+    _port_mode: str = "block"                       # "block" | "channel_interleave"
+    _interleave_unit: int | None = None             # channel_interleave일 때만
 
     # ── 원본 위임 ──
     @property

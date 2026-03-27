@@ -280,13 +280,12 @@ class TestExpansionCounts:
         assert len(cmds) == 1
         assert cmds[0].op == OpCode.LOAD
 
-    def test_store_tensor_expands_to_1(self):
-        """STORE_TENSOR → 1 STORE command."""
+    def test_store_tensor_skipped_for_axi4s(self):
+        """STORE_TENSOR → 0 commands for AXI4-Stream (data read from SHM directly)."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
         op = Operation(kind=OpKind.STORE_TENSOR, tensor=inst.get_tensor("data_out"))
         cmds, _ = _lower_ops(view, lowering, [op])
-        assert len(cmds) == 1
-        assert cmds[0].op == OpCode.STORE
+        assert len(cmds) == 0
 
     def test_push_tensor_single_port(self):
         """PUSH_TENSOR (no split) → 1 PUSH command."""
@@ -341,6 +340,167 @@ class TestExpansionCounts:
         # AXI4-Stream: PULL only, no STORE
         assert len(cmds) == 1
         assert cmds[0].op == OpCode.PULL
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §12.8 — chunked recv_tensor lowering
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestChunkedRecvTensorLowering:
+    """recv_tensor(tensor, chunks=N) generates per-chunk PULL commands."""
+
+    def test_chunked_recv_stream_generates_n_pulls(self):
+        """chunks=4 on AXI4-Stream → 4 separate PULL commands."""
+        view, lowering, inst = _make_ir_setup(
+            _make_stream_spec(), PassthroughKernel,
+        )
+        ops = [
+            Operation(
+                kind=OpKind.RECV_TENSOR,
+                tensor=inst.get_tensor("data_out"),
+                chunk_index=i,
+                chunk_total=4,
+                chunks_spec=4,
+            )
+            for i in range(4)
+        ]
+        cmds, buf_ids = _lower_ops(view, lowering, ops)
+        # AXI4-Stream: PULL only per chunk, no STORE
+        assert len(cmds) == 4
+        assert all(c.op == OpCode.PULL for c in cmds)
+        # Each chunk has a unique buffer_id
+        chunk_bids = [c.buffer_id for c in cmds]
+        assert len(set(chunk_bids)) == 4
+
+    def test_chunked_recv_mem_generates_pull_store_pairs(self):
+        """chunks=2 on AXI4 → 2 × (PULL + STORE) = 4 commands."""
+        view, lowering, inst = _make_ir_setup(
+            _make_mem_spec(), MemKernel, runtime_params={"IN_CH": 32},
+        )
+        ops = [
+            Operation(
+                kind=OpKind.RECV_TENSOR,
+                tensor=inst.get_tensor("ofm"),
+                chunk_index=i,
+                chunk_total=2,
+                chunks_spec=2,
+            )
+            for i in range(2)
+        ]
+        cmds, buf_ids = _lower_ops(view, lowering, ops)
+        assert len(cmds) == 4
+        assert cmds[0].op == OpCode.PULL
+        assert cmds[1].op == OpCode.STORE
+        assert cmds[2].op == OpCode.PULL
+        assert cmds[3].op == OpCode.STORE
+        # Different buffer_ids for each chunk
+        assert cmds[0].buffer_id != cmds[2].buffer_id
+
+    def test_chunked_recv_sizes_are_equal_split(self):
+        """Each chunk's PULL size = total_serialized_size / N."""
+        view, lowering, inst = _make_ir_setup(
+            _make_stream_spec(), PassthroughKernel,
+        )
+        tensor = inst.get_tensor("data_out")
+        total_size = view.exposed_tensors["data_out"]._serialized_size
+        ops = [
+            Operation(
+                kind=OpKind.RECV_TENSOR,
+                tensor=tensor,
+                chunk_index=i,
+                chunk_total=4,
+                chunks_spec=4,
+            )
+            for i in range(4)
+        ]
+        cmds, _ = _lower_ops(view, lowering, ops)
+        expected_per_chunk = total_size // 4
+        for cmd in cmds:
+            assert cmd.size == expected_per_chunk
+
+    def test_chunked_recv_buffer_id_naming(self):
+        """Buffer IDs follow {name}:chunk_{i} pattern."""
+        view, lowering, inst = _make_ir_setup(
+            _make_stream_spec(), PassthroughKernel,
+        )
+        ops = [
+            Operation(
+                kind=OpKind.RECV_TENSOR,
+                tensor=inst.get_tensor("data_out"),
+                chunk_index=i,
+                chunk_total=3,
+                chunks_spec=3,
+            )
+            for i in range(3)
+        ]
+        _, buf_ids = _lower_ops(view, lowering, ops)
+        for i in range(3):
+            assert f"data_out:chunk_{i}" in buf_ids
+        # Logical name maps to chunk_0
+        assert buf_ids["data_out"] == buf_ids["data_out:chunk_0"]
+
+    def test_chunked_recv_with_list_chunks_spec(self):
+        """chunks=[10, 6] gives proportional sizes."""
+        view, lowering, inst = _make_ir_setup(
+            _make_stream_spec(), PassthroughKernel,
+        )
+        total_size = view.exposed_tensors["data_out"]._serialized_size
+        ops = [
+            Operation(
+                kind=OpKind.RECV_TENSOR,
+                tensor=inst.get_tensor("data_out"),
+                chunk_index=i,
+                chunk_total=2,
+                chunks_spec=[10, 6],
+            )
+            for i in range(2)
+        ]
+        cmds, _ = _lower_ops(view, lowering, ops)
+        assert len(cmds) == 2
+        assert cmds[0].size == total_size * 10 // 16
+        assert cmds[1].size == total_size * 6 // 16
+
+
+class TestChunkedRecvTensorContext:
+    """ExecutionContext.recv_tensor(chunks=...) API tests."""
+
+    def test_recv_tensor_chunks_returns_list(self):
+        """chunks=N returns list of N OperationHandles."""
+        from vten.runtime.context import ExecutionContext
+
+        ctx = ExecutionContext()
+        tensor = Tensor(shape=(16,), dtype=torch.int8, interface="axis_out")
+        tensor.name = "data_out"
+        handles = ctx.recv_tensor(tensor, chunks=4)
+        assert isinstance(handles, list)
+        assert len(handles) == 4
+        for i, h in enumerate(handles):
+            assert h.op.chunk_index == i
+            assert h.op.chunk_total == 4
+            assert h.op.chunks_spec == 4
+
+    def test_recv_tensor_no_chunks_returns_single_handle(self):
+        """Without chunks, returns single OperationHandle (backward compat)."""
+        from vten.runtime.context import ExecutionContext
+
+        ctx = ExecutionContext()
+        tensor = Tensor(shape=(16,), dtype=torch.int8, interface="axis_out")
+        tensor.name = "data_out"
+        handle = ctx.recv_tensor(tensor)
+        assert isinstance(handle, OperationHandle)
+        assert handle.op.chunk_index is None
+
+    def test_recv_tensor_list_chunks_returns_list(self):
+        """chunks=[5, 11] returns list of 2 handles."""
+        from vten.runtime.context import ExecutionContext
+
+        ctx = ExecutionContext()
+        tensor = Tensor(shape=(16,), dtype=torch.int8, interface="axis_out")
+        tensor.name = "data_out"
+        handles = ctx.recv_tensor(tensor, chunks=[5, 11])
+        assert len(handles) == 2
+        assert handles[0].op.chunks_spec == [5, 11]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -794,9 +954,9 @@ class TestMultiPortPushPull:
     def test_multi_port_push_generates_n_commands(self):
         """Split interface with 4 ports → 4 PUSH commands."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
-        # Manually set split_buffers on exposed tensor
+        # Manually set port_buffers on exposed tensor
         exposed = view.exposed_tensors["data_in"]
-        exposed._split_buffers = {
+        exposed._port_buffers = {
             f"port_{i}": bytes(64) for i in range(4)
         }
         op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
@@ -808,7 +968,7 @@ class TestMultiPortPushPull:
         """Only first port command gets dep, rest empty."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
         exposed = view.exposed_tensors["data_in"]
-        exposed._split_buffers = {
+        exposed._port_buffers = {
             f"port_{i}": bytes(32) for i in range(3)
         }
         # Create a preceding load to generate a dep
@@ -827,19 +987,18 @@ class TestMultiPortPushPull:
         assert push_cmds[1].dep == []
         assert push_cmds[2].dep == []
 
-    def test_each_port_gets_port_name(self):
-        """Each split command has the port name set."""
+    def test_each_port_gets_unique_interface_id(self):
+        """Each port command gets a distinct interface_id."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
         exposed = view.exposed_tensors["data_in"]
-        exposed._split_buffers = {
+        exposed._port_buffers = {
             "hbm_00": bytes(32),
             "hbm_01": bytes(32),
         }
         op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
         cmds, _ = _lower_ops(view, lowering, [op])
-        ports = [c.port for c in cmds]
-        assert "hbm_00" in ports
-        assert "hbm_01" in ports
+        iface_ids = [c.interface_id for c in cmds]
+        assert len(set(iface_ids)) == 2  # each port gets unique ID
 
 
 # ═══════════════════════════════════════════════════════════════════

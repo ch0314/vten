@@ -5,9 +5,13 @@ Spec reference: 02_runtime_engine.md §4
 
 from __future__ import annotations
 
+import logging
 import math
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 from vten.errors import (
     CompilationError,
@@ -60,7 +64,62 @@ if TYPE_CHECKING:
     from vten.runtime.context import AliasRegistry
 
 
+# ── Helpers ──
+
+
+def _parse_split_spec(raw):
+    """Parse a raw dict or SplitSpec into a SplitSpec dataclass."""
+    from vten.spec.models import InterleaveSpec, PortDef, SplitSpec
+
+    if isinstance(raw, SplitSpec):
+        return raw
+    ports = [
+        PortDef(name=p["name"], base_addr=p.get("base_addr", 0))
+        for p in raw.get("ports", [])
+    ]
+    interleave = None
+    if "interleave" in raw:
+        interleave = InterleaveSpec(unit=raw["interleave"]["unit"])
+    return SplitSpec(mode=raw["mode"], ports=ports, interleave=interleave)
+
+
+def _block_split_data(
+    serialized: bytes | None,
+    flat_names: list[str],
+    serialized_size: int,
+) -> dict[str, bytes]:
+    """Block-split serialized data (or allocate empty) across port names."""
+    n = len(flat_names)
+    if serialized is not None:
+        data = serialized
+        chunk_size = len(data) // n
+        remainder = len(data) % n
+        result = {}
+        offset = 0
+        for i, fname in enumerate(flat_names):
+            sz = chunk_size + (1 if i < remainder else 0)
+            result[fname] = data[offset : offset + sz]
+            offset += sz
+        return result
+    else:
+        per_elem_size = serialized_size // n
+        return {fname: bytes(per_elem_size) for fname in flat_names}
+
+
 # ── CompiledResult ──
+
+
+@dataclass
+class SHMLayout:
+    """SHM region offsets and counts for in-place batch updates."""
+
+    cmd_offset: int
+    stats_offset: int
+    bufdesc_offset: int
+    data_region_offset: int
+    num_commands: int
+    num_buffers: int
+    total_size: int
 
 
 @dataclass
@@ -73,6 +132,8 @@ class CompiledResult:
     probe_reports: list[ProbePoint] = field(default_factory=list)
     tensor_data: dict[int, bytes] = field(default_factory=dict)
     iface_id_to_name: dict[int, str] = field(default_factory=dict)
+    shm_layout: SHMLayout | None = None
+    views: list[FlattenedKernelView] | None = None  # multi-config: all views
 
 
 # ── RuntimeEngine ──
@@ -93,65 +154,94 @@ class RuntimeEngine:
         self._project_params = project_params
         self._alias_registry = alias_registry
 
-    def compile(self, target: str = "sim") -> CompiledResult:
-        """Run the 8-stage compile pipeline.
+    # ── Internal: Stages 0–6 (IR generation, no SHM packing) ──
 
-        Args:
-            target: "sim" for SIM backends (includes Stage 7 SHM packing),
-                    "hw" for HW backends (skips SHM packing).
+    def _compile_ir(
+        self,
+        *,
+        cmd_id_start: int = 0,
+        buffer_id_start: int = 0,
+    ) -> tuple[
+        FlattenedKernelView,
+        list[Command],
+        dict[str, int],
+        list[BFMConfig],
+        dict[int, str],
+    ]:
+        """Run Stages 0–6 and return intermediate results.
+
+        Returns:
+            (view, commands, buffer_ids, bfm_configs, iface_id_to_name)
         """
         kernel = self._get_primary_kernel()
 
         # Stage 0: Flatten or wrap
+        logger.debug("Stage 0: flatten/wrap")
         if self._is_composite(kernel):
             view = self._flatten_composite(kernel)
         else:
             view = self._wrap_unit_as_flat(kernel)
 
         # Stage 1: Parameter resolution (re-validate)
+        logger.debug("Stage 1: parameter resolution")
         self._resolve_parameters(view)
 
         # Stage 2: Shape resolution & validation
+        logger.debug("Stage 2: shape resolution")
         self._resolve_shapes(view)
 
-        # Stage 2b: Refine direction from operations (for tensors without explicit direction)
+        # Stage 2b: Refine direction from operations
+        logger.debug("Stage 2b: direction refinement")
         self._refine_directions_from_ops(view)
 
         # Stage 3: Tensor serialization
+        logger.debug("Stage 3: tensor serialization")
         self._serialize_tensors(view)
 
         # Stage 3b: Probe golden serialization
+        logger.debug("Stage 3b: probe golden serialization")
         self._serialize_probe_golden(view)
 
         # Stage 4: Address allocation
+        logger.debug("Stage 4: address allocation")
         self._allocate_addresses(view)
 
         # Stage 5: auto_bind resolution
+        logger.debug("Stage 5: auto_bind resolution")
         self._resolve_auto_binds(view)
 
         # Stage 6: IR lowering
+        logger.debug("Stage 6: IR lowering")
         lowering = IRLowering(view, self._alias_registry)
-        commands, buffer_ids = lowering.lower(self._ops)
+        commands, buffer_ids = lowering.lower(
+            self._ops,
+            cmd_id_start=cmd_id_start,
+            buffer_id_start=buffer_id_start,
+        )
 
-        # Capture interface_id reverse map for reporting
         iface_id_to_name: dict[int, str] = {
             v: k for k, v in lowering._iface_id_map.items()
         }
 
+        if logger.isEnabledFor(logging.DEBUG):
+            self._log_ir_commands(commands, iface_id_to_name, buffer_ids)
+
         # Stage 6b: BFM configuration synthesis
+        logger.debug("Stage 6b: BFM config synthesis")
         bfm_configs = self._synthesize_bfm_configs(view, commands, buffer_ids)
 
-        # Stage 7: SHM packing (SIM path only)
-        if target == "sim":
-            shm_image = self._pack_shm(view, commands, buffer_ids)
-        else:
-            shm_image = b""
+        return view, commands, buffer_ids, bfm_configs, iface_id_to_name
 
-        # Collect serialized tensor data (used by HW path / CommandInterpreter)
+    @staticmethod
+    def _collect_tensor_data(
+        view: FlattenedKernelView,
+        buffer_ids: dict[str, int],
+    ) -> dict[int, bytes]:
+        """Collect serialized tensor data from a flattened view."""
         tensor_data: dict[int, bytes] = {}
         for name, exposed in view.exposed_tensors.items():
-            if exposed._array_element_buffers:
-                for flat_name, chunk in exposed._array_element_buffers.items():
+            if exposed._port_buffers:
+                for flat_name, chunk in exposed._port_buffers.items():
                     bid = buffer_ids.get(f"{name}:{flat_name}")
                     if bid is not None and chunk:
                         tensor_data[bid] = chunk
@@ -159,6 +249,37 @@ class RuntimeEngine:
                 bid = buffer_ids.get(name)
                 if bid is not None:
                     tensor_data[bid] = exposed._serialized
+        return tensor_data
+
+    # ── Public: Single-config compile ──
+
+    def compile(self, target: str = "sim") -> CompiledResult:
+        """Run the 8-stage compile pipeline.
+
+        Args:
+            target: "sim" for SIM backends (includes Stage 7 SHM packing),
+                    "hw" for HW backends (skips SHM packing).
+        """
+        t0 = time.perf_counter()
+        logger.debug("compile pipeline starting (target=%s, ops=%d)", target, len(self._ops))
+
+        view, commands, buffer_ids, bfm_configs, iface_id_to_name = (
+            self._compile_ir()
+        )
+
+        # Stage 7: SHM packing (SIM path only)
+        if target == "sim":
+            logger.debug("Stage 7: SHM packing")
+            shm_image = self._pack_shm(view, commands, buffer_ids)
+            logger.debug("SHM image: %d bytes", len(shm_image))
+        else:
+            shm_image = b""
+
+        tensor_data = self._collect_tensor_data(view, buffer_ids)
+
+        elapsed = time.perf_counter() - t0
+        logger.debug("compile complete: %d commands, %d buffers, %.1fms",
+                     len(commands), len(buffer_ids), elapsed * 1000)
 
         return CompiledResult(
             commands=commands,
@@ -169,7 +290,55 @@ class RuntimeEngine:
             probe_reports=view.probe_points,
             tensor_data=tensor_data,
             iface_id_to_name=iface_id_to_name,
+            shm_layout=self._last_shm_layout,
         )
+
+    @staticmethod
+    def _log_ir_commands(
+        commands: list,
+        iface_map: dict[int, str],
+        buffer_ids: dict[str, int],
+    ) -> None:
+        """Log compiled IR commands as a readable table."""
+        # Reverse buffer_ids: id → name
+        bid_to_name: dict[int, str] = {v: k for k, v in buffer_ids.items()}
+
+        lines: list[str] = ["compiled IR commands:"]
+        lines.append(
+            f"  {'#':>3}  {'Op':<10} {'Iface':<16} {'Buf':<16} "
+            f"{'Size':>8}  {'Dep':<10} {'Extra'}"
+        )
+        lines.append("  " + "-" * 78)
+
+        for cmd in commands:
+            op = cmd.op.name
+            iface = iface_map.get(cmd.interface_id, str(cmd.interface_id))
+            buf = bid_to_name.get(cmd.buffer_id, str(cmd.buffer_id))
+            size = cmd.size
+            dep = ",".join(str(d) for d in cmd.dep) if cmd.dep else "-"
+
+            # Extra info depends on op type
+            extra_parts: list[str] = []
+            if cmd.reg_offset:
+                extra_parts.append(f"reg=0x{cmd.reg_offset:X}")
+            if cmd.reg_value:
+                extra_parts.append(f"val=0x{cmd.reg_value:X}")
+            if cmd.reg_mask:
+                extra_parts.append(f"mask=0x{cmd.reg_mask:X}")
+            if cmd.probe:
+                extra_parts.append("probe")
+            if cmd.sync:
+                extra_parts.append("sync")
+            if cmd.port:
+                extra_parts.append(f"port={cmd.port}")
+            extra = " ".join(extra_parts)
+
+            lines.append(
+                f"  {cmd.cmd_id:3d}  {op:<10} {iface:<16} {buf:<16} "
+                f"{size:>8}  {dep:<10} {extra}"
+            )
+
+        logger.debug("\n".join(lines))
 
     def _get_primary_kernel(self) -> KernelInstance:
         if not self._kernels:
@@ -757,56 +926,24 @@ class RuntimeEngine:
                 exposed._serialized = None
                 exposed._serialized_size = num_beats * (packing.bus_width // 8)
 
-            # Multi-port split
+            # Multi-port split → _port_buffers
             if iface_spec.split and exposed._serialized is not None:
-                from vten.spec.models import SplitSpec
-
-                split_spec = iface_spec.split
-                if isinstance(split_spec, dict):
-                    # Parse raw dict to SplitSpec
-                    from vten.spec.models import InterleaveSpec, PortDef
-
-                    ports = [
-                        PortDef(name=p["name"], base_addr=p.get("base_addr", 0))
-                        for p in split_spec.get("ports", [])
-                    ]
-                    interleave = None
-                    if "interleave" in split_spec:
-                        interleave = InterleaveSpec(
-                            unit=split_spec["interleave"]["unit"]
-                        )
-                    split_spec = SplitSpec(
-                        mode=split_spec["mode"],
-                        ports=ports,
-                        interleave=interleave,
-                    )
+                split_spec = _parse_split_spec(iface_spec.split)
                 splitter = MultiPortSerializer()
-                exposed._split_buffers = splitter.split_tensor(
+                exposed._port_buffers = splitter.split_tensor(
                     exposed._serialized, split_spec
                 )
+                exposed._port_mode = split_spec.mode
+                if split_spec.interleave:
+                    exposed._interleave_unit = split_spec.interleave.unit
 
-            # Array interface: block-split data across elements
-            if iface_spec.array and not exposed._split_buffers:
+            # Array interface → _port_buffers (when split didn't already set it)
+            if iface_spec.array and not exposed._port_buffers:
                 flat_names = iface_spec.array.flat_names(exposed.top_interface)
-                n = len(flat_names)
-                if exposed._serialized is not None:
-                    # Input tensor: split actual data
-                    data = exposed._serialized
-                    chunk_size = len(data) // n
-                    remainder = len(data) % n
-                    exposed._array_element_buffers = {}
-                    offset = 0
-                    for i, fname in enumerate(flat_names):
-                        sz = chunk_size + (1 if i < remainder else 0)
-                        exposed._array_element_buffers[fname] = data[offset : offset + sz]
-                        offset += sz
-                else:
-                    # Output tensor: allocate size per element (no data yet)
-                    per_elem_size = exposed._serialized_size // n
-                    exposed._array_element_buffers = {
-                        fname: bytes(per_elem_size)
-                        for fname in flat_names
-                    }
+                exposed._port_buffers = _block_split_data(
+                    exposed._serialized, flat_names, exposed._serialized_size
+                )
+                exposed._port_mode = "block"
 
     # ── Stage 3b: Probe Golden Serialization ──
 
@@ -899,6 +1036,8 @@ class RuntimeEngine:
 
     # ── Stage 7: SHM Packing ──
 
+    _last_shm_layout: SHMLayout | None = None
+
     def _pack_shm(
         self,
         view: FlattenedKernelView,
@@ -909,11 +1048,56 @@ class RuntimeEngine:
 
         # Allocate data buffers
         allocated_buffer_ids: set[int] = set()
+
+        # Collect chunk info from ops to detect chunked tensors
+        chunk_tensors: dict[str, int | list[int]] = {}
+        for op in self._ops:
+            if op.chunk_total is not None and op.tensor is not None:
+                chunk_tensors[op.tensor.name] = op.chunks_spec
+
         for name, exposed in view.exposed_tensors.items():
             direction = DIRECTION_ENCODING.get(exposed.direction, 0)
-            if exposed._array_element_buffers:
+
+            if name in chunk_tensors:
+                # Chunked tensor: allocate per-chunk buffers
+                chunks_spec = chunk_tensors[name]
+                n_chunks = (
+                    len(chunks_spec) if isinstance(chunks_spec, list)
+                    else chunks_spec
+                )
+                for ci in range(n_chunks):
+                    if isinstance(chunks_spec, list):
+                        total_elems = sum(chunks_spec)
+                        chunk_size = (
+                            exposed._serialized_size * chunks_spec[ci]
+                            // total_elems
+                        )
+                    else:
+                        chunk_size = exposed._serialized_size // n_chunks
+
+                    if exposed._port_buffers:
+                        flat_names = list(
+                            exposed._port_buffers.keys()
+                        )
+                        n_elems = len(flat_names)
+                        per_elem_size = chunk_size // n_elems
+                        for fname in flat_names:
+                            bid = buffer_ids[
+                                f"{name}:chunk_{ci}:{fname}"
+                            ]
+                            if bid not in allocated_buffer_ids:
+                                allocated_buffer_ids.add(bid)
+                                shm_alloc.allocate(
+                                    bid, per_elem_size, direction,
+                                )
+                    else:
+                        bid = buffer_ids[f"{name}:chunk_{ci}"]
+                        if bid not in allocated_buffer_ids:
+                            allocated_buffer_ids.add(bid)
+                            shm_alloc.allocate(bid, chunk_size, direction)
+            elif exposed._port_buffers:
                 # Array tensor: one buffer per flat element
-                for flat_name, chunk in exposed._array_element_buffers.items():
+                for flat_name, chunk in exposed._port_buffers.items():
                     bid = buffer_ids[f"{name}:{flat_name}"]
                     if bid not in allocated_buffer_ids:
                         allocated_buffer_ids.add(bid)
@@ -933,6 +1117,252 @@ class RuntimeEngine:
                 )
                 probe.golden_buffer_id = next_buffer_id
                 next_buffer_id += 1
+
+        # Calculate sizes
+        num_commands = len(commands)
+        num_buffers = len(shm_alloc.descriptors)
+
+        total = calculate_shm_size(
+            num_commands=num_commands,
+            num_buffers=num_buffers,
+            buffer_sizes=[d.size for d in shm_alloc.descriptors],
+        )
+
+        image = bytearray(total)
+
+        # Region offsets
+        cmd_offset = CONTROL_SIZE
+        stats_offset = cmd_offset + CMD_SLOT_SIZE * num_commands
+        bufdesc_offset = stats_offset + STATS_SLOT_SIZE * num_commands
+        data_region_raw = bufdesc_offset + BUF_DESC_SIZE * num_buffers
+        data_region_offset = (data_region_raw + CACHE_LINE - 1) & ~(CACHE_LINE - 1)
+
+        # Store layout metadata for session-based batch updates
+        self._last_shm_layout = SHMLayout(
+            cmd_offset=cmd_offset,
+            stats_offset=stats_offset,
+            bufdesc_offset=bufdesc_offset,
+            data_region_offset=data_region_offset,
+            num_commands=num_commands,
+            num_buffers=num_buffers,
+            total_size=total,
+        )
+
+        # Pack control header
+        pack_control_header(
+            image,
+            num_commands=num_commands,
+            num_buffers=num_buffers,
+            cmd_region_offset=cmd_offset,
+            stats_region_offset=stats_offset,
+            buf_desc_offset=bufdesc_offset,
+            data_region_offset=data_region_offset,
+            total_shm_size=total,
+        )
+
+        # Pack command slots
+        for i, cmd in enumerate(commands):
+            pack_command_slot(image, cmd_offset + i * CMD_SLOT_SIZE, cmd)
+
+        # Pack stats entries: LOAD commands pre-marked as COMMITTED
+        from vten.spec.models import CommandStatus
+
+        for cmd in commands:
+            if cmd.op == OpCode.LOAD:
+                pack_stats_entry(
+                    image,
+                    stats_offset + cmd.cmd_id * STATS_SLOT_SIZE,
+                    status=CommandStatus.COMMITTED.value,
+                )
+
+        # Pack buffer descriptors
+        for i, desc in enumerate(shm_alloc.descriptors):
+            pack_buffer_descriptor(
+                image, bufdesc_offset + i * BUF_DESC_SIZE, desc
+            )
+
+        # Copy input tensor data
+        for name, exposed in view.exposed_tensors.items():
+            if exposed._port_buffers:
+                # Array tensor: copy per-element data chunks
+                for flat_name, chunk in exposed._port_buffers.items():
+                    if not chunk or all(b == 0 for b in chunk):
+                        continue  # Skip zero-filled output placeholders
+                    bid = buffer_ids[f"{name}:{flat_name}"]
+                    try:
+                        desc = shm_alloc.get_descriptor(bid)
+                    except KeyError:
+                        continue
+                    start = data_region_offset + desc.data_offset
+                    image[start : start + len(chunk)] = chunk
+            elif exposed._serialized is not None:
+                bid = buffer_ids[name]
+                try:
+                    desc = shm_alloc.get_descriptor(bid)
+                except KeyError:
+                    continue
+                start = data_region_offset + desc.data_offset
+                image[start : start + len(exposed._serialized)] = (
+                    exposed._serialized
+                )
+
+        # Copy probe golden data
+        for probe in view.probe_points:
+            if probe.serialized_golden is not None and probe.golden_buffer_id is not None:
+                desc = shm_alloc.get_descriptor(probe.golden_buffer_id)
+                start = data_region_offset + desc.data_offset
+                image[start : start + len(probe.serialized_golden)] = (
+                    probe.serialized_golden
+                )
+
+        return bytes(image)
+
+    # ── Multi-config compile ──
+
+    @staticmethod
+    def compile_multi(
+        engines: list[RuntimeEngine],
+        *,
+        target: str = "sim",
+    ) -> CompiledResult:
+        """Compile multiple config groups into a single batch.
+
+        Each engine represents one config group. Commands are merged with
+        BARRIER commands inserted between groups. cmd_id and buffer_id
+        are offset to maintain global uniqueness.
+
+        Args:
+            engines: List of RuntimeEngine instances, one per config group.
+            target: "sim" for SIM backends, "hw" for HW backends.
+
+        Returns:
+            A single CompiledResult with merged commands and unified SHM image.
+        """
+        if not engines:
+            raise CompilationError("compile_multi requires at least one engine")
+
+        if len(engines) == 1:
+            return engines[0].compile(target=target)
+
+        t0 = time.perf_counter()
+        logger.debug("compile_multi: %d config groups", len(engines))
+
+        all_commands: list[Command] = []
+        all_buffer_ids: dict[str, int] = {}
+        all_bfm_configs: list[BFMConfig] = []
+        all_iface_id_to_name: dict[int, str] = {}
+        all_tensor_data: dict[int, bytes] = {}
+        views: list[FlattenedKernelView] = []
+        view_buffer_ids: list[dict[str, int]] = []
+
+        next_cmd_id = 0
+        next_buffer_id = 0
+        bfm_configs_set: set[str] = set()  # dedup by interface_name
+
+        for idx, engine in enumerate(engines):
+            logger.debug("compile_multi: group %d/%d", idx + 1, len(engines))
+
+            view, commands, buffer_ids, bfm_configs, iface_id_to_name = (
+                engine._compile_ir(
+                    cmd_id_start=next_cmd_id,
+                    buffer_id_start=next_buffer_id,
+                )
+            )
+
+            views.append(view)
+            view_buffer_ids.append(buffer_ids)
+
+            # Merge commands
+            all_commands.extend(commands)
+
+            # Prefix buffer_ids with config index to avoid name collision
+            for name, bid in buffer_ids.items():
+                all_buffer_ids[f"cfg{idx}:{name}"] = bid
+                # Also keep unprefixed for single-config backward compat
+                if idx == 0:
+                    all_buffer_ids[name] = bid
+
+            # Update next offsets
+            if commands:
+                next_cmd_id = max(c.cmd_id for c in commands) + 1
+            if buffer_ids:
+                next_buffer_id = max(buffer_ids.values()) + 1
+
+            # Merge BFM configs (dedup by interface_name)
+            for cfg in bfm_configs:
+                if cfg.interface_name not in bfm_configs_set:
+                    bfm_configs_set.add(cfg.interface_name)
+                    all_bfm_configs.append(cfg)
+
+            # Merge iface_id_to_name
+            all_iface_id_to_name.update(iface_id_to_name)
+
+            # Collect tensor data
+            td = RuntimeEngine._collect_tensor_data(view, buffer_ids)
+            all_tensor_data.update(td)
+
+            # Insert BARRIER between config groups (not after last)
+            if idx < len(engines) - 1:
+                barrier_cmd = Command(
+                    op=OpCode.BARRIER,
+                    cmd_id=next_cmd_id,
+                    sync=True,
+                )
+                all_commands.append(barrier_cmd)
+                next_cmd_id += 1
+
+        # Stage 7: SHM packing with merged data
+        if target == "sim":
+            logger.debug("Stage 7: multi-config SHM packing")
+            shm_image = engines[0]._pack_shm_multi(
+                views, view_buffer_ids, all_commands,
+            )
+            logger.debug("SHM image: %d bytes", len(shm_image))
+        else:
+            shm_image = b""
+
+        elapsed = time.perf_counter() - t0
+        logger.debug("compile_multi complete: %d commands, %d buffers, %.1fms",
+                     len(all_commands), len(all_buffer_ids), elapsed * 1000)
+
+        return CompiledResult(
+            commands=all_commands,
+            shm_image=shm_image,
+            bfm_configs=all_bfm_configs,
+            buffer_ids=all_buffer_ids,
+            flattened_view=views[0],  # Primary view for output tensor reading
+            probe_reports=views[0].probe_points,
+            tensor_data=all_tensor_data,
+            iface_id_to_name=all_iface_id_to_name,
+            views=views,  # all views for multi-config verify
+        )
+
+    def _pack_shm_multi(
+        self,
+        views: list[FlattenedKernelView],
+        view_buffer_ids: list[dict[str, int]],
+        commands: list[Command],
+    ) -> bytes:
+        """Pack SHM image for multi-config batch with multiple views."""
+        shm_alloc = SHMBufferAllocator()
+        allocated_buffer_ids: set[int] = set()
+
+        # Allocate data buffers from all views
+        for view, buffer_ids in zip(views, view_buffer_ids):
+            for name, exposed in view.exposed_tensors.items():
+                direction = DIRECTION_ENCODING.get(exposed.direction, 0)
+
+                if exposed._port_buffers:
+                    for flat_name, chunk in exposed._port_buffers.items():
+                        bid = buffer_ids[f"{name}:{flat_name}"]
+                        if bid not in allocated_buffer_ids:
+                            allocated_buffer_ids.add(bid)
+                            shm_alloc.allocate(bid, len(chunk), direction)
+                else:
+                    bid = buffer_ids[name]
+                    if bid not in allocated_buffer_ids:
+                        allocated_buffer_ids.add(bid)
+                        shm_alloc.allocate(bid, exposed._serialized_size, direction)
 
         # Calculate sizes
         num_commands = len(commands)
@@ -986,38 +1416,29 @@ class RuntimeEngine:
                 image, bufdesc_offset + i * BUF_DESC_SIZE, desc
             )
 
-        # Copy input tensor data
-        for name, exposed in view.exposed_tensors.items():
-            if exposed._array_element_buffers:
-                # Array tensor: copy per-element data chunks
-                for flat_name, chunk in exposed._array_element_buffers.items():
-                    if not chunk or all(b == 0 for b in chunk):
-                        continue  # Skip zero-filled output placeholders
-                    bid = buffer_ids[f"{name}:{flat_name}"]
+        # Copy input tensor data from all views
+        for view, buffer_ids in zip(views, view_buffer_ids):
+            for name, exposed in view.exposed_tensors.items():
+                if exposed._port_buffers:
+                    for flat_name, chunk in exposed._port_buffers.items():
+                        if not chunk or all(b == 0 for b in chunk):
+                            continue
+                        bid = buffer_ids[f"{name}:{flat_name}"]
+                        try:
+                            desc = shm_alloc.get_descriptor(bid)
+                        except KeyError:
+                            continue
+                        start = data_region_offset + desc.data_offset
+                        image[start : start + len(chunk)] = chunk
+                elif exposed._serialized is not None:
+                    bid = buffer_ids[name]
                     try:
                         desc = shm_alloc.get_descriptor(bid)
                     except KeyError:
                         continue
                     start = data_region_offset + desc.data_offset
-                    image[start : start + len(chunk)] = chunk
-            elif exposed._serialized is not None:
-                bid = buffer_ids[name]
-                try:
-                    desc = shm_alloc.get_descriptor(bid)
-                except KeyError:
-                    continue
-                start = data_region_offset + desc.data_offset
-                image[start : start + len(exposed._serialized)] = (
-                    exposed._serialized
-                )
-
-        # Copy probe golden data
-        for probe in view.probe_points:
-            if probe.serialized_golden is not None and probe.golden_buffer_id is not None:
-                desc = shm_alloc.get_descriptor(probe.golden_buffer_id)
-                start = data_region_offset + desc.data_offset
-                image[start : start + len(probe.serialized_golden)] = (
-                    probe.serialized_golden
-                )
+                    image[start : start + len(exposed._serialized)] = (
+                        exposed._serialized
+                    )
 
         return bytes(image)

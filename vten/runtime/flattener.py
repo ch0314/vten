@@ -60,8 +60,9 @@ class ExposedTensor:
     # Mutable state set during compilation
     _serialized: bytes | None = None
     _serialized_size: int = 0
-    _split_buffers: dict[str, bytes] | None = None
-    _array_element_buffers: dict[str, bytes] | None = None  # flat_name → data chunk
+    _port_buffers: dict[str, bytes] | None = None  # port_name → data chunk
+    _port_mode: str = "block"  # "block" | "channel_interleave"
+    _interleave_unit: int | None = None
 
     @property
     def data(self):

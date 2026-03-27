@@ -201,3 +201,17 @@ class MultiPortSerializer:
             end = start + block_size if i < num_ports - 1 else len(data)
             result[port.name] = data[start:end]
         return result
+
+    @staticmethod
+    def reassemble(port_data: dict[str, bytes], interleave_unit: int) -> bytes:
+        """Reverse channel_interleave: round-robin reassembly."""
+        ports = list(port_data.values())
+        n_ports = len(ports)
+        result = bytearray()
+        offsets = [0] * n_ports
+        while any(offsets[i] < len(ports[i]) for i in range(n_ports)):
+            for i in range(n_ports):
+                chunk = ports[i][offsets[i] : offsets[i] + interleave_unit]
+                result.extend(chunk)
+                offsets[i] += interleave_unit
+        return bytes(result)

@@ -170,22 +170,22 @@ def _make_array_ir_setup(spec, kernel_class, tensor_name="wgt"):
             exp._serialized_size = num_beats * (packing.bus_width // 8)
 
         # Array split (same logic as engine._serialize_tensors)
-        if iface.array and not exp._split_buffers:
+        if iface.array and not exp._port_buffers:
             flat_names = iface.array.flat_names(exp.top_interface)
             n = len(flat_names)
             if exp._serialized is not None:
                 data = exp._serialized
                 chunk_size = len(data) // n
                 remainder = len(data) % n
-                exp._array_element_buffers = {}
+                exp._port_buffers = {}
                 offset = 0
                 for i, fname in enumerate(flat_names):
                     sz = chunk_size + (1 if i < remainder else 0)
-                    exp._array_element_buffers[fname] = data[offset: offset + sz]
+                    exp._port_buffers[fname] = data[offset: offset + sz]
                     offset += sz
             else:
                 per_elem_size = exp._serialized_size // n
-                exp._array_element_buffers = {
+                exp._port_buffers = {
                     fname: bytes(per_elem_size) for fname in flat_names
                 }
 
@@ -281,7 +281,7 @@ class TestArrayBufferIdAllocation:
         data = bytes(64)
         exp._serialized = data
         exp._serialized_size = 64
-        exp._array_element_buffers = {
+        exp._port_buffers = {
             f"wgt_{i}": data[i*16:(i+1)*16] for i in range(4)
         }
         # Re-create lowering to pick up array buffers
@@ -301,7 +301,7 @@ class TestArrayBufferIdAllocation:
         spec = _make_array_spec([3])
         view, _, inst = _make_array_ir_setup(spec, ArrayKernel)
         exp = view.exposed_tensors["wgt"]
-        exp._array_element_buffers = {
+        exp._port_buffers = {
             f"wgt_{i}": bytes(10) for i in range(3)
         }
         lowering = IRLowering(view)
@@ -335,10 +335,10 @@ class TestArrayPushPullCommands:
         flat_names = spec.interfaces["wgt"].array.flat_names("wgt")
         n = len(flat_names)
         chunk_size = len(data) // n
-        exp._array_element_buffers = {}
+        exp._port_buffers = {}
         offset = 0
         for fname in flat_names:
-            exp._array_element_buffers[fname] = data[offset: offset + chunk_size]
+            exp._port_buffers[fname] = data[offset: offset + chunk_size]
             offset += chunk_size
 
         lowering = IRLowering(view)
@@ -408,8 +408,8 @@ class TestArrayPushPullCommands:
         )
         exp = view.exposed_tensors["result"]
         # Verify array element buffers were created
-        assert exp._array_element_buffers is not None
-        assert len(exp._array_element_buffers) == 3
+        assert exp._port_buffers is not None
+        assert len(exp._port_buffers) == 3
 
         ops = [
             Operation(kind=OpKind.PULL_TENSOR, tensor=exp.origin_tensor),
@@ -457,7 +457,7 @@ class TestArraySendRecvCommands:
         exp._serialized = data
         exp._serialized_size = 64
         flat_names = spec.interfaces["wgt"].array.flat_names("wgt")
-        exp._array_element_buffers = {
+        exp._port_buffers = {
             fn: data[i*32:(i+1)*32] for i, fn in enumerate(flat_names)
         }
         lowering = IRLowering(view)
@@ -481,7 +481,7 @@ class TestArraySendRecvCommands:
             spec, ArrayOutputKernel, tensor_name="result"
         )
         exp = view.exposed_tensors["result"]
-        assert exp._array_element_buffers is not None
+        assert exp._port_buffers is not None
 
         ops = [
             Operation(kind=OpKind.RECV_TENSOR, tensor=exp.origin_tensor),

@@ -102,9 +102,12 @@ class PackingScheme:
     byte_order: str = "little"
     mode: str = "standard"
     custom_fields: list[CustomField] | None = None
+    _explicit_bus_width: int | None = None
 
     @property
     def bus_width(self) -> int:
+        if self._explicit_bus_width is not None:
+            return self._explicit_bus_width
         if self.mode == "custom" and self.custom_fields:
             return max(f.bits[1] for f in self.custom_fields) + 1
         if self.alignment == "packed":
@@ -337,16 +340,19 @@ class KernelSpec:
         return list(self.interfaces.keys())
 
     def expanded_interface_names(self) -> list[str]:
-        """Interface names with array interfaces expanded to flat elements.
+        """Interface names with array/split interfaces expanded to flat elements.
 
-        Non-array interfaces return their name as-is.
+        Non-array/split interfaces return their name as-is.
         Array interfaces expand to flat element names in index order.
+        Split interfaces expand to port names in definition order.
         Used by both IR lowering and codegen to ensure consistent ID assignment.
         """
         result: list[str] = []
         for name, iface in self.interfaces.items():
             if iface.array:
                 result.extend(iface.array.flat_names(name))
+            elif iface.split and isinstance(iface.split, dict) and "ports" in iface.split:
+                result.extend(p["name"] for p in iface.split["ports"])
             else:
                 result.append(name)
         return result

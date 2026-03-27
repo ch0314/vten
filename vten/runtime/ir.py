@@ -99,26 +99,42 @@ class IRLowering:
         self._buffer_ids: dict[str, int] = {}
         # Pre-populate interface ID map using spec order so it matches
         # codegen's iface_to_bfm mapping.
-        # Array interfaces are expanded to flat element names; the logical
-        # name maps to the first element's ID for backward compatibility.
+        # Array/split interfaces are expanded to flat element/port names;
+        # the logical name maps to the first element's ID for backward compat.
         self._iface_id_map: dict[str, int] = {}
         expanded = view.top_spec.expanded_interface_names()
         for idx, flat_name in enumerate(expanded):
             self._iface_id_map[flat_name] = idx
-        # Also map logical array names → first element ID
+        # Also map logical array/split names → first element/port ID
         for name, iface in view.top_spec.interfaces.items():
             if iface.array and name not in self._iface_id_map:
                 first_flat = iface.array.flat_names(name)[0]
                 self._iface_id_map[name] = self._iface_id_map[first_flat]
+            elif (iface.split and isinstance(iface.split, dict)
+                  and "ports" in iface.split and name not in self._iface_id_map):
+                first_port = iface.split["ports"][0]["name"]
+                self._iface_id_map[name] = self._iface_id_map[first_port]
         self._next_iface_id = len(expanded)
 
     def lower(
-        self, ops: list[Operation]
+        self,
+        ops: list[Operation],
+        *,
+        cmd_id_start: int = 0,
+        buffer_id_start: int = 0,
     ) -> tuple[list[Command], dict[str, int]]:
-        """Lower all operations to commands. Returns (commands, buffer_ids)."""
-        self._buffer_ids = self._allocate_buffer_ids()
+        """Lower all operations to commands. Returns (commands, buffer_ids).
+
+        Args:
+            ops: Operations to lower.
+            cmd_id_start: Starting cmd_id offset (for multi-config batches).
+            buffer_id_start: Starting buffer_id offset (for multi-config batches).
+        """
+        self._buffer_ids = self._allocate_buffer_ids(
+            ops, buffer_id_start=buffer_id_start,
+        )
         commands: list[Command] = []
-        next_cmd_id = 0
+        next_cmd_id = cmd_id_start
         op_to_cmd_range: dict[int, tuple[int, int]] = {}
 
         for op in ops:
@@ -153,21 +169,52 @@ class IRLowering:
 
         return commands, self._buffer_ids
 
-    def _allocate_buffer_ids(self) -> dict[str, int]:
+    def _allocate_buffer_ids(
+        self,
+        ops: list[Operation] | None = None,
+        *,
+        buffer_id_start: int = 0,
+    ) -> dict[str, int]:
         buffer_ids: dict[str, int] = {}
-        next_id = 0
+        next_id = buffer_id_start
+
+        # Collect chunk info from ops
+        chunk_tensors: dict[str, int] = {}  # tensor_name → chunk_total
+        if ops:
+            for op in ops:
+                if op.chunk_total is not None and op.tensor is not None:
+                    chunk_tensors[op.tensor.name] = op.chunk_total
+
         # Two-pass: allocate non-alias tensors first, then resolve aliases
         alias_targets: list[str] = []
         for name, exposed in self._view.exposed_tensors.items():
             if self._alias_registry and self._alias_registry.is_alias_target(name):
                 alias_targets.append(name)
-            elif exposed._array_element_buffers:
-                # Array tensor: one buffer_id per flat element
-                for flat_name in exposed._array_element_buffers:
-                    buffer_ids[f"{name}:{flat_name}"] = next_id
+            elif name in chunk_tensors:
+                # Chunked tensor: allocate per-chunk (and per-array-element) IDs
+                n_chunks = chunk_tensors[name]
+                if exposed._port_buffers:
+                    port_names = list(exposed._port_buffers.keys())
+                    for ci in range(n_chunks):
+                        for pname in port_names:
+                            buffer_ids[f"{name}:chunk_{ci}:{pname}"] = next_id
+                            next_id += 1
+                    # Logical name → first chunk's first port
+                    buffer_ids[name] = buffer_ids[
+                        f"{name}:chunk_0:{port_names[0]}"
+                    ]
+                else:
+                    for ci in range(n_chunks):
+                        buffer_ids[f"{name}:chunk_{ci}"] = next_id
+                        next_id += 1
+                    buffer_ids[name] = buffer_ids[f"{name}:chunk_0"]
+            elif exposed._port_buffers:
+                # Multi-port tensor: one buffer_id per port
+                for port_name in exposed._port_buffers:
+                    buffer_ids[f"{name}:{port_name}"] = next_id
                     next_id += 1
-                # Logical name → first element's ID (for backward compat)
-                first_key = f"{name}:{next(iter(exposed._array_element_buffers))}"
+                # Logical name → first port's ID (for backward compat)
+                first_key = f"{name}:{next(iter(exposed._port_buffers))}"
                 buffer_ids[name] = buffer_ids[first_key]
             else:
                 buffer_ids[name] = next_id
@@ -242,6 +289,15 @@ class IRLowering:
         self, op: Operation, dep_ids: list[int], next_cmd_id: int
     ) -> tuple[list[Command], int]:
         exposed = self._view.exposed_tensors[op.tensor.name]
+
+        # Skip LOAD for alias targets — buffer already has data from prior batch
+        is_alias_target = (
+            self._alias_registry
+            and self._alias_registry.is_alias_target(exposed.name)
+        )
+        if is_alias_target:
+            return [], next_cmd_id
+
         cmd = Command(
             op=OpCode.LOAD,
             cmd_id=next_cmd_id,
@@ -255,6 +311,17 @@ class IRLowering:
         self, op: Operation, dep_ids: list[int], next_cmd_id: int
     ) -> tuple[list[Command], int]:
         exposed = self._view.exposed_tensors[op.tensor.name]
+        iface = self._view.top_spec.get_interface(exposed.top_interface)
+
+        # Skip STORE for alias sources (buffer reused by next batch)
+        # and for AXI4-Stream (data read directly from SHM)
+        is_alias_source = (
+            self._alias_registry
+            and self._alias_registry.is_alias_source(exposed.name)
+        )
+        if is_alias_source or iface.protocol == Protocol.AXI4S:
+            return [], next_cmd_id
+
         cmd = Command(
             op=OpCode.STORE,
             cmd_id=next_cmd_id,
@@ -270,42 +337,20 @@ class IRLowering:
         exposed = self._view.exposed_tensors[op.tensor.name]
         iface = self._view.top_spec.get_interface(exposed.top_interface)
 
-        # Array interface: per-element PUSH commands
-        if exposed._array_element_buffers:
+        # Multi-port (array or split): per-port PUSH commands
+        if exposed._port_buffers:
             commands: list[Command] = []
-            for flat_name, chunk in exposed._array_element_buffers.items():
+            for port_name, port_data in exposed._port_buffers.items():
                 cmd = Command(
                     op=OpCode.PUSH,
                     cmd_id=next_cmd_id,
-                    interface_id=self._get_iface_id(flat_name),
-                    buffer_id=self._buffer_ids[f"{exposed.name}:{flat_name}"],
-                    protocol=iface.protocol,
-                    phys_addr=exposed.address or 0,
-                    size=len(chunk),
-                    role=_determine_role(iface.protocol, OpCode.PUSH),
-                    probe=op.probe,
-                    dep=dep_ids if not commands else [],
-                )
-                commands.append(cmd)
-                next_cmd_id += 1
-            return commands, next_cmd_id
-
-        if exposed._split_buffers:
-            # Spec §12.3: first split cmd gets upstream deps,
-            # remaining get [] (ordered implicitly by cmd_id).
-            commands = []
-            for port_name, port_data in exposed._split_buffers.items():
-                cmd = Command(
-                    op=OpCode.PUSH,
-                    cmd_id=next_cmd_id,
-                    interface_id=self._get_iface_id(exposed.top_interface),
-                    buffer_id=self._buffer_ids[exposed.name],
+                    interface_id=self._get_iface_id(port_name),
+                    buffer_id=self._buffer_ids[f"{exposed.name}:{port_name}"],
                     protocol=iface.protocol,
                     phys_addr=exposed.address or 0,
                     size=len(port_data),
                     role=_determine_role(iface.protocol, OpCode.PUSH),
                     probe=op.probe,
-                    port=port_name,
                     dep=dep_ids if not commands else [],
                 )
                 commands.append(cmd)
@@ -332,45 +377,25 @@ class IRLowering:
         exposed = self._view.exposed_tensors[op.tensor.name]
         iface = self._view.top_spec.get_interface(exposed.top_interface)
 
-        # Array interface: per-element PULL commands
-        if exposed._array_element_buffers:
+        # Multi-port (array or split): per-port PULL commands
+        if exposed._port_buffers:
             commands: list[Command] = []
-            for flat_name, chunk in exposed._array_element_buffers.items():
+            for port_name, port_data in exposed._port_buffers.items():
                 cmd = Command(
                     op=OpCode.PULL,
                     cmd_id=next_cmd_id,
-                    interface_id=self._get_iface_id(flat_name),
-                    buffer_id=self._buffer_ids[f"{exposed.name}:{flat_name}"],
+                    interface_id=self._get_iface_id(port_name),
+                    buffer_id=self._buffer_ids[f"{exposed.name}:{port_name}"],
                     protocol=iface.protocol,
                     phys_addr=exposed.address or 0,
-                    size=len(chunk),
+                    size=len(port_data),
                     role=_determine_role(iface.protocol, OpCode.PULL),
                     probe=op.probe,
                     dep=dep_ids if not commands else [],
                 )
                 commands.append(cmd)
-                next_cmd_id += 1
-            return commands, next_cmd_id
-
-        if exposed._split_buffers:
-            # Spec §12.3: first split cmd gets upstream deps,
-            # remaining get [] (ordered implicitly by cmd_id).
-            commands = []
-            for port_name in exposed._split_buffers:
-                cmd = Command(
-                    op=OpCode.PULL,
-                    cmd_id=next_cmd_id,
-                    interface_id=self._get_iface_id(exposed.top_interface),
-                    buffer_id=self._buffer_ids[exposed.name],
-                    protocol=iface.protocol,
-                    phys_addr=exposed.address or 0,
-                    size=exposed._serialized_size // len(exposed._split_buffers),
-                    role=_determine_role(iface.protocol, OpCode.PULL),
-                    probe=op.probe,
-                    port=port_name,
-                    dep=dep_ids if not commands else [],
-                )
-                commands.append(cmd)
+                if self._alias_registry:
+                    self._alias_registry.record_write_cmd(exposed.name, next_cmd_id)
                 next_cmd_id += 1
             return commands, next_cmd_id
 
@@ -386,6 +411,8 @@ class IRLowering:
             probe=op.probe,
             dep=dep_ids,
         )
+        if self._alias_registry:
+            self._alias_registry.record_write_cmd(exposed.name, next_cmd_id)
         return [cmd], next_cmd_id + 1
 
     def _lower_write_reg(
@@ -506,18 +533,18 @@ class IRLowering:
             and self._alias_registry.is_alias_target(exposed.name)
         )
 
-        # Array interface: per-element LOAD + PUSH
-        if exposed._array_element_buffers:
-            for i, (flat_name, chunk) in enumerate(
-                exposed._array_element_buffers.items()
+        # Multi-port (array or split): per-port LOAD + PUSH
+        if exposed._port_buffers:
+            for i, (port_name, port_data) in enumerate(
+                exposed._port_buffers.items()
             ):
-                bid = self._buffer_ids[f"{exposed.name}:{flat_name}"]
+                bid = self._buffer_ids[f"{exposed.name}:{port_name}"]
                 if not is_alias_target:
                     load_cmd = Command(
                         op=OpCode.LOAD,
                         cmd_id=next_cmd_id,
                         buffer_id=bid,
-                        size=len(chunk),
+                        size=len(port_data),
                         dep=dep_ids if i == 0 else [],
                     )
                     commands.append(load_cmd)
@@ -529,11 +556,11 @@ class IRLowering:
                 push_cmd = Command(
                     op=OpCode.PUSH,
                     cmd_id=next_cmd_id,
-                    interface_id=self._get_iface_id(flat_name),
+                    interface_id=self._get_iface_id(port_name),
                     buffer_id=bid,
                     protocol=iface.protocol,
                     phys_addr=exposed.address or 0,
-                    size=len(chunk),
+                    size=len(port_data),
                     role=_determine_role(iface.protocol, OpCode.PUSH),
                     dep=push_dep,
                 )
@@ -576,6 +603,13 @@ class IRLowering:
     ) -> tuple[list[Command], int]:
         exposed = self._view.exposed_tensors[op.tensor.name]
         iface = self._view.top_spec.get_interface(exposed.top_interface)
+
+        # Chunked recv: delegate to chunk-aware lowering
+        if op.chunk_total is not None:
+            return self._lower_recv_tensor_chunk(
+                op, exposed, iface, dep_ids, next_cmd_id,
+            )
+
         commands: list[Command] = []
 
         is_alias_source = (
@@ -583,20 +617,20 @@ class IRLowering:
             and self._alias_registry.is_alias_source(exposed.name)
         )
 
-        # Array interface: per-element PULL + STORE
-        if exposed._array_element_buffers:
-            for i, (flat_name, chunk) in enumerate(
-                exposed._array_element_buffers.items()
+        # Multi-port (array or split): per-port PULL + STORE
+        if exposed._port_buffers:
+            for i, (port_name, port_data) in enumerate(
+                exposed._port_buffers.items()
             ):
-                bid = self._buffer_ids[f"{exposed.name}:{flat_name}"]
+                bid = self._buffer_ids[f"{exposed.name}:{port_name}"]
                 pull_cmd = Command(
                     op=OpCode.PULL,
                     cmd_id=next_cmd_id,
-                    interface_id=self._get_iface_id(flat_name),
+                    interface_id=self._get_iface_id(port_name),
                     buffer_id=bid,
                     protocol=iface.protocol,
                     phys_addr=exposed.address or 0,
-                    size=len(chunk),
+                    size=len(port_data),
                     role=_determine_role(iface.protocol, OpCode.PULL),
                     dep=dep_ids if i == 0 else [],
                 )
@@ -645,6 +679,105 @@ class IRLowering:
             )
             commands.append(store_cmd)
             next_cmd_id += 1
+
+        return commands, next_cmd_id
+
+    def _lower_recv_tensor_chunk(
+        self,
+        op: Operation,
+        exposed: object,
+        iface: object,
+        dep_ids: list[int],
+        next_cmd_id: int,
+    ) -> tuple[list[Command], int]:
+        """Lower a single chunk of a chunked recv_tensor operation."""
+        commands: list[Command] = []
+        ci = op.chunk_index
+        n_chunks = op.chunk_total
+        name = exposed.name
+
+        is_alias_source = (
+            self._alias_registry
+            and self._alias_registry.is_alias_source(name)
+        )
+
+        # Compute per-chunk size
+        chunks_spec = op.chunks_spec
+        if isinstance(chunks_spec, list):
+            # Explicit per-chunk element counts — need packing info
+            # for now derive byte size from fraction of total
+            total_elems = sum(chunks_spec)
+            chunk_size = (
+                exposed._serialized_size * chunks_spec[ci] // total_elems
+            )
+        else:
+            chunk_size = exposed._serialized_size // n_chunks
+
+        if exposed._port_buffers:
+            # Chunked + multi-port: split chunk across ports
+            port_names = list(exposed._port_buffers.keys())
+            n_elems = len(port_names)
+            per_elem_size = chunk_size // n_elems
+
+            for j, fname in enumerate(port_names):
+                bid = self._buffer_ids[f"{name}:chunk_{ci}:{fname}"]
+                pull_cmd = Command(
+                    op=OpCode.PULL,
+                    cmd_id=next_cmd_id,
+                    interface_id=self._get_iface_id(fname),
+                    buffer_id=bid,
+                    protocol=iface.protocol,
+                    phys_addr=exposed.address or 0,
+                    size=per_elem_size,
+                    role=_determine_role(iface.protocol, OpCode.PULL),
+                    dep=dep_ids if j == 0 else [],
+                )
+                commands.append(pull_cmd)
+                pull_id = next_cmd_id
+                next_cmd_id += 1
+
+                if self._alias_registry:
+                    self._alias_registry.record_write_cmd(name, pull_id)
+
+                if not is_alias_source and iface.protocol != Protocol.AXI4S:
+                    store_cmd = Command(
+                        op=OpCode.STORE,
+                        cmd_id=next_cmd_id,
+                        buffer_id=bid,
+                        dep=[pull_id],
+                    )
+                    commands.append(store_cmd)
+                    next_cmd_id += 1
+        else:
+            # Chunked non-array: single PULL per chunk
+            bid = self._buffer_ids[f"{name}:chunk_{ci}"]
+            pull_cmd = Command(
+                op=OpCode.PULL,
+                cmd_id=next_cmd_id,
+                interface_id=self._get_iface_id(exposed.top_interface),
+                buffer_id=bid,
+                protocol=iface.protocol,
+                phys_addr=exposed.address or 0,
+                size=chunk_size,
+                role=_determine_role(iface.protocol, OpCode.PULL),
+                dep=dep_ids,
+            )
+            commands.append(pull_cmd)
+            pull_id = next_cmd_id
+            next_cmd_id += 1
+
+            if self._alias_registry:
+                self._alias_registry.record_write_cmd(name, pull_id)
+
+            if not is_alias_source and iface.protocol != Protocol.AXI4S:
+                store_cmd = Command(
+                    op=OpCode.STORE,
+                    cmd_id=next_cmd_id,
+                    buffer_id=bid,
+                    dep=[pull_id],
+                )
+                commands.append(store_cmd)
+                next_cmd_id += 1
 
         return commands, next_cmd_id
 

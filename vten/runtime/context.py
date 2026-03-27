@@ -5,6 +5,7 @@ Spec reference: 02_runtime_engine.md §3
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,8 @@ import torch
 from vten.dsl.operations import Operation, OperationHandle
 from vten.errors import VerificationError
 from vten.spec.models import Direction, OpKind
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from vten.kernel.tensor import Tensor
@@ -92,6 +95,13 @@ class ExecutionContext:
         self._alias_registry = AliasRegistry()
         self._last_compiled: object | None = None
         self._last_backend_result: object | None = None
+        # Multi-config: config group boundaries
+        self._config_boundaries: list[int] = []  # indices into _pending_ops
+        self._config_kernels: list[dict[str, KernelInstance]] = []  # per-group
+        self._config_params: list[dict] = []  # per-group project_params
+        self._current_config_group: int = 0  # tracks current group index
+        # Session state (multi-batch)
+        self._session_open: bool = False
 
     def instantiate(self, kernel_class: type, spec=None, **params) -> KernelInstance:
         """Create and initialize a kernel instance with eager resolution."""
@@ -175,13 +185,73 @@ class ExecutionContext:
     def barrier(self) -> OperationHandle:
         return self._record(OpKind.BARRIER)
 
+    # ── Multi-config ──
+
+    def config_boundary(self) -> None:
+        """Mark a config group boundary for single-batch multi-config execution.
+
+        All ops recorded before this call belong to the current config group.
+        After run(), groups are compiled with separate pipeline passes (Stages 0-6)
+        and merged into a single SHM batch with BARRIER commands between them.
+
+        Usage::
+
+            ctx = ExecutionContext(backend=backend)
+            for cfg in configs:
+                ki = ctx.instantiate(kernel_class, spec=spec, **cfg)
+                ctx.send_tensor(ki.get_tensor("in"))
+                ctx.recv_tensor(ki.get_tensor("out"))
+                ctx.config_boundary()
+            result = ctx.run()  # single batch, all configs
+        """
+        self._config_boundaries.append(len(self._pending_ops))
+        self._config_kernels.append(dict(self._kernels))
+        self._config_params.append(dict(self._project_params))
+        self._current_config_group += 1
+        # Reset kernels for next group (new instantiate calls go to new group)
+        self._kernels = {}
+
     # ── Shorthands ──
 
     def send_tensor(self, tensor, dep=None) -> OperationHandle:
         return self._record(OpKind.SEND_TENSOR, tensor=tensor, dep=dep)
 
-    def recv_tensor(self, tensor, dep=None) -> OperationHandle:
-        return self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep)
+    def recv_tensor(
+        self, tensor, dep=None, chunks: int | list[int] | None = None,
+    ) -> OperationHandle | list[OperationHandle]:
+        """Receive tensor from device.
+
+        Args:
+            chunks: Split the receive into multiple PULL command groups.
+                int → N equal-sized chunks along the first axis.
+                list[int] → explicit per-chunk element counts.
+                Split is along the serialized byte stream (C-contiguous
+                order = axis 0). Each chunk generates separate BFM
+                commands, so tready is naturally deasserted/reasserted
+                between chunks.
+                Returns list[OperationHandle] when chunks is specified.
+                TODO: axis= parameter for arbitrary axis split.
+        """
+        if chunks is None:
+            return self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep)
+
+        if isinstance(chunks, int):
+            chunk_total = chunks
+        else:
+            chunk_total = len(chunks)
+
+        handles: list[OperationHandle] = []
+        for i in range(chunk_total):
+            h = self._record(
+                OpKind.RECV_TENSOR,
+                tensor=tensor,
+                dep=dep,
+                chunk_index=i,
+                chunk_total=chunk_total,
+                chunks_spec=chunks,
+            )
+            handles.append(h)
+        return handles
 
     # ── Verification ──
 
@@ -240,21 +310,99 @@ class ExecutionContext:
     @staticmethod
     def _read_tensor_bytes(
         name: str, exposed, compiled, backend_result,
+        buffer_prefix: str = "",
     ) -> bytes:
-        """Read raw bytes for a tensor, reassembling array element chunks."""
-        if exposed._array_element_buffers:
-            chunks = []
-            for flat_name in exposed._array_element_buffers:
-                key = f"{name}:{flat_name}"
+        """Read raw bytes for a tensor, reassembling array/chunk buffers.
+
+        Args:
+            buffer_prefix: Key prefix for multi-config (e.g. "cfg1:").
+        """
+        prefixed = f"{buffer_prefix}{name}"
+        # Detect chunked buffers: look for chunk_0 key pattern
+        chunk_0_key = f"{prefixed}:chunk_0"
+        is_chunked = any(
+            k.startswith(chunk_0_key) for k in compiled.buffer_ids
+        )
+
+        if is_chunked:
+            return ExecutionContext._read_all_chunk_bytes(
+                name, exposed, compiled, backend_result,
+                buffer_prefix=buffer_prefix,
+            )
+
+        if exposed._port_buffers:
+            parts = {}
+            for port_name in exposed._port_buffers:
+                key = f"{prefixed}:{port_name}"
                 bid = compiled.buffer_ids.get(key)
                 if bid is None:
                     continue
-                chunk = backend_result.read_buffer(bid)
-                if chunk:
-                    chunks.append(chunk)
-            return b"".join(chunks)
-        buffer_id = compiled.buffer_ids[name]
+                data = backend_result.read_buffer(bid)
+                if data:
+                    parts[port_name] = data
+            if exposed._port_mode == "channel_interleave" and parts:
+                from vten.runtime.serializer import MultiPortSerializer
+                return MultiPortSerializer.reassemble(
+                    parts, exposed._interleave_unit
+                )
+            return b"".join(parts.values())
+        buffer_id = compiled.buffer_ids[prefixed]
         return backend_result.read_buffer(buffer_id)
+
+    @staticmethod
+    def _read_all_chunk_bytes(
+        name: str, exposed, compiled, backend_result,
+        buffer_prefix: str = "",
+    ) -> bytes:
+        """Read and concatenate all chunk buffers for a chunked tensor."""
+        prefixed = f"{buffer_prefix}{name}"
+        parts: list[bytes] = []
+        ci = 0
+        while True:
+            if exposed._port_buffers:
+                # Chunked + array: read per-chunk-per-element
+                chunk_parts: list[bytes] = []
+                for fname in exposed._port_buffers:
+                    key = f"{prefixed}:chunk_{ci}:{fname}"
+                    bid = compiled.buffer_ids.get(key)
+                    if bid is None:
+                        return b"".join(parts)
+                    data = backend_result.read_buffer(bid)
+                    if data:
+                        chunk_parts.append(data)
+                parts.extend(chunk_parts)
+            else:
+                key = f"{prefixed}:chunk_{ci}"
+                bid = compiled.buffer_ids.get(key)
+                if bid is None:
+                    break
+                data = backend_result.read_buffer(bid)
+                if data:
+                    parts.append(data)
+            ci += 1
+        return b"".join(parts)
+
+    @staticmethod
+    def _read_chunk_bytes(
+        name: str, exposed, compiled, backend_result,
+        chunk_index: int, buffer_prefix: str = "",
+    ) -> bytes:
+        """Read raw bytes for a single chunk of a chunked tensor."""
+        prefixed = f"{buffer_prefix}{name}"
+        if exposed._port_buffers:
+            parts: list[bytes] = []
+            for fname in exposed._port_buffers:
+                key = f"{prefixed}:chunk_{chunk_index}:{fname}"
+                bid = compiled.buffer_ids.get(key)
+                if bid is None:
+                    continue
+                data = backend_result.read_buffer(bid)
+                if data:
+                    parts.append(data)
+            return b"".join(parts)
+        key = f"{prefixed}:chunk_{chunk_index}"
+        bid = compiled.buffer_ids[key]
+        return backend_result.read_buffer(bid)
 
     # ── Verification internals ──
 
@@ -266,18 +414,42 @@ class ExecutionContext:
         backend_result = self._last_backend_result
 
         tensor_name = op_handle.op.tensor.name
-        exposed = compiled.flattened_view.exposed_tensors[tensor_name]
-        raw_bytes = self._read_tensor_bytes(
-            tensor_name, exposed, compiled, backend_result,
-        )
+        op = op_handle.op
+
+        # Multi-config: use correct view and buffer prefix for config group
+        config_group = getattr(op, "config_group", 0)
+        if config_group > 0 and compiled.views and config_group < len(compiled.views):
+            view = compiled.views[config_group]
+            buffer_prefix = f"cfg{config_group}:"
+        else:
+            view = compiled.flattened_view
+            buffer_prefix = ""
+
+        exposed = view.exposed_tensors[tensor_name]
+
+        # Chunked: read only this chunk's buffer
+        if op.chunk_index is not None:
+            raw_bytes = self._read_chunk_bytes(
+                tensor_name, exposed, compiled, backend_result,
+                op.chunk_index, buffer_prefix=buffer_prefix,
+            )
+        else:
+            raw_bytes = self._read_tensor_bytes(
+                tensor_name, exposed, compiled, backend_result,
+                buffer_prefix=buffer_prefix,
+            )
+
         if not raw_bytes:
+            chunk_label = (
+                f" chunk {op.chunk_index}" if op.chunk_index is not None else ""
+            )
             raise VerificationError(
-                f"No data returned for tensor '{tensor_name}'. "
+                f"No data returned for tensor '{tensor_name}'{chunk_label}. "
                 f"SHM may have been cleaned up.",
                 tensor=tensor_name,
             )
 
-        iface = compiled.flattened_view.top_spec.get_interface(
+        iface = view.top_spec.get_interface(
             exposed.top_interface
         )
         packing = iface.packing
@@ -288,19 +460,42 @@ class ExecutionContext:
             )
 
         serializer = StreamSerializer(packing)
+
+        # For chunked ops, compute per-chunk element count and shape
+        if op.chunk_index is not None:
+            element_count, shape = self._chunk_element_info(
+                exposed, op.chunk_index, op.chunk_total, op.chunks_spec,
+            )
+        else:
+            element_count = exposed.origin_tensor._element_count
+            shape = exposed.origin_tensor._resolved_shape
+
         hw_output = serializer.deserialize(
             raw_bytes,
-            exposed.origin_tensor._element_count,
-            exposed.origin_tensor._resolved_shape,
+            element_count,
+            shape,
             dtype=golden.dtype if golden is not None else None,
         )
 
         if not self._compare(hw_output, golden):
             raise VerificationError(
                 tensor=tensor_name,
-                shape=exposed.origin_tensor._resolved_shape,
+                shape=shape,
                 max_diff=self._max_diff(hw_output, golden),
             )
+
+    @staticmethod
+    def _chunk_element_info(
+        exposed, chunk_index: int, chunk_total: int,
+        chunks_spec: int | list[int] | None,
+    ) -> tuple[int, tuple[int, ...]]:
+        """Compute element count and shape for a single chunk."""
+        total_elems = exposed.origin_tensor._element_count
+        if isinstance(chunks_spec, list):
+            chunk_elems = chunks_spec[chunk_index]
+        else:
+            chunk_elems = total_elems // chunk_total
+        return chunk_elems, (chunk_elems,)
 
     def _run_deferred_verifications(self) -> tuple[int, list]:
         """Execute all deferred VerificationTasks after run().
@@ -357,23 +552,86 @@ class ExecutionContext:
 
     # ── Execution ──
 
+    def _compile_multi_config(self, target: str) -> object:
+        """Split pending ops by config boundaries and compile as multi-config batch."""
+        from vten.runtime.engine import RuntimeEngine
+
+        # Build op groups: split _pending_ops at each boundary
+        boundaries = self._config_boundaries
+        op_groups: list[list] = []
+        start = 0
+        for b in boundaries:
+            op_groups.append(self._pending_ops[start:b])
+            start = b
+        # Remaining ops after last boundary (if any)
+        if start < len(self._pending_ops):
+            op_groups.append(self._pending_ops[start:])
+            # This group uses current self._kernels
+            self._config_kernels.append(dict(self._kernels))
+            self._config_params.append(dict(self._project_params))
+
+        # Build one RuntimeEngine per group
+        engines = []
+        for i, ops in enumerate(op_groups):
+            kernels = self._config_kernels[i] if i < len(self._config_kernels) else self._kernels
+            params = self._config_params[i] if i < len(self._config_params) else self._project_params
+            engines.append(RuntimeEngine(
+                kernels=kernels,
+                ops=ops,
+                project_params=params,
+                alias_registry=self._alias_registry,
+            ))
+
+        return RuntimeEngine.compile_multi(engines, target=target)
+
     def run(self) -> BatchResult:
         """Compile pending ops → submit → wait → return BatchResult."""
         from vten.runtime.engine import RuntimeEngine
 
-        engine = RuntimeEngine(
-            kernels=self._kernels,
-            ops=self._pending_ops,
-            project_params=self._project_params,
-            alias_registry=self._alias_registry,
-        )
+        logger.debug("ExecutionContext.run(): %d pending ops", len(self._pending_ops))
+
         target = self._backend.compile_target if self._backend else "sim"
-        compiled = engine.compile(target=target)
+
+        if self._config_boundaries:
+            compiled = self._compile_multi_config(target)
+        else:
+            engine = RuntimeEngine(
+                kernels=self._kernels,
+                ops=self._pending_ops,
+                project_params=self._project_params,
+                alias_registry=self._alias_registry,
+            )
+            compiled = engine.compile(target=target)
+
         self._last_compiled = compiled
         self._pending_ops = []
+        self._config_boundaries = []
+        self._config_kernels = []
+        self._config_params = []
+        self._current_config_group = 0
 
         if self._backend is not None:
-            backend_result = self._backend.execute(compiled)
+            # Session mode: use open_session/submit_batch/wait_batch
+            if (
+                hasattr(self._backend, "supports_session")
+                and self._backend.supports_session
+                and self._session_open
+            ):
+                logger.debug("submitting batch via session")
+                self._backend.submit_batch(compiled)
+                backend_result = self._backend.wait_batch()
+            elif (
+                hasattr(self._backend, "supports_session")
+                and self._backend.supports_session
+                and not self._session_open
+            ):
+                logger.debug("opening session + first batch")
+                self._backend.open_session(compiled)
+                backend_result = self._backend.wait_batch()
+                self._session_open = True
+            else:
+                logger.debug("submitting to backend (one-shot)")
+                backend_result = self._backend.execute(compiled)
             self._last_backend_result = backend_result
 
             # Build BatchResult from backend stats
@@ -398,6 +656,7 @@ class ExecutionContext:
             verification_count = 0
             verification_results: list = []
             if self._verifications:
+                logger.debug("running %d deferred verifications", len(self._verifications))
                 try:
                     verification_count, verification_results = (
                         self._run_deferred_verifications()
@@ -411,6 +670,11 @@ class ExecutionContext:
                     )
                     raise
 
+            logger.debug("execution complete: status=%s, cycles=%d, verifications=%d/%d",
+                         status, total_cycles,
+                         sum(1 for v in verification_results if getattr(v, 'passed', False)),
+                         verification_count)
+
             return BatchResult(
                 verification_count=verification_count,
                 verification_results=verification_results,
@@ -421,6 +685,21 @@ class ExecutionContext:
             )
 
         return BatchResult(status="DONE")
+
+    # ── Session lifecycle ──
+
+    def close(self) -> None:
+        """Close the backend session if one is open. Idempotent."""
+        if self._session_open and self._backend is not None:
+            if hasattr(self._backend, "close_session"):
+                self._backend.close_session()
+            self._session_open = False
+
+    def __enter__(self) -> ExecutionContext:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     # ── Internal ──
 
@@ -434,6 +713,7 @@ class ExecutionContext:
             sync=kwargs.pop("sync", False),
             golden=None,
             verify=False,
+            config_group=self._current_config_group,
             **kwargs,
         )
         self._pending_ops.append(op)

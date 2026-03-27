@@ -373,9 +373,9 @@ class TestExposedTensor:
         assert exposed_with_data._serialized is None
         assert exposed_with_data._serialized_size == 0
 
-    def test_split_buffers_initially_none(self, exposed_with_data):
-        """_split_buffers is None for non-split interfaces."""
-        assert exposed_with_data._split_buffers is None
+    def test_port_buffers_initially_none(self, exposed_with_data):
+        """_port_buffers is None for non-split/non-array interfaces."""
+        assert exposed_with_data._port_buffers is None
 
 
 # ═══════════════════════════════════════════════════════════════════

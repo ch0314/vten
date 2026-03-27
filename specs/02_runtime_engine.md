@@ -1,6 +1,6 @@
 # vTen Runtime Engine — Compilation Pipeline
 
-**Version 0.4.2 — March 2026**
+**Version 0.5.0 — March 2026**
 **참조 모델: `00_data_models.md` (모든 타입 정의)**
 **소스: 서플리먼트 전체 + 메인 스펙 §6-9**
 
@@ -15,14 +15,15 @@
 5. [Stage 0: Composite Kernel Flattening](#5-stage-0-composite-kernel-flattening)
 6. [Stage 1: Parameter Resolution](#6-stage-1-parameter-resolution)
 7. [Stage 2: Shape Resolution & Validation](#7-stage-2-shape-resolution--validation)
-8. [Stage 3: Tensor Serialization](#8-stage-3-tensor-serialization)
-9. [Stage 3b: Probe Golden Serialization](#9-stage-3b-probe-golden-serialization)
-10. [Stage 4: Address Allocation](#10-stage-4-address-allocation)
-11. [Stage 5: auto_bind & Bank Offset Resolution](#11-stage-5-auto_bind--bank-offset-resolution)
-12. [Stage 6: IR Lowering](#12-stage-6-ir-lowering)
-13. [Stage 6b: BFM Configuration Synthesis](#13-stage-6b-bfm-configuration-synthesis)
-14. [Stage 7: SHM Packing](#14-stage-7-shm-packing)
-15. [Unit vs Composite Unification](#15-unit-vs-composite-unification)
+8. [Stage 2b: Direction Refinement from Operations](#8-stage-2b-direction-refinement-from-operations)
+9. [Stage 3: Tensor Serialization](#9-stage-3-tensor-serialization)
+10. [Stage 3b: Probe Golden Serialization](#10-stage-3b-probe-golden-serialization)
+11. [Stage 4: Address Allocation](#11-stage-4-address-allocation)
+12. [Stage 5: auto_bind & Bank Offset Resolution](#12-stage-5-auto_bind--bank-offset-resolution)
+13. [Stage 6: IR Lowering](#13-stage-6-ir-lowering)
+14. [Stage 6b: BFM Configuration Synthesis](#14-stage-6b-bfm-configuration-synthesis)
+15. [Stage 7: SHM Packing](#15-stage-7-shm-packing)
+16. [Unit vs Composite Unification](#16-unit-vs-composite-unification)
 16. [Validation Rules](#16-validation-rules)
 
 ---
@@ -305,8 +306,18 @@ class KernelInstance:
     def send_tensor(self, tensor, dep=None) -> OperationHandle:
         return self._record(OpKind.SEND_TENSOR, tensor=tensor, dep=dep)
 
-    def recv_tensor(self, tensor, dep=None) -> OperationHandle:
-        return self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep)
+    def recv_tensor(self, tensor, dep=None,
+                    chunks: int | list[int] | None = None,
+                    ) -> OperationHandle | list[OperationHandle]:
+        """chunks: 전송을 N개 청크로 분할. BFM이 청크 사이에 tready deassert.
+        int → N등분, list[int] → explicit per-chunk element counts.
+        Returns list[OperationHandle] when chunks is specified."""
+        if chunks is None:
+            return self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep)
+        # Creates N separate RECV_TENSOR ops, each with chunk_index/chunk_total
+        return [self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep,
+                             chunk_index=i, chunk_total=N, chunks_spec=chunks)
+                for i in range(N := len(chunks) if isinstance(chunks, list) else chunks)]
 
     # ── Verification ──
 
@@ -484,7 +495,7 @@ class RuntimeEngine:
 Stage 0 ──► FlattenedKernelView (불변 구조)
 Stage 1 ──► 서브커널별 resolver (view에 저장)
 Stage 2 ──► 해결된 형상, 원소 수 (텐서에 저장)
-Stage 3 ──► 직렬화된 바이트, 크기 (ExposedTensor에 저장)
+Stage 3 ──► 직렬화된 바이트, 크기, _port_buffers (ExposedTensor에 저장)
 Stage 3b ──► golden 바이트 (ProbePoint에 저장)
 Stage 4 ──► 물리 주소 (ExposedTensor → origin_tensor에 저장)
 Stage 5 ──► 레지스터 바인딩 (view._register_bindings에 저장)
@@ -737,7 +748,44 @@ def _resolve_shapes(self, view):
 
 ---
 
-## 8. Stage 3: Tensor Serialization
+## 8. Stage 2b: Direction Refinement from Operations
+
+Shape validation 이후, DSL 연산 목록에서 텐서의 방향(Direction)을 추론 또는 확인한다.
+
+### 8.1 추론 규칙
+
+| DSL Operation | 추론 방향 |
+|---------------|----------|
+| `push_tensor`, `send_tensor` | `HOST_TO_DEV` |
+| `pull_tensor`, `recv_tensor` | `DEV_TO_HOST` |
+| `configure` | 해당 없음 (register only) |
+
+### 8.2 동작
+
+```python
+def _refine_directions_from_ops(self, view):
+    for op in self._ops:
+        if op.tensor is None:
+            continue
+        inferred = _direction_from_op(op.kind)
+        if inferred is None:
+            continue
+        if op.tensor.direction is not None and op.tensor.direction != inferred:
+            raise DirectionConflictError(
+                f"Tensor '{op.tensor.name}': explicit direction "
+                f"{op.tensor.direction} conflicts with {op.kind}")
+        op.tensor.direction = inferred
+```
+
+### 8.3 설계 근거
+
+- `Tensor.direction`은 선택적 필드 (`None` → 추론)
+- 명시적으로 설정된 direction과 DSL 연산이 충돌하면 에러
+- Stage 3 직렬화 전에 방향이 확정되어야 LOAD/STORE 결정 가능
+
+---
+
+## 9. Stage 3: Tensor Serialization
 
 ### 8.1 외부 텐서만 직렬화
 
@@ -763,11 +811,22 @@ def _serialize_tensors(self, view):
             exposed._serialized = None
             exposed._serialized_size = num_beats * (packing.bus_width // 8)
 
-        # 멀티포트 분할
+        # 멀티포트 분할 → _port_buffers (split)
         if iface_spec.split and exposed._serialized is not None:
+            split_spec = _parse_split_spec(iface_spec.split)
             splitter = MultiPortSerializer()
-            exposed._split_buffers = splitter.split_tensor(
-                exposed._serialized, iface_spec.split)
+            exposed._port_buffers = splitter.split_tensor(
+                exposed._serialized, split_spec)
+            exposed._port_mode = split_spec.mode
+            if split_spec.interleave:
+                exposed._interleave_unit = split_spec.interleave.unit
+
+        # 멀티포트 분할 → _port_buffers (array, split이 없을 때)
+        if iface_spec.array and not exposed._port_buffers:
+            flat_names = iface_spec.array.flat_names(exposed.top_interface)
+            exposed._port_buffers = _block_split_data(
+                exposed._serialized, flat_names, exposed._serialized_size)
+            exposed._port_mode = "block"
 ```
 
 ### 8.2 StreamSerializer
@@ -862,6 +921,51 @@ class MultiPortSerializer:
             port_idx = (i // unit) % num_ports
             result[spec.ports[port_idx].name].extend(data[i:i+unit])
         return {k: bytes(v) for k, v in result.items()}
+
+    @staticmethod
+    def reassemble(port_data: dict[str, bytes], interleave_unit: int) -> bytes:
+        """Reverse channel_interleave: round-robin 재조립."""
+        ports = list(port_data.values())
+        n_ports = len(ports)
+        result = bytearray()
+        offsets = [0] * n_ports
+        while any(offsets[i] < len(ports[i]) for i in range(n_ports)):
+            for i in range(n_ports):
+                chunk = ports[i][offsets[i]:offsets[i] + interleave_unit]
+                result.extend(chunk)
+                offsets[i] += interleave_unit
+        return bytes(result)
+```
+
+### 8.4 헬퍼 함수
+
+```python
+def _parse_split_spec(raw) -> SplitSpec:
+    """raw dict 또는 SplitSpec → SplitSpec 변환."""
+    if isinstance(raw, SplitSpec):
+        return raw
+    ports = [PortDef(name=p["name"], base_addr=p.get("base_addr", 0))
+             for p in raw.get("ports", [])]
+    interleave = None
+    if "interleave" in raw:
+        interleave = InterleaveSpec(unit=raw["interleave"]["unit"])
+    return SplitSpec(mode=raw["mode"], ports=ports, interleave=interleave)
+
+def _block_split_data(serialized, flat_names, serialized_size) -> dict[str, bytes]:
+    """블록 분할: 직렬화 데이터를 포트별로 균등 분배."""
+    n = len(flat_names)
+    if serialized is not None:
+        chunk_size = len(serialized) // n
+        remainder = len(serialized) % n
+        result, offset = {}, 0
+        for i, fname in enumerate(flat_names):
+            sz = chunk_size + (1 if i < remainder else 0)
+            result[fname] = serialized[offset:offset + sz]
+            offset += sz
+        return result
+    else:
+        per_elem_size = serialized_size // n
+        return {fname: bytes(per_elem_size) for fname in flat_names}
 ```
 
 ---
@@ -1203,19 +1307,19 @@ def _lower_push(self, op, view, next_cmd_id, op_to_cmd_range):
     iface = view.top_spec.get_interface(exposed.top_interface)
     dep_ids = self._resolve_deps(op.dep, op_to_cmd_range)
 
-    # 멀티포트 분할 처리
-    if exposed._split_buffers:
+    # 멀티포트 (array 또는 split) 처리
+    if exposed._port_buffers:
         commands = []
-        for port_name, port_data in exposed._split_buffers.items():
+        for port_name, port_data in exposed._port_buffers.items():
             cmd = Command(
                 op=OpCode.PUSH, cmd_id=next_cmd_id,
-                interface_id=self._get_iface_id(exposed.top_interface),
-                buffer_id=self._buffer_ids[exposed.name],  # TODO: port별 buffer
+                interface_id=self._get_iface_id(port_name),
+                buffer_id=self._buffer_ids[f"{exposed.name}:{port_name}"],
                 protocol=iface.protocol,
                 phys_addr=exposed.address or 0,
                 size=len(port_data),
                 role=self._determine_role(iface.protocol, OpCode.PUSH),
-                probe=op.probe, port=port_name,
+                probe=op.probe,
                 dep=dep_ids if not commands else [])
             commands.append(cmd)
             next_cmd_id += 1
@@ -1660,7 +1764,9 @@ def _synthesize_bfm_configs(self, view, commands):
             bfm_configs[top_iface_name] = BFMConfig(
                 interface_name=top_iface_name,
                 protocol=Protocol.AXI4L,
-                data_width=32, role="master")
+                data_width=32, addr_width=iface_spec.addr_width,
+                role="master",
+                poll_interval=1, poll_timeout=100000)
 
     return list(bfm_configs.values())
 ```
