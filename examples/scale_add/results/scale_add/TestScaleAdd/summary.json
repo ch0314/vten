@@ -1,12 +1,12 @@
 {
   "test_name": "TestScaleAdd",
   "kernel": "scale_add",
-  "status": "PASS",
-  "total_cycles": 167,
+  "status": "FAIL",
+  "total_cycles": 71,
   "configs_run": 6,
-  "configs_passed": 6,
-  "verification_count": 6,
-  "verification_passed": 6,
+  "configs_passed": 1,
+  "verification_count": 3,
+  "verification_passed": 1,
   "verification_results": [
     {
       "tensor": "data_out",
@@ -15,28 +15,23 @@
     },
     {
       "tensor": "data_out",
-      "passed": true,
-      "max_diff": 0.0
+      "passed": false,
+      "max_diff": 127.0
     },
     {
       "tensor": "data_out",
-      "passed": true,
-      "max_diff": 0.0
-    },
-    {
-      "tensor": "data_out",
-      "passed": true,
-      "max_diff": 0.0
-    },
-    {
-      "tensor": "data_out",
-      "passed": true,
-      "max_diff": 0.0
-    },
-    {
-      "tensor": "data_out",
-      "passed": true,
-      "max_diff": 0.0
+      "passed": false,
+      "max_diff": 128.0
     }
+  ],
+  "error_message": "Verification failed for tensor 'data_out': shape=(1024,), max_diff=128.0",
+  "error_traceback": [
+    "Traceback (most recent call last):\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/cli/run.py\", line 304, in _run_single_test\n    batch_result = ctx.run()\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/runtime/context.py\", line 662, in run\n    self._run_deferred_verifications()\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/runtime/context.py\", line 535, in _run_deferred_verifications\n    raise first_error\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/runtime/context.py\", line 515, in _run_deferred_verifications\n    self._verify_immediate(task.op_handle, task.golden)\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/runtime/context.py\", line 481, in _verify_immediate\n    raise VerificationError(\n",
+    "vten.errors.VerificationError: Verification failed for tensor 'data_out': shape=(1024,), max_diff=128.0\n"
   ]
 }

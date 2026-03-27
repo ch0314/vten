@@ -150,6 +150,7 @@ int main() {
             dut->rst_n = 0;
             dut->feed_valid = 0;
             dut->feed_done = 0;
+            dut->batch_init = 0;
             memset(dut->feed_data_flat, 0, sizeof(dut->feed_data_flat));
             /* All BFMs idle by default */
             dut->bfm0_done_valid = 0; dut->bfm0_idle = 1;

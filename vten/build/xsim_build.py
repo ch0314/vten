@@ -186,54 +186,6 @@ class XsimBuildPipeline(BuildPipeline):
 
     # ── Stage implementations ──
 
-    @staticmethod
-    def _normalize_ip_config(ip_raw: dict | list | None) -> list[dict]:
-        """Normalize [ip] table or [[ip]] array to unified list[dict].
-
-        Supports:
-          [ip] sources = ["a.xci"]          -> [{"source": "a.xci"}]
-          [[ip]] source = "a.xci"           -> [{"source": "a.xci"}]
-          [[ip]] vlnv = "x:y:z:1.0" ...    -> [{"vlnv": ..., ...}]
-        """
-        if ip_raw is None:
-            return []
-        if isinstance(ip_raw, list):
-            return ip_raw
-        # dict form: [ip] table with sources key
-        if isinstance(ip_raw, dict):
-            entries: list[dict] = []
-            for src in ip_raw.get("sources", []):
-                entries.append({"source": src})
-            return entries
-        return []
-
-    @staticmethod
-    def _parse_ip_entries(ip_list: list[dict], project: Path) -> tuple[list[str], list[dict]]:
-        """Parse unified [[ip]] entries into (ip_sources, ip_create).
-
-        Entries with 'source' key are existing .xci references (glob supported).
-        Entries with 'vlnv' key are declarative IP creation requests.
-        """
-        ip_sources: list[str] = []
-        ip_create: list[dict] = []
-        for entry in ip_list:
-            if "source" in entry:
-                ip_sources.extend(
-                    str(p) for p in sorted(project.glob(entry["source"]))
-                )
-            elif "vlnv" in entry:
-                vendor, library, component, version = entry["vlnv"].split(":")
-                ip_create.append({
-                    "name": entry["name"],
-                    "vendor": vendor,
-                    "library": library,
-                    "component": component,
-                    "version": version,
-                    "output_dir": f"build/ip/{entry['name']}",
-                    "properties": entry.get("properties", {}),
-                })
-        return ip_sources, ip_create
-
     def _project_setup_hash(self) -> str:
         h = hashlib.sha256()
         h.update(json.dumps(self._config.get("rtl", {}), sort_keys=True).encode())

@@ -27,6 +27,7 @@ from vten.runtime.ir import BFMConfig, Command, IRLowering
 from vten.spec.models import (
     ArraySpec,
     Direction,
+    InterleaveSpec,
     InterfaceSpec,
     KernelSpec,
     MappingType,
@@ -173,7 +174,28 @@ def _make_array_ir_setup(spec, kernel_class, tensor_name="wgt"):
         if iface.array and not exp._port_buffers:
             flat_names = iface.array.flat_names(exp.top_interface)
             n = len(flat_names)
-            if exp._serialized is not None:
+            if iface.array.interleave and exp._serialized is not None:
+                from vten.runtime.serializer import MultiPortSerializer
+                from vten.spec.models import InterleaveSpec, PortDef, SplitSpec
+                pseudo_spec = SplitSpec(
+                    mode="channel_interleave",
+                    ports=[PortDef(name=fn, base_addr=0) for fn in flat_names],
+                    interleave=iface.array.interleave,
+                )
+                splitter = MultiPortSerializer()
+                exp._port_buffers = splitter.split_tensor(
+                    exp._serialized, pseudo_spec
+                )
+                exp._port_mode = "channel_interleave"
+                exp._interleave_unit = iface.array.interleave.unit
+            elif iface.array.interleave and exp._serialized is None:
+                per_elem_size = exp._serialized_size // n
+                exp._port_buffers = {
+                    fname: bytes(per_elem_size) for fname in flat_names
+                }
+                exp._port_mode = "channel_interleave"
+                exp._interleave_unit = iface.array.interleave.unit
+            elif exp._serialized is not None:
                 data = exp._serialized
                 chunk_size = len(data) // n
                 remainder = len(data) % n
@@ -758,3 +780,189 @@ class TestArrayCodegenIntegration:
         view = result.flattened_view
         exp = view.exposed_tensors["wgt"]
         assert len(reconstructed) == exp._serialized_size
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §7 — Array Interleave Mode
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _make_array_interleave_spec(
+    dimensions, unit, flat_name_pattern=None,
+) -> KernelSpec:
+    """Create a KernelSpec with an interleaved array interface."""
+    return KernelSpec(
+        kernel_name="array_interleave_test",
+        rtl_top="rtl/array_interleave.sv",
+        interfaces={
+            "wgt": InterfaceSpec(
+                name="wgt",
+                rtl_port="s_axis_wgt",
+                protocol=Protocol.AXI4S,
+                data_width=256,
+                tensor="wgt",
+                array=ArraySpec(
+                    dimensions=dimensions,
+                    flat_name_pattern=flat_name_pattern,
+                    interleave=InterleaveSpec(unit=unit),
+                ),
+                packing=PackingScheme(element_width=8, elements_per_beat=32),
+            ),
+        },
+    )
+
+
+def _make_array_interleave_output_spec(dimensions, unit) -> KernelSpec:
+    """Create a KernelSpec with an interleaved array output interface."""
+    return KernelSpec(
+        kernel_name="array_interleave_out",
+        rtl_top="rtl/array_interleave_out.sv",
+        interfaces={
+            "result_stream": InterfaceSpec(
+                name="result_stream",
+                rtl_port="m_axis_result",
+                protocol=Protocol.AXI4S,
+                data_width=256,
+                tensor="result",
+                array=ArraySpec(
+                    dimensions=dimensions,
+                    interleave=InterleaveSpec(unit=unit),
+                ),
+                packing=PackingScheme(element_width=8, elements_per_beat=32),
+            ),
+        },
+    )
+
+
+class TestArrayInterleaveDistribution:
+    """Array with interleave: round-robin beat distribution across ports."""
+
+    def test_interleave_3_ports_round_robin(self):
+        """3-port interleave (unit=32): beats distributed round-robin."""
+        # 6 beats × 32 bytes = 192 bytes → 2 beats per port
+        data = bytes(range(192))
+        unit = 32
+        n_ports = 3
+        flat_names = ArraySpec(dimensions=[n_ports]).flat_names("psum")
+
+        from vten.runtime.serializer import MultiPortSerializer
+        from vten.spec.models import PortDef, SplitSpec
+
+        spec = SplitSpec(
+            mode="channel_interleave",
+            ports=[PortDef(name=n, base_addr=0) for n in flat_names],
+            interleave=InterleaveSpec(unit=unit),
+        )
+        result = MultiPortSerializer().split_tensor(data, spec)
+
+        assert len(result) == 3
+        # port 0 gets beats 0, 3 (bytes 0-31, 96-127)
+        assert result["psum_0"][:32] == data[0:32]
+        assert result["psum_0"][32:64] == data[96:128]
+        # port 1 gets beats 1, 4 (bytes 32-63, 128-159)
+        assert result["psum_1"][:32] == data[32:64]
+        assert result["psum_1"][32:64] == data[128:160]
+        # port 2 gets beats 2, 5 (bytes 64-95, 160-191)
+        assert result["psum_2"][:32] == data[64:96]
+        assert result["psum_2"][32:64] == data[160:192]
+
+    def test_interleave_6_ports_npu_pattern(self):
+        """NPU MAC pattern: 6 streams, beat-interleaved."""
+        unit = 32  # 256-bit bus = 32 bytes
+        n_ports = 6
+        total_beats = 12  # 2 beats per port
+        data = bytes(i % 256 for i in range(total_beats * unit))
+
+        flat_names = ArraySpec(dimensions=[n_ports]).flat_names("psum")
+        from vten.runtime.serializer import MultiPortSerializer
+        from vten.spec.models import PortDef, SplitSpec
+
+        spec = SplitSpec(
+            mode="channel_interleave",
+            ports=[PortDef(name=n, base_addr=0) for n in flat_names],
+            interleave=InterleaveSpec(unit=unit),
+        )
+        result = MultiPortSerializer().split_tensor(data, spec)
+
+        assert len(result) == 6
+        for i, fn in enumerate(flat_names):
+            assert len(result[fn]) == 2 * unit  # 2 beats each
+            # First beat of port i = beat i of original
+            assert result[fn][:unit] == data[i * unit : (i + 1) * unit]
+            # Second beat of port i = beat (6+i) of original
+            assert result[fn][unit : 2 * unit] == data[(6 + i) * unit : (7 + i) * unit]
+
+    def test_interleave_reassemble_roundtrip(self):
+        """Interleave → reassemble recovers original data."""
+        from vten.runtime.serializer import MultiPortSerializer
+        from vten.spec.models import PortDef, SplitSpec
+
+        unit = 32
+        n_ports = 4
+        data = bytes(i % 256 for i in range(n_ports * 8 * unit))  # 8 beats/port
+
+        spec = SplitSpec(
+            mode="channel_interleave",
+            ports=[PortDef(name=f"p{i}", base_addr=0) for i in range(n_ports)],
+            interleave=InterleaveSpec(unit=unit),
+        )
+        split = MultiPortSerializer().split_tensor(data, spec)
+        reassembled = MultiPortSerializer.reassemble(split, unit)
+        assert reassembled == data
+
+    def test_interleave_via_ir_setup(self):
+        """Full IR setup with interleaved array generates correct _port_buffers."""
+        spec = _make_array_interleave_spec([3], unit=32)
+        view, lowering, inst = _make_array_ir_setup(spec, ArrayKernel)
+
+        exp = view.exposed_tensors["wgt"]
+        assert exp._port_mode == "channel_interleave"
+        assert exp._interleave_unit == 32
+        assert len(exp._port_buffers) == 3
+        assert set(exp._port_buffers.keys()) == {"wgt_0", "wgt_1", "wgt_2"}
+
+    def test_interleave_output_empty_buffers(self):
+        """DEV_TO_HOST array interleave allocates empty per-port buffers."""
+        spec = _make_array_interleave_output_spec([4], unit=32)
+        view, lowering, inst = _make_array_ir_setup(
+            spec, ArrayOutputKernel, tensor_name="result",
+        )
+
+        exp = view.exposed_tensors["result"]
+        assert exp._port_mode == "channel_interleave"
+        assert exp._interleave_unit == 32
+        assert len(exp._port_buffers) == 4
+        # All buffers should be empty (zeros)
+        for port_data in exp._port_buffers.values():
+            assert port_data == bytes(len(port_data))
+
+    def test_interleave_per_port_buffer_ids(self):
+        """Interleaved array gets distinct buffer_id per port."""
+        spec = _make_array_interleave_spec([3], unit=32)
+        view, lowering, inst = _make_array_ir_setup(spec, ArrayKernel)
+
+        op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.kernel_class_instance.wgt)
+        lowering._buffer_ids = lowering._allocate_buffer_ids([op])
+
+        exp = view.exposed_tensors["wgt"]
+        bids = set()
+        for port_name in exp._port_buffers:
+            key = f"{exp.name}:{port_name}"
+            bid = lowering._buffer_ids.get(key)
+            assert bid is not None, f"Missing buffer_id for {key}"
+            bids.add(bid)
+        assert len(bids) == 3
+
+    def test_interleave_push_commands(self):
+        """Interleaved array generates N PUSH commands."""
+        spec = _make_array_interleave_spec([3], unit=32)
+        view, lowering, inst = _make_array_ir_setup(spec, ArrayKernel)
+
+        op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.kernel_class_instance.wgt)
+        commands, _ = lowering.lower([op])
+        push_cmds = [c for c in commands if c.op == OpCode.PUSH]
+        assert len(push_cmds) == 3
+        iface_ids = {c.interface_id for c in push_cmds}
+        buf_ids = {c.buffer_id for c in push_cmds}
+        assert len(iface_ids) == 3
+        assert len(buf_ids) == 3

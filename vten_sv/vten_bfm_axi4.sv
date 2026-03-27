@@ -4,6 +4,8 @@
 // BFM is slave — DUT is master.
 // Supports simultaneous AR/AW processing with fully independent
 // Read Path and Write Path always_ff blocks.
+//
+// Diagnostics: +VTEN_VERBOSE (xsim) or +define+VTEN_VERBOSE (verilator)
 
 `include "vten_types.svh"
 `include "vten_dpi_imports.svh"
@@ -46,6 +48,20 @@ module vten_bfm_axi4 #(
     input  int                  cycle_count
 );
     localparam int BYTES_PER_BEAT = DATA_W / 8;
+
+    // Runtime verbose flag
+    bit verbose;
+    initial begin
+`ifdef VTEN_VERBOSE
+        verbose = 1;
+`else
+  `ifndef VERILATOR
+        verbose = $test$plusargs("VTEN_VERBOSE");
+  `else
+        verbose = 0;
+  `endif
+`endif
+    end
 
     // Bulk transfer buffers: byte[] for cross-simulator memcpy
     byte r_beat_buf [0:BYTES_PER_BEAT-1];
@@ -152,6 +168,12 @@ module vten_bfm_axi4 #(
             entry.stall_cycles     = 0;
             entry.total_beats      = 0;
             active_table.push_back(entry);
+            if (verbose)
+                $display("[AXI4 %0t] %s iface=%0d cmd#%0d: buf=%0d, %0d bytes, phys=0x%016h",
+                         $time, cmd_if.cmd_data.opcode.name(),
+                         cmd_if.cmd_data.interface_id, cmd_if.cmd_data.cmd_id,
+                         cmd_if.cmd_data.buffer_id,
+                         cmd_if.cmd_data.size, cmd_if.cmd_data.phys_addr);
         end
     end
 
@@ -391,6 +413,11 @@ module vten_bfm_axi4 #(
             done_queue.push_back('{cmd_id: cid, error: 1'b0, error_code: 16'd0});
             vten_write_cmd_stats(cid, CMD_COMMITTED, iss_cycle, cycle_count,
                 first_act, last_act, act_cycles, tot_beats, stl_cycles);
+            if (verbose)
+                $display("[AXI4 %0t] %s iface=%0d cmd#%0d done: %0d beats, %0d stall cyc, %0d active cyc",
+                         $time, active_table[idx].cmd.opcode.name(),
+                         active_table[idx].cmd.interface_id, cid,
+                         tot_beats, stl_cycles, act_cycles);
         end
     endtask
 

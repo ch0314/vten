@@ -160,6 +160,7 @@ module tb_top;
     bfm_cmd_t    feed_data;
     logic        feed_ready;
     logic        feed_done;
+    logic        batch_init;
     logic        sched_all_committed;
     logic        sched_all_drained;
     logic        sched_error;
@@ -175,6 +176,7 @@ module tb_top;
         .feed_data(feed_data),
         .feed_ready(feed_ready),
         .feed_done(feed_done),
+        .batch_init(batch_init),
         .sched_all_committed(sched_all_committed),
         .sched_all_drained(sched_all_drained),
         .sched_error(sched_error),
@@ -206,6 +208,7 @@ module tb_top;
         .feed_data(feed_data),
         .feed_ready(feed_ready),
         .feed_done(feed_done),
+        .batch_init(batch_init),
         .all_committed(sched_all_committed),
         .all_drained(sched_all_drained),
         .error_flag(sched_error),

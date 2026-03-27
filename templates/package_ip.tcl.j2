@@ -30,6 +30,26 @@ add_files $project_dir/{{ gen_file }}
 add_files $vten_root/{{ sv_file }}
 {% endfor %}
 
+# ── IP 생성 (선언형) ──
+{% for ip in ip_create %}
+file mkdir $project_root/{{ ip.output_dir }}
+create_ip -name {{ ip.component }} -vendor {{ ip.vendor }} -library {{ ip.library }} \
+          -version {{ ip.version }} -module_name {{ ip.name }} \
+          -dir $project_root/{{ ip.output_dir }}
+{% for prop, val in ip.properties.items() %}
+set_property -dict [list CONFIG.{{ prop }} {{ val }}] [get_ips {{ ip.name }}]
+{% endfor %}
+{% endfor %}
+
+# ── IP 등록 (기존 .xci 참조) ──
+{% for xci in ip_sources %}
+add_files {{ xci }}
+{% endfor %}
+
+{% if ip_sources or ip_create %}
+generate_target all [get_ips *]
+{% endif %}
+
 set_property top {{ kernel_name }} [current_fileset]
 update_compile_order -fileset sources_1
 

@@ -949,10 +949,34 @@ class RuntimeEngine:
             # Array interface → _port_buffers (when split didn't already set it)
             if iface_spec.array and not exposed._port_buffers:
                 flat_names = iface_spec.array.flat_names(exposed.top_interface)
-                exposed._port_buffers = _block_split_data(
-                    exposed._serialized, flat_names, exposed._serialized_size
-                )
-                exposed._port_mode = "block"
+                if iface_spec.array.interleave and exposed._serialized is not None:
+                    from vten.runtime.serializer import MultiPortSerializer
+                    from vten.spec.models import PortDef, SplitSpec
+                    pseudo_spec = SplitSpec(
+                        mode="channel_interleave",
+                        ports=[PortDef(name=n, base_addr=0) for n in flat_names],
+                        interleave=iface_spec.array.interleave,
+                    )
+                    splitter = MultiPortSerializer()
+                    exposed._port_buffers = splitter.split_tensor(
+                        exposed._serialized, pseudo_spec
+                    )
+                    exposed._port_mode = "channel_interleave"
+                    exposed._interleave_unit = iface_spec.array.interleave.unit
+                elif iface_spec.array.interleave and exposed._serialized is None:
+                    # DEV_TO_HOST: allocate empty per-port buffers
+                    n_ports = len(flat_names)
+                    per_port_size = exposed._serialized_size // n_ports
+                    exposed._port_buffers = {
+                        fn: bytes(per_port_size) for fn in flat_names
+                    }
+                    exposed._port_mode = "channel_interleave"
+                    exposed._interleave_unit = iface_spec.array.interleave.unit
+                else:
+                    exposed._port_buffers = _block_split_data(
+                        exposed._serialized, flat_names, exposed._serialized_size
+                    )
+                    exposed._port_mode = "block"
 
     # ── Stage 3b: Probe Golden Serialization ──
 

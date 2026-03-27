@@ -3,6 +3,8 @@
 //
 // BFM is master — drives AXI-Lite transactions.
 // Supports WRITE_REG, READ_REG, POLL_REG.
+//
+// Diagnostics: +VTEN_VERBOSE (xsim) or +define+VTEN_VERBOSE (verilator)
 
 `include "vten_types.svh"
 `include "vten_dpi_imports.svh"
@@ -47,6 +49,20 @@ module vten_bfm_axilite #(
     // Write handshake phase tracking
     logic aw_accepted;
     logic w_accepted;
+
+    // Runtime verbose flag
+    bit verbose;
+    initial begin
+`ifdef VTEN_VERBOSE
+        verbose = 1;
+`else
+  `ifndef VERILATOR
+        verbose = $test$plusargs("VTEN_VERBOSE");
+  `else
+        verbose = 0;
+  `endif
+`endif
+    end
 
     // v0.4.1: idle signal — registered to avoid xsim continuous-assign issue
     logic idle_r;
@@ -132,6 +148,11 @@ module vten_bfm_axilite #(
         m_bready <= 1;
         if (m_bvalid && m_bready) begin
             m_bready <= 0;
+            if (verbose)
+                $display("[AXILITE %0t] WRITE_REG iface=%0d cmd#%0d done: addr=0x%04h, val=0x%08h, resp=%0b",
+                         $time, current_cmd.interface_id, current_cmd.cmd_id,
+                         current_cmd.reg_offset[ADDR_W-1:0],
+                         current_cmd.reg_value[DATA_W-1:0], m_bresp);
             finish_cmd(m_bresp != 2'b00);
         end
     endtask
@@ -178,10 +199,22 @@ module vten_bfm_axilite #(
             aw_accepted <= 0;  // reset for next poll iteration
             if ((m_rdata & current_cmd.reg_mask[DATA_W-1:0]) ==
                 current_cmd.reg_expected[DATA_W-1:0]) begin
+                if (verbose)
+                    $display("[AXILITE %0t] POLL_REG iface=%0d cmd#%0d: match after %0d polls (addr=0x%04h, got=0x%08h, mask=0x%08h, expected=0x%08h)",
+                             $time, current_cmd.interface_id, current_cmd.cmd_id, poll_count,
+                             current_cmd.reg_offset[ADDR_W-1:0], m_rdata,
+                             current_cmd.reg_mask[DATA_W-1:0],
+                             current_cmd.reg_expected[DATA_W-1:0]);
                 finish_cmd(0);
             end else begin
                 poll_count <= poll_count + 1;
                 if (poll_count >= POLL_TIMEOUT) begin
+                    if (verbose)
+                        $display("[AXILITE %0t] POLL_REG iface=%0d cmd#%0d TIMEOUT: %0d polls exhausted (addr=0x%04h, last=0x%08h, mask=0x%08h, expected=0x%08h)",
+                                 $time, current_cmd.interface_id, current_cmd.cmd_id, POLL_TIMEOUT,
+                                 current_cmd.reg_offset[ADDR_W-1:0], m_rdata,
+                                 current_cmd.reg_mask[DATA_W-1:0],
+                                 current_cmd.reg_expected[DATA_W-1:0]);
                     finish_cmd(1);  // Timeout error
                 end
             end

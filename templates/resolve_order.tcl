@@ -37,6 +37,11 @@ foreach f $ordered {
     set ftype [get_property FILE_TYPE $f]
     set lib   [get_property LIBRARY $f]
     set path  [get_property NAME $f]
+    # Remap IP-specific libraries to xil_defaultlib — xvlog cannot write .sdb
+    # to read-only Vivado install dirs for IP libraries like uram_rd_back_v1_0_3
+    if {$lib ne "xil_defaultlib" && $lib ne "work"} {
+        set lib "xil_defaultlib"
+    }
     if {$ftype eq "SystemVerilog"} {
         puts $fp "sv $lib $path"
     } elseif {$ftype eq "Verilog"} {

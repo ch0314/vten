@@ -159,6 +159,7 @@ class SplitSpec:
 class ArraySpec:
     dimensions: list[int]
     flat_name_pattern: str | None = None  # auto: {name}_{i} or {name}_{i}_{j}
+    interleave: InterleaveSpec | None = None  # beat-interleave distribution
 
     @property
     def total_elements(self) -> int:

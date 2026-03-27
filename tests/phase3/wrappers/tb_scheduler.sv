@@ -18,6 +18,7 @@ module tb_scheduler #(
     input  logic [303:0] feed_data_flat,   // bfm_cmd_t flattened
     output logic        feed_ready,
     input  logic        feed_done,
+    input  logic        batch_init,
 
     // Scheduler → Controller: status
     output logic        all_committed,
@@ -100,6 +101,7 @@ module tb_scheduler #(
         .feed_data(feed_cmd),
         .feed_ready(feed_ready),
         .feed_done(feed_done),
+        .batch_init(batch_init),
         .all_committed(all_committed),
         .all_drained(all_drained),
         .error_flag(error_flag),

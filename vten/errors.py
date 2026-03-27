@@ -21,6 +21,17 @@ class VTenError(Exception):
         self.stage = stage
         self.context = context or {}
 
+    def __str__(self) -> str:
+        msg = super().__str__()
+        prefix_parts: list[str] = []
+        if self.stage:
+            prefix_parts.append(f"[{self.stage}]")
+        if self.kernel_path:
+            prefix_parts.append(f"({self.kernel_path})")
+        if prefix_parts:
+            return f"{' '.join(prefix_parts)} {msg}"
+        return msg
+
 
 # ── Build errors (CLI build pipeline) ──
 

@@ -7,12 +7,16 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import sys
+import traceback
 from pathlib import Path
 
 from vten.backend.registry import get_backend, resolve_backend_name
 from vten.cli.config import load_project_config
 from vten.errors import VTenError, VerificationError
+
+logger = logging.getLogger(__name__)
 
 
 class TestScenario:
@@ -59,22 +63,27 @@ def discover_test(name: str, tests_dir: str | Path) -> TestScenario:
                 candidates.append((test_file.stem, obj))
 
     name_lower = name.lower()
-    matches: list[type] = []
+
+    # Priority tiers: exact match wins over fuzzy match
+    exact_matches: list[type] = []
+    fuzzy_matches: list[type] = []
 
     for file_stem, cls in candidates:
         cls_name = cls.__name__
-        # Match by exact class name
+        # Tier 1: Exact class name match
         if cls_name == name:
-            matches.append(cls)
-        # Match by case-insensitive class name
+            exact_matches.append(cls)
+        # Tier 2: Case-insensitive class name
         elif cls_name.lower() == name_lower:
-            matches.append(cls)
-        # Match by snake_case (e.g., "test_conv3d" matches TestConv3D via file stem)
+            fuzzy_matches.append(cls)
+        # Tier 2: snake_case / filename stem match
         elif file_stem == name or file_stem == f"test_{name}":
-            matches.append(cls)
-        # Match by filename stem without test_ prefix
+            fuzzy_matches.append(cls)
         elif file_stem.removeprefix("test_") == name:
-            matches.append(cls)
+            fuzzy_matches.append(cls)
+
+    # Use exact matches if available, otherwise fall back to fuzzy
+    matches = exact_matches if exact_matches else fuzzy_matches
 
     if not matches:
         raise ValueError(f"Not found: no test scenario matching '{name}'")
@@ -88,6 +97,42 @@ def discover_test(name: str, tests_dir: str | Path) -> TestScenario:
         matches = unique
 
     return matches[0]()
+
+
+def discover_all_tests(tests_dir: str | Path) -> list[tuple[str, TestScenario]]:
+    """Discover all TestScenario subclasses in tests_dir.
+
+    Returns a list of (class_name, instance) pairs, sorted by class name.
+    """
+    tests_path = Path(tests_dir)
+    test_files = sorted(tests_path.glob("test_*.py"))
+
+    seen: dict[int, tuple[str, type]] = {}
+
+    for test_file in test_files:
+        mod_name = f"_vten_discover_{test_file.stem}"
+        spec = importlib.util.spec_from_file_location(mod_name, test_file)
+        if spec is None or spec.loader is None:
+            continue
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            continue
+
+        for attr_name in dir(module):
+            obj = getattr(module, attr_name)
+            if (
+                isinstance(obj, type)
+                and issubclass(obj, TestScenario)
+                and obj is not TestScenario
+                and id(obj) not in seen
+            ):
+                seen[id(obj)] = (obj.__name__, obj)
+
+    return [(name, cls()) for name, cls in sorted(seen.values(), key=lambda x: x[0])]
 
 
 def merge_configs(base: dict, override: dict | None) -> dict:
@@ -203,30 +248,19 @@ def _enrich_stats(
     ]
 
 
-def run_test(
-    project_dir: str = ".",
-    kernel_name: str = "",
-    test_name: str = "",
-    backend: str | None = None,
-    waveform: bool = False,
-    gui: bool = False,
+def _run_single_test(
+    project: Path,
+    config: dict,
+    kernel_name: str,
+    test_name: str,
+    scenario: TestScenario,
+    kernel_dir: Path,
+    backend_name: str,
+    backend_inst,
     config_overrides: dict | None = None,
+    gui: bool = False,
 ) -> None:
-    """Discover, execute, and record results for a test scenario."""
-    project = Path(project_dir).resolve()
-    config = load_project_config(project)
-    kernel_dir = project / "kernels" / kernel_name
-
-    # Validate kernel directory
-    from vten.build.composite import is_composite_kernel
-    spec_path = kernel_dir / "kernel_spec.yaml"
-    if not spec_path.exists() and not is_composite_kernel(kernel_dir):
-        raise VTenError(f"kernel_spec.yaml not found: {spec_path}")
-
-    # Test discovery from kernel tests dir
-    tests_dir = kernel_dir / "tests"
-    scenario = discover_test(test_name, tests_dir)
-
+    """Execute a single test scenario and write results."""
     base_params = config.get("parameters", {})
     if config_overrides:
         base_params = merge_configs(base_params, config_overrides)
@@ -248,21 +282,14 @@ def run_test(
     all_verification_results: list[dict] = []
     status = "PASS"
 
-    # Inject kernel-level paths into config
-    config["_project_dir"] = str(project)
-    config["_kernel_build_dir"] = str(kernel_dir / "build")
-    if gui:
-        config["_gui"] = True
+    logger.info("run %s/%s (backend=%s, configs=%d)",
+                kernel_name, test_name, backend_name, len(run_cfgs))
 
-    backend_name = resolve_backend_name(config, cli_backend=backend)
-    backend_inst = get_backend(backend_name, config)
-
-    # Change to project directory so relative paths in kernel specs resolve correctly
-    import os
-    prev_cwd = os.getcwd()
-    os.chdir(str(project))
+    last_error: Exception | None = None
+    session_open = False  # Track session state across configs
     try:
-        for cfg in run_cfgs:
+        for cfg_idx, cfg in enumerate(run_cfgs):
+            logger.debug("config %d/%d: %s", cfg_idx + 1, len(run_cfgs), cfg)
             try:
                 # Create ExecutionContext with backend so ctx.run() drives
                 # the full lifecycle: compile → execute → verify
@@ -272,12 +299,15 @@ def run_test(
                     backend=backend_inst,
                     project_params=cfg,
                 )
+                # Share session state across configs for multi-batch mode
+                ctx._session_open = session_open
                 scenario.run(ctx, cfg)
 
                 if ctx._pending_ops:
                     # Scenario recorded DSL ops — ctx.run() handles everything
                     # including deferred verifications
                     batch_result = ctx.run()
+                    session_open = ctx._session_open
                     configs_passed += 1
 
                     if batch_result.per_command_stats:
@@ -293,6 +323,11 @@ def run_test(
                                 ctx._last_compiled,
                             )
                         )
+
+                    logger.info("  config %d/%d: PASS (%d cycles, %d verifications)",
+                               cfg_idx + 1, len(run_cfgs),
+                               batch_result.total_cycles,
+                               batch_result.verification_count)
 
                     # Count verifications that passed (no VerificationError raised)
                     verification_count += batch_result.verification_count
@@ -329,6 +364,9 @@ def run_test(
                         )
             except VerificationError as ve:
                 status = "FAIL"
+                last_error = ve
+                logger.warning("verification failed (config %d/%d): %s",
+                               cfg_idx + 1, len(run_cfgs), ve)
                 # Collect verification results from the error context
                 vr_list = ve.context.get("verification_results", [])
                 verification_count += len(vr_list) if vr_list else 1
@@ -346,21 +384,32 @@ def run_test(
                         "passed": False,
                         "max_diff": ve.max_diff,
                     })
-            except Exception:
+            except Exception as exc:
                 status = "FAIL"
+                last_error = exc
+                logger.error("test execution failed (config %d/%d)",
+                             cfg_idx + 1, len(run_cfgs), exc_info=True)
 
         if configs_passed < len(run_cfgs):
             status = "FAIL"
     finally:
-        os.chdir(prev_cwd)
-        try:
-            backend_inst.shutdown()
-        except Exception:
-            pass
-        try:
-            backend_inst.cleanup()
-        except Exception:
-            pass
+        # Close session if one was opened (multi-batch mode)
+        if session_open:
+            try:
+                backend_inst.close_session()
+            except Exception:
+                pass
+        else:
+            try:
+                backend_inst.shutdown()
+            except Exception:
+                pass
+            try:
+                backend_inst.cleanup()
+            except Exception:
+                pass
+
+    logger.info("result: %s (%d/%d configs passed)", status, configs_passed, len(run_cfgs))
 
     summary: dict = {
         "test_name": test_name,
@@ -374,9 +423,81 @@ def run_test(
     }
     if all_verification_results:
         summary["verification_results"] = all_verification_results
+    if last_error is not None:
+        summary["error_message"] = str(last_error)
+        summary["error_traceback"] = traceback.format_exception(last_error)
 
     (results_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
     (results_dir / "stats.json").write_text(json.dumps(
         {"commands": all_cmd_stats}, indent=2,
     ))
+
+
+def run_test(
+    project_dir: str = ".",
+    kernel_name: str = "",
+    test_name: str = "",
+    backend: str | None = None,
+    waveform: bool = False,
+    gui: bool = False,
+    sim_verbose: bool = False,
+    config_overrides: dict | None = None,
+) -> None:
+    """Discover, execute, and record results for test scenario(s).
+
+    When test_name is empty, discovers and runs all TestScenario subclasses
+    in the kernel's tests/ directory.
+    """
+    project = Path(project_dir).resolve()
+    config = load_project_config(project)
+    kernel_dir = project / "kernels" / kernel_name
+
+    # Validate kernel directory
+    from vten.build.composite import is_composite_kernel
+    spec_path = kernel_dir / "kernel_spec.yaml"
+    if not spec_path.exists() and not is_composite_kernel(kernel_dir):
+        raise VTenError(f"kernel_spec.yaml not found: {spec_path}")
+
+    # Test discovery
+    tests_dir = kernel_dir / "tests"
+    if test_name:
+        scenarios = [(test_name, discover_test(test_name, tests_dir))]
+    else:
+        scenarios = discover_all_tests(tests_dir)
+        if not scenarios:
+            raise VTenError(f"no test scenarios found in {tests_dir}")
+        logger.info("discovered %d test(s): %s",
+                     len(scenarios), [n for n, _ in scenarios])
+
+    # Inject kernel-level paths into config
+    config["_project_dir"] = str(project)
+    config["_kernel_build_dir"] = str(kernel_dir / "build")
+    if gui:
+        config["_gui"] = True
+    if sim_verbose:
+        config["_sim_verbose"] = True
+
+    backend_name = resolve_backend_name(config, cli_backend=backend)
+    backend_inst = get_backend(backend_name, config)
+
+    # Change to project directory so relative paths in kernel specs resolve correctly
+    import os
+    prev_cwd = os.getcwd()
+    os.chdir(str(project))
+    try:
+        for scenario_name, scenario in scenarios:
+            _run_single_test(
+                project=project,
+                config=config,
+                kernel_name=kernel_name,
+                test_name=scenario_name,
+                scenario=scenario,
+                kernel_dir=kernel_dir,
+                backend_name=backend_name,
+                backend_inst=backend_inst,
+                config_overrides=config_overrides,
+                gui=gui,
+            )
+    finally:
+        os.chdir(prev_cwd)

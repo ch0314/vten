@@ -86,8 +86,8 @@ class TestRunKernel:
         ki = captured_ki["PassthroughKernel"]
         assert torch.equal(ki.get_tensor("data_in").data, x)
 
-    def test_send_recv_ops_generated(self):
-        """run_kernel generates SEND_TENSOR for inputs, RECV_TENSOR for non-inputs."""
+    def test_load_push_pull_store_ops_generated(self):
+        """run_kernel generates LOAD+PUSH for inputs, PULL+STORE for outputs."""
         captured_ops = []
         x = torch.tensor([1, 2, 3, 4], dtype=torch.uint8)
 
@@ -95,21 +95,27 @@ class TestRunKernel:
             run_kernel(PassthroughKernel, {"data_in": x})
 
         op_kinds = [op.kind for op in captured_ops]
-        assert OpKind.SEND_TENSOR in op_kinds
-        assert OpKind.RECV_TENSOR in op_kinds
+        assert OpKind.LOAD_TENSOR in op_kinds
+        assert OpKind.PUSH_TENSOR in op_kinds
+        assert OpKind.PULL_TENSOR in op_kinds
+        assert OpKind.STORE_TENSOR in op_kinds
 
-    def test_send_recv_tensor_names(self):
-        """Correct tensors assigned to send/recv ops."""
+    def test_load_push_pull_store_tensor_names(self):
+        """Correct tensors assigned to load/push/pull/store ops."""
         captured_ops = []
         x = torch.tensor([1, 2, 3, 4], dtype=torch.uint8)
 
         with patch.object(ExecutionContext, "run", _capture_run(captured_ops)):
             run_kernel(PassthroughKernel, {"data_in": x})
 
-        send_op = next(op for op in captured_ops if op.kind == OpKind.SEND_TENSOR)
-        recv_op = next(op for op in captured_ops if op.kind == OpKind.RECV_TENSOR)
-        assert send_op.tensor.name == "data_in"
-        assert recv_op.tensor.name == "data_out"
+        load_op = next(op for op in captured_ops if op.kind == OpKind.LOAD_TENSOR)
+        push_op = next(op for op in captured_ops if op.kind == OpKind.PUSH_TENSOR)
+        pull_op = next(op for op in captured_ops if op.kind == OpKind.PULL_TENSOR)
+        store_op = next(op for op in captured_ops if op.kind == OpKind.STORE_TENSOR)
+        assert load_op.tensor.name == "data_in"
+        assert push_op.tensor.name == "data_in"
+        assert pull_op.tensor.name == "data_out"
+        assert store_op.tensor.name == "data_out"
 
     def test_configure_flag_adds_op(self):
         """configure=True adds CONFIGURE op."""
@@ -134,7 +140,7 @@ class TestRunKernel:
         assert OpKind.CONFIGURE not in op_kinds
 
     def test_multiple_inputs(self):
-        """Multiple input tensors each get a send_tensor; non-inputs get recv_tensor."""
+        """Multiple input tensors each get LOAD+PUSH; non-inputs get PULL+STORE."""
         captured_ops = []
         ifm = torch.zeros(8, dtype=torch.uint8)
         wgt = torch.ones(8, dtype=torch.uint8)
@@ -142,10 +148,14 @@ class TestRunKernel:
         with patch.object(ExecutionContext, "run", _capture_run(captured_ops)):
             run_kernel(TwoInputKernel, {"ifm": ifm, "wgt": wgt})
 
-        send_ops = [op for op in captured_ops if op.kind == OpKind.SEND_TENSOR]
-        recv_ops = [op for op in captured_ops if op.kind == OpKind.RECV_TENSOR]
-        assert len(send_ops) == 2  # ifm + wgt
-        assert len(recv_ops) == 1  # ofm
+        load_ops = [op for op in captured_ops if op.kind == OpKind.LOAD_TENSOR]
+        push_ops = [op for op in captured_ops if op.kind == OpKind.PUSH_TENSOR]
+        pull_ops = [op for op in captured_ops if op.kind == OpKind.PULL_TENSOR]
+        store_ops = [op for op in captured_ops if op.kind == OpKind.STORE_TENSOR]
+        assert len(load_ops) == 2  # ifm + wgt
+        assert len(push_ops) == 2  # ifm + wgt
+        assert len(pull_ops) == 1  # ofm
+        assert len(store_ops) == 1  # ofm
 
     def test_params_forwarded(self):
         """Runtime params are forwarded to kernel instantiation."""
@@ -161,29 +171,29 @@ class TestRunKernel:
         ki = captured_ki["PassthroughKernel"]
         assert ki.runtime_params.get("SIZE") == 16
 
-    def test_send_depends_on_nothing_first(self):
-        """First send_tensor has no dependency."""
+    def test_load_depends_on_nothing(self):
+        """First load_tensor has no dependency."""
         captured_ops = []
         x = torch.tensor([1, 2, 3, 4], dtype=torch.uint8)
 
         with patch.object(ExecutionContext, "run", _capture_run(captured_ops)):
             run_kernel(PassthroughKernel, {"data_in": x})
 
-        send_op = next(op for op in captured_ops if op.kind == OpKind.SEND_TENSOR)
-        assert send_op.dep == []
+        load_op = next(op for op in captured_ops if op.kind == OpKind.LOAD_TENSOR)
+        assert load_op.dep == []
 
-    def test_recv_depends_on_last_send(self):
-        """recv_tensor depends on the last send_tensor handle."""
+    def test_pull_depends_on_load_not_push(self):
+        """PULL depends on LOAD (not PUSH) so PUSH and PULL run concurrently."""
         captured_ops = []
         x = torch.tensor([1, 2, 3, 4], dtype=torch.uint8)
 
         with patch.object(ExecutionContext, "run", _capture_run(captured_ops)):
             run_kernel(PassthroughKernel, {"data_in": x})
 
-        recv_op = next(op for op in captured_ops if op.kind == OpKind.RECV_TENSOR)
-        # recv should have dependency on the send handle
-        assert len(recv_op.dep) == 1
-        assert recv_op.dep[0].op.kind == OpKind.SEND_TENSOR
+        pull_op = next(op for op in captured_ops if op.kind == OpKind.PULL_TENSOR)
+        # PULL should depend on LOAD, allowing PUSH and PULL to run in parallel
+        assert len(pull_op.dep) == 1
+        assert pull_op.dep[0].op.kind == OpKind.LOAD_TENSOR
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -202,15 +212,17 @@ class TestKernelExecutor:
         assert isinstance(result, dict)
 
     def test_dsl_ops_generated(self):
-        """KernelExecutor auto-generates send/recv ops."""
+        """KernelExecutor auto-generates load/push/pull/store ops."""
         captured_ops = []
         with patch.object(ExecutionContext, "run", _capture_run(captured_ops)):
             npu = KernelExecutor(PassthroughKernel)
             npu(data_in=torch.tensor([1, 2, 3, 4], dtype=torch.uint8))
 
         op_kinds = [op.kind for op in captured_ops]
-        assert OpKind.SEND_TENSOR in op_kinds
-        assert OpKind.RECV_TENSOR in op_kinds
+        assert OpKind.LOAD_TENSOR in op_kinds
+        assert OpKind.PUSH_TENSOR in op_kinds
+        assert OpKind.PULL_TENSOR in op_kinds
+        assert OpKind.STORE_TENSOR in op_kinds
 
     def test_configure_flag(self):
         """configure=True in constructor adds CONFIGURE on each call."""

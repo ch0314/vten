@@ -92,7 +92,7 @@ class TestVTenErrorBase:
             stage="stage_6_ir",
             context={"cmd_id": 5},
         )
-        assert str(e) == "full error"
+        assert str(e) == "[stage_6_ir] (kernels/npu) full error"
         assert e.kernel_path == "kernels/npu"
         assert e.stage == "stage_6_ir"
         assert e.context["cmd_id"] == 5
@@ -224,7 +224,7 @@ class TestErrorAttributes:
             stage="stage_1",
             context={"key": "val"},
         )
-        assert str(e) == "test message"
+        assert str(e) == "[stage_1] (kernels/test) test message"
         assert e.kernel_path == "kernels/test"
         assert e.stage == "stage_1"
         assert e.context == {"key": "val"}

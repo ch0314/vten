@@ -16,6 +16,7 @@ Spec reference: 08_backend_abstraction.md §8.2, §8.3
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -25,6 +26,8 @@ from vten.build.base import BuildPipeline
 from vten.codegen.xrt_generator import XrtGenerator
 from vten.errors import BuildError
 from vten.spec.parser import parse_kernel_spec
+
+logger = logging.getLogger(__name__)
 
 
 def _find_tool(name: str, config: dict) -> str:
@@ -63,6 +66,7 @@ class XrtBuildPipeline(BuildPipeline):
 
     def __init__(self, project: Path, config: dict) -> None:
         super().__init__(project, config)
+        self._config["ip"] = self._normalize_ip_config(self._config.get("ip"))
 
     def stages(self) -> list[str]:
         return list(self._STAGES)
@@ -165,7 +169,7 @@ class XrtBuildPipeline(BuildPipeline):
 
     def _stage_gen_codegen(self, kernel_dir: Path) -> None:
         """Generate wrapper.sv and axilite_ctrl.sv with Vitis naming."""
-        print(f"[Stage 1] gen_codegen: {kernel_dir.name}")
+        logger.info("[Stage 1] gen_codegen: %s", kernel_dir.name)
         spec = self._load_spec(kernel_dir)
 
         from vten.codegen.sv_generator import SVGenerator
@@ -188,13 +192,13 @@ class XrtBuildPipeline(BuildPipeline):
             if iface.protocol.value == "axi4_lite" and iface.generate_controller:
                 gen._generate_axilite_ctrl(env, output_dir, iface)
 
-        print("  done")
+        logger.info("  done")
 
     # ── Stage 2: gen_xrt_packaging ──
 
     def _stage_gen_xrt_packaging(self, kernel_dir: Path) -> None:
         """Generate XRT packaging artifacts (TCL/XML/CFG)."""
-        print(f"[Stage 2] gen_xrt_packaging: {kernel_dir.name}")
+        logger.info("[Stage 2] gen_xrt_packaging: %s", kernel_dir.name)
         spec = self._load_spec(kernel_dir)
 
         output_dir = self._build_dir(kernel_dir)
@@ -238,16 +242,22 @@ class XrtBuildPipeline(BuildPipeline):
                 rel = os.path.relpath(m, self._project)
                 resolved_rtl.append(rel)
 
+        ip_sources, ip_create = self._parse_ip_entries(
+            self._config.get("ip", []), self._project,
+        )
+
         config = dict(self._config)
         config["rtl"] = {"sources": resolved_rtl}
         config["generated_files"] = generated_files
         config["vten_sv_files"] = vten_sv_files
         config["_project_root"] = project_root
         config["_vten_root"] = vten_root
+        config["_ip_sources"] = ip_sources
+        config["_ip_create"] = ip_create
 
         gen = XrtGenerator(kernel_spec=spec, project_config=config)
         gen.generate(str(output_dir))
-        print("  done")
+        logger.info("  done")
 
     # ── Stage 3: package_ip ──
 
@@ -263,7 +273,7 @@ class XrtBuildPipeline(BuildPipeline):
 
         ip_repo = build_dir / "ip_repo"
         if ip_repo.exists() and not force:
-            print(f"[Stage 3] package_ip: {kernel_dir.name} (cached)")
+            logger.info("[Stage 3] package_ip: %s (cached)", kernel_dir.name)
             return
 
         vivado = _find_tool("vivado", self._config)
@@ -274,7 +284,7 @@ class XrtBuildPipeline(BuildPipeline):
                 "To generate artifacts only: vten build --backend xrt --upto gen_xrt_packaging"
             )
 
-        print(f"[Stage 3] package_ip: {kernel_dir.name}")
+        logger.info("[Stage 3] package_ip: %s", kernel_dir.name)
         log_dir = self._log_dir(kernel_dir)
         self._run_subprocess(
             [vivado, "-mode", "batch", "-source", "package_ip.tcl",
@@ -286,7 +296,7 @@ class XrtBuildPipeline(BuildPipeline):
             stage_name="package_ip",
         )
         self._cleanup_stray_files(build_dir)
-        print("  done")
+        logger.info("  done")
 
     # ── Stage 4: gen_xo ──
 
@@ -303,14 +313,14 @@ class XrtBuildPipeline(BuildPipeline):
             )
 
         if xo_file.exists() and not force:
-            print(f"[Stage 4] gen_xo: {kernel_dir.name} (cached)")
+            logger.info("[Stage 4] gen_xo: %s (cached)", kernel_dir.name)
             return
 
         vivado = _find_tool("vivado", self._config)
         if not vivado:
             raise BuildError("vivado not found. See stage 3 error message.")
 
-        print(f"[Stage 4] gen_xo: {kernel_dir.name}")
+        logger.info("[Stage 4] gen_xo: %s", kernel_dir.name)
         log_dir = self._log_dir(kernel_dir)
         self._run_subprocess(
             [vivado, "-mode", "batch", "-source", "gen_xo.tcl",
@@ -326,7 +336,7 @@ class XrtBuildPipeline(BuildPipeline):
         if not xo_file.exists():
             raise BuildError(f"XO not generated: {xo_file}")
 
-        print(f"  done ({xo_file.name}: {xo_file.stat().st_size // 1024}KB)")
+        logger.info("  done (%s: %dKB)", xo_file.name, xo_file.stat().st_size // 1024)
 
     # ── Stage 5: vpp_link ──
 
@@ -357,7 +367,7 @@ class XrtBuildPipeline(BuildPipeline):
             )
 
         if xclbin_file.exists() and not force:
-            print(f"[Stage 5] vpp_link: {kernel_dir.name} (cached)")
+            logger.info("[Stage 5] vpp_link: %s (cached)", kernel_dir.name)
             return
 
         vpp = _find_tool("v++", self._config)
@@ -367,7 +377,7 @@ class XrtBuildPipeline(BuildPipeline):
                 "To generate artifacts only: vten build --backend xrt --upto gen_xo"
             )
 
-        print(f"[Stage 5] vpp_link: {kernel_dir.name} ({target})")
+        logger.info("[Stage 5] vpp_link: %s (%s)", kernel_dir.name, target)
         log_dir = self._log_dir(kernel_dir)
         self._run_subprocess(
             [vpp, "-l", "-t", target,
@@ -389,7 +399,7 @@ class XrtBuildPipeline(BuildPipeline):
             raise BuildError(f"xclbin not generated: {xclbin_file}")
 
         size_mb = xclbin_file.stat().st_size / (1024 * 1024)
-        print(f"  xclbin: {xclbin_file.name} ({size_mb:.1f}MB)")
+        logger.info("  xclbin: %s (%.1fMB)", xclbin_file.name, size_mb)
 
         # Generate emconfig.json for hw_emu
         if target == "hw_emu":
@@ -402,15 +412,15 @@ class XrtBuildPipeline(BuildPipeline):
                     stage_name="emconfigutil",
                 )
                 self._cleanup_stray_files(build_dir)
-                print("  emconfig.json generated")
+                logger.info("  emconfig.json generated")
 
-        print("  done")
+        logger.info("  done")
 
     # ── Stage 6: validate ──
 
     def _stage_validate(self, kernel_dir: Path) -> None:
         """Optional: validate xclbin metadata against kernel_spec."""
-        print(f"[Stage 6] validate: {kernel_dir.name}")
+        logger.info("[Stage 6] validate: %s", kernel_dir.name)
         xrt_cfg = self._config.get("backend", {}).get("xrt", {})
         xclbin_path = xrt_cfg.get("xclbin_path", "")
 
@@ -421,9 +431,9 @@ class XrtBuildPipeline(BuildPipeline):
             spec = self._load_spec(kernel_dir)
             candidate = build_dir / f"{spec.kernel_name}_{target}.xclbin"
             if candidate.exists():
-                print(f"  xclbin exists: {candidate.name}")
+                logger.info("  xclbin exists: %s", candidate.name)
                 return
-            print("  xclbin not found, skip validation")
+            logger.info("  xclbin not found, skip validation")
             return
 
-        print("  xclbin exists, validation passed")
+        logger.info("  xclbin exists, validation passed")

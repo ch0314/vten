@@ -2,7 +2,7 @@
   "test_name": "TestStreamScatter",
   "kernel": "stream_scatter",
   "status": "PASS",
-  "total_cycles": 316,
+  "total_cycles": 282,
   "configs_run": 1,
   "configs_passed": 1,
   "verification_count": 2,

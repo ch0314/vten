@@ -6,7 +6,10 @@ Spec reference: 08_backend_abstraction.md §8
 from __future__ import annotations
 
 import abc
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class BuildPipeline(abc.ABC):
@@ -20,6 +23,57 @@ class BuildPipeline(abc.ABC):
     def __init__(self, project: Path, config: dict) -> None:
         self._project = project
         self._config = config
+
+    # ── Shared IP utilities ──
+
+    @staticmethod
+    def _normalize_ip_config(ip_raw: dict | list | None) -> list[dict]:
+        """Normalize [ip] table or [[ip]] array to unified list[dict].
+
+        Supports:
+          [ip] sources = ["a.xci"]          -> [{"source": "a.xci"}]
+          [[ip]] source = "a.xci"           -> [{"source": "a.xci"}]
+          [[ip]] vlnv = "x:y:z:1.0" ...    -> [{"vlnv": ..., ...}]
+        """
+        if ip_raw is None:
+            return []
+        if isinstance(ip_raw, list):
+            return ip_raw
+        if isinstance(ip_raw, dict):
+            entries: list[dict] = []
+            for src in ip_raw.get("sources", []):
+                entries.append({"source": src})
+            return entries
+        return []
+
+    @staticmethod
+    def _parse_ip_entries(
+        ip_list: list[dict], project: Path,
+    ) -> tuple[list[str], list[dict]]:
+        """Parse unified [[ip]] entries into (ip_sources, ip_create).
+
+        Entries with 'source' key are existing .xci references (glob supported).
+        Entries with 'vlnv' key are declarative IP creation requests.
+        """
+        ip_sources: list[str] = []
+        ip_create: list[dict] = []
+        for entry in ip_list:
+            if "source" in entry:
+                ip_sources.extend(
+                    str(p) for p in sorted(project.glob(entry["source"]))
+                )
+            elif "vlnv" in entry:
+                vendor, library, component, version = entry["vlnv"].split(":")
+                ip_create.append({
+                    "name": entry["name"],
+                    "vendor": vendor,
+                    "library": library,
+                    "component": component,
+                    "version": version,
+                    "output_dir": f"build/ip/{entry['name']}",
+                    "properties": entry.get("properties", {}),
+                })
+        return ip_sources, ip_create
 
     @abc.abstractmethod
     def stages(self) -> list[str]:
@@ -83,9 +137,9 @@ class BuildPipeline(abc.ABC):
         # Per-kernel stages
         for kname in target_kernels:
             kernel_dir = self._project / "kernels" / kname
-            print(f"\n=== Kernel: {kname} ===")
+            logger.info("=== Kernel: %s ===", kname)
             for s in target_stages:
                 if s not in project_stages:
                     self.run_stage(s, kernel_name=kname, kernel_dir=kernel_dir, force=force)
 
-        print("\nBuild complete.")
+        logger.info("Build complete.")

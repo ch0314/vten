@@ -9,10 +9,13 @@ Spec reference: 04_backend_xsim.md §1-6, 06_codegen_and_cli.md §4.4,
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 
 from vten.backend.sim_base import SimBackend
+
+logger = logging.getLogger(__name__)
 
 
 class XsimBackend(SimBackend):
@@ -70,14 +73,22 @@ class XsimBackend(SimBackend):
             "--testplusarg", f"TIMEOUT_MS={self._timeout_ms}",
         ]
 
+        if self._config.get("_sim_verbose"):
+            cmd.extend(["--testplusarg", "VTEN_VERBOSE"])
+
         if self._config.get("_gui"):
             cmd.append("--gui")
         else:
             cmd.extend(["--runall", "--onerror", "quit"])
 
+        logger.info("launching xsim: %s", " ".join(cmd))
+        logger.debug("xsim cwd: %s", xsim_cwd)
+
+        # sim_verbose: let xsim $display go directly to terminal
+        capture_stdout = not self._config.get("_sim_verbose")
         self._process = subprocess.Popen(
             cmd,
             cwd=xsim_cwd,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.PIPE if capture_stdout else None,
             stderr=subprocess.PIPE,
         )

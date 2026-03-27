@@ -8,10 +8,13 @@ Spec reference: 08_backend_abstraction.md §7.3
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 
 from vten.backend.sim_base import SimBackend
+
+logger = logging.getLogger(__name__)
 
 
 class VerilatorBackend(SimBackend):
@@ -66,6 +69,9 @@ class VerilatorBackend(SimBackend):
 
         if self._trace:
             cmd.append("+trace")
+
+        logger.info("launching verilator: %s", " ".join(cmd))
+        logger.debug("verilator cwd: %s", cwd)
 
         self._process = subprocess.Popen(
             cmd,

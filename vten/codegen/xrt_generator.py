@@ -193,6 +193,10 @@ class XrtGenerator:
 
         generated: dict[str, Path] = {}
 
+        # IP entries from build pipeline
+        ip_sources = self._config.get("_ip_sources", [])
+        ip_create = self._config.get("_ip_create", [])
+
         # 1. package_ip.tcl
         content = _render("package_ip.tcl.j2", {
             "kernel_name": kernel_name,
@@ -204,6 +208,8 @@ class XrtGenerator:
             "interfaces": interfaces,
             "registers": registers,
             "part": part,
+            "ip_sources": ip_sources,
+            "ip_create": ip_create,
         })
         path = out / "package_ip.tcl"
         path.write_text(content)

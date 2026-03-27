@@ -1,5 +1,7 @@
 // vten_bfm_axi4s.sv — AXI4-Stream BFM (MASTER/SLAVE via parameter)
 // Reference: specs/05_bfm_library.md §1
+//
+// Diagnostics: +VTEN_VERBOSE (xsim) or +define+VTEN_VERBOSE (verilator)
 
 `include "vten_types.svh"
 `include "vten_dpi_imports.svh"
@@ -32,6 +34,20 @@ module vten_bfm_axi4s #(
     int beat_count, expected_beats;
     int issue_cycle, first_active, last_active;
     int active_cycles, stall_cycles, total_beats;
+
+    // Runtime verbose flag
+    bit verbose;
+    initial begin
+`ifdef VTEN_VERBOSE
+        verbose = 1;
+`else
+  `ifndef VERILATOR
+        verbose = $test$plusargs("VTEN_VERBOSE");
+  `else
+        verbose = 0;
+  `endif
+`endif
+    end
 
     // v0.4.1: idle signal — registered to avoid xsim continuous-assign issue
     // with queue.size() not re-evaluating in assign/always_comb.
@@ -74,6 +90,12 @@ module vten_bfm_axi4s #(
                 active_cycles <= 0;
                 stall_cycles <= 0;
                 total_beats <= 0;
+                if (verbose)
+                    $display("[AXI4S %0t] %s %s iface=%0d cmd#%0d: buf=%0d, %0d bytes (%0d beats)",
+                             $time, MODE, current_cmd.opcode.name(),
+                             current_cmd.interface_id, current_cmd.cmd_id,
+                             current_cmd.buffer_id,
+                             current_cmd.size, current_cmd.size / BYTES_PER_BEAT);
             end
 
             if (cmd_active) begin
@@ -170,5 +192,10 @@ module vten_bfm_axi4s #(
             (first_active == 0) ? cycle_count : first_active,
             cycle_count,
             active_cycles, total_beats, stall_cycles);
+        if (verbose)
+            $display("[AXI4S %0t] %s %s iface=%0d cmd#%0d done: %0d beats, %0d stall cyc, %0d active cyc",
+                     $time, MODE, current_cmd.opcode.name(),
+                     current_cmd.interface_id, current_cmd.cmd_id,
+                     total_beats, stall_cycles, active_cycles);
     endtask
 endmodule

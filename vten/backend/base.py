@@ -188,3 +188,40 @@ class Backend(abc.ABC):
         "hw" for hardware backends (skips SHM packing).
         """
         return "sim"
+
+    # ── Session protocol (multi-batch) ──
+
+    @property
+    def supports_session(self) -> bool:
+        """Whether this backend supports persistent session mode."""
+        return False
+
+    def open_session(self, compiled: CompiledResult) -> None:
+        """Open a persistent session with the first batch's compiled result.
+
+        Creates SHM, starts simulator, waits for ready. The Data Region
+        is preserved across batches for cross-batch buffer aliasing.
+        """
+        raise NotImplementedError
+
+    def submit_batch(self, compiled: CompiledResult) -> None:
+        """Submit a new batch within an open session.
+
+        Updates Command, Stats, and BufferDescriptor regions in-place,
+        writes new tensor data, then signals CMD_READY.
+        """
+        raise NotImplementedError
+
+    def wait_batch(self) -> BackendResult:
+        """Wait for the current batch to complete within a session.
+
+        Does NOT send SHUTDOWN — the simulator stays alive.
+        """
+        raise NotImplementedError
+
+    def close_session(self) -> None:
+        """Close the session: send SHUTDOWN, wait for process exit, cleanup.
+
+        Idempotent — safe to call multiple times.
+        """
+        pass

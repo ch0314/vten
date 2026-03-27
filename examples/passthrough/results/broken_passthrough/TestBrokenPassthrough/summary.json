@@ -1,0 +1,27 @@
+{
+  "test_name": "TestBrokenPassthrough",
+  "kernel": "broken_passthrough",
+  "status": "FAIL",
+  "total_cycles": 0,
+  "configs_run": 1,
+  "configs_passed": 0,
+  "verification_count": 1,
+  "verification_passed": 0,
+  "verification_results": [
+    {
+      "tensor": "data_out",
+      "passed": false,
+      "max_diff": 1.0
+    }
+  ],
+  "error_message": "Verification failed for tensor 'data_out': shape=(1024,), max_diff=1.0",
+  "error_traceback": [
+    "Traceback (most recent call last):\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/cli/run.py\", line 304, in _run_single_test\n    batch_result = ctx.run()\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/runtime/context.py\", line 633, in run\n    self._run_deferred_verifications()\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/runtime/context.py\", line 507, in _run_deferred_verifications\n    raise first_error\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/runtime/context.py\", line 487, in _run_deferred_verifications\n    self._verify_immediate(task.op_handle, task.golden)\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/runtime/context.py\", line 453, in _verify_immediate\n    raise VerificationError(\n",
+    "vten.errors.VerificationError: Verification failed for tensor 'data_out': shape=(1024,), max_diff=1.0\n"
+  ]
+}

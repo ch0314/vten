@@ -1,5 +1,7 @@
 // vten_command_scheduler.sv — Dependency-aware command dispatch
 // Reference: specs/04_backend_xsim.md §10
+//
+// Diagnostics: +VTEN_VERBOSE (xsim) or +define+VTEN_VERBOSE (verilator)
 
 `include "vten_types.svh"
 `include "vten_dpi_imports.svh"
@@ -16,6 +18,8 @@ module vten_command_scheduler #(
     input  bfm_cmd_t    feed_data,
     output logic        feed_ready,
     input  logic        feed_done,     // Batch complete trigger
+    // ← Controller: batch lifecycle
+    input  logic        batch_init,    // Reset scheduler for new batch
     // → Controller: status report
     output logic        all_committed,
     output logic        all_drained,
@@ -56,6 +60,20 @@ module vten_command_scheduler #(
     logic ready     [0:MAX_CMDS-1];  // Combinational
     logic stats_enabled;
 
+    // Runtime verbose flag
+    bit verbose;
+    initial begin
+`ifdef VTEN_VERBOSE
+        verbose = 1;
+`else
+  `ifndef VERILATOR
+        verbose = $test$plusargs("VTEN_VERBOSE");
+  `else
+        verbose = 0;
+  `endif
+`endif
+    end
+
     // ── Per-BFM intermediate signals (xvlog constant-index requirement) ──
     // Output registers (Scheduler → BFM)
     logic     bfm_cmd_valid_r [0:MAX_BFMS-1];
@@ -94,6 +112,17 @@ module vten_command_scheduler #(
             error_flag   <= 0;
             stats_enabled <= 0;
         end else begin
+            // batch_init: force-reset scheduler for new batch (clears stuck state
+            // from prior error where batch_active never drained)
+            if (batch_init) begin
+                if (verbose && batch_active)
+                    $display("[SCHED %0t] batch_init: force-clearing stuck batch (error_flag=%0d)",
+                             $time, error_flag);
+                batch_active <= 0;
+                error_flag   <= 0;
+                num_loaded   <= 0;
+                num_commands <= 0;
+            end
             if (feed_valid && feed_ready) begin
                 cmd_store[num_loaded] <= feed_data;
                 num_loaded <= num_loaded + 1;
@@ -102,6 +131,9 @@ module vten_command_scheduler #(
                 num_commands <= num_loaded;
                 batch_active <= 1;
                 stats_enabled <= (vten_read_flags() & 1) != 0;
+                if (verbose)
+                    $display("[SCHED %0t] batch start: %0d commands, stats=%0b",
+                             $time, num_loaded, (vten_read_flags() & 1) != 0);
                 preprocess_batch(num_loaded);
             end
             if (batch_active && all_drained) begin
@@ -308,6 +340,9 @@ module vten_command_scheduler #(
 
     // ── Error report ──
     task automatic report_error(int cmd_id, int code_val);
+        if (verbose)
+            $display("[SCHED %0t] ERROR: cmd_id=%0d, code=%0d, first=%0b",
+                     $time, cmd_id, code_val, !error_flag);
         if (!error_flag) begin  // Only record first error
             error_flag   <= 1'b1;
             error_cmd_id <= cmd_id[15:0];

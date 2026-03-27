@@ -33,3 +33,6 @@ include = ["vten*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "xsim: requires xsim (Vivado simulator) for E2E execution",
+]

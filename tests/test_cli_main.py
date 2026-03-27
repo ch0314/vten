@@ -227,12 +227,21 @@ class TestMainRunDispatch:
             main(["run", "--test", "TestFoo"])
 
     @patch("vten.cli.run.run_test")
-    def test_run_requires_test(self, mock_run):
-        """--test is required for vten run."""
+    def test_run_without_test_runs_all(self, mock_run):
+        """--test is optional; omitting it runs all tests."""
         from vten.cli.main import main
 
-        with pytest.raises(SystemExit):
-            main(["run", "--kernel", "conv3d"])
+        main(["run", "--kernel", "conv3d"])
+        mock_run.assert_called_once_with(
+            project_dir=".",
+            kernel_name="conv3d",
+            test_name="",
+            backend=None,
+            waveform=False,
+            gui=False,
+            sim_verbose=False,
+            config_overrides=None,
+        )
 
     @patch("vten.cli.run.run_test")
     def test_run_dispatches_correctly(self, mock_run):
@@ -246,6 +255,7 @@ class TestMainRunDispatch:
             backend=None,
             waveform=False,
             gui=False,
+            sim_verbose=False,
             config_overrides=None,
         )
 

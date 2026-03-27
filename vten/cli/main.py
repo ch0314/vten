@@ -11,6 +11,12 @@ import sys
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="vten", description="vTen verification framework")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Verbose output (DEBUG level)")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress info messages (WARNING level)")
+    parser.add_argument("--log-file", default=None,
+                        help="Write debug log to file")
     sub = parser.add_subparsers(dest="command")
 
     # vten init
@@ -40,13 +46,15 @@ def main(argv: list[str] | None = None) -> None:
     # vten run
     run_parser = sub.add_parser("run", help="Run test")
     run_parser.add_argument("--kernel", required=True, help="Kernel name")
-    run_parser.add_argument("--test", required=True, help="Test scenario name")
+    run_parser.add_argument("--test", default=None, help="Test scenario name (omit to run all)")
     run_parser.add_argument("--project", default=".", help="Project directory")
     run_parser.add_argument("--backend", default=None,
         choices=["xsim", "verilator", "xrt"],
         help="Target backend (default: from vten.toml or xsim)")
     run_parser.add_argument("--waveform", action="store_true", help="Enable waveform dump")
     run_parser.add_argument("--gui", action="store_true", help="xsim GUI mode")
+    run_parser.add_argument("-v", "--sim-verbose", action="store_true",
+                            help="Enable simulator verbose output (+VTEN_VERBOSE)")
     run_parser.add_argument("--config", nargs="*", help="Config overrides (K=V)")
 
     # vten report
@@ -55,6 +63,16 @@ def main(argv: list[str] | None = None) -> None:
     report_parser.add_argument("--format", default="terminal", choices=["terminal", "html", "json"])
 
     args = parser.parse_args(argv)
+
+    # Configure logging before any command handler runs
+    from vten.log import setup_logging
+    if args.verbose:
+        log_level = "DEBUG"
+    elif args.quiet:
+        log_level = "WARNING"
+    else:
+        log_level = "INFO"
+    setup_logging(level=log_level, log_file=args.log_file)
 
     if args.command == "init":
         from vten.cli.init_cmd import init_project
@@ -90,13 +108,18 @@ def main(argv: list[str] | None = None) -> None:
             for item in args.config:
                 k, v = item.split("=", 1)
                 overrides[k] = int(v) if v.isdigit() else v
+        # -v on run subcommand enables both sim verbose AND Python DEBUG
+        effective_sim_verbose = args.sim_verbose or args.verbose
+        if effective_sim_verbose and log_level != "DEBUG":
+            setup_logging(level="DEBUG", log_file=args.log_file)
         run_test(
             project_dir=args.project,
             kernel_name=args.kernel,
-            test_name=args.test,
+            test_name=args.test or "",
             backend=args.backend,
             waveform=args.waveform,
             gui=args.gui,
+            sim_verbose=effective_sim_verbose,
             config_overrides=overrides or None,
         )
 

@@ -232,7 +232,11 @@ def _parse_array(raw: dict, iface_name: str) -> ArraySpec:
     # flat_name_pattern: optional — auto-generated from name + dimensions
     # e.g. 1D: "{name}_{i}", 2D: "{name}_{i}_{j}"
     pattern = raw.get("flat_name_pattern")  # None if omitted
-    return ArraySpec(dimensions=dims, flat_name_pattern=pattern)
+    interleave = None
+    if "interleave" in raw:
+        from vten.spec.models import InterleaveSpec
+        interleave = InterleaveSpec(unit=raw["interleave"]["unit"])
+    return ArraySpec(dimensions=dims, flat_name_pattern=pattern, interleave=interleave)
 
 
 def _parse_protocol(value: str, iface_name: str) -> Protocol:
@@ -261,7 +265,7 @@ def _parse_packing(raw: dict) -> PackingScheme:
         scheme.validate_custom_fields()
         return scheme
 
-    return PackingScheme(
+    scheme = PackingScheme(
         element_width=raw["element_width"],
         elements_per_beat=raw["elements_per_beat"],
         bit_order=raw.get("bit_order", "lsb_first"),
@@ -269,6 +273,9 @@ def _parse_packing(raw: dict) -> PackingScheme:
         byte_order=raw.get("byte_order", "little"),
         mode="standard",
     )
+    if "bus_width" in raw:
+        scheme._explicit_bus_width = raw["bus_width"]
+    return scheme
 
 
 def _parse_split(raw: dict) -> SplitSpec:

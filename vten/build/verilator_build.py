@@ -11,10 +11,13 @@ Pipeline stages:
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 
 from vten.build.base import BuildPipeline
+
+logger = logging.getLogger(__name__)
 from vten.build.common import (
     cache_valid,
     dir_hash,
@@ -83,13 +86,13 @@ class VerilatorBuildPipeline(BuildPipeline):
 
     def _stage_dpi_c(self, force: bool) -> None:
         """Compile DPI-C shared library (same as xsim, no Vivado includes)."""
-        print("[Stage 1] dpi_c")
+        logger.info("[Stage 1] dpi_c")
         src_c = self._vten_sv_dir / "vten_shm_bridge.c"
         src_h = self._vten_sv_dir / "vten_shm_bridge.h"
         current = dir_hash([p for p in [src_c, src_h] if p.exists()])
 
         if not force and cache_valid(self._cache, "dpi_c", current):
-            print("  cached, skip")
+            logger.info("  cached, skip")
             return
 
         so_path = self._project / "build" / "lib" / "libvten_shm.so"
@@ -110,11 +113,11 @@ class VerilatorBuildPipeline(BuildPipeline):
             raise BuildError(f"gcc failed:\n{result.stderr}")
 
         update_cache(self._cache, "dpi_c", current)
-        print("  done")
+        logger.info("  done")
 
     def _stage_codegen(self, kernel_dir: Path) -> None:
         """Generate testbench SV from kernel_spec.yaml (same as xsim)."""
-        print(f"[Stage 2] codegen: {kernel_dir.name}")
+        logger.info("[Stage 2] codegen: %s", kernel_dir.name)
         from vten.build.xsim_build import _derive_bfm_configs, _expand_split_interfaces
 
         spec_path = kernel_dir / "kernel_spec.yaml"
@@ -137,11 +140,11 @@ class VerilatorBuildPipeline(BuildPipeline):
                 f.unlink()
         output.mkdir(parents=True, exist_ok=True)
         gen.generate(str(output), num_commands=256)
-        print("  done")
+        logger.info("  done")
 
     def _stage_verilate(self, kernel_dir: Path) -> None:
         """Run verilator --cc --exe to generate C++ model."""
-        print(f"[Stage 3] verilate: {kernel_dir.name}")
+        logger.info("[Stage 3] verilate: %s", kernel_dir.name)
         tb_top = kernel_dir / "build" / "generated" / "tb_top.sv"
         if not tb_top.exists():
             raise BuildError(
@@ -211,11 +214,11 @@ class VerilatorBuildPipeline(BuildPipeline):
             detail = result.stderr[-1000:] if result.stderr else result.stdout[-1000:]
             raise BuildError(f"verilator failed:\n{detail}")
 
-        print("  done")
+        logger.info("  done")
 
     def _stage_make(self, kernel_dir: Path) -> None:
         """Build Verilator binary from generated C++ sources."""
-        print(f"[Stage 4] make: {kernel_dir.name}")
+        logger.info("[Stage 4] make: %s", kernel_dir.name)
         obj_dir = kernel_dir / "build" / "obj_dir"
         makefile = obj_dir / "Vtb_top.mk"
         if not makefile.exists():
@@ -235,4 +238,4 @@ class VerilatorBuildPipeline(BuildPipeline):
         if result.returncode != 0:
             raise BuildError(f"make failed:\n{result.stderr[-500:]}")
 
-        print("  done")
+        logger.info("  done")
