@@ -18,8 +18,8 @@ trace = false
 sources = ["rtl/**/*.sv", "rtl/**/*.v"]
 tb_module = "tb_top"
 
-[ip]
-sources = ["ip/**/*.xci"]
+[[ip]]
+source = "ip/**/*.xci"
 
 [test]
 default_seed = 42

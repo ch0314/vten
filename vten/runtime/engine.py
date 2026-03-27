@@ -927,12 +927,21 @@ class RuntimeEngine:
                 exposed._serialized_size = num_beats * (packing.bus_width // 8)
 
             # Multi-port split → _port_buffers
-            if iface_spec.split and exposed._serialized is not None:
+            if iface_spec.split:
                 split_spec = _parse_split_spec(iface_spec.split)
-                splitter = MultiPortSerializer()
-                exposed._port_buffers = splitter.split_tensor(
-                    exposed._serialized, split_spec
-                )
+                if exposed._serialized is not None:
+                    splitter = MultiPortSerializer()
+                    exposed._port_buffers = splitter.split_tensor(
+                        exposed._serialized, split_spec
+                    )
+                else:
+                    # Output tensor: allocate empty per-port buffers
+                    n_ports = len(split_spec.ports)
+                    per_port_size = exposed._serialized_size // n_ports
+                    exposed._port_buffers = {
+                        p.name: bytes(per_port_size)
+                        for p in split_spec.ports
+                    }
                 exposed._port_mode = split_spec.mode
                 if split_spec.interleave:
                     exposed._interleave_unit = split_spec.interleave.unit

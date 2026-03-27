@@ -1,0 +1,33 @@
+kernel: multi_port_scatter
+rtl_top: rtl/multi_port_passthrough.sv
+
+interfaces:
+  din:
+    rtl_port: din
+    protocol: axi4_stream
+    role: slave
+    tensor: data_in
+    split:
+      mode: block_split
+      ports:
+        - { name: din_0 }
+        - { name: din_1 }
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first
+
+  dout:
+    rtl_port: dout
+    protocol: axi4_stream
+    role: master
+    tensor: data_out
+    split:
+      mode: block_split
+      ports:
+        - { name: dout_0 }
+        - { name: dout_1 }
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first

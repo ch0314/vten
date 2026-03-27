@@ -69,6 +69,7 @@ def _expand_split_interfaces(spec: KernelSpec) -> KernelSpec:
                     tensor=iface.tensor,
                     tensors=iface.tensors,
                     packing=iface.packing,
+                    role=iface.role,
                 )
         else:
             expanded[name] = iface
@@ -79,7 +80,10 @@ def _expand_split_interfaces(spec: KernelSpec) -> KernelSpec:
 
 
 def _infer_bfm_role(iface: InterfaceSpec) -> str:
-    """Infer BFM role from protocol and interface conventions."""
+    """Infer BFM role from explicit role, protocol, and interface conventions."""
+    if iface.role:
+        # Explicit role: slave DUT port → BFM drives (master), and vice versa
+        return "master" if iface.role == "slave" else "slave"
     if iface.protocol == Protocol.AXI4L:
         return "master"
     if iface.protocol == Protocol.AXI4:
@@ -133,6 +137,8 @@ class XsimBuildPipeline(BuildPipeline):
         self._vten_root = Path(__file__).resolve().parent.parent.parent
         self._vten_sv_dir = self._vten_root / "vten_sv"
         self._cache = load_cache(project / "build" / ".cache.json")
+        # Normalize [ip] table format to [[ip]] list format
+        self._config["ip"] = self._normalize_ip_config(self._config.get("ip"))
 
     def stages(self) -> list[str]:
         return list(self._STAGES)
@@ -157,7 +163,7 @@ class XsimBuildPipeline(BuildPipeline):
             if force:
                 self._invalidate_kernel_cache(kernel_name)
             if self._kernel_cache_valid(kernel_name, stage, kernel_dir):
-                print(f"[{stage}] {kernel_name}: cached, skip")
+                logger.info("[%s] %s: cached, skip", stage, kernel_name)
                 return
             # Run stage
             if stage == "codegen":
@@ -180,10 +186,58 @@ class XsimBuildPipeline(BuildPipeline):
 
     # ── Stage implementations ──
 
+    @staticmethod
+    def _normalize_ip_config(ip_raw: dict | list | None) -> list[dict]:
+        """Normalize [ip] table or [[ip]] array to unified list[dict].
+
+        Supports:
+          [ip] sources = ["a.xci"]          -> [{"source": "a.xci"}]
+          [[ip]] source = "a.xci"           -> [{"source": "a.xci"}]
+          [[ip]] vlnv = "x:y:z:1.0" ...    -> [{"vlnv": ..., ...}]
+        """
+        if ip_raw is None:
+            return []
+        if isinstance(ip_raw, list):
+            return ip_raw
+        # dict form: [ip] table with sources key
+        if isinstance(ip_raw, dict):
+            entries: list[dict] = []
+            for src in ip_raw.get("sources", []):
+                entries.append({"source": src})
+            return entries
+        return []
+
+    @staticmethod
+    def _parse_ip_entries(ip_list: list[dict], project: Path) -> tuple[list[str], list[dict]]:
+        """Parse unified [[ip]] entries into (ip_sources, ip_create).
+
+        Entries with 'source' key are existing .xci references (glob supported).
+        Entries with 'vlnv' key are declarative IP creation requests.
+        """
+        ip_sources: list[str] = []
+        ip_create: list[dict] = []
+        for entry in ip_list:
+            if "source" in entry:
+                ip_sources.extend(
+                    str(p) for p in sorted(project.glob(entry["source"]))
+                )
+            elif "vlnv" in entry:
+                vendor, library, component, version = entry["vlnv"].split(":")
+                ip_create.append({
+                    "name": entry["name"],
+                    "vendor": vendor,
+                    "library": library,
+                    "component": component,
+                    "version": version,
+                    "output_dir": f"build/ip/{entry['name']}",
+                    "properties": entry.get("properties", {}),
+                })
+        return ip_sources, ip_create
+
     def _project_setup_hash(self) -> str:
         h = hashlib.sha256()
         h.update(json.dumps(self._config.get("rtl", {}), sort_keys=True).encode())
-        h.update(json.dumps(self._config.get("ip", {}), sort_keys=True).encode())
+        h.update(json.dumps(self._config.get("ip", []), sort_keys=True).encode())
         h.update(
             self._config.get("backend", {}).get("xsim", {}).get("part", "").encode()
         )
@@ -194,27 +248,32 @@ class XsimBuildPipeline(BuildPipeline):
         for glob_pat in self._config.get("rtl", {}).get("sources", []):
             for p in sorted(self._project.glob(glob_pat)):
                 h.update(p.read_bytes())
-        for glob_pat in self._config.get("ip", {}).get("sources", []):
-            for p in sorted(self._project.glob(glob_pat)):
-                h.update(p.read_bytes())
+        # Hash existing .xci file contents
+        for entry in self._config.get("ip", []):
+            if "source" in entry:
+                for p in sorted(self._project.glob(entry["source"])):
+                    h.update(p.read_bytes())
         return h.hexdigest()
 
     def _stage_project_setup(self, force: bool) -> None:
-        print("[Stage 1] project_setup")
+        logger.info("[Stage 1] project_setup")
         current = self._project_setup_hash()
         if not force and cache_valid(self._cache, "project_setup", current):
-            print("  cached, skip")
+            logger.info("  cached, skip")
             return
 
         rtl_patterns = self._config.get("rtl", {}).get("sources", [])
         rtl_files = expand_globs(self._project, rtl_patterns)
 
+        ip_sources, ip_create = self._parse_ip_entries(
+            self._config.get("ip", []), self._project,
+        )
+
         tcl = render_template("project_setup.tcl.j2", {
             "rtl_files": rtl_files,
             "include_dirs": self._config.get("rtl", {}).get("include_dirs", []),
-            "ip_sources": expand_globs(
-                self._project, self._config.get("ip", {}).get("sources", []),
-            ),
+            "ip_sources": ip_sources,
+            "ip_create": ip_create,
         })
         tcl_path = self._project / "build" / "project_setup.tcl"
         tcl_path.parent.mkdir(parents=True, exist_ok=True)
@@ -232,16 +291,16 @@ class XsimBuildPipeline(BuildPipeline):
         )
 
         update_cache(self._cache, "project_setup", current)
-        print("  done")
+        logger.info("  done")
 
     def _stage_dpi_c(self, force: bool) -> None:
-        print("[Stage 2] dpi_c")
+        logger.info("[Stage 2] dpi_c")
         src_c = self._vten_sv_dir / "vten_shm_bridge.c"
         src_h = self._vten_sv_dir / "vten_shm_bridge.h"
         current = dir_hash([p for p in [src_c, src_h] if p.exists()])
 
         if not force and cache_valid(self._cache, "dpi_c", current):
-            print("  cached, skip")
+            logger.info("  cached, skip")
             return
 
         so_path = self._project / "build" / "lib" / "libvten_shm.so"
@@ -266,10 +325,11 @@ class XsimBuildPipeline(BuildPipeline):
             text=True,
         )
         if result.returncode != 0:
+            logger.debug("gcc stderr:\n%s", result.stderr)
             raise BuildError(f"gcc failed:\n{result.stderr}")
 
         update_cache(self._cache, "dpi_c", current)
-        print("  done")
+        logger.info("  done")
 
     # ── Per-kernel cache system ──
 
@@ -405,7 +465,7 @@ class XsimBuildPipeline(BuildPipeline):
                     break
 
             if needs_build:
-                print(f"\n  --- Auto-building sub-kernel: {sname} ---")
+                logger.info("  --- Auto-building sub-kernel: %s ---", sname)
                 for stage in ("codegen", "compile_order", "compile"):
                     if not self._kernel_cache_valid(sname, stage, sub_dir):
                         self.run_stage(
@@ -418,7 +478,7 @@ class XsimBuildPipeline(BuildPipeline):
     # ── Stage implementations ──
 
     def _stage_codegen(self, kernel_dir: Path, force: bool = False) -> None:
-        print(f"[Stage 3] codegen: {kernel_dir.name}")
+        logger.info("[Stage 3] codegen: %s", kernel_dir.name)
 
         from vten.build.composite import is_composite_kernel
 
@@ -440,7 +500,7 @@ class XsimBuildPipeline(BuildPipeline):
         output = kernel_dir / "build" / "generated"
         output.mkdir(parents=True, exist_ok=True)
         gen.generate(str(output), num_commands=256)
-        print("  done")
+        logger.info("  done")
 
     def _stage_codegen_composite(self, kernel_dir: Path, force: bool = False) -> None:
         """Composite kernel codegen: auto-build sub-kernels + synthesize spec + generate wrapper."""
@@ -476,10 +536,10 @@ class XsimBuildPipeline(BuildPipeline):
             project_config=self._config,
         )
         gen.generate(str(output), num_commands=256)
-        print("  done")
+        logger.info("  done")
 
     def _stage_compile_order(self, kernel_dir: Path) -> None:
-        print(f"[Stage 4] compile_order: {kernel_dir.name}")
+        logger.info("[Stage 4] compile_order: %s", kernel_dir.name)
         tb_top = kernel_dir / "build" / "generated" / "tb_top.sv"
         prj_out = kernel_dir / "build" / "compile.prj"
 
@@ -547,10 +607,10 @@ class XsimBuildPipeline(BuildPipeline):
                     "\n".join(sub_lines) + "\n" + existing
                 )
 
-        print("  done")
+        logger.info("  done")
 
     def _stage_compile(self, kernel_dir: Path) -> None:
-        print(f"[Stage 5] compile: {kernel_dir.name}")
+        logger.info("[Stage 5] compile: %s", kernel_dir.name)
         prj = kernel_dir / "build" / "compile.prj"
         dpi_lib = self._project / "build" / "lib" / "libvten_shm"
 
@@ -576,7 +636,31 @@ class XsimBuildPipeline(BuildPipeline):
             cwd=str(build_dir),
         )
         if result.returncode != 0:
+            logger.debug("xvlog stdout:\n%s", result.stdout)
+            logger.debug("xvlog stderr:\n%s", result.stderr)
+            logger.error("xvlog log: %s", log_dir / "xvlog.log")
             raise BuildError(f"xvlog failed:\n{result.stderr[-500:]}")
+
+        # Compile glbl.v if backend.xsim.glbl is set (Xilinx primitive library support)
+        xsim_cfg = self._config.get("backend", {}).get("xsim", {})
+        use_glbl = xsim_cfg.get("glbl", False)
+        if use_glbl:
+            glbl_path = (
+                Path(self._vivado_path) / "data" / "verilog" / "src" / "glbl.v"
+            )
+            result = subprocess.run(
+                [
+                    f"{self._vivado_path}/bin/xvlog",
+                    str(glbl_path),
+                    "--log", str(log_dir / "xvlog_glbl.log"),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(build_dir),
+            )
+            if result.returncode != 0:
+                logger.debug("xvlog glbl stderr:\n%s", result.stderr)
+                raise BuildError(f"xvlog glbl.v failed:\n{result.stderr[-500:]}")
 
         # Determine elab top from compile.prj
         elab_top = "tb_top"
@@ -600,10 +684,17 @@ class XsimBuildPipeline(BuildPipeline):
             if lib != "work":
                 lib_args += ["-L", lib]
 
+        # Append IP-specific xelab libraries (unisims_ver, xpm, etc.)
+        for lib in xsim_cfg.get("xelab_libs", []):
+            lib_args += ["-L", lib]
+
         # xelab
+        elab_tops = [elab_top]
+        if use_glbl:
+            elab_tops.append("work.glbl")
         result = subprocess.run(
             [
-                f"{self._vivado_path}/bin/xelab", elab_top,
+                f"{self._vivado_path}/bin/xelab", *elab_tops,
                 *lib_args,
                 "--sv_lib", dpi_lib.name,
                 "--sv_root", str(dpi_lib.parent),
@@ -618,6 +709,9 @@ class XsimBuildPipeline(BuildPipeline):
             cwd=str(build_dir),
         )
         if result.returncode != 0:
+            logger.debug("xelab stdout:\n%s", result.stdout)
+            logger.debug("xelab stderr:\n%s", result.stderr)
+            logger.error("xelab log: %s", log_dir / "xelab.log")
             detail = result.stdout[-500:] if result.stdout else result.stderr[-500:]
             raise BuildError(f"xelab failed:\n{detail}")
 
@@ -634,4 +728,4 @@ class XsimBuildPipeline(BuildPipeline):
                 if f.is_file():
                     f.rename(log_dir / f.name)
 
-        print("  done")
+        logger.info("  done")
