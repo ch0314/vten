@@ -462,6 +462,43 @@ class TestMultiBatchSessionE2E:
                 pass
 
     @pytest.mark.xsim
+    def test_session_growing_tensor_sizes(self):
+        """E2.6: Multi-batch with increasing tensor sizes triggers SHM resize.
+
+        Batch 1: N=256 (small SHM), Batch 2: N=1024 (4x larger SHM),
+        Batch 3: N=4096 (16x larger SHM). Each batch must trigger
+        ftruncate + remap on the C bridge side.
+        """
+        project, config, backend = _load_passthrough_env()
+        spec = parse_kernel_spec(project / "kernels" / "passthrough" / "kernel_spec.yaml")
+        KernelClass = _get_passthrough_kernel(project)
+
+        prev_cwd = os.getcwd()
+        os.chdir(str(project))
+        try:
+            session_open = False
+            for N in [256, 1024, 4096]:
+                ctx = ExecutionContext(backend=backend, project_params={"N": N})
+                ctx._session_open = session_open
+                ki = ctx.instantiate(KernelClass, spec=spec, N=N)
+                ki.generate_inputs(seed=N)
+                h_load = ctx.load_tensor(ki.data_in)
+                ctx.push_tensor(ki.data_in, dep=h_load)
+                h_pull = ctx.pull_tensor(ki.data_out, dep=h_load)
+                ctx.verify(h_pull, ki.forward())
+                result = ctx.run()
+                session_open = ctx._session_open
+                assert result.status == "DONE", f"Failed at N={N}"
+
+            backend.close_session()
+        finally:
+            os.chdir(prev_cwd)
+            try:
+                backend.cleanup()
+            except Exception:
+                pass
+
+    @pytest.mark.xsim
     def test_session_executor_close(self):
         """E2.5: Open session, execute once, close cleanly."""
         project, config, backend = _load_passthrough_env()
