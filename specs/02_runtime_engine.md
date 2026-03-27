@@ -511,6 +511,27 @@ Stage 7 ──► 최종 SHM 바이트 이미지
 - Stage 3b는 Stage 2 필요 (golden 직렬화에 해결된 형상 필요)
 - Stage 3b는 Stage 4와 독립 (golden은 서브커널 패킹 사용)
 
+### 4.2 Multi-Config Compilation (compile_multi)
+
+단일 배치에 여러 config 그룹을 묶어 컴파일한다. `config_boundary()`로 구분된 N개 config를 하나의 SHM 이미지로 합성.
+
+```python
+@staticmethod
+def compile_multi(engines: list[RuntimeEngine], target: str = "sim") -> CompiledResult:
+    """여러 config 그룹을 단일 배치로 컴파일.
+
+    각 engine은 독립 compile()을 수행한 후:
+    1. cmd_id를 누적 오프셋으로 재배정
+    2. buffer_id를 'cfg{idx}:{name}' 접두사로 prefix
+    3. config 간 BARRIER 커맨드 자동 삽입
+    4. 모든 SHM 영역을 하나의 이미지로 합성
+    """
+```
+
+**Buffer naming convention**: multi-config에서 각 config의 버퍼는 `cfg{idx}:{tensor_name}` 키로 구분된다. 예: `cfg0:data_in`, `cfg1:data_in`, `cfg2:data_out`.
+
+**Verify 시 config_group 참조**: `_verify_immediate()`는 `Operation.config_group`을 참조하여 해당 config의 `views[config_group]`과 `cfg{config_group}:` prefix를 사용해 올바른 버퍼 데이터에 접근한다.
+
 ---
 
 ## 5. Stage 0: Composite Kernel Flattening
@@ -812,11 +833,18 @@ def _serialize_tensors(self, view):
             exposed._serialized_size = num_beats * (packing.bus_width // 8)
 
         # 멀티포트 분할 → _port_buffers (split)
-        if iface_spec.split and exposed._serialized is not None:
+        if iface_spec.split:
             split_spec = _parse_split_spec(iface_spec.split)
-            splitter = MultiPortSerializer()
-            exposed._port_buffers = splitter.split_tensor(
-                exposed._serialized, split_spec)
+            if exposed._serialized is not None:
+                splitter = MultiPortSerializer()
+                exposed._port_buffers = splitter.split_tensor(
+                    exposed._serialized, split_spec)
+            else:
+                # 출력 텐서: 포트별 빈 버퍼 할당
+                n_ports = len(split_spec.ports)
+                per_port_size = exposed._serialized_size // n_ports
+                exposed._port_buffers = {
+                    p.name: bytes(per_port_size) for p in split_spec.ports}
             exposed._port_mode = split_spec.mode
             if split_spec.interleave:
                 exposed._interleave_unit = split_spec.interleave.unit

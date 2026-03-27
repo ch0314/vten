@@ -1369,3 +1369,60 @@ assign all_drained = all_committed && all_bfm_idle;
 | Phase 2: Ready eval | Combinational | `committed` 비트맵, sync chain, barrier fence 대비 `ready[i]` 평가. |
 | Phase 3: Dispatch | Sequential | Ready 커맨드를 BFM에 디스패치 (BFM당 1개/사이클) 또는 내부 commit (STORE/BARRIER). |
 | Phase 4: Stats | Sequential | `STATS_ENABLED` 시 DPI-C로 Stats 엔트리 기록. |
+
+---
+
+## 11. Session Management Protocol
+
+단일 xsim 프로세스에서 여러 배치를 연속 실행하는 세션 모드. 시뮬레이터 기동 비용을 배치 수에 관계없이 1회로 줄인다.
+
+### 11.1 세션 수명주기
+
+```
+open_session(compiled)     ← SHM 생성, xsim 프로세스 기동, 초기 배치 제출
+    │
+    ├── wait_batch()       ← 완료 대기 → BackendResult 반환
+    │
+    ├── submit_batch(compiled)  ← 새 배치 데이터를 SHM data region에 덮어쓰기
+    │   └── wait_batch()       ← 완료 대기
+    │   ...                    (반복)
+    │
+    └── close_session()    ← SHUTDOWN 전송, xsim 프로세스 종료, SHM 정리
+```
+
+### 11.2 API
+
+```python
+class Backend(abc.ABC):
+    @property
+    def supports_session(self) -> bool:
+        """세션 모드 지원 여부. SimBackend만 True."""
+        return False
+
+    def open_session(self, compiled: CompiledResult) -> None:
+        """세션 시작: SHM 생성 + 시뮬레이터 기동 + 초기 배치 제출."""
+        ...
+
+    def submit_batch(self, compiled: CompiledResult) -> None:
+        """세션 내 후속 배치 제출. SHM data region 덮어쓰기.
+
+        주의: data region 전체를 새 배치 데이터로 교체하므로,
+        이전 배치의 버퍼 데이터에 대한 alias 참조가 무효화된다.
+        따라서 sim backend에서는 cross-batch alias를 비활성화해야 한다.
+        """
+        ...
+
+    def wait_batch(self) -> BackendResult:
+        """현재 배치 완료 대기. 시뮬레이터는 종료하지 않음."""
+        ...
+
+    def close_session(self) -> None:
+        """세션 종료: SHUTDOWN 전송 + 프로세스 종료 + SHM 정리."""
+        ...
+```
+
+### 11.3 SHM 재사용 규칙
+
+- `submit_batch()`는 SHM의 **control + command + data** 영역을 모두 덮어쓴다
+- 시뮬레이터 프로세스와 세마포어는 유지된다
+- **Cross-batch alias 제약**: data region 덮어쓰기로 인해 이전 배치 출력 버퍼가 소실. sim backend에서는 `KernelExecutor`의 auto-alias를 비활성화하고 매 배치마다 full LOAD/STORE를 수행한다

@@ -1,6 +1,6 @@
 # vTen BFM Library
 
-**Version 0.4.2 — March 2026**
+**Version 0.5.0 — March 2026**
 **참조: `00_data_models.md`, `04_backend_xsim.md` (Scheduler ↔ BFM Interface)**
 **소스: 메인 스펙 §11.16-11.19, §12**
 

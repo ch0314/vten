@@ -1200,6 +1200,7 @@ class Operation:
     sync: bool = False
     golden: torch.Tensor | None = None       # verify()에서 설정
     verify: bool = False
+    config_group: int = 0                    # multi-config 그룹 인덱스 (config_boundary()로 증가)
 
 
 @dataclass
@@ -1754,6 +1755,9 @@ class CompiledResult:
     # SIM 경로에서는 shm_image에 데이터 포함. XRT 경로에서는 이 필드로 직접 접근.
     iface_id_to_name: dict[int, str] = field(default_factory=dict)
     # 🆕 v0.5.0: interface_id → interface name (reporting 용)
+    views: list[FlattenedKernelView] | None = None
+    # 🆕 v0.6.0: multi-config 컴파일 시 config별 FlattenedKernelView.
+    # compile_multi()에서 설정. 단일 config 시 None.
 
 
 @dataclass

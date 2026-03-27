@@ -1,6 +1,6 @@
 # vTen kernel_spec.yaml Complete Schema
 
-**Version 0.4.2 — March 2026**
+**Version 0.5.0 — March 2026**
 **참조 모델: `00_data_models.md` (KernelSpec, InterfaceSpec, PackingScheme 등)**
 **Status: Phase 1 구현 전 완성 필요**
 
@@ -139,10 +139,69 @@ AXI4 인터페이스에서 `memory_region` 필드로 참조된다.
 ```yaml
 interfaces:
   <name>:
-    rtl_port: <string>       # REQUIRED. RTL 포트 접두사
+    rtl_port: <string>       # OPTIONAL. RTL 포트 접두사 (기본값: 자동 생성)
     protocol: <protocol>     # REQUIRED. axi4_stream | axi4 | axi4_lite
+    array:                   # OPTIONAL. 인터페이스 배열 (§5.2)
+      dimensions: [N]
+      flat_name_pattern: "..."
     ... (프로토콜별 필드)
 ```
+
+### 5.1 rtl_port 기본값 자동 생성 (v0.5.0)
+
+> **이전: `12_interface_array_and_port_naming.md` §2 — 본 문서로 병합.**
+
+`rtl_port`가 생략되면 protocol + role + name으로 자동 생성:
+
+```python
+_PREFIX = {
+    ("axi4_stream", "master"): "m_axis_",
+    ("axi4_stream", "slave"):  "s_axis_",
+    ("axi4", "master"):        "m_axi_",
+    ("axi4", "slave"):         "s_axi_",
+    ("axi4_lite", "slave"):    "s_axilite_",
+    ("axi4_lite", "master"):   "m_axilite_",
+}
+rtl_port = _PREFIX[(protocol, role)] + name
+```
+
+예: `name: wgt`, `protocol: axi4_stream`, `role: slave` → `rtl_port: s_axis_wgt`
+
+이 규칙은 Vitis v++ linker의 `stream_connect`, `sp` 설정과 호환된다.
+
+### 5.2 array Sub-Schema (v0.5.0)
+
+> **이전: `12_interface_array_and_port_naming.md` §3.1 — 본 문서로 병합.**
+
+하나의 논리 인터페이스가 복수의 물리 포트로 확장될 때 사용:
+
+```yaml
+interfaces:
+  wgt:
+    protocol: axi4_stream
+    role: slave
+    data_width: 256
+    array:
+      dimensions: [32, 2]              # 2D: [32][2] = 64 ports
+      flat_name_pattern: "wgt_{i}_{j}" # 선택. 기본: {name}_{i}_{j}
+```
+
+| 필드 | 타입 | 필수 | 기본값 |
+|------|------|------|--------|
+| `dimensions` | list[int] | ✓ | — |
+| `flat_name_pattern` | string | — | `{name}_{i}` (1D), `{name}_{i}_{j}` (2D) |
+
+**인덱스 변수**: `{i}`, `{j}`, `{k}` (각 차원별, 0부터)
+
+**flat 포트 이름 생성**:
+```
+{rtl_port_prefix} + flat_name_pattern.format(i=..., j=...) + "_{signal}"
+```
+예: `s_axis_wgt_0_0_tdata`, `s_axis_wgt_31_1_tlast`
+
+**DataClass**: `ArraySpec(dimensions: list[int], flat_name_pattern: str | None)`
+- `total_elements`: 모든 차원의 곱
+- `flat_names(base_name)`: 전체 요소의 flat 이름 리스트 생성
 
 ---
 
@@ -343,15 +402,46 @@ split:
 
 ## 11. registers Sub-Schema
 
+> **v0.5.0**: `user_register_base` 및 offset 자동 할당 추가 (이전: `11_axilite_codegen_enhancement.md` §2.1).
+
 ```yaml
 registers:
   - name: <string>             # REQUIRED. 레지스터 이름
-    offset: <int>              # REQUIRED. 바이트 오프셋
+    offset: <int>              # OPTIONAL. 바이트 오프셋 (생략 시 자동 할당)
     fields:                    # OPTIONAL. 비트 필드 매핑
       <field_name>: "<hi>:<lo>"
+    access: <string>           # OPTIONAL. rw | ro | wo | w1c (기본: "rw")
+    pulse: <bool>              # OPTIONAL. true이면 1-cycle pulse (기본: false)
+    reset_value: <int>         # OPTIONAL. 리셋 값 (기본: 0)
     auto_bind:                 # OPTIONAL. 자동 바인딩
       { ... }
 ```
+
+### 11.1 user_register_base와 Offset 자동 할당
+
+Vitis/XRT 커널은 AXI-Lite 주소 0x00~0x13을 시스템 레지스터로 예약한다.
+`InterfaceSpec.user_register_base` (기본값: `0x14`)가 자동 할당의 시작점이다.
+
+```yaml
+interfaces:
+  ctrl:
+    protocol: axi4_lite
+    user_register_base: 0x14    # 기본값. Vitis 예약: 0x00-0x13
+    registers:
+      - name: in_depth          # offset 생략 → 0x14
+        fields: { value: "31:0" }
+      - name: in_height         # offset 생략 → 0x18
+        fields: { value: "31:0" }
+      - name: src_addr
+        offset: 0x30            # 명시적 offset → 그대로 사용
+        fields: { value: "31:0" }
+```
+
+| 규칙 | 설명 |
+|------|------|
+| offset 명시 | 그대로 사용 |
+| offset 생략 (첫 번째) | `user_register_base`부터 시작 |
+| offset 생략 (이후) | 이전 레지스터 + 4 bytes |
 
 ---
 

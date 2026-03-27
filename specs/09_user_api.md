@@ -192,6 +192,7 @@ print(result.status)  # "DONE"
 |--------|------|------|
 | `ctx.send_tensor(t)` | load + push | H2D 텐서 전체 전송 |
 | `ctx.recv_tensor(t)` | pull + store | D2H 텐서 전체 수신 |
+| `ctx.recv_tensor(t, chunks=N)` | N × (pull + store) | D2H 텐서를 N 청크로 분할 수신 |
 
 **검증 & 버퍼 재사용**
 
@@ -220,7 +221,39 @@ store = ctx.store_tensor(k.ofm, dep=pull)
 ctx.verify(store, k.forward())
 ```
 
-### 3.4 BatchResult
+### 3.4 Chunked Receive (`chunks=`)
+
+DUT가 depth slice 사이에 tready rising edge를 요구하는 경우 등, 전송을 시간적으로 분할해야 할 때 사용한다. 선언적 Tensor 하나로 per-chunk 분할 수신이 가능하다.
+
+```python
+# chunks=N (int): N등분
+handles = ctx.recv_tensor(k.partial_sum, chunks=in_depth, dep=h_cfg)
+# → list[OperationHandle], 각 chunk별 handle
+
+# chunks=[n0, n1, ...] (list[int]): element count 직접 지정
+handles = ctx.recv_tensor(k.output, chunks=[100, 200, 100], dep=h_cfg)
+```
+
+**동작 원리:**
+- 직렬화된 바이트 스트림을 N등분하여 분할 수신 (C-contiguous = **axis 0 기준**)
+- 각 chunk는 별도의 PULL 커맨드 그룹으로 lowering됨
+- BFM이 커맨드 사이에 tready를 deassert/reassert → edge-triggered DUT에 필요한 rising edge 제공
+- Array interface와 결합 가능: 각 chunk가 array element별로 분할됨
+
+> **제약:** 현재 axis 0 기준 분할만 지원. 임의 축 분할(`axis=` 파라미터)은 추후 지원 예정.
+
+**Per-chunk 검증:**
+```python
+handles = ctx.recv_tensor(k.psum, chunks=4, dep=h_cfg)
+for d in range(4):
+    ctx.verify(handles[d], golden_per_depth[d])
+```
+
+**반환 타입:**
+- `chunks=None` (기본값): `OperationHandle` — 기존 동작과 동일
+- `chunks=N` 또는 `chunks=[...]`: `list[OperationHandle]`
+
+### 3.5 BatchResult
 
 ```python
 result = ctx.run()
@@ -382,6 +415,9 @@ $ vten build --kernel passthrough
 # 실행
 $ vten run --kernel passthrough --test test_passthrough
 
+# 모든 테스트 실행 (--test 생략)
+$ vten run --kernel passthrough
+
 # 파형 덤프 포함 실행
 $ vten run --kernel passthrough --test test_passthrough --waveform
 
@@ -498,7 +534,8 @@ assert torch.allclose(hw_out.float(), golden.float(), atol=1e-3)
 | `vten build --kernel <name>` | 특정 커널만 빌드 |
 | `vten build --upto codegen` | 특정 단계까지만 빌드 |
 | `vten build --skip-compile` | 코드 생성만 (컴파일 생략) |
-| `vten run --kernel <name> --test <test>` | 테스트 실행 |
+| `vten run --kernel <name> --test <test>` | 특정 테스트 실행 |
+| `vten run --kernel <name>` | 모든 테스트 실행 (--test 생략) |
 | `vten run ... --waveform` | 파형 덤프 포함 |
 | `vten run ... --gui` | xsim GUI 모드 |
 | `vten report` | 결과 리포트 |
@@ -522,6 +559,9 @@ $ vten build --kernel conv3d
 
 # 5. 실행
 $ vten run --kernel conv3d --test test_conv3d
+
+# 5-b. 모든 테스트 실행 (--test 생략)
+$ vten run --kernel conv3d
 
 # 6. 디버그 (파형 확인)
 $ vten run --kernel conv3d --test test_conv3d --waveform --gui
@@ -577,7 +617,38 @@ from vten import run_kernel, KernelExecutor
 # 1회성
 outputs = run_kernel(MyKernel, {"t_in": x}, backend=b, params={...}, configure=True)
 
-# 반복 (auto-alias)
+# 반복 (auto-alias, multi-batch session 자동 관리)
 npu = KernelExecutor(MyKernel, backend=b, params={...}, configure=True)
 y = npu(t_in=x, _params={...})["t_out"]
+```
+
+### Multi-Config (Level 1 — 단일 배치, 복수 config)
+
+```python
+ctx = ExecutionContext(backend=b, project_params={"N": 1024})
+
+for cfg in [{"scale_factor": 1}, {"scale_factor": 2}, {"scale_factor": 3}]:
+    ki = ctx.instantiate(MyKernel, **cfg)
+    ki.generate_inputs(seed=42)
+    h_load = ctx.load_tensor(ki.data_in)
+    h_push = ctx.push_tensor(ki.data_in, dep=h_load)
+    h_pull = ctx.pull_tensor(ki.data_out, dep=h_push)
+    ctx.verify(h_pull, ki.forward())
+    ctx.config_boundary()           # BARRIER 삽입 + config_group 증가
+
+result = ctx.run()                  # 1회 xsim 실행으로 3개 config 검증
+```
+
+### Multi-Batch Session (Level 2 — KernelExecutor)
+
+```python
+with KernelExecutor(MyKernel, backend=b, params={...}) as npu:
+    # 배치 1
+    y1 = npu(t_in=x1)["t_out"]     # open_session → submit → wait
+    assert torch.equal(y1, expected1)
+
+    # 배치 2 (동일 xsim 프로세스 재사용)
+    y2 = npu(t_in=x2)["t_out"]     # submit_batch → wait_batch
+    assert torch.equal(y2, expected2)
+                                    # close_session (context manager exit)
 ```

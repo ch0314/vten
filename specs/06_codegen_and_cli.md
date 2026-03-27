@@ -16,6 +16,8 @@
 6. [vten.toml Reference](#6-vtentoml-reference)
 7. [Multi-Kernel Project Structure](#7-multi-kernel-project-structure)
 8. [Staged Build Pipeline](#8-staged-build-pipeline)
+9. [SV Interface Library](#9-sv-interface-library)
+10. [AXI-Lite Controller & Wrapper Auto-Generation](#10-axi-lite-controller--wrapper-auto-generation)
 
 ---
 
@@ -28,7 +30,14 @@ templates/
 ├── tb_top.sv.j2                # DUT 인스턴스화, 클럭/리셋, BFM 연결
 ├── bfm_instantiation.sv.j2     # BFMConfig 기반 BFM 인스턴스 생성 (include)
 ├── wire_declarations.sv.j2     # DUT-BFM 와이어 선언 (include)
+├── axilite_ctrl.sv.j2          # AXI-Lite Controller 자동 생성 (§1.4)
+├── wrapper.sv.j2               # Controller + Core Wrapper 자동 생성 (§1.4)
 ├── project_setup.tcl.j2        # Vivado 프로젝트 생성 (Stage 1)
+├── package_ip.tcl.j2           # XRT IP 패키징
+├── gen_xo.tcl.j2               # XRT XO 생성
+├── kernel.xml.j2               # XRT 커널 메타데이터
+├── connectivity.cfg.j2          # XRT 커넥티비티
+├── build_xrt.sh.j2             # XRT 빌드 스크립트
 └── resolve_order.tcl           # 컴파일 순서 해석 (Stage 4)
 ```
 
@@ -373,9 +382,11 @@ kernels/conv3d/build/
 ```bash
 $ vten run --kernel conv3d --test test_conv3d [--backend xsim] [--waveform] [--waveform-on-fail]
 $ vten run --kernel conv3d --test test_conv3d --gui   # xsim GUI 모드
+$ vten run --kernel conv3d                             # --test 생략 → 모든 테스트 실행
 ```
 
 **`--kernel`은 필수.** 커널별 빌드 산출물과 테스트 디렉토리를 특정한다.
+**`--test`는 선택.** 생략 시 `kernels/<kernel>/tests/` 아래 모든 `TestScenario` 서브클래스를 디스커버리하여 순차 실행한다.
 
 **단계:**
 1. `kernels/<kernel>/build/` 에서 빌드 산출물 확인 (없으면 에러)
@@ -496,6 +507,8 @@ part = "xcu250-figd2104-2L-e"    # FPGA part (Vivado 프로젝트 생성에 필�
 compile_options = ["-timescale", "1ns/1ps"]
 timeout_ms = 0                    # 0 = batch mode (10s default)
 submit_timeout_s = 300
+xelab_libs = ["unisims_ver", "xpm"]  # xelab -L 플래그 (IP가 Xilinx primitive 사용 시)
+glbl = true                      # glbl.v 컴파일 + xelab 포함 (IP가 글로벌 시그널 사용 시)
 
 [backend.scheduler]              # OPTIONAL. 자동 계산 값보다 큰 경우에만 적용
 # max_bfms = 48                  # default: max(8, BFM 수)
@@ -511,8 +524,14 @@ sources = ["rtl/**/*.sv", "rtl/**/*.v"]   # 공유 RTL (프로젝트 루트 기�
 top_module = "NPU_3D_top"                  # DUT 탑 모듈 (커널별 오버라이드 가능)
 include_dirs = ["rtl/include"]
 
-[ip]                             # OPTIONAL. Vivado IP 정의
-sources = ["ip/**/*.xci"]        # .xci 파일 경로 (글로브 지원, PROJECT_ROOT 기준)
+[[ip]]                           # OPTIONAL. 기존 .xci 참조 (글로브 지원, PROJECT_ROOT 기준)
+source = "ip/**/*.xci"
+
+[[ip]]                           # 선언형 IP 생성 (Vivado create_ip)
+name = "uram_ifm"                # 모듈 인스턴스 이름
+vlnv = "xilinx.com:ip:uram_rd_back:1.0"   # Vendor:Library:Name:Version
+output_dir = "ip/common/uram_ifm"          # .xci 생성 위치 (PROJECT_ROOT 기준)
+properties = { BWE_MODE_A = "PARITY_INTERLEAVED", NUM_URAM = "1" }
 
 [test]
 default_seed = 42
@@ -697,10 +716,20 @@ foreach src $rtl_sources {
 # 4) include 디렉토리 설정
 set_property include_dirs $include_dirs [get_filesets sim_1]
 
-# 5) IP 등록 + 시뮬레이션 소스 생성
+# 5-a) IP 생성 (선언형 — [[ip.create]] 엔트리)
+foreach ip $ip_create_list {
+    create_ip -name $component -vendor $vendor -library $library \
+              -version $version -module_name $name \
+              -dir $project_root/$output_dir
+    # set_property -dict [list CONFIG.<prop> <val>] [get_ips $name]
+}
+
+# 5-b) IP 등록 (기존 .xci 참조)
 foreach xci $ip_sources {
     add_files $xci
 }
+
+# 5-c) 시뮬레이션 소스 생성
 if {[llength [get_ips]] > 0} {
     generate_target simulation [get_ips *]
 }
@@ -857,13 +886,23 @@ Stage 4에서 생성된 .prj 파일로 xvlog 컴파일 후 xelab elaboration:
 xvlog --sv --prj kernels/conv3d/build/compile.prj \
     --work work=kernels/conv3d/build/xsim.dir/work
 
+# glbl.v 컴파일 (ip.glbl = true 일 때)
+xvlog $VIVADO/data/verilog/src/glbl.v
+
 # xelab: DPI-C 링크 + elaboration
-xelab tb_top \
+# ip.xelab_libs → -L 플래그 추가 (예: -L unisims_ver -L xpm)
+# ip.glbl → work.glbl 추가
+xelab tb_top [work.glbl] \
+    [-L unisims_ver] [-L xpm] \
     --sv_lib build/lib/libvten_shm \
     --timescale 1ns/1ps \
     --debug typical \
     --snapshot kernels/conv3d/build/xsim.dir/tb_top
 ```
+
+**Xilinx Primitive Library 지원:**
+- `ip.xelab_libs`: IP가 unisim primitive (URAM288 등)나 XPM 매크로를 사용하면 해당 라이브러리를 xelab `-L` 플래그로 추가해야 한다.
+- `ip.glbl`: Xilinx IP 중 글로벌 시그널(`GSR`, `GTS` 등)을 사용하는 경우 `glbl.v`를 컴파일하고 xelab에 `work.glbl`을 포함해야 한다.
 
 ### 8.7 CLI 옵션 상세
 
@@ -902,3 +941,148 @@ templates/
 
 기존 `build_xsim.tcl.j2`, `run_xsim.tcl.j2`, `Makefile.j2`는 삭제.
 xvlog/xelab/xsim 호출은 Python (`vten/cli/build.py`, `vten/cli/run.py`)에서 직접 subprocess로 실행.
+
+---
+
+## 9. SV Interface Library
+
+> **이전: `10_sv_convenience.md` §4 — v0.5.0에서 본 문서로 병합.**
+
+`vten_sv/`에 고정 라이브러리로 제공. 빌드 시 자동 컴파일에 포함.
+
+### 9.1 vten_axis_if.sv
+
+```systemverilog
+interface vten_axis_if #(parameter int DATA_W = 256);
+    logic [DATA_W-1:0] tdata;
+    logic              tvalid, tready, tlast;
+    modport master (output tdata, tvalid, tlast, input  tready);
+    modport slave  (input  tdata, tvalid, tlast, output tready);
+endinterface
+```
+
+### 9.2 vten_aximm_if.sv
+
+AW/W/B/AR/R 5채널, 파라미터: `DATA_W=256`, `ADDR_W=64`.
+
+### 9.3 vten_axilite_if.sv
+
+AW/W/B/AR/R 5채널, 파라미터: `ADDR_W=32`, `DATA_W=32`.
+
+사용자 core에서 SV interface modport로 깔끔하게 포트를 선언할 수 있다:
+
+```systemverilog
+module my_core (
+    input  logic clk, rst_n,
+    input  logic [31:0] reg_length,
+    vten_axis_if.slave   s_axis,
+    vten_aximm_if.master m_axi
+);
+```
+
+---
+
+## 10. AXI-Lite Controller & Wrapper Auto-Generation
+
+> **이전: `10_sv_convenience.md` §5-6 — v0.5.0에서 본 문서로 병합.**
+
+### 10.1 동기
+
+DUT 설계자는 커널마다 동일한 AXI-Lite 보일러플레이트를 반복 작성한다:
+
+| 보일러플레이트 | 줄 수 (stream_dma 기준) |
+|---------------|------------------------|
+| AXI-Lite slave Write FSM | ~56줄 |
+| AXI-Lite slave Read FSM | ~27줄 |
+| AXI4/AXI4-Stream 개별 신호 나열 | ~55줄 |
+
+`kernel_spec.yaml`에 레지스터 맵이 이미 선언되어 있으므로 자동 생성 가능.
+
+### 10.2 활성화
+
+`kernel_spec.yaml`의 AXI4-Lite 인터페이스에 `generate_controller: true` 설정:
+
+```yaml
+interfaces:
+  ctrl:
+    protocol: axi4_lite
+    role: slave
+    generate_controller: true
+    registers:
+      - name: start
+        offset: 0x14
+        pulse: true
+      - name: status
+        offset: 0x18
+        access: ro
+```
+
+### 10.3 생성 파일
+
+| 파일 | 내용 |
+|------|------|
+| `<kernel>_axilite_ctrl.sv` | AW/W handshake, address decode, B response, AR/R read path |
+| `<kernel>_wrapper.sv` | controller + user core 연결, 외부 flat 포트 ↔ 내부 SV interface 변환 |
+
+### 10.4 Before / After 비교 (stream_dma)
+
+| | Before (수동) | After (자동 생성) |
+|---|--------|-------|
+| 포트 선언 | 48개 개별 신호 (62줄) | 5 레지스터 + 2 SV interface (12줄) |
+| AXI-Lite FSM | 83줄 수동 작성 | 없음 (자동 생성) |
+| DMA 로직 | 105줄 | 105줄 (동일) |
+| **총** | **293줄** | **~120줄** |
+
+### 10.5 레지스터 포트 방향 규칙
+
+| access | pulse | 포트 방향 | 설명 |
+|--------|-------|----------|------|
+| `rw` | false | `output` | host writes, core reads |
+| `rw` | true | `output` (1-cycle pulse) | host triggers, controller auto-clear |
+| `ro` | — | `input` | core drives, host reads |
+| `wo` | — | `output` | host writes only |
+| `w1c` | — | `input` | core sets bits, host clears by writing 1 |
+
+### 10.6 빌드 통합
+
+`vten build` 시 `codegen` 스테이지에서 자동 생성:
+
+```python
+# sv_generator.py
+if self._has_generate_controller():
+    for iface in spec.interfaces.values():
+        if iface.generate_controller:
+            self._generate_axilite_ctrl(env, out, iface)
+    self._generate_wrapper(env, out)
+```
+
+생성된 파일은 `kernels/<name>/build/generated/`에 저장되고, compile에 자동 포함.
+
+### 10.7 Wrapper Detection & Port Naming
+
+테스트벤치 코드생성 시, DUT가 wrapper를 가지는지에 따라 포트 네이밍 규칙이 달라진다.
+
+**Wrapper 존재 판별:**
+```python
+has_wrapper = self._has_generate_controller() or not self.spec.rtl_top
+```
+
+- `_has_generate_controller()`: 단일 커널이 `generate_controller: true` 인터페이스를 가짐
+- `not self.spec.rtl_top`: Composite 커널 (자동 생성 wrapper, `rtl_top=""`)
+
+**적용 규칙:**
+
+| 항목 | `has_wrapper = True` | `has_wrapper = False` |
+|------|---------------------|----------------------|
+| BFM port prefix | `ext_port` (Vitis 규약: `s_axi_`, `s_axis_`, `m_axis_`) | `rtl_port` (사용자 RTL 원본 포트명) |
+| DUT top module | `kernel_name` (wrapper가 최상위) | `rtl_top` 파일명 stem |
+
+**Clock/Reset은 별도 규칙:**
+
+| 조건 | clock | reset |
+|------|-------|-------|
+| `_has_generate_controller()` only | `ap_clk` | `ap_aresetn` |
+| Composite (`not rtl_top`) | `spec.clock_name` (e.g. `clk`) | `spec.reset_name` (e.g. `rst_n`) |
+| Raw RTL | `spec.clock_name` | `spec.reset_name` |
+
+> **Note**: Composite wrapper는 내부적으로 sub-kernel wrapper에 `ap_clk`/`ap_aresetn`을 전달하지만, 자체 외부 포트는 spec의 native clock/reset 이름을 사용한다.

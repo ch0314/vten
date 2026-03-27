@@ -327,11 +327,41 @@ class BackendResult:
         return self.output_buffers.get(buffer_id, b"")
 ```
 
-### 5.5 클래스 계층
+### 5.5 Session Management Methods
+
+SimBackend가 제공하는 multi-batch 세션 인터페이스. 단일 시뮬레이터 프로세스에서 여러 배치를 연속 실행한다.
+
+```python
+class Backend(abc.ABC):
+    @property
+    def supports_session(self) -> bool:
+        """세션 모드 지원 여부. 기본 False."""
+        return False
+
+    def open_session(self, compiled: CompiledResult) -> None:
+        """세션 시작 + 초기 배치 제출."""
+        raise NotImplementedError
+
+    def submit_batch(self, compiled: CompiledResult) -> None:
+        """세션 내 후속 배치 제출 (SHM data region 덮어쓰기)."""
+        raise NotImplementedError
+
+    def wait_batch(self) -> BackendResult:
+        """현재 배치 완료 대기 (시뮬레이터 유지)."""
+        raise NotImplementedError
+
+    def close_session(self) -> None:
+        """세션 종료: SHUTDOWN + 정리."""
+        raise NotImplementedError
+```
+
+**Alias 제약**: `submit_batch()`가 SHM data region을 덮어쓰므로, sim backend에서는 cross-batch alias가 동작하지 않는다. `KernelExecutor`는 `compile_target == "sim"`일 때 auto-alias를 비활성화한다.
+
+### 5.6 클래스 계층
 
 ```
 Backend (ABC)
-├── SimBackend (ABC) — SHM 핸드셰이크 공통 로직
+├── SimBackend (ABC) — SHM 핸드셰이크 공통 로직 + Session 관리
 │   ├── XsimBackend — Vivado xsim 프로세스 관리
 │   └── VerilatorBackend — Verilator 바이너리 관리
 └── XrtBackend — XRT/pyxrt 기반 FPGA 실행

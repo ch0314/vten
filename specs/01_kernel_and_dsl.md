@@ -1,6 +1,6 @@
 # vTen Kernel Abstraction & DSL Operations
 
-**Version 0.4.2 — March 2026**
+**Version 0.5.0 — March 2026**
 **참조 모델: `00_data_models.md` (Tensor, Kernel, CompositeKernel, OpKind, register())**
 **소스: 메인 스펙 §3-5, §10 + 서플리먼트 §18 (errata)**
 
@@ -266,6 +266,7 @@ class ComplexPipelineKernel(Kernel):
 | Shorthand | `send_tensor` | = load + push (자동, alias 시 push만) | 두 단계 모두 | push만 |
 | | `recv_tensor` | = pull + store (자동, alias source 시 pull만) | 두 단계 모두 | pull만 |
 | | `alias` | 버퍼 재사용 선언 (Invocation 간) | 동일 | 동일 |
+| | `config_boundary` | multi-config 그룹 경계 표시 | BARRIER 삽입 + config_group 증가 | 동일 |
 
 ### 3.2 Dependency Model
 
