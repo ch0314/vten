@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from vten.errors import VTenError
+
 
 # ── Backend-specific TOML templates (08_backend_abstraction.md §9.3) ──
 
@@ -107,16 +109,16 @@ def _add_backend(root: Path, backend_name: str) -> None:
     """Add a backend section to an existing project's vten.toml."""
     toml_path = root / "vten.toml"
     if not toml_path.exists():
-        raise FileNotFoundError(f"vten.toml not found in {root}")
+        raise VTenError(f"vten.toml not found in {root}")
 
     content = toml_path.read_text()
     section_header = f"[backend.{backend_name}]"
     if section_header in content:
-        raise ValueError(f"{section_header} section already exists in vten.toml")
+        raise VTenError(f"{section_header} section already exists in vten.toml")
 
     template = _BACKEND_TOML_TEMPLATES.get(backend_name)
     if template is None:
-        raise ValueError(f"Unknown backend: {backend_name}")
+        raise VTenError(f"Unknown backend: {backend_name}")
 
     # Append backend section
     if not content.endswith("\n"):

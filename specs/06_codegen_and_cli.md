@@ -429,6 +429,66 @@ $ vten report [--format terminal|html|json]
 
 **출력:** 터미널 보고서, HTML 보고서, 또는 JSON (§5.2 of `05_bfm_library.md` 참조)
 
+### 4.6 CLI 에러 처리 및 Exit Code
+
+#### 공통 플래그
+
+| 플래그 | 설명 |
+|--------|------|
+| `-v, --verbose` | DEBUG 로그 레벨 + 에러 발생 시 full traceback 출력 |
+| `-q, --quiet` | WARNING 로그 레벨 (INFO 메시지 억제) |
+| `--log-file <path>` | 디버그 로그를 파일에 기록 (타임스탬프 포함) |
+
+#### Exit Code
+
+| Code | 의미 | 조건 |
+|------|------|------|
+| 0 | 성공 | 명령 정상 완료 |
+| 1 | 예상된 사용자 에러 | `VTenError` 계열 예외 (설정 누락, 빌드 실패, 잘못된 인자 등) |
+| 2 | 예상치 못한 내부 에러 | vTen 내부 버그 |
+| 130 | 사용자 중단 | Ctrl-C (`KeyboardInterrupt`) |
+
+#### 에러 출력 형식
+
+`VTenError` 계열 예외는 traceback 없이 메시지만 출력한다:
+
+```
+$ vten build
+ERROR cli       | vten.toml not found in .
+$ echo $?
+1
+```
+
+예상치 못한 예외는 `-v` 안내와 함께 요약만 출력한다:
+
+```
+$ vten build --kernel conv3d
+ERROR cli       | internal error: 'weight_transposed'
+ERROR cli       | Re-run with -v for full traceback.
+$ echo $?
+2
+```
+
+`-v` 옵션 시 full traceback을 출력한다:
+
+```
+$ vten -v build --kernel conv3d
+ERROR cli       | internal error
+Traceback (most recent call last):
+  ...
+KeyError: 'weight_transposed'
+```
+
+#### Top-level 핸들러 계층
+
+`main()` 에서 모든 서브커맨드를 감싸는 에러 핸들러 우선순위:
+
+1. `KeyboardInterrupt` → `"interrupted"`, exit 130
+2. `VTenError` (및 모든 서브클래스) → 에러 메시지 출력, exit 1
+3. `Exception` (기타) → `"internal error"` + `-v` 안내, exit 2
+
+`vten run` 내부에서 이미 처리하는 에러 (`ProbeMismatchError`, `VerificationError`, `BackendError`)는 run 내부에서 결과를 `summary.json`에 기록한 후 정상 종료(exit 0)한다. 이 에러들은 top-level 핸들러까지 전파되지 않는다.
+
 ---
 
 ## 5. Error Propagation Path

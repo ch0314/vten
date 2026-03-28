@@ -216,6 +216,67 @@ def check_sub_kernels_built(
     return unbuilt
 
 
+# ── Probe Info Extraction ──
+
+
+def extract_probe_bfm_info(
+    composite_cls: type,
+    project: Path,
+) -> list[dict]:
+    """Extract probe BFM info from composite class for codegen.
+
+    Returns a list of dicts, one per probed internal connection:
+      - probe_index: sequential index (0, 1, ...)
+      - wire_name: internal wire name in composite wrapper (e.g. "internal_0")
+      - data_width: bus width of the internal wire
+      - connection_index: index into connections list
+    """
+    from vten.kernel.composite import Internal
+
+    bindings = dict(composite_cls._sub_kernel_bindings)
+    connections = list(composite_cls._connections)
+
+    # Build set of (sub_name, sub_iface_name) that are Internal(probe=True)
+    probed_interfaces: set[tuple[str, str]] = set()
+    for sub_name, binding in bindings.items():
+        for sub_iface_name, mapping in binding.interface_map.items():
+            if isinstance(mapping, Internal) and mapping.probe:
+                probed_interfaces.add((sub_name, sub_iface_name))
+
+    probe_bfms = []
+    probe_index = 0
+    for conn_idx, conn in enumerate(connections):
+        # A connection is probed if either end's interface is Internal(probe=True)
+        src_key = (conn.source_sub, conn.source_interface)
+        dst_iface = _find_dest_interface(conn, bindings)
+        dst_key = (conn.dest_sub, dst_iface) if dst_iface else None
+
+        is_probed = src_key in probed_interfaces or (
+            dst_key is not None and dst_key in probed_interfaces
+        )
+        if not is_probed:
+            continue
+
+        # Get data width from source interface
+        src_binding = bindings[conn.source_sub]
+        src_spec = _load_sub_kernel_spec(src_binding.kernel_class, project)
+        src_iface = src_spec.interfaces.get(conn.source_interface)
+        data_w = 256
+        if src_iface and src_iface.packing:
+            data_w = src_iface.packing.bus_width
+
+        wire_name = f"internal_{conn_idx}"
+        probe_bfms.append({
+            "probe_index": probe_index,
+            "wire_name": wire_name,
+            "data_width": data_w,
+            "connection_index": conn_idx,
+        })
+        probe_index += 1
+
+    return probe_bfms
+
+
 # ── Composite SV Generation ──
 
 
@@ -247,32 +308,55 @@ def generate_composite_sv(
             "binding": binding,
         })
 
-    # Build internal wire list from connections
+    # Build internal wire list from connections.
+    # Array interfaces expand into one wire per element.
     internal_wires = []
     for idx, conn in enumerate(connections):
-        wire_name = f"internal_{idx}"
-        # Find the source interface spec to get DATA_W
+        wire_base = f"internal_{idx}"
         src_sub = conn.source_sub
         src_binding = bindings[src_sub]
         src_spec = _load_sub_kernel_spec(src_binding.kernel_class, project)
         src_iface = src_spec.interfaces.get(conn.source_interface)
-        data_w = 256  # default
+        data_w = 256
         if src_iface and src_iface.packing:
             data_w = src_iface.packing.bus_width
         protocol = src_iface.protocol if src_iface else Protocol.AXI4S
-        addr_w = 64  # default
-        if src_iface:
-            addr_w = src_iface.addr_width or 64
-        internal_wires.append({
-            "name": wire_name,
-            "data_w": data_w,
-            "protocol": protocol,
-            "addr_w": addr_w,
-            "source_sub": src_sub,
-            "source_iface": conn.source_interface,
-            "dest_sub": conn.dest_sub,
-            "dest_iface": _find_dest_interface(conn, bindings),
-        })
+        addr_w = src_iface.addr_width or 64 if src_iface else 64
+        dest_iface_name = _find_dest_interface(conn, bindings)
+
+        if src_iface and src_iface.array:
+            flat_src = src_iface.array.flat_names(conn.source_interface)
+            # Resolve dest flat names
+            dest_binding = bindings[conn.dest_sub]
+            dest_spec = _load_sub_kernel_spec(dest_binding.kernel_class, project)
+            dest_iface = dest_spec.interfaces.get(dest_iface_name) if dest_iface_name else None
+            flat_dst = dest_iface.array.flat_names(dest_iface_name) if (dest_iface and dest_iface.array) else flat_src
+            for ei, (sf, df) in enumerate(zip(flat_src, flat_dst)):
+                suffix = sf[len(conn.source_interface):]
+                internal_wires.append({
+                    "name": f"{wire_base}{suffix}",
+                    "data_w": data_w,
+                    "protocol": protocol,
+                    "addr_w": addr_w,
+                    "source_sub": src_sub,
+                    "source_iface": conn.source_interface,
+                    "source_flat": sf,
+                    "dest_sub": conn.dest_sub,
+                    "dest_iface": dest_iface_name,
+                    "dest_flat": df,
+                    "is_array_element": True,
+                })
+        else:
+            internal_wires.append({
+                "name": wire_base,
+                "data_w": data_w,
+                "protocol": protocol,
+                "addr_w": addr_w,
+                "source_sub": src_sub,
+                "source_iface": conn.source_interface,
+                "dest_sub": conn.dest_sub,
+                "dest_iface": dest_iface_name,
+            })
 
     # Generate SV
     lines = []
@@ -372,17 +456,39 @@ def _generate_port_lines(iface_name: str, iface: InterfaceSpec) -> list[str]:
     elif iface.protocol == Protocol.AXI4S:
         dw = iface.packing.bus_width if iface.packing else 256
         rp = iface.ext_port
-        lines.append(f"// {iface_name}: AXI4-Stream")
-        if rp.startswith("s_"):
-            lines.append(f"input  logic [{dw-1}:0] {rp}_tdata")
-            lines.append(f"input  logic          {rp}_tvalid")
-            lines.append(f"output logic          {rp}_tready")
-            lines.append(f"input  logic          {rp}_tlast")
+        # Array expansion: one port set per element
+        if iface.array:
+            flat_names = iface.array.flat_names(iface_name)
+            lines.append(f"// {iface_name}: AXI4-Stream array[{iface.array.total_elements}]")
+            for fn in flat_names:
+                suffix = fn[len(iface_name):]
+                erp = f"{rp}{suffix}"
+                if rp.startswith("s_"):
+                    lines.extend([
+                        f"input  logic [{dw-1}:0] {erp}_tdata",
+                        f"input  logic          {erp}_tvalid",
+                        f"output logic          {erp}_tready",
+                        f"input  logic          {erp}_tlast",
+                    ])
+                else:
+                    lines.extend([
+                        f"output logic [{dw-1}:0] {erp}_tdata",
+                        f"output logic          {erp}_tvalid",
+                        f"input  logic          {erp}_tready",
+                        f"output logic          {erp}_tlast",
+                    ])
         else:
-            lines.append(f"output logic [{dw-1}:0] {rp}_tdata")
-            lines.append(f"output logic          {rp}_tvalid")
-            lines.append(f"input  logic          {rp}_tready")
-            lines.append(f"output logic          {rp}_tlast")
+            lines.append(f"// {iface_name}: AXI4-Stream")
+            if rp.startswith("s_"):
+                lines.append(f"input  logic [{dw-1}:0] {rp}_tdata")
+                lines.append(f"input  logic          {rp}_tvalid")
+                lines.append(f"output logic          {rp}_tready")
+                lines.append(f"input  logic          {rp}_tlast")
+            else:
+                lines.append(f"output logic [{dw-1}:0] {rp}_tdata")
+                lines.append(f"output logic          {rp}_tvalid")
+                lines.append(f"input  logic          {rp}_tready")
+                lines.append(f"output logic          {rp}_tlast")
     elif iface.protocol == Protocol.AXI4:
         dw = iface.data_width or 256
         aw = iface.addr_width or 64
@@ -458,14 +564,18 @@ def _generate_sub_kernel_instance(
             continue
 
         if isinstance(mapping, Internal):
-            # Find the internal wire for this connection
-            wire = _find_internal_wire(
+            wire_or_wires = _find_internal_wire(
                 sub_name, sub_iface_name, internal_wires
             )
-            if wire:
-                port_connections.extend(
-                    _wire_to_internal(sub_iface, wire)
-                )
+            if wire_or_wires is not None:
+                if isinstance(wire_or_wires, list):
+                    port_connections.extend(
+                        _wire_array_to_internal(sub_iface, sub_name, wire_or_wires)
+                    )
+                else:
+                    port_connections.extend(
+                        _wire_to_internal(sub_iface, wire_or_wires)
+                    )
         elif isinstance(mapping, str):
             # External mapping — connect to top-level ports
             top_iface = top_spec.interfaces.get(mapping)
@@ -492,16 +602,24 @@ def _generate_sub_kernel_instance(
 
 def _find_internal_wire(
     sub_name: str, sub_iface_name: str, internal_wires: list[dict]
-) -> dict | None:
-    """Find the internal wire connected to this sub-kernel interface."""
+) -> dict | list[dict] | None:
+    """Find internal wire(s) for a sub-kernel interface.
+
+    Returns list for array interfaces, single dict for scalar.
+    """
+    matches = []
     for wire in internal_wires:
         if (wire["source_sub"] == sub_name and
                 wire["source_iface"] == sub_iface_name):
-            return wire
-        if (wire["dest_sub"] == sub_name and
+            matches.append(wire)
+        elif (wire["dest_sub"] == sub_name and
                 wire["dest_iface"] == sub_iface_name):
-            return wire
-    return None
+            matches.append(wire)
+    if not matches:
+        return None
+    if len(matches) == 1 and not matches[0].get("is_array_element"):
+        return matches[0]
+    return matches
 
 
 def _declare_internal_wire(wire: dict) -> list[str]:
@@ -585,6 +703,22 @@ def _declare_internal_wire(wire: dict) -> list[str]:
         )
 
 
+def _wire_array_to_internal(
+    sub_iface: InterfaceSpec, sub_name: str, wires: list[dict]
+) -> list[str]:
+    """Wire array sub-kernel ports to per-element internal wires."""
+    conns = []
+    rp = sub_iface.ext_port
+    base = sub_iface.name
+    for wire in wires:
+        wn = wire["name"]
+        flat = wire.get("source_flat") if wire.get("source_sub") == sub_name else wire.get("dest_flat")
+        suffix = flat[len(base):] if flat else ""
+        for sig in ["tdata", "tvalid", "tready", "tlast"]:
+            conns.append(f".{rp}{suffix}_{sig}({wn}_{sig})")
+    return conns
+
+
 def _wire_to_internal(
     sub_iface: InterfaceSpec, wire: dict
 ) -> list[str]:
@@ -646,8 +780,19 @@ def _wire_to_top(
                      "rvalid", "rready"]:
             conns.append(f".{sub_rp}_{sig}({top_rp}_{sig})")
     elif sub_iface.protocol == Protocol.AXI4S:
-        for sig in ["tdata", "tvalid", "tready", "tlast"]:
-            conns.append(f".{sub_rp}_{sig}({top_rp}_{sig})")
+        if sub_iface.array:
+            sb = sub_iface.name
+            tb = top_iface.name
+            for sf, tf in zip(
+                sub_iface.array.flat_names(sb),
+                top_iface.array.flat_names(tb) if top_iface.array else sub_iface.array.flat_names(sb),
+            ):
+                ss, ts = sf[len(sb):], tf[len(tb):]
+                for sig in ["tdata", "tvalid", "tready", "tlast"]:
+                    conns.append(f".{sub_rp}{ss}_{sig}({top_rp}{ts}_{sig})")
+        else:
+            for sig in ["tdata", "tvalid", "tready", "tlast"]:
+                conns.append(f".{sub_rp}_{sig}({top_rp}_{sig})")
     elif sub_iface.protocol == Protocol.AXI4:
         for sig in ["araddr", "arlen", "arsize", "arburst", "arvalid", "arready",
                      "rdata", "rresp", "rlast", "rvalid", "rready",

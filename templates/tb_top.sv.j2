@@ -167,6 +167,15 @@ module tb_top;
     logic [15:0] sched_error_cmd_id;
     logic [15:0] sched_error_code;
 
+{% if probe_bfms %}
+    // Probe error signals (OR'd together for controller)
+{% for probe in probe_bfms %}
+    logic probe_error_{{ probe.probe_index }};
+{% endfor %}
+    logic probe_error_any;
+    assign probe_error_any = {% for probe in probe_bfms %}probe_error_{{ probe.probe_index }}{{ " | " if not loop.last else "" }}{% endfor %};
+{% endif %}
+
     vten_shm_controller #(
         .MAX_CMDS({{ max_cmds }})
     ) shm_ctrl (
@@ -181,7 +190,8 @@ module tb_top;
         .sched_all_drained(sched_all_drained),
         .sched_error(sched_error),
         .sched_error_cmd_id(sched_error_cmd_id),
-        .sched_error_code(sched_error_code)
+        .sched_error_code(sched_error_code),
+        .probe_error({{ "probe_error_any" if probe_bfms else "1'b0" }})
     );
 
     // ── Command Scheduler ──
@@ -312,6 +322,23 @@ module tb_top;
     assign bfm_cmd[{{ i }}].done_error_code = 16'd0;
 {% endif %}
 {% endfor %}
+
+{% if probe_bfms %}
+    // ── Probe BFM Instantiations (passive internal wire monitors) ──
+{% for probe in probe_bfms %}
+    vten_bfm_axi4s_probe #(
+        .DATA_W({{ probe.data_width }}),
+        .PROBE_INDEX({{ probe.probe_index }})
+    ) probe_{{ probe.probe_index }} (
+        .clk({{ clock_name }}),
+        .tdata(dut.{{ probe.wire_name }}_tdata),
+        .tvalid(dut.{{ probe.wire_name }}_tvalid),
+        .tready(),
+        .tlast(dut.{{ probe.wire_name }}_tlast),
+        .probe_error(probe_error_{{ probe.probe_index }})
+    );
+{% endfor %}
+{% endif %}
 
     // ── Timeout ──
     initial begin

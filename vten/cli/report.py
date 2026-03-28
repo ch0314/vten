@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from vten.errors import VTenError
+
 
 def _scan_results(results_dir: Path) -> list[dict]:
     """Scan results directory, supporting both flat and nested layouts.
@@ -71,15 +73,15 @@ def generate_report(project_dir: str, format: str = "terminal") -> str:
     results_dir = Path(project_dir) / "results"
 
     if format not in ("terminal", "html", "json"):
-        raise ValueError(f"Unsupported report format: {format}")
+        raise VTenError(f"Unsupported report format: {format}")
 
     if not results_dir.exists() or not any(results_dir.iterdir()):
-        raise FileNotFoundError(f"No results found in {results_dir}")
+        raise VTenError(f"No results found in {results_dir}")
 
     report_data = _scan_results(results_dir)
 
     if not report_data:
-        raise FileNotFoundError(f"No test results in {results_dir}")
+        raise VTenError(f"No test results in {results_dir}")
 
     if format == "json":
         return json.dumps(report_data, indent=2)

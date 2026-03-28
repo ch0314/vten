@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING
 
-from vten.errors import BackendError, BFMError, PollTimeoutError
+from vten.errors import BackendError, BFMError, PollTimeoutError, ProbeMismatchError
 from vten.errors import TimeoutError as VTenTimeoutError
 
 if TYPE_CHECKING:
@@ -41,6 +41,7 @@ _ERROR_MAP: dict[int, type[BackendError]] = {
     BackendErrorCode.ADDR_UNMATCH: BFMError,
     BackendErrorCode.POLL_TIMEOUT: PollTimeoutError,
     BackendErrorCode.BFM_QUEUE_ERROR: BFMError,
+    BackendErrorCode.PROBE_MISMATCH: ProbeMismatchError,
     BackendErrorCode.TIMEOUT: VTenTimeoutError,
 }
 
@@ -49,10 +50,10 @@ def raise_backend_error(code: int, cmd_id: int, message: str) -> None:
     """Raise appropriate exception for a backend error code."""
     exc_cls = _ERROR_MAP.get(code, BackendError)
     full_message = f"{message} (cmd_id={cmd_id})"
-    raise exc_cls(
-        full_message,
-        context={"error_code": code, "cmd_id": cmd_id},
-    )
+    kwargs: dict = {"context": {"error_code": code, "cmd_id": cmd_id}}
+    if issubclass(exc_cls, ProbeMismatchError):
+        kwargs["cmd_id"] = cmd_id
+    raise exc_cls(full_message, **kwargs)
 
 
 # ── CmdStats — Stats Region per-command metrics ──

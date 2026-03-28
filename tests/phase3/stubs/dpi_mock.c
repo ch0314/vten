@@ -226,6 +226,18 @@ void vten_signal_error(int code, const char* msg) {
     error_count++;
 }
 
+void vten_signal_error_with_cmd(int code, int cmd_id, const char* msg) {
+    if (ctrl == NULL) return;
+    ctrl->backend_status = BACKEND_ERROR;
+    ctrl->error_code = (uint32_t)code;
+    ctrl->error_cmd_id = (uint32_t)cmd_id;
+    if (msg != NULL) {
+        snprintf(last_error_msg, sizeof(last_error_msg), "%s", msg);
+        snprintf(ctrl->error_message, 64, "%s", msg);
+    }
+    error_count++;
+}
+
 int vten_read_num_commands(void) {
     if (ctrl == NULL) return 0;
     return (int)ctrl->num_commands;
@@ -383,11 +395,11 @@ void vten_write_cmd_status(int cmd_id, int status) {
     entry->status = (uint8_t)status;
 }
 
-void vten_log_mismatch(int cycle, int beat,
+void vten_log_mismatch(int cmd_id, int cycle, int beat,
     int expected_hi, int expected_lo,
     int actual_hi, int actual_lo)
 {
-    fprintf(stderr, "[PROBE MISMATCH] cycle=%d beat=%d "
+    fprintf(stderr, "[PROBE MISMATCH] cmd=%d cycle=%d beat=%d "
             "expected=0x%08X_%08X actual=0x%08X_%08X\n",
-            cycle, beat, expected_hi, expected_lo, actual_hi, actual_lo);
+            cmd_id, cycle, beat, expected_hi, expected_lo, actual_hi, actual_lo);
 }

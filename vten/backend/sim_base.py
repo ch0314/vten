@@ -39,16 +39,17 @@ from vten.runtime.shm import (
     STATS_SLOT_SIZE,
 )
 
-# Command status names for diagnostic output (matches CommandStatus enum)
-_STATUS_NAMES = {0: "PENDING", 1: "ISSUED", 2: "ACTIVE", 3: "COMMITTED", 4: "ERROR"}
-# OpCode names for diagnostic output (matches OpCode enum)
-_OPCODE_NAMES = {
-    1: "LOAD", 2: "PUSH", 3: "PULL", 4: "STORE",
-    5: "WRITE_REG", 6: "READ_REG", 7: "POLL_REG",
-    8: "BARRIER", 9: "COMPARE",
+# Diagnostic name maps derived from enums (single source of truth)
+from vten.spec.models import CommandStatus, OpCode
+
+_STATUS_NAMES = {e.value: e.name for e in CommandStatus}
+_OPCODE_NAMES = {e.value: e.name for e in OpCode}
+_BACKEND_STATUS_NAMES = {
+    BACKEND_STATUS_IDLE: "IDLE",
+    BACKEND_STATUS_RUNNING: "RUNNING",
+    BACKEND_STATUS_DONE: "DONE",
+    BACKEND_STATUS_ERROR: "ERROR",
 }
-# Backend status names
-_BACKEND_STATUS_NAMES = {0: "IDLE", 1: "RUNNING", 2: "DONE", 3: "ERROR"}
 
 if TYPE_CHECKING:
     from vten.runtime.engine import CompiledResult
@@ -193,6 +194,7 @@ class SimBackend(Backend):
     def execute(self, compiled: CompiledResult) -> BackendResult:
         """Full lifecycle: submit SHM → start sim → wait → result."""
         try:
+            self._probe_buffer_map = getattr(compiled, "probe_buffer_map", {})
             self._submit_shm(compiled.shm_image, compiled.bfm_configs)
             return self._wait_completion()
         finally:
@@ -268,7 +270,40 @@ class SimBackend(Backend):
         return uuid.uuid4().hex[:16]
 
     def _raise_backend_error(self, code: int, cmd_id: int, message: str) -> None:
+        # Enrich ProbeMismatchError with mismatch details from JSONL file
+        if code == 8:  # ERR_PROBE_MISMATCH
+            mismatches = self._parse_mismatch_file()
+            if mismatches:
+                beat_index = mismatches[0].get("beat", 0)
+                from vten.errors import ProbeMismatchError
+                raise ProbeMismatchError(
+                    f"{message} (cmd_id={cmd_id})",
+                    cmd_id=cmd_id,
+                    beat_index=beat_index,
+                    mismatches=mismatches,
+                    context={"error_code": code, "cmd_id": cmd_id},
+                )
         raise_backend_error(code, cmd_id, message)
+
+    def _parse_mismatch_file(self) -> list[dict]:
+        """Parse mismatches.jsonl written by the C bridge."""
+        import json
+        mismatch_dir = self._config.get("_mismatch_dir")
+        if not mismatch_dir:
+            return []
+        mismatch_path = os.path.join(str(mismatch_dir), "mismatches.jsonl")
+        if not os.path.isfile(mismatch_path):
+            return []
+        results = []
+        try:
+            with open(mismatch_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        results.append(json.loads(line))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("failed to parse mismatches.jsonl: %s", e)
+        return results
 
     def _read_shm_u32(self, offset: int) -> int:
         """Read uint32 from SHM control region."""
@@ -375,77 +410,167 @@ class SimBackend(Backend):
         Polls SHM stats region periodically to report command progress,
         then reads full results on completion.
 
+        In GUI mode, stays alive across error/done/restart cycles so the
+        user can interactively restart and re-run in xsim.  Only exits
+        when the xsim process terminates (user closes GUI) or Ctrl-C.
+
         Implements handshake steps [8]-[9] from 04_backend_xsim.md §3.
         """
         # No SHM / semaphore → stub mode (for mocked tests)
         if self._sem_b2h is None or self._shm is None:
             return BackendResult(status=BACKEND_STATUS_DONE)
 
+        gui_mode = self._config.get("_gui")
+
         # Step [8]: Wait for backend done/error signal with progress polling
-        logger.debug("[handshake 8] waiting for backend completion (timeout=%ds)",
-                     self._submit_timeout_s)
-        deadline = time.monotonic() + self._submit_timeout_s
-        last_progress_str = ""
-        poll_count = 0
+        # GUI mode: extend timeout to 24h — user controls simulation interactively
+        effective_timeout = self._submit_timeout_s
+        if gui_mode:
+            effective_timeout = 86400  # 24 hours
 
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
+        # GUI state: accumulate across restart cycles
+        gui_last_error: tuple | None = None   # (code, cmd_id, msg)
+        gui_last_result: BackendResult | None = None
 
-            wait_time = min(self._PROGRESS_POLL_INTERVAL, remaining)
-            if self._sem_b2h.timedwait(wait_time):
-                # Semaphore acquired — backend signaled completion
-                break
-            else:
-                # Timeout on this poll — read progress from SHM
-                poll_count += 1
-                progress_str = self._format_progress()
-                if progress_str and progress_str != last_progress_str:
-                    elapsed = time.monotonic() - (deadline - self._submit_timeout_s)
-                    logger.info("  [%.1fs] %s", elapsed, progress_str)
-                    last_progress_str = progress_str
-                # Check if simulator process died
-                if self._process is not None and self._process.poll() is not None:
-                    # Process exited while we were waiting
-                    break
-        else:
-            # Outer while exhausted remaining time → timeout
-            self._handle_timeout()
+        while True:  # GUI restart loop (single iteration in normal mode)
+            logger.debug("[handshake 8] waiting for backend completion (timeout=%ds)",
+                         effective_timeout)
+            deadline = time.monotonic() + effective_timeout
+            last_progress_str = ""
+            poll_count = 0
+            process_exited = False
 
-        backend_status = self._read_shm_u32(self.BACKEND_STATUS_OFFSET)
-        logger.debug("[handshake 8] backend status=%d", backend_status)
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
 
-        # Handle ERROR
-        if backend_status == BACKEND_STATUS_ERROR:
-            error_code = self._read_shm_u32(self.ERROR_CODE_OFFSET)
-            error_cmd_id = self._read_shm_u32(self.ERROR_CMD_ID_OFFSET)
-            error_msg_raw = bytes(
-                self._shm.buf[self.ERROR_MSG_OFFSET:self.ERROR_MSG_OFFSET + self.ERROR_MSG_SIZE]
-            )
-            error_msg = error_msg_raw.split(b"\x00")[0].decode("utf-8", errors="replace")
-            logger.error("backend error: code=%d, cmd_id=%d, msg=%s",
-                         error_code, error_cmd_id, error_msg)
+                    wait_time = min(self._PROGRESS_POLL_INTERVAL, remaining)
+                    if self._sem_b2h.timedwait(wait_time):
+                        # Semaphore acquired — backend signaled completion
+                        break
+                    else:
+                        # Timeout on this poll — read progress from SHM
+                        poll_count += 1
+                        progress_str = self._format_progress()
+                        if progress_str and progress_str != last_progress_str:
+                            elapsed = time.monotonic() - (deadline - effective_timeout)
+                            logger.info("  [%.1fs] %s", elapsed, progress_str)
+                            last_progress_str = progress_str
+                        # Check if simulator process died
+                        if self._process is not None and self._process.poll() is not None:
+                            process_exited = True
+                            break
+                else:
+                    # Outer while exhausted remaining time → timeout
+                    self._handle_timeout()
+            except KeyboardInterrupt:
+                logger.info("Ctrl-C detected, shutting down simulator...")
+                self._shutdown_sim()
+                raise
 
-            # Still send ACK before raising
+            backend_status = self._read_shm_u32(self.BACKEND_STATUS_OFFSET)
+            logger.debug("[handshake 8] backend status=%d", backend_status)
+            process_alive = self._process is None or self._process.poll() is None
+
+            # Handle ERROR
+            if backend_status == BACKEND_STATUS_ERROR:
+                error_code = self._read_shm_u32(self.ERROR_CODE_OFFSET)
+                error_cmd_id = self._read_shm_u32(self.ERROR_CMD_ID_OFFSET)
+                error_msg_raw = bytes(
+                    self._shm.buf[self.ERROR_MSG_OFFSET:self.ERROR_MSG_OFFSET + self.ERROR_MSG_SIZE]
+                )
+                error_msg = error_msg_raw.split(b"\x00")[0].decode("utf-8", errors="replace")
+                logger.error("backend error: code=%d, cmd_id=%d, msg=%s",
+                             error_code, error_cmd_id, error_msg)
+
+                if gui_mode and process_alive:
+                    # GUI: log error, reset SHM for restart, keep session alive
+                    gui_last_error = (error_code, error_cmd_id, error_msg)
+                    logger.info("[gui] error logged — restart xsim or close to finish")
+                    self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_CMD_READY)
+                    self._sem_h2b.post()
+                    continue  # Wait for restart or process exit
+
+                # Normal mode or process exited: raise
+                self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_ACK)
+                self._raise_backend_error(error_code, error_cmd_id, error_msg)
+
+            # IDLE after b2h signal → xsim restarted (re-called vten_shm_init)
+            if backend_status == BACKEND_STATUS_IDLE:
+                if gui_mode and process_alive:
+                    logger.info("[gui] simulator restarted — re-sending CMD_READY")
+                    self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_CMD_READY)
+                    self._sem_h2b.post()
+                    continue
+
+            # RUNNING: either restart (b2h from new vten_shm_init, old status)
+            # or process exited while sim was stuck / at $stop
+            if backend_status == BACKEND_STATUS_RUNNING:
+                if gui_mode and process_alive and not process_exited:
+                    # b2h signal received but status still RUNNING →
+                    # xsim restarted (vten_shm_init posted b2h, old RUNNING
+                    # status wasn't cleared). Reset and re-send CMD_READY.
+                    logger.info("[gui] simulator restarted — re-sending CMD_READY")
+                    self._write_shm_u32(self.BACKEND_STATUS_OFFSET,
+                                        BACKEND_STATUS_IDLE)
+                    self._write_shm_u32(self.HOST_STATUS_OFFSET,
+                                        HOST_STATUS_CMD_READY)
+                    self._sem_h2b.post()
+                    continue
+                if not process_alive:
+                    if gui_mode:
+                        # User closed xsim GUI (possibly at $stop).
+                        # Return partial stats — runner will report FAIL
+                        # if verifications didn't pass.
+                        logger.info("[gui] xsim closed by user (status=RUNNING)")
+                        if gui_last_error:
+                            code, cmd_id, msg = gui_last_error
+                            self._write_shm_u32(self.HOST_STATUS_OFFSET,
+                                                HOST_STATUS_ACK)
+                            self._raise_backend_error(code, cmd_id, msg)
+                        stats = self._read_stats_from_shm()
+                        return BackendResult(
+                            status=BACKEND_STATUS_DONE,
+                            stats=stats,
+                        )
+                    self._handle_timeout()
+                self._handle_timeout()
+
+            # DONE: read stats, build buffer reader
+            stats = self._read_stats_from_shm()
+            buffer_reader = self._make_buffer_reader()
+
+            if gui_mode and process_alive:
+                # GUI: save result, reset SHM for restart, keep session alive
+                gui_last_result = BackendResult(
+                    status=backend_status,
+                    stats=stats,
+                    _shm_reader=buffer_reader,
+                )
+                logger.info("[gui] simulation done — restart xsim or close to finish")
+                self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_CMD_READY)
+                self._sem_h2b.post()
+                continue
+
+            # Normal mode or process exited: return result
             self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_ACK)
-            self._raise_backend_error(error_code, error_cmd_id, error_msg)
+            logger.debug("backend completed: %d command stats read", len(stats))
 
-        # Process exited unexpectedly without signaling DONE/ERROR
-        if backend_status == BACKEND_STATUS_RUNNING:
-            self._handle_timeout()
+            return BackendResult(
+                status=backend_status,
+                stats=stats,
+                _shm_reader=buffer_reader,
+            )
 
-        # DONE: read stats, build buffer reader, send ACK
-        stats = self._read_stats_from_shm()
-        buffer_reader = self._make_buffer_reader()
-        self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_ACK)
-        logger.debug("backend completed: %d command stats read", len(stats))
-
-        return BackendResult(
-            status=backend_status,
-            stats=stats,
-            _shm_reader=buffer_reader,
-        )
+        # GUI loop exited (should not normally reach here)
+        if gui_last_error:
+            code, cmd_id, msg = gui_last_error
+            self._raise_backend_error(code, cmd_id, msg)
+        if gui_last_result:
+            return gui_last_result
+        return BackendResult(status=BACKEND_STATUS_DONE)
 
     # ── Progress monitoring ──
 
@@ -765,6 +890,7 @@ class SimBackend(Backend):
 
     def open_session(self, compiled: CompiledResult) -> None:
         """Open persistent session: create SHM, start sim, submit first batch."""
+        self._probe_buffer_map = getattr(compiled, "probe_buffer_map", {})
         self._submit_shm(compiled.shm_image, compiled.bfm_configs)
         self._session_active = True
 

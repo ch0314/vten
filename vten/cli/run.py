@@ -14,19 +14,87 @@ from pathlib import Path
 
 from vten.backend.registry import get_backend, resolve_backend_name
 from vten.cli.config import load_project_config
-from vten.errors import VTenError, VerificationError
+from vten.errors import BackendError, ProbeMismatchError, VTenError, VerificationError
 
 logger = logging.getLogger(__name__)
 
 
 class TestScenario:
-    """Base class for user-defined test scenarios."""
+    """Base class for user-defined test scenarios.
+
+    For kernels that implement ``run(self, ctx)``, subclasses can omit the
+    ``run`` method entirely.  The default implementation:
+
+    1. Discovers the Kernel class from ``self.kernel`` name.
+    2. Instantiates with *cfg* as runtime params.
+    3. Calls ``generate_inputs(seed=cfg.get("seed", 42))``.
+    4. Calls ``kernel.run(ctx)``.
+    """
 
     kernel: str = ""
     configs: list[dict] | None = None
 
     def run(self, ctx, cfg) -> None:
-        raise NotImplementedError
+        """Default run: auto-discover kernel class, instantiate, run."""
+        kernel_cls = self._discover_kernel_class()
+        if kernel_cls is None:
+            raise NotImplementedError(
+                f"{self.__class__.__name__} must either override run() "
+                f"or set 'kernel' to a valid kernel name."
+            )
+        k = ctx.instantiate(kernel_cls, **cfg)
+        ki = k.kernel_class_instance
+        ki.generate_inputs(seed=cfg.get("seed", 42))
+        ki.run(ctx)
+
+    def _discover_kernel_class(self) -> type | None:
+        """Find Kernel subclass from self.kernel name.
+
+        Searches ``kernels/{name}/{name}_kernel.py`` relative to the test
+        file location, which is the standard NPU_3D layout.
+        """
+        if not self.kernel:
+            return None
+
+        from vten.kernel.base import Kernel
+
+        # Locate kernel module: tests/ is inside kernels/{name}/tests/
+        # so go up two levels to find kernels/{name}/{name}_kernel.py
+        test_file = sys.modules.get(self.__class__.__module__)
+        if test_file and hasattr(test_file, "__file__") and test_file.__file__:
+            tests_dir = Path(test_file.__file__).resolve().parent
+            kernel_dir = tests_dir.parent
+            kernel_file = kernel_dir / f"{self.kernel}_kernel.py"
+            if not kernel_file.exists():
+                # Try parent's parent for composites (kernels/{name}/)
+                kernels_base = kernel_dir.parent
+                kernel_file = (
+                    kernels_base / self.kernel / f"{self.kernel}_kernel.py"
+                )
+
+            if kernel_file.exists():
+                mod_name = f"_vten_kernel_{self.kernel}"
+                # Add parent dir to sys.path for imports within the kernel
+                parent = str(kernel_file.parent)
+                if parent not in sys.path:
+                    sys.path.insert(0, parent)
+
+                spec = importlib.util.spec_from_file_location(
+                    mod_name, kernel_file,
+                )
+                if spec and spec.loader:
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[mod_name] = module
+                    spec.loader.exec_module(module)
+                    for attr_name in dir(module):
+                        obj = getattr(module, attr_name)
+                        if (
+                            isinstance(obj, type)
+                            and issubclass(obj, Kernel)
+                            and obj is not Kernel
+                        ):
+                            return obj
+        return None
 
 
 def discover_test(name: str, tests_dir: str | Path) -> TestScenario:
@@ -50,7 +118,8 @@ def discover_test(name: str, tests_dir: str | Path) -> TestScenario:
         sys.modules[mod_name] = module
         try:
             spec.loader.exec_module(module)
-        except Exception:
+        except Exception as exc:
+            logger.warning("failed to load %s: %s", test_file.name, exc)
             continue
 
         for attr_name in dir(module):
@@ -86,14 +155,14 @@ def discover_test(name: str, tests_dir: str | Path) -> TestScenario:
     matches = exact_matches if exact_matches else fuzzy_matches
 
     if not matches:
-        raise ValueError(f"Not found: no test scenario matching '{name}'")
+        raise VTenError(f"Not found: no test scenario matching '{name}'")
 
     if len(matches) > 1:
         # Deduplicate by class identity
         unique = list({id(c): c for c in matches}.values())
         if len(unique) > 1:
             names = [c.__name__ for c in unique]
-            raise ValueError(f"Ambiguous: multiple matches for '{name}': {names}")
+            raise VTenError(f"Ambiguous: multiple matches for '{name}': {names}")
         matches = unique
 
     return matches[0]()
@@ -119,7 +188,8 @@ def discover_all_tests(tests_dir: str | Path) -> list[tuple[str, TestScenario]]:
         sys.modules[mod_name] = module
         try:
             spec.loader.exec_module(module)
-        except Exception:
+        except Exception as exc:
+            logger.warning("failed to load %s: %s", test_file.name, exc)
             continue
 
         for attr_name in dir(module):
@@ -248,6 +318,155 @@ def _enrich_stats(
     ]
 
 
+def _report_probe_mismatch(
+    pme: ProbeMismatchError,
+    results_dir: Path,
+    ctx,
+    cfg_idx: int,
+    total_cfgs: int,
+) -> None:
+    """Report ProbeMismatchError with dtype-aware element info."""
+    # Resolve tensor name and dtype from compiled context
+    tensor_name = "unknown"
+    dtype_str = ""
+    packing = None
+    compiled = getattr(ctx, "_last_compiled", None)
+    if compiled and hasattr(compiled, "buffer_ids") and hasattr(compiled, "commands"):
+        # Reverse map: cmd_id → buffer_id → tensor_name
+        cmd_bid = None
+        for cmd in compiled.commands:
+            if cmd.cmd_id == pme.cmd_id:
+                cmd_bid = cmd.buffer_id
+                break
+        if cmd_bid is not None:
+            bid_to_name = {bid: name for name, bid in compiled.buffer_ids.items()}
+            raw_name = bid_to_name.get(cmd_bid, "unknown")
+            tensor_name = raw_name.split(":")[0] if ":" in raw_name else raw_name
+
+        # Get dtype and packing from flattened view
+        view = compiled.flattened_view
+        if view:
+            exposed = view.exposed_tensors.get(tensor_name)
+            if exposed and exposed.origin_tensor:
+                dtype_str = str(exposed.origin_tensor.dtype).replace("torch.", "")
+            iface_name = exposed.top_interface if exposed else None
+            if iface_name:
+                iface = view.top_spec.get_interface(iface_name)
+                packing = iface.packing if iface else None
+
+    # Parse mismatches.jsonl for element-level detail
+    mismatch_file = results_dir / "mismatches.jsonl"
+    mismatches = []
+    if mismatch_file.exists():
+        try:
+            for line in mismatch_file.read_text().strip().splitlines():
+                mismatches.append(json.loads(line))
+        except Exception:
+            pass
+
+    # Build readable message
+    lines = [f"probe mismatch (config {cfg_idx + 1}/{total_cfgs})"]
+    lines.append(f"  tensor: {tensor_name}" + (f" ({dtype_str})" if dtype_str else ""))
+    lines.append(f"  cmd_id: {pme.cmd_id}")
+
+    if mismatches and packing:
+        m = mismatches[0]
+        beat = m.get("beat", 0)
+        # Compute element indices from beat index
+        epb = packing.elements_per_beat
+        elem_start = beat * epb
+        elem_end = elem_start + epb - 1
+        lines.append(f"  first mismatch: beat {beat} (elements [{elem_start}..{elem_end}])")
+
+        # Show expected vs actual bytes interpreted as dtype elements
+        try:
+            exp_hi = int(m.get("expected_hi", "0"), 16)
+            exp_lo = int(m.get("expected_lo", "0"), 16)
+            act_hi = int(m.get("actual_hi", "0"), 16)
+            act_lo = int(m.get("actual_lo", "0"), 16)
+            exp_bytes = exp_hi.to_bytes(4, "big") + exp_lo.to_bytes(4, "big")
+            act_bytes = act_hi.to_bytes(4, "big") + act_lo.to_bytes(4, "big")
+
+            import struct
+            import torch
+            ew = packing.element_width
+            dtype_torch = None
+            if exposed and exposed.origin_tensor:
+                dtype_torch = exposed.origin_tensor.dtype
+
+            # Show first few differing elements
+            elem_size = ew // 8
+            if elem_size > 0:
+                n_show = min(epb, len(exp_bytes) // elem_size, 8)
+                exp_vals = _unpack_elements(exp_bytes, elem_size, n_show, dtype_torch)
+                act_vals = _unpack_elements(act_bytes, elem_size, n_show, dtype_torch)
+                diff_indices = [
+                    i for i in range(n_show)
+                    if exp_vals[i] != act_vals[i]
+                ]
+                if diff_indices:
+                    for i in diff_indices[:4]:
+                        lines.append(
+                            f"    [{elem_start + i}]: expected={exp_vals[i]}, "
+                            f"actual={act_vals[i]}"
+                        )
+                    if len(diff_indices) > 4:
+                        lines.append(f"    ... and {len(diff_indices) - 4} more")
+        except Exception:
+            # Fall back to raw hex
+            lines.append(
+                f"    expected: 0x{m.get('expected_hi','')}{m.get('expected_lo','')}"
+            )
+            lines.append(
+                f"    actual:   0x{m.get('actual_hi','')}{m.get('actual_lo','')}"
+            )
+
+        if len(mismatches) > 1:
+            lines.append(f"  total mismatches logged: {len(mismatches)}")
+    elif mismatches:
+        m = mismatches[0]
+        lines.append(f"  beat {m.get('beat', '?')}, cycle {m.get('cycle', '?')}")
+        lines.append(
+            f"    expected: 0x{m.get('expected_hi','')}{m.get('expected_lo','')}"
+        )
+        lines.append(
+            f"    actual:   0x{m.get('actual_hi','')}{m.get('actual_lo','')}"
+        )
+
+    logger.error("\n".join(lines))
+
+
+def _unpack_elements(
+    raw: bytes, elem_size: int, count: int, dtype=None,
+) -> list:
+    """Unpack raw bytes into element values based on dtype."""
+    import struct
+    import torch
+
+    values = []
+    for i in range(count):
+        chunk = raw[i * elem_size : (i + 1) * elem_size]
+        if len(chunk) < elem_size:
+            break
+        if dtype == torch.float32 and elem_size == 4:
+            values.append(round(struct.unpack("<f", chunk)[0], 6))
+        elif dtype == torch.float16 and elem_size == 2:
+            values.append(round(struct.unpack("<e", chunk)[0], 4))
+        elif dtype == torch.int32 and elem_size == 4:
+            values.append(struct.unpack("<i", chunk)[0])
+        elif dtype == torch.int16 and elem_size == 2:
+            values.append(struct.unpack("<h", chunk)[0])
+        elif elem_size == 1:
+            values.append(chunk[0])
+        elif elem_size == 2:
+            values.append(int.from_bytes(chunk, "little"))
+        elif elem_size == 4:
+            values.append(int.from_bytes(chunk, "little"))
+        else:
+            values.append(f"0x{chunk.hex()}")
+    return values
+
+
 def _run_single_test(
     project: Path,
     config: dict,
@@ -273,6 +492,9 @@ def _run_single_test(
     # Results under results/<kernel>/<test>/
     results_dir = project / "results" / kernel_name / test_name
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set mismatch dir for probe logging (C bridge reads via env var)
+    config["_mismatch_dir"] = str(results_dir)
 
     configs_passed = 0
     total_cycles = 0
@@ -384,11 +606,21 @@ def _run_single_test(
                         "passed": False,
                         "max_diff": ve.max_diff,
                     })
+            except ProbeMismatchError as pme:
+                status = "FAIL"
+                last_error = pme
+                _report_probe_mismatch(pme, results_dir, ctx, cfg_idx, len(run_cfgs))
+            except BackendError as be:
+                status = "FAIL"
+                last_error = be
+                logger.error("backend error (config %d/%d): %s",
+                             cfg_idx + 1, len(run_cfgs), be)
             except Exception as exc:
                 status = "FAIL"
                 last_error = exc
-                logger.error("test execution failed (config %d/%d)",
-                             cfg_idx + 1, len(run_cfgs), exc_info=True)
+                logger.error("test execution failed (config %d/%d): %s",
+                             cfg_idx + 1, len(run_cfgs), exc)
+                logger.debug("traceback:", exc_info=True)
 
         if configs_passed < len(run_cfgs):
             status = "FAIL"
@@ -426,12 +658,41 @@ def _run_single_test(
     if last_error is not None:
         summary["error_message"] = str(last_error)
         summary["error_traceback"] = traceback.format_exception(last_error)
+        if isinstance(last_error, ProbeMismatchError):
+            summary["probe_mismatch"] = {
+                "cmd_id": last_error.cmd_id,
+                "beat_index": last_error.beat_index,
+                "mismatches": last_error.mismatches[:10],  # Cap at 10 entries
+            }
 
     (results_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
     (results_dir / "stats.json").write_text(json.dumps(
         {"commands": all_cmd_stats}, indent=2,
     ))
+
+    # Waveform file management
+    if config.get("_waveform"):
+        build_dir = Path(config.get("_kernel_build_dir", "."))
+        # Look for .wdb files in common locations
+        for wdb_glob in [build_dir / "*.wdb",
+                         build_dir / "generated" / "*.wdb",
+                         build_dir / "xsim.dir" / "*.wdb"]:
+            import glob as glob_mod
+            for wdb_path in glob_mod.glob(str(wdb_glob)):
+                wdb_src = Path(wdb_path)
+                wdb_dst = results_dir / "waveform.wdb"
+                import shutil
+                shutil.copy2(wdb_src, wdb_dst)
+                logger.info("waveform saved: %s", wdb_dst)
+                break
+
+        # waveform_on_fail: delete wdb on PASS
+        if config.get("_waveform_on_fail") and status == "PASS":
+            wdb_file = results_dir / "waveform.wdb"
+            if wdb_file.exists():
+                wdb_file.unlink()
+                logger.debug("waveform deleted (test passed, --waveform-on-fail)")
 
 
 def run_test(
@@ -440,6 +701,7 @@ def run_test(
     test_name: str = "",
     backend: str | None = None,
     waveform: bool = False,
+    waveform_on_fail: bool = False,
     gui: bool = False,
     sim_verbose: bool = False,
     config_overrides: dict | None = None,
@@ -473,6 +735,10 @@ def run_test(
     # Inject kernel-level paths into config
     config["_project_dir"] = str(project)
     config["_kernel_build_dir"] = str(kernel_dir / "build")
+    if waveform or waveform_on_fail:
+        config["_waveform"] = True
+    if waveform_on_fail:
+        config["_waveform_on_fail"] = True
     if gui:
         config["_gui"] = True
     if sim_verbose:

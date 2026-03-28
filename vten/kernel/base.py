@@ -65,6 +65,21 @@ class Kernel:
             return getattr(self, name)
         raise AttributeError(f"No tensor '{name}' in {self.__class__.__name__}")
 
+    @staticmethod
+    def compute_derived_params(params: dict) -> dict:
+        """Compute derived parameters from resolved base params.
+
+        Override this to add computed values (e.g., shape calculations
+        involving conditionals) to the parameter namespace before tensor
+        shape resolution. Called during KernelInstance.initialize().
+
+        Args:
+            params: Current namespace (project + kernel + runtime, resolved).
+        Returns:
+            Dict of additional params to merge into namespace.
+        """
+        return {}
+
     def generate_inputs(self, seed: int | None = None) -> None:
         """User-overrideable: generate input tensors."""
         raise NotImplementedError
@@ -72,6 +87,21 @@ class Kernel:
     def forward(self) -> torch.Tensor:
         """User-overrideable: compute golden reference output."""
         raise NotImplementedError
+
+    def run(self, ctx: object) -> None:
+        """User-overrideable: DUT-specific execution protocol.
+
+        Override this to define the DSL sequence (send, recv, configure,
+        write_register, verify) for this kernel. Called by @test_kernel
+        or directly from test scenarios.
+
+        Args:
+            ctx: ExecutionContext instance.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement run(). "
+            f"Override run(self, ctx) to define the execution protocol."
+        )
 
     def verify(
         self, hw_output: torch.Tensor, golden: torch.Tensor

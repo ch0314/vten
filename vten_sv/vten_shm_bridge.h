@@ -114,6 +114,7 @@ int  vten_read_host_status(void);
 void vten_set_backend_status(int status);
 void vten_signal_complete(void);
 void vten_signal_error(int code, const char* msg);
+void vten_signal_error_with_cmd(int code, int cmd_id, const char* msg);
 
 /* Control header reads */
 int  vten_read_num_commands(void);
@@ -151,7 +152,7 @@ void vten_write_cmd_stats(int cmd_id, int status,
 void vten_write_cmd_status(int cmd_id, int status);
 
 /* Probe */
-void vten_log_mismatch(int cycle, int beat,
+void vten_log_mismatch(int cmd_id, int cycle, int beat,
     int expected_hi, int expected_lo,
     int actual_hi, int actual_lo);
 

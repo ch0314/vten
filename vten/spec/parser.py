@@ -323,6 +323,16 @@ def _parse_registers(
         else:
             offset = next_offset
             next_offset += 4
+        # Role: explicit or auto-inferred
+        role = r.get("role", "")
+        if not role:
+            if pulse:
+                role = "control"
+            elif auto_bind:
+                role = "auto_bind"
+            else:
+                role = "config"
+
         registers.append(
             RegisterSpec(
                 name=r["name"],
@@ -333,6 +343,7 @@ def _parse_registers(
                 access=access,
                 pulse=pulse,
                 reset_value=r.get("reset_value", 0),
+                role=role,
             )
         )
     return registers

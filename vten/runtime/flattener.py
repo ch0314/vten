@@ -100,10 +100,16 @@ class ExposedTensor:
 
 @dataclass
 class ProbePoint:
-    """Golden data container for Internal(probe=True) interfaces."""
+    """Golden data for probe verification.
 
-    connection: Connect
-    interface_mapping: InterfaceMapping
+    Two usage modes:
+    - Composite internal probe: connection + interface_mapping set.
+    - Single kernel probe (probe=True on PULL): tensor_name set.
+    """
+
+    connection: Connect | None = None
+    interface_mapping: InterfaceMapping | None = None
+    tensor_name: str | None = None
     golden_data: object = None  # torch.Tensor
     serialized_golden: bytes | None = None
     golden_buffer_id: int | None = None
@@ -134,7 +140,13 @@ class KernelInstance:
             self.runtime_params,
         )
 
+        # Compute derived params (conditional shape logic etc.) and merge
+        derived = self.kernel_class.compute_derived_params(self._resolver.namespace)
+        if derived:
+            self._resolver.namespace.update(derived)
+
         self.kernel_class_instance = self.kernel_class()
+        self.kernel_class_instance._kernel_instance = self
 
         for tensor in self.kernel_class_instance.tensors():
             instance_tensor = copy.copy(tensor)

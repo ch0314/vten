@@ -41,6 +41,9 @@ static char             shm_name_buf[256] = {0};  /* saved for remap */
 static BufferDescriptor buf_cache[MAX_BUFFERS];
 static int              buf_cache_valid = 0;
 
+/* Mismatch log file (JSONL format) */
+static FILE*            mismatch_fp     = NULL;
+
 /* ── Internal helpers ── */
 
 static void _load_buf_cache(void) {
@@ -60,6 +63,7 @@ static void _load_buf_cache(void) {
         buf_cache[i].data_offset = *(uint64_t*)(desc_ptr + 0x08);
     }
     buf_cache_valid = 1;
+    fprintf(stderr, "[vten_shm_bridge] buf_cache reloaded: %d buffers\n", n);
 }
 
 /* Drain stale semaphore counts (non-blocking) */
@@ -163,6 +167,17 @@ int vten_shm_init(const char* session_id) {
     /* Signal host: backend is ready */
     sem_post(sem_b2h);
 
+    /* Open mismatch log file if VTEN_MISMATCH_DIR is set */
+    const char* mdir = getenv("VTEN_MISMATCH_DIR");
+    if (mdir != NULL && mdir[0] != '\0') {
+        char mpath[512];
+        snprintf(mpath, sizeof(mpath), "%s/mismatches.jsonl", mdir);
+        mismatch_fp = fopen(mpath, "w");
+        if (mismatch_fp == NULL)
+            fprintf(stderr, "[vten_shm_bridge] warning: cannot open %s: %s\n",
+                    mpath, strerror(errno));
+    }
+
     fprintf(stderr, "[vten_shm_bridge] init OK: shm=%s size=%zu cmds=%u bufs=%u\n",
             shm_name, shm_size, ctrl->num_commands, ctrl->num_buffers);
 
@@ -188,8 +203,24 @@ int vten_shm_remap(void) {
     }
 
     size_t new_size = (size_t)st.st_size;
+
+    /* Always invalidate buffer descriptor cache — host may have rewritten
+     * buffer descriptors in-place for a new batch even without resizing. */
+    buf_cache_valid = 0;
+
+    /* Re-derive region pointers: even without resize the host may have
+     * updated the control header (num_commands, num_buffers, offsets). */
+    ctrl         = (ControlHeader*)shm_base;
+    cmd_base     = (uint8_t*)shm_base + ctrl->cmd_region_offset;
+    stats_base   = (uint8_t*)shm_base + ctrl->stats_region_offset;
+    bufdesc_base = (uint8_t*)shm_base + ctrl->buf_desc_offset;
+    data_base    = (uint8_t*)shm_base + ctrl->data_region_offset;
+
+    fprintf(stderr, "[vten_shm_bridge] remap called: cur=%zu new=%zu cmds=%u bufs=%u\n",
+            shm_size, new_size, ctrl->num_commands, ctrl->num_buffers);
+
     if (new_size == shm_size) {
-        /* No resize needed */
+        /* No resize needed — pointers and cache already refreshed above */
         close(fd);
         return VTEN_OK;
     }
@@ -225,6 +256,7 @@ int vten_shm_remap(void) {
 }
 
 void vten_cleanup(void) {
+    if (mismatch_fp != NULL) { fclose(mismatch_fp); mismatch_fp = NULL; }
     if (sem_h2b != NULL) { sem_close(sem_h2b); sem_h2b = NULL; }
     if (sem_b2h != NULL) { sem_close(sem_b2h); sem_b2h = NULL; }
     if (shm_base != NULL && shm_base != MAP_FAILED) {
@@ -284,6 +316,17 @@ void vten_signal_error(int code, const char* msg) {
     if (ctrl == NULL) return;
     ctrl->backend_status = BACKEND_ERROR;
     ctrl->error_code = (uint32_t)code;            /* offset 0x40 */
+    if (msg != NULL) {
+        snprintf(ctrl->error_message, MAX_ERROR_MSG_LEN, "%s", msg);  /* offset 0x48 */
+    }
+    if (sem_b2h != NULL) sem_post(sem_b2h);
+}
+
+void vten_signal_error_with_cmd(int code, int cmd_id, const char* msg) {
+    if (ctrl == NULL) return;
+    ctrl->backend_status = BACKEND_ERROR;
+    ctrl->error_code = (uint32_t)code;            /* offset 0x40 */
+    ctrl->error_cmd_id = (uint32_t)cmd_id;        /* offset 0x44 */
     if (msg != NULL) {
         snprintf(ctrl->error_message, MAX_ERROR_MSG_LEN, "%s", msg);  /* offset 0x48 */
     }
@@ -486,11 +529,20 @@ void vten_write_cmd_status(int cmd_id, int status) {
  * Probe
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-void vten_log_mismatch(int cycle, int beat,
+void vten_log_mismatch(int cmd_id, int cycle, int beat,
     int expected_hi, int expected_lo,
     int actual_hi, int actual_lo)
 {
-    fprintf(stderr, "[PROBE MISMATCH] cycle=%d beat=%d "
+    fprintf(stderr, "[PROBE MISMATCH] cmd=%d cycle=%d beat=%d "
             "expected=0x%08X_%08X actual=0x%08X_%08X\n",
-            cycle, beat, expected_hi, expected_lo, actual_hi, actual_lo);
+            cmd_id, cycle, beat, expected_hi, expected_lo, actual_hi, actual_lo);
+
+    if (mismatch_fp != NULL) {
+        fprintf(mismatch_fp,
+            "{\"cmd_id\":%d,\"cycle\":%d,\"beat\":%d,"
+            "\"expected_hi\":\"0x%08X\",\"expected_lo\":\"0x%08X\","
+            "\"actual_hi\":\"0x%08X\",\"actual_lo\":\"0x%08X\"}\n",
+            cmd_id, cycle, beat, expected_hi, expected_lo, actual_hi, actual_lo);
+        fflush(mismatch_fp);
+    }
 }

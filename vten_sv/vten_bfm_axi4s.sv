@@ -165,12 +165,34 @@ module vten_bfm_axi4s #(
                     beat_count * BYTES_PER_BEAT, BYTES_PER_BEAT, golden_buf);
                 for (int i = 0; i < BYTES_PER_BEAT; i++)
                     golden[i*8 +: 8] = golden_buf[i];
-                if (s_tdata !== golden)
-                    vten_log_mismatch(cycle_count, beat_count,
+                if (s_tdata !== golden) begin
+                    vten_log_mismatch(current_cmd.cmd_id, cycle_count, beat_count,
                                       golden[DATA_W-1:DATA_W/2],
                                       golden[DATA_W/2-1:0],
                                       s_tdata[DATA_W-1:DATA_W/2],
                                       s_tdata[DATA_W/2-1:0]);
+                    if (vten_read_flags() & 8) begin
+                        // GUI mode: $stop for waveform inspection, then continue
+                        // Don't signal error — let user resume and observe more mismatches
+                        $display("[PROBE MISMATCH] cycle=%0d beat=%0d cmd_id=%0d — $stop for inspection",
+                                 cycle_count, beat_count, current_cmd.cmd_id);
+                        $stop;
+                    end else begin
+                        // Batch mode: early abort — signal error to scheduler
+                        s_tready <= 1'b0;
+                        cmd_active <= 0;
+                        cmd_if.done_valid  <= 1'b1;
+                        cmd_if.done_cmd_id <= current_cmd.cmd_id;
+                        cmd_if.done_error  <= 1'b1;
+                        cmd_if.done_error_code <= 16'd8;  // ERR_PROBE_MISMATCH
+                        vten_write_cmd_stats(current_cmd.cmd_id,
+                            CMD_ERROR, issue_cycle, cycle_count,
+                            (first_active == 0) ? cycle_count : first_active,
+                            cycle_count,
+                            active_cycles, total_beats, stall_cycles);
+                        return;
+                    end
+                end
             end
 
             if (beat_count == expected_beats - 1) begin

@@ -30,7 +30,9 @@ module vten_shm_controller #(
     // ← Scheduler: error report
     input  logic        sched_error,
     input  logic [15:0] sched_error_cmd_id,
-    input  logic [15:0] sched_error_code
+    input  logic [15:0] sched_error_code,
+    // ← Probe: mismatch error (active-high, latched)
+    input  logic        probe_error
 );
 
     typedef enum logic [3:0] {
@@ -179,10 +181,15 @@ module vten_shm_controller #(
 
                 // ── Monitor Scheduler execution ──
                 S_EXECUTE: begin
-                    if (sched_error) begin
-                        if (verbose)
-                            $display("[CTRL %0t] EXECUTE → ERROR (cmd=%0d, code=%0d)",
-                                     $time, sched_error_cmd_id, sched_error_code);
+                    if (sched_error || probe_error) begin
+                        if (verbose) begin
+                            if (probe_error && !sched_error)
+                                $display("[CTRL %0t] EXECUTE → ERROR (probe mismatch, code=%0d)",
+                                         $time, 8);
+                            else
+                                $display("[CTRL %0t] EXECUTE → ERROR (cmd=%0d, code=%0d)",
+                                         $time, sched_error_cmd_id, sched_error_code);
+                        end
                         state <= S_ERROR;
                     end else if (sched_all_drained) begin
                         if (verbose)
@@ -197,7 +204,9 @@ module vten_shm_controller #(
 
                 // ── Drain BFM in-flight responses ──
                 S_DRAIN: begin
-                    if (sched_all_drained) begin
+                    if (sched_error || probe_error) begin
+                        state <= S_ERROR;
+                    end else if (sched_all_drained) begin
                         if (verbose)
                             $display("[CTRL %0t] DRAIN → COMPLETE", $time);
                         state <= S_COMPLETE;
@@ -214,14 +223,25 @@ module vten_shm_controller #(
 
                 // ── Error → notify host ──
                 S_ERROR: begin
-                    if (verbose)
-                        $display("[CTRL %0t] ERROR: cmd=%0d code=%0d → WAIT_HOST",
-                                 $time, sched_error_cmd_id, sched_error_code);
-                    vten_signal_error(
-                        sched_error_code,
-                        $sformatf("[Scheduler] error at cmd_id=%0d",
-                                  sched_error_cmd_id)
-                    );
+                    if (probe_error && !sched_error) begin
+                        // Probe mismatch: use ERR_PROBE_MISMATCH (8)
+                        if (verbose)
+                            $display("[CTRL %0t] ERROR: probe mismatch code=8 → WAIT_HOST", $time);
+                        vten_signal_error_with_cmd(
+                            8, 0,
+                            "[Probe] mismatch detected on internal wire"
+                        );
+                    end else begin
+                        if (verbose)
+                            $display("[CTRL %0t] ERROR: cmd=%0d code=%0d → WAIT_HOST",
+                                     $time, sched_error_cmd_id, sched_error_code);
+                        vten_signal_error_with_cmd(
+                            sched_error_code,
+                            sched_error_cmd_id,
+                            $sformatf("[Scheduler] error at cmd_id=%0d",
+                                      sched_error_cmd_id)
+                        );
+                    end
                     state <= S_WAIT_HOST;
                 end
 

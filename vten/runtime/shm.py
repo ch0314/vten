@@ -57,6 +57,12 @@ BACKEND_STATUS_RUNNING = 1
 BACKEND_STATUS_DONE = 2
 BACKEND_STATUS_ERROR = 3
 
+# SHM Control Header flags (offset 0x88)
+FLAG_STATS_ENABLED = 0x01
+FLAG_PROGRESS_ENABLED = 0x02
+FLAG_WAVEFORM_DUMP = 0x04
+FLAG_PAUSE_ON_MISMATCH = 0x08
+
 
 # ── BufferDescriptor ──
 
@@ -135,6 +141,7 @@ def pack_control_header(
     buf_desc_offset: int,
     data_region_offset: int,
     total_shm_size: int,
+    flags: int = FLAG_STATS_ENABLED,
 ) -> None:
     """Pack the 256-byte control header."""
     struct.pack_into("<I", image, 0x00, SHM_MAGIC)
@@ -149,7 +156,7 @@ def pack_control_header(
     struct.pack_into("<Q", image, 0x30, data_region_offset)
     struct.pack_into("<Q", image, 0x38, total_shm_size)
     # error_code, error_cmd_id, error_message, flags, timeout, freq, seq = 0
-    struct.pack_into("<I", image, 0x88, 0x01)  # flags: STATS_ENABLED
+    struct.pack_into("<I", image, 0x88, flags)
 
 
 def pack_command_slot(

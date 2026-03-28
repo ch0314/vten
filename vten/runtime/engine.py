@@ -33,7 +33,11 @@ from vten.spec.models import (
     Role,
 )
 from vten.runtime.address import AddressAllocator
-from vten.runtime.binder import RegisterBindingEntry, resolve_auto_binds
+from vten.runtime.binder import (
+    RegisterBindingEntry,
+    resolve_auto_binds,
+    resolve_config_registers,
+)
 from vten.runtime.flattener import (
     ExposedTensor,
     FlattenedKernelView,
@@ -65,6 +69,90 @@ if TYPE_CHECKING:
 
 
 # ── Helpers ──
+
+
+def _pack_shm_common(
+    shm_alloc: SHMBufferAllocator,
+    commands: list[Command],
+    *,
+    flags: int = 0,
+) -> tuple[bytearray, SHMLayout, int]:
+    """Pack SHM header, command slots, stats, and buffer descriptors.
+
+    Shared by _pack_shm (single-config) and _pack_shm_multi (multi-config).
+    Callers are responsible for allocating data buffers into *shm_alloc*
+    before calling, and for copying tensor data into the returned image
+    after this function returns.
+
+    Returns:
+        (image, layout, data_region_offset) — mutable image, layout metadata,
+        and the byte offset where the data region starts.
+    """
+    from vten.runtime.shm import FLAG_STATS_ENABLED
+    from vten.spec.models import CommandStatus
+
+    num_commands = len(commands)
+    num_buffers = len(shm_alloc.descriptors)
+
+    total = calculate_shm_size(
+        num_commands=num_commands,
+        num_buffers=num_buffers,
+        buffer_sizes=[d.size for d in shm_alloc.descriptors],
+    )
+
+    image = bytearray(total)
+
+    # Region offsets
+    cmd_offset = CONTROL_SIZE
+    stats_offset = cmd_offset + CMD_SLOT_SIZE * num_commands
+    bufdesc_offset = stats_offset + STATS_SLOT_SIZE * num_commands
+    data_region_raw = bufdesc_offset + BUF_DESC_SIZE * num_buffers
+    data_region_offset = (data_region_raw + CACHE_LINE - 1) & ~(CACHE_LINE - 1)
+
+    layout = SHMLayout(
+        cmd_offset=cmd_offset,
+        stats_offset=stats_offset,
+        bufdesc_offset=bufdesc_offset,
+        data_region_offset=data_region_offset,
+        num_commands=num_commands,
+        num_buffers=num_buffers,
+        total_size=total,
+    )
+
+    # Pack control header
+    shm_flags = flags | FLAG_STATS_ENABLED
+    pack_control_header(
+        image,
+        num_commands=num_commands,
+        num_buffers=num_buffers,
+        cmd_region_offset=cmd_offset,
+        stats_region_offset=stats_offset,
+        buf_desc_offset=bufdesc_offset,
+        data_region_offset=data_region_offset,
+        total_shm_size=total,
+        flags=shm_flags,
+    )
+
+    # Pack command slots
+    for i, cmd in enumerate(commands):
+        pack_command_slot(image, cmd_offset + i * CMD_SLOT_SIZE, cmd)
+
+    # Pack stats entries: LOAD commands pre-marked as COMMITTED
+    for cmd in commands:
+        if cmd.op == OpCode.LOAD:
+            pack_stats_entry(
+                image,
+                stats_offset + cmd.cmd_id * STATS_SLOT_SIZE,
+                status=CommandStatus.COMMITTED.value,
+            )
+
+    # Pack buffer descriptors
+    for i, desc in enumerate(shm_alloc.descriptors):
+        pack_buffer_descriptor(
+            image, bufdesc_offset + i * BUF_DESC_SIZE, desc
+        )
+
+    return image, layout, data_region_offset
 
 
 def _parse_split_spec(raw):
@@ -134,6 +222,7 @@ class CompiledResult:
     iface_id_to_name: dict[int, str] = field(default_factory=dict)
     shm_layout: SHMLayout | None = None
     views: list[FlattenedKernelView] | None = None  # multi-config: all views
+    probe_buffer_map: dict[int, int] = field(default_factory=dict)  # probe_index → golden_buffer_id
 
 
 # ── RuntimeEngine ──
@@ -253,12 +342,22 @@ class RuntimeEngine:
 
     # ── Public: Single-config compile ──
 
-    def compile(self, target: str = "sim") -> CompiledResult:
+    def compile(
+        self,
+        target: str = "sim",
+        probe_golden_tensors: dict | None = None,
+        internal_probe_golden: dict | None = None,
+        flags: int = 0,
+    ) -> CompiledResult:
         """Run the 8-stage compile pipeline.
 
         Args:
             target: "sim" for SIM backends (includes Stage 7 SHM packing),
                     "hw" for HW backends (skips SHM packing).
+            probe_golden_tensors: tensor_name → torch.Tensor golden data for probe.
+            internal_probe_golden: (sub_name, tensor_name) → torch.Tensor for
+                composite internal probe golden data.
+            flags: SHM control header flags (e.g. FLAG_WAVEFORM_DUMP).
         """
         t0 = time.perf_counter()
         logger.debug("compile pipeline starting (target=%s, ops=%d)", target, len(self._ops))
@@ -267,11 +366,22 @@ class RuntimeEngine:
             self._compile_ir()
         )
 
+        # Populate view.probe_points for single-kernel probe golden tensors
+        if probe_golden_tensors:
+            self._add_probe_golden_to_view(view, probe_golden_tensors)
+
+        # Serialize composite internal probe golden data
+        if internal_probe_golden:
+            self._serialize_probe_golden(view, internal_probe_golden)
+
         # Stage 7: SHM packing (SIM path only)
+        probe_buffer_map: dict[int, int] = {}
         if target == "sim":
             logger.debug("Stage 7: SHM packing")
-            shm_image = self._pack_shm(view, commands, buffer_ids)
+            shm_image = self._pack_shm(view, commands, buffer_ids, flags=flags)
             logger.debug("SHM image: %d bytes", len(shm_image))
+            # Build probe_index → golden_buffer_id mapping for plusargs
+            probe_buffer_map = self._build_probe_buffer_map(view)
         else:
             shm_image = b""
 
@@ -291,6 +401,7 @@ class RuntimeEngine:
             tensor_data=tensor_data,
             iface_id_to_name=iface_id_to_name,
             shm_layout=self._last_shm_layout,
+            probe_buffer_map=probe_buffer_map,
         )
 
     @staticmethod
@@ -491,18 +602,37 @@ class RuntimeEngine:
             )
 
         # ── Phase D: Probe point collection ──
+        # Must iterate connections in list order to match codegen probe_index
+        # assignment (build/composite.py extract_probe_bfm_info).
         probe_points: list[ProbePoint] = []
         connections = composite_instance._connections or []
 
+        # Build set of probed (sub_name, sub_interface) from INTERNAL_PROBE mappings
+        probed_ifaces: set[tuple[str, str]] = set()
+        probe_mapping_by_key: dict[tuple[str, str], InterfaceMapping] = {}
         for m in mappings:
             if m.mapping_type == MappingType.INTERNAL_PROBE:
-                conn = self._find_connection_for_interface(
-                    connections, m.sub_kernel, m.sub_interface
+                key = (m.sub_kernel, m.sub_interface)
+                probed_ifaces.add(key)
+                probe_mapping_by_key[key] = m
+
+        for conn in connections:
+            # Check if either end of this connection is probed
+            src_key = (conn.source_sub, conn.source_interface)
+            dst_iface = self._find_dest_interface_name(conn, mappings)
+            dst_key = (conn.dest_sub, dst_iface) if dst_iface else None
+
+            matched_key = None
+            if src_key in probed_ifaces:
+                matched_key = src_key
+            elif dst_key is not None and dst_key in probed_ifaces:
+                matched_key = dst_key
+
+            if matched_key is not None:
+                m = probe_mapping_by_key[matched_key]
+                probe_points.append(
+                    ProbePoint(connection=conn, interface_mapping=m)
                 )
-                if conn is not None:
-                    probe_points.append(
-                        ProbePoint(connection=conn, interface_mapping=m)
-                    )
 
         # ── Phase E: Validation ──
         self._validate_flattened(
@@ -607,6 +737,16 @@ class RuntimeEngine:
                     return conn
         return None
 
+    @staticmethod
+    def _find_dest_interface_name(conn, mappings: list) -> str | None:
+        """Find the destination interface name from a Connect object."""
+        from vten.kernel.tensor import Tensor
+
+        dest_tensor = getattr(conn._dest_proxy.kernel_class, conn.dest_name, None)
+        if isinstance(dest_tensor, Tensor):
+            return dest_tensor.interface
+        return None
+
     def _validate_flattened(
         self,
         mappings: list[InterfaceMapping],
@@ -668,7 +808,11 @@ class RuntimeEngine:
         connections: list,
         sub_kernels: dict[str, KernelInstance],
     ) -> None:
-        """Validate that connected tensors have matching dtype."""
+        """Validate that connected tensors have matching dtype.
+
+        Even for internal (RTL wire) connections, dtype must match
+        unless an explicit *transform* is provided on the Connect.
+        """
         for conn in connections:
             src_ki = sub_kernels.get(conn.source_sub)
             dst_ki = sub_kernels.get(conn.dest_sub)
@@ -827,7 +971,11 @@ class RuntimeEngine:
                         )
 
         # Connection shape compatibility (Composite only)
+        # Skip for internal RTL wires — tensor shapes are for host
+        # serialization and may intentionally differ between sub-kernels.
         for conn in view.connections:
+            if getattr(conn, "is_internal_wire", False):
+                continue
             src = view.sub_kernels[conn.source_sub].get_tensor(conn.source_name)
             dst = view.sub_kernels[conn.dest_sub].get_tensor(conn.dest_name)
             if src._element_count != dst._element_count:
@@ -950,7 +1098,6 @@ class RuntimeEngine:
             if iface_spec.array and not exposed._port_buffers:
                 flat_names = iface_spec.array.flat_names(exposed.top_interface)
                 if iface_spec.array.interleave and exposed._serialized is not None:
-                    from vten.runtime.serializer import MultiPortSerializer
                     from vten.spec.models import PortDef, SplitSpec
                     pseudo_spec = SplitSpec(
                         mode="channel_interleave",
@@ -980,10 +1127,108 @@ class RuntimeEngine:
 
     # ── Stage 3b: Probe Golden Serialization ──
 
-    def _serialize_probe_golden(self, view: FlattenedKernelView) -> None:
-        if not view.probe_points:
+    def _serialize_probe_golden(
+        self,
+        view: FlattenedKernelView,
+        internal_probe_golden: dict[tuple[str, str], object] | None = None,
+    ) -> None:
+        """Serialize composite internal probe golden data.
+
+        For each ProbePoint with a connection (composite internal probe),
+        finds the matching golden tensor from internal_probe_golden,
+        serializes it using the source interface's packing, and stores
+        the result in probe.serialized_golden.
+        """
+        if not internal_probe_golden:
             return
-        # Probe serialization handled by engine when probe points exist
+
+        from vten.runtime.serializer import StreamSerializer
+
+        for probe in view.probe_points:
+            if probe.connection is None:
+                continue
+
+            conn = probe.connection
+            key = (conn.source_sub, conn.source_name)
+            golden_tensor = internal_probe_golden.get(key)
+            if golden_tensor is None:
+                logger.warning(
+                    "No internal probe golden for %s.%s — skipping",
+                    conn.source_sub, conn.source_name,
+                )
+                continue
+
+            # Find the source interface packing from the sub-kernel's spec
+            sub_inst = view.sub_kernels.get(conn.source_sub)
+            if sub_inst is None:
+                continue
+
+            # The connection's source_interface is the sub-kernel interface name
+            src_iface = sub_inst.spec.get_interface(conn.source_interface)
+            if src_iface is None or src_iface.packing is None:
+                logger.warning(
+                    "No packing for interface %s.%s — skipping probe golden",
+                    conn.source_sub, conn.source_interface,
+                )
+                continue
+
+            serializer = StreamSerializer(src_iface.packing)
+            serialized = serializer.serialize(golden_tensor)
+
+            probe.golden_data = golden_tensor
+            probe.serialized_golden = serialized
+            probe.tensor_name = f"__probe_{conn.source_sub}_{conn.source_name}"
+
+            logger.debug(
+                "Serialized internal probe golden: %s.%s → %d bytes",
+                conn.source_sub, conn.source_name, len(serialized),
+            )
+
+    @staticmethod
+    def _build_probe_buffer_map(
+        view: FlattenedKernelView,
+    ) -> dict[int, int]:
+        """Build probe_index → golden_buffer_id mapping.
+
+        Only includes composite internal probes (those with connection set).
+        probe_index is deterministic: sequential order of probe_points with
+        connections, matching the codegen order for probe BFM instantiation.
+        """
+        mapping: dict[int, int] = {}
+        probe_index = 0
+        for probe in view.probe_points:
+            if probe.connection is not None and probe.golden_buffer_id is not None:
+                mapping[probe_index] = probe.golden_buffer_id
+                probe_index += 1
+        return mapping
+
+    @staticmethod
+    def _add_probe_golden_to_view(
+        view: FlattenedKernelView,
+        probe_golden_tensors: dict,
+    ) -> None:
+        """Serialize golden tensors and add as ProbePoints to view.
+
+        Creates ProbePoint(tensor_name=..., serialized_golden=...) entries
+        in view.probe_points. These are then allocated and packed by _pack_shm()
+        through the unified probe_points path.
+        """
+        from vten.runtime.serializer import StreamSerializer
+
+        for tensor_name, golden_tensor in probe_golden_tensors.items():
+            exposed = view.exposed_tensors.get(tensor_name)
+            if exposed is None:
+                continue
+            iface = view.top_spec.get_interface(exposed.top_interface)
+            if iface.packing is None:
+                continue
+            serializer = StreamSerializer(iface.packing)
+            serialized = serializer.serialize(golden_tensor)
+            view.probe_points.append(ProbePoint(
+                tensor_name=tensor_name,
+                golden_data=golden_tensor,
+                serialized_golden=serialized,
+            ))
 
     # ── Stage 4: Address Allocation ──
 
@@ -1009,10 +1254,12 @@ class RuntimeEngine:
             )
             exposed.set_address(addr)
 
-    # ── Stage 5: auto_bind Resolution ──
+    # ── Stage 5: auto_bind + config register Resolution ──
 
     def _resolve_auto_binds(self, view: FlattenedKernelView) -> None:
-        view._register_bindings = resolve_auto_binds(view)
+        auto_bindings = resolve_auto_binds(view)
+        config_bindings = resolve_config_registers(view)
+        view._register_bindings = auto_bindings + config_bindings
 
     # ── Stage 6b: BFM Configuration Synthesis ──
 
@@ -1076,6 +1323,7 @@ class RuntimeEngine:
         view: FlattenedKernelView,
         commands: list[Command],
         buffer_ids: dict[str, int],
+        flags: int = 0,
     ) -> bytes:
         shm_alloc = SHMBufferAllocator()
 
@@ -1141,78 +1389,73 @@ class RuntimeEngine:
                     allocated_buffer_ids.add(bid)
                     shm_alloc.allocate(bid, exposed._serialized_size, direction)
 
-        # Probe golden buffers
+        # Probe golden buffers (unified: composite + single kernel)
+        # For split tensors, create per-port golden buffers matching the data split.
         next_buffer_id = max(buffer_ids.values(), default=-1) + 1
+        # Track per-port golden: cmd.buffer_id → (golden_buffer_id, golden_bytes)
+        probe_port_golden: dict[int, tuple[int, bytes]] = {}
         for probe in view.probe_points:
-            if probe.serialized_golden is not None:
+            if probe.serialized_golden is None:
+                continue
+            # Check if tensor is split into ports
+            exposed = (
+                view.exposed_tensors.get(probe.tensor_name)
+                if probe.tensor_name else None
+            )
+            if exposed and exposed._port_buffers:
+                # Split golden matching the tensor data split order
+                golden_bytes = probe.serialized_golden
+                offset = 0
+                for port_name, port_data in exposed._port_buffers.items():
+                    port_size = len(port_data)
+                    golden_chunk = golden_bytes[offset:offset + port_size]
+                    shm_alloc.allocate(
+                        next_buffer_id, port_size, 0, flags=0x01
+                    )
+                    port_bid = buffer_ids.get(
+                        f"{probe.tensor_name}:{port_name}"
+                    )
+                    if port_bid is not None:
+                        probe_port_golden[port_bid] = (
+                            next_buffer_id, golden_chunk
+                        )
+                    next_buffer_id += 1
+                    offset += port_size
+            else:
+                # Non-split: single golden buffer
                 shm_alloc.allocate(
-                    next_buffer_id, len(probe.serialized_golden), 0, flags=0x01
+                    next_buffer_id, len(probe.serialized_golden), 0,
+                    flags=0x01,
                 )
                 probe.golden_buffer_id = next_buffer_id
                 next_buffer_id += 1
 
-        # Calculate sizes
-        num_commands = len(commands)
-        num_buffers = len(shm_alloc.descriptors)
+        # Assign cmd.golden_buf for probe PULL commands
+        # Non-split: map by base tensor name
+        probe_tensor_bids = {
+            p.tensor_name: p.golden_buffer_id
+            for p in view.probe_points
+            if p.tensor_name and p.golden_buffer_id is not None
+        }
+        for cmd in commands:
+            if cmd.probe and cmd.op == OpCode.PULL:
+                # Split tensor: direct buffer_id → golden_buffer_id map
+                if cmd.buffer_id in probe_port_golden:
+                    cmd.golden_buf = probe_port_golden[cmd.buffer_id][0]
+                elif probe_tensor_bids:
+                    # Non-split: reverse map buffer_id → tensor name
+                    for tname, bid in buffer_ids.items():
+                        base = tname.split(":")[0] if ":" in tname else tname
+                        if bid == cmd.buffer_id and base in probe_tensor_bids:
+                            cmd.golden_buf = probe_tensor_bids[base]
+                            break
 
-        total = calculate_shm_size(
-            num_commands=num_commands,
-            num_buffers=num_buffers,
-            buffer_sizes=[d.size for d in shm_alloc.descriptors],
+        image, layout, data_region_offset = _pack_shm_common(
+            shm_alloc, commands, flags=flags,
         )
-
-        image = bytearray(total)
-
-        # Region offsets
-        cmd_offset = CONTROL_SIZE
-        stats_offset = cmd_offset + CMD_SLOT_SIZE * num_commands
-        bufdesc_offset = stats_offset + STATS_SLOT_SIZE * num_commands
-        data_region_raw = bufdesc_offset + BUF_DESC_SIZE * num_buffers
-        data_region_offset = (data_region_raw + CACHE_LINE - 1) & ~(CACHE_LINE - 1)
 
         # Store layout metadata for session-based batch updates
-        self._last_shm_layout = SHMLayout(
-            cmd_offset=cmd_offset,
-            stats_offset=stats_offset,
-            bufdesc_offset=bufdesc_offset,
-            data_region_offset=data_region_offset,
-            num_commands=num_commands,
-            num_buffers=num_buffers,
-            total_size=total,
-        )
-
-        # Pack control header
-        pack_control_header(
-            image,
-            num_commands=num_commands,
-            num_buffers=num_buffers,
-            cmd_region_offset=cmd_offset,
-            stats_region_offset=stats_offset,
-            buf_desc_offset=bufdesc_offset,
-            data_region_offset=data_region_offset,
-            total_shm_size=total,
-        )
-
-        # Pack command slots
-        for i, cmd in enumerate(commands):
-            pack_command_slot(image, cmd_offset + i * CMD_SLOT_SIZE, cmd)
-
-        # Pack stats entries: LOAD commands pre-marked as COMMITTED
-        from vten.spec.models import CommandStatus
-
-        for cmd in commands:
-            if cmd.op == OpCode.LOAD:
-                pack_stats_entry(
-                    image,
-                    stats_offset + cmd.cmd_id * STATS_SLOT_SIZE,
-                    status=CommandStatus.COMMITTED.value,
-                )
-
-        # Pack buffer descriptors
-        for i, desc in enumerate(shm_alloc.descriptors):
-            pack_buffer_descriptor(
-                image, bufdesc_offset + i * BUF_DESC_SIZE, desc
-            )
+        self._last_shm_layout = layout
 
         # Copy input tensor data
         for name, exposed in view.exposed_tensors.items():
@@ -1239,7 +1482,7 @@ class RuntimeEngine:
                     exposed._serialized
                 )
 
-        # Copy probe golden data
+        # Copy probe golden data (unified + per-port split)
         for probe in view.probe_points:
             if probe.serialized_golden is not None and probe.golden_buffer_id is not None:
                 desc = shm_alloc.get_descriptor(probe.golden_buffer_id)
@@ -1247,6 +1490,11 @@ class RuntimeEngine:
                 image[start : start + len(probe.serialized_golden)] = (
                     probe.serialized_golden
                 )
+        # Copy per-port split golden data
+        for _port_bid, (golden_bid, golden_chunk) in probe_port_golden.items():
+            desc = shm_alloc.get_descriptor(golden_bid)
+            start = data_region_offset + desc.data_offset
+            image[start : start + len(golden_chunk)] = golden_chunk
 
         return bytes(image)
 
@@ -1397,57 +1645,9 @@ class RuntimeEngine:
                         allocated_buffer_ids.add(bid)
                         shm_alloc.allocate(bid, exposed._serialized_size, direction)
 
-        # Calculate sizes
-        num_commands = len(commands)
-        num_buffers = len(shm_alloc.descriptors)
-
-        total = calculate_shm_size(
-            num_commands=num_commands,
-            num_buffers=num_buffers,
-            buffer_sizes=[d.size for d in shm_alloc.descriptors],
+        image, _layout, data_region_offset = _pack_shm_common(
+            shm_alloc, commands,
         )
-
-        image = bytearray(total)
-
-        # Region offsets
-        cmd_offset = CONTROL_SIZE
-        stats_offset = cmd_offset + CMD_SLOT_SIZE * num_commands
-        bufdesc_offset = stats_offset + STATS_SLOT_SIZE * num_commands
-        data_region_raw = bufdesc_offset + BUF_DESC_SIZE * num_buffers
-        data_region_offset = (data_region_raw + CACHE_LINE - 1) & ~(CACHE_LINE - 1)
-
-        # Pack control header
-        pack_control_header(
-            image,
-            num_commands=num_commands,
-            num_buffers=num_buffers,
-            cmd_region_offset=cmd_offset,
-            stats_region_offset=stats_offset,
-            buf_desc_offset=bufdesc_offset,
-            data_region_offset=data_region_offset,
-            total_shm_size=total,
-        )
-
-        # Pack command slots
-        for i, cmd in enumerate(commands):
-            pack_command_slot(image, cmd_offset + i * CMD_SLOT_SIZE, cmd)
-
-        # Pack stats entries: LOAD commands pre-marked as COMMITTED
-        from vten.spec.models import CommandStatus
-
-        for cmd in commands:
-            if cmd.op == OpCode.LOAD:
-                pack_stats_entry(
-                    image,
-                    stats_offset + cmd.cmd_id * STATS_SLOT_SIZE,
-                    status=CommandStatus.COMMITTED.value,
-                )
-
-        # Pack buffer descriptors
-        for i, desc in enumerate(shm_alloc.descriptors):
-            pack_buffer_descriptor(
-                image, bufdesc_offset + i * BUF_DESC_SIZE, desc
-            )
 
         # Copy input tensor data from all views
         for view, buffer_ids in zip(views, view_buffer_ids):

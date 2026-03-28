@@ -491,14 +491,44 @@ int vten_shm_init(const char* session_id) {
 }
 ```
 
-### 5.4 Global Timeout Policy
+### 5.4 Python GUI Session Loop
+
+GUI 모드에서 Python `_wait_completion()`은 단일 실행이 아닌 **restart loop**로 동작한다:
+
+```
+┌─────────────────────────────────────────────┐
+│  Python: wait on b2h semaphore (24h timeout) │
+│                                              │
+│  b2h acquired → read backend_status          │
+│    ├─ ERROR: log error, reset SHM to         │
+│    │         CMD_READY, post h2b → continue   │
+│    ├─ IDLE:  restart detected, send           │
+│    │         CMD_READY, post h2b → continue   │
+│    ├─ RUNNING: restart detected (old status), │
+│    │          reset to IDLE + CMD_READY,      │
+│    │          post h2b → continue             │
+│    ├─ DONE:  save result, reset SHM,          │
+│    │         post h2b → continue              │
+│    └─ process exited: break → return/raise    │
+└─────────────────────────────────────────────┘
+```
+
+**핵심**: GUI 모드에서 error/done 후 Python이 세션을 유지하고, xsim restart를 감지하여 CMD_READY를 재전송한다. xsim 종료 시에만 Python이 결과를 리포트한다.
+
+**Restart 감지 메커니즘:**
+- xsim restart → `vten_shm_init()` → `sem_post(b2h)` (ready signal)
+- Python이 b2h를 수신하지만 backend_status가 `RUNNING` (이전 실행의 잔여)
+- Python이 이를 restart로 해석: status를 IDLE로 리셋, CMD_READY 전송
+
+### 5.5 Global Timeout Policy
 
 | 컨텍스트 | `sem_timedwait` 타임아웃 | 만료 시 동작 |
 |----------|--------------------------|-------------|
 | Backend `S_WAIT_HOST` (GUI 모드) | 10ms | 재시도 (GUI 이벤트 허용) |
 | Backend `S_WAIT_HOST` (배치 모드) | 10s | 경고 로그와 함께 재시도 |
-| Host `execute()` (내부 submit) | 300s (설정 가능) | `TimeoutError` 발생 |
-| Host `wait_backend_ready` | 30s | `TimeoutError` 발생 |
+| Host `execute()` (배치 모드) | 300s (설정 가능) | `TimeoutError` 발생 |
+| Host `execute()` (GUI 모드) | 86400s (24시간) | `TimeoutError` 발생 |
+| Host `wait_backend_ready` | 120s | `TimeoutError` 발생 |
 
 ---
 
@@ -517,6 +547,12 @@ int  vten_read_host_status();
 void vten_set_backend_status(int status);
 void vten_signal_complete();
 void vten_signal_error(int code, const char* msg);
+void vten_signal_error_with_cmd(int code, int cmd_id, const char* msg);
+
+// ── Probe Mismatch Logging ──
+void vten_log_mismatch(int probe_idx, int cycle, int beat,
+                       int expected_hi, int expected_lo,
+                       int actual_hi, int actual_lo);
 
 // ── Control Region ──
 int  vten_read_num_commands();

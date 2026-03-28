@@ -9,6 +9,8 @@ import importlib
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from vten.errors import VTenError
+
 if TYPE_CHECKING:
     from vten.backend.base import Backend
     from vten.build.base import BuildPipeline
@@ -41,7 +43,7 @@ def get_backend(name: str, config: dict) -> Backend:
         ValueError: Unknown backend name.
     """
     if name not in _BACKEND_MAP:
-        raise ValueError(
+        raise VTenError(
             f"Unknown backend: {name!r}. Available: {list(_BACKEND_MAP)}"
         )
     module_path, class_name = _BACKEND_MAP[name]
@@ -65,7 +67,7 @@ def get_build_pipeline(name: str, project: Path, config: dict) -> BuildPipeline:
         ValueError: Unknown build pipeline name.
     """
     if name not in _BUILD_MAP:
-        raise ValueError(
+        raise VTenError(
             f"Unknown build pipeline: {name!r}. Available: {list(_BUILD_MAP)}"
         )
     module_path, class_name = _BUILD_MAP[name]

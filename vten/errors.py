@@ -133,6 +133,30 @@ class PollTimeoutError(BackendError):
     pass
 
 
+class ProbeMismatchError(BackendError):
+    """Raised when probe detects mismatch during simulation.
+
+    Attributes:
+        cmd_id: The command ID that detected the mismatch.
+        beat_index: Beat index where first mismatch occurred.
+        mismatches: List of mismatch detail dicts (cycle, beat, expected, actual).
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        cmd_id: int = 0,
+        beat_index: int = 0,
+        mismatches: list[dict] | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(message, **kwargs)
+        self.cmd_id = cmd_id
+        self.beat_index = beat_index
+        self.mismatches = mismatches or []
+
+
 # ── Verification errors ──
 
 

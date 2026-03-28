@@ -16,6 +16,7 @@ import "DPI-C" function int  vten_read_host_status();
 import "DPI-C" function void vten_set_backend_status(input int status);
 import "DPI-C" function void vten_signal_complete();
 import "DPI-C" function void vten_signal_error(input int code, input string msg);
+import "DPI-C" function void vten_signal_error_with_cmd(input int code, input int cmd_id, input string msg);
 
 // ── Control Header ──
 import "DPI-C" function int  vten_read_num_commands();
@@ -72,7 +73,7 @@ import "DPI-C" function void vten_write_cmd_status(
 
 // ── Probe ──
 import "DPI-C" function void vten_log_mismatch(
-    input int cycle, input int beat,
+    input int cmd_id, input int cycle, input int beat,
     input int expected_hi, input int expected_lo,
     input int actual_hi, input int actual_lo);
 

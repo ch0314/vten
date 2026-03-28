@@ -201,6 +201,7 @@ print(result.status)  # "DONE"
 | `ctx.verify(handle, golden)` | HW 출력 vs golden 비교 |
 | `ctx.alias(src, dst)` | 버퍼 재사용 (LOAD/STORE 스킵) |
 | `handle.add_commit_dependency(other)` | commit 의존성 추가 |
+| `ctx.set_internal_probe_golden(sub, tensor, golden)` | 내부 probe golden 등록 |
 
 ### 3.3 의존성 그래프
 
@@ -264,6 +265,47 @@ result.per_command_stats  # 명령별 통계 (CmdStats 리스트)
 result.output_tensors    # {"tensor_name": torch.Tensor} — D2H 텐서 자동 역직렬화
 result.error             # 에러 정보 (있을 경우)
 ```
+
+### 3.6 Probe 검증
+
+#### 출력 Probe
+
+`probe=True`로 pull_tensor를 호출하면, golden 데이터를 SHM에 올려 BFM이 매 beat마다 실시간 비교한다.
+첫 mismatch에서 시뮬레이션이 즉시 중단되어 timeout을 기다리지 않는다.
+
+```python
+h_pull = ctx.pull_tensor(k.data_out, dep=h_push, probe=True)
+ctx.verify(h_pull, k.forward())  # golden이 SHM에도 전달됨
+```
+
+Mismatch 발생 시 `ProbeMismatchError`가 raise되며, beat/cycle/expected/actual 정보를 포함한다.
+
+#### 내부 Probe (CompositeKernel)
+
+`Internal(probe=True)` 연결에 패시브 모니터 BFM이 자동 생성된다.
+TestScenario에서 golden을 등록한다:
+
+```python
+# CompositeKernel 정의
+connections = [
+    Connect(scale.data_out, offset.data_in, Internal(probe=True)),
+]
+
+# TestScenario.run()에서 golden 등록
+scale_golden = k.forward_scale_only(scale_factor=2)
+ctx.set_internal_probe_golden("scale", "data_out", scale_golden)
+```
+
+#### GUI 모드: Waveform 디버깅
+
+```bash
+vten run --kernel my_accel --test TestMyAccel --gui       # interactive
+vten run --kernel my_accel --test TestMyAccel --waveform  # waveform 덤프
+```
+
+GUI 모드에서 probe mismatch 발생 시 `$stop`으로 시뮬레이션이 일시정지된다.
+xsim waveform 창에서 mismatch 시점의 신호를 확인하고, restart로 반복 디버깅이 가능하다.
+Python은 restart 감지 후 CMD_READY를 재전송하여 세션을 유지한다.
 
 ---
 
@@ -421,6 +463,9 @@ $ vten run --kernel passthrough
 # 파형 덤프 포함 실행
 $ vten run --kernel passthrough --test test_passthrough --waveform
 
+# 실패 시에만 파형 저장
+$ vten run --kernel passthrough --test test_passthrough --waveform-on-fail
+
 # GUI 모드
 $ vten run --kernel passthrough --test test_passthrough --gui
 ```
@@ -538,6 +583,7 @@ assert torch.allclose(hw_out.float(), golden.float(), atol=1e-3)
 | `vten run --kernel <name>` | 모든 테스트 실행 (--test 생략) |
 | `vten run ... --waveform` | 파형 덤프 포함 |
 | `vten run ... --gui` | xsim GUI 모드 |
+| `vten run ... --waveform-on-fail` | 실패 시에만 파형 저장 |
 | `vten report` | 결과 리포트 |
 
 ### 7.2 전형적인 개발 사이클
@@ -605,6 +651,7 @@ h = ctx.configure(k) / ctx.barrier()
 ctx.verify(h, golden)
 ctx.alias(src, dst)
 h.add_commit_dependency(other_h)
+ctx.set_internal_probe_golden(sub, tensor, golden)  # 내부 probe golden 등록
 
 result = ctx.run()  # → BatchResult
 ```

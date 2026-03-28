@@ -308,11 +308,11 @@ class TestErrorCompleteness:
     """Verify all expected error classes exist."""
 
     def test_total_error_class_count(self):
-        """00_data_models.md §11 defines 22 error classes."""
+        """00_data_models.md §11 defines error classes."""
         import vten.errors as mod
 
         error_classes = [
             v for v in vars(mod).values()
             if isinstance(v, type) and issubclass(v, Exception) and v is not Exception
         ]
-        assert len(error_classes) == 23
+        assert len(error_classes) == 24

@@ -219,6 +219,7 @@ class RegisterSpec:
     access: str = "rw"  # rw | ro | wo | w1c
     pulse: bool = False  # 1-cycle pulse (only with access=rw/wo)
     reset_value: int = 0
+    role: str = ""  # "config" | "control" | "status" | "" (auto-infer)
 
     @property
     def width(self) -> int:

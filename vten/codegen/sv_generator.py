@@ -93,10 +93,12 @@ class SVGenerator:
         kernel_spec: KernelSpec,
         bfm_configs: list[BFMConfig],
         project_config: dict,
+        probe_bfms: list[dict] | None = None,
     ) -> None:
         self.spec = kernel_spec
         self.bfm_configs = bfm_configs
         self.config = project_config
+        self.probe_bfms = probe_bfms or []
 
     def _module_for_protocol(self, protocol: Protocol) -> str:
         return _PROTOCOL_MODULE_MAP[protocol]
@@ -585,6 +587,7 @@ class SVGenerator:
             "vten_sv_dir": vten_sv_dir,
             "generated_dir": str(out),
             "lib_dir": str(out.parent / "lib") if out.parent.exists() else "build/lib",
+            "probe_bfms": self.probe_bfms,
         }
 
         generated_files = []
@@ -594,6 +597,12 @@ class SVGenerator:
         rendered = tmpl.render(**template_vars)
         (out / "tb_top.sv").write_text(rendered)
         generated_files.append("tb_top.sv")
+
+        # Waveform TCL (always generated at build time; used at runtime if --waveform)
+        tmpl_wave = env.get_template("waveform.tcl.j2")
+        rendered_wave = tmpl_wave.render(**template_vars)
+        (out / "waveform.tcl").write_text(rendered_wave)
+        generated_files.append("waveform.tcl")
 
         # Controller + Wrapper (if any interface has generate_controller)
         if self._has_generate_controller():

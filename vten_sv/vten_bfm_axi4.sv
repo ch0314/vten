@@ -198,10 +198,15 @@ module vten_bfm_axi4 #(
     end
 
     // ── R channel: serve data from SHM ──
+    // Data is loaded via NBA → visible to DUT next cycle.
+    // On handshake, we immediately load the NEXT beat so back-to-back
+    // streaming works at full throughput and rlast aligns with the
+    // correct data beat.
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             r_active <= 0;
             s_rvalid <= 0;
+            s_rlast  <= 0;
         end else begin
             if (read_pending.size() > 0 && !r_active) begin
                 current_read = read_pending.pop_front();
@@ -228,23 +233,11 @@ module vten_bfm_axi4 #(
                 end else begin : blk_r_serve
                     int idx;
                     int offset;
+                    int next_beat;
                     idx = current_read.entry_idx;
-                    offset = (current_read.addr - active_table[idx].cmd.phys_addr)
-                             + r_beat * (1 << current_read.size);
-
-                    // Bulk read from SHM → byte buffer → rdata
-                    vten_read_data_bulk(
-                        active_table[idx].cmd.buffer_id, offset,
-                        BYTES_PER_BEAT, r_beat_buf);
-                    for (int i = 0; i < BYTES_PER_BEAT; i++)
-                        s_rdata[i*8 +: 8] <= r_beat_buf[i];
-
-                    s_rvalid <= 1;
-                    s_rresp  <= 2'b00;
-                    s_rlast  <= (r_beat == current_read.len);
 
                     if (s_rvalid && s_rready) begin
-                        r_beat <= r_beat + 1;
+                        // ── Handshake: current beat accepted ──
                         active_table[idx].active_cycles++;
                         active_table[idx].total_beats++;
                         if (active_table[idx].first_active == 0)
@@ -252,13 +245,42 @@ module vten_bfm_axi4 #(
                         active_table[idx].last_active = cycle_count;
 
                         if (r_beat == current_read.len) begin
+                            // Last beat accepted — done
                             s_rvalid <= 0;
+                            s_rlast  <= 0;
                             r_active <= 0;
                             active_table[idx].transferred_bytes +=
                                 (current_read.len + 1) * (1 << current_read.size);
                             check_completion(idx);
+                        end else begin
+                            // Load NEXT beat immediately
+                            next_beat = r_beat + 1;
+                            r_beat <= next_beat;
+                            offset = (current_read.addr - active_table[idx].cmd.phys_addr)
+                                     + next_beat * (1 << current_read.size);
+                            vten_read_data_bulk(
+                                active_table[idx].cmd.buffer_id, offset,
+                                BYTES_PER_BEAT, r_beat_buf);
+                            for (int i = 0; i < BYTES_PER_BEAT; i++)
+                                s_rdata[i*8 +: 8] <= r_beat_buf[i];
+                            s_rvalid <= 1;
+                            s_rresp  <= 2'b00;
+                            s_rlast  <= (next_beat == current_read.len);
                         end
+                    end else if (!s_rvalid) begin
+                        // ── First presentation: load beat 0 ──
+                        offset = (current_read.addr - active_table[idx].cmd.phys_addr)
+                                 + r_beat * (1 << current_read.size);
+                        vten_read_data_bulk(
+                            active_table[idx].cmd.buffer_id, offset,
+                            BYTES_PER_BEAT, r_beat_buf);
+                        for (int i = 0; i < BYTES_PER_BEAT; i++)
+                            s_rdata[i*8 +: 8] <= r_beat_buf[i];
+                        s_rvalid <= 1;
+                        s_rresp  <= 2'b00;
+                        s_rlast  <= (r_beat == current_read.len);
                     end
+                    // else: rvalid=1, rready=0 → hold current data (regs retain)
                 end
             end
         end
@@ -345,7 +367,8 @@ module vten_bfm_axi4 #(
                         for (int i = 0; i < BYTES_PER_BEAT; i++)
                             golden[i*8 +: 8] = golden_byte_buf[i];
                         if (s_wdata !== golden)
-                            vten_log_mismatch(cycle_count,
+                            vten_log_mismatch(active_table[idx].cmd.cmd_id,
+                                              cycle_count,
                                               active_table[idx].total_beats - 1,
                                               golden[DATA_W-1:DATA_W/2],
                                               golden[DATA_W/2-1:0],

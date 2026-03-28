@@ -124,6 +124,7 @@ class Connect:
         self.source_name = source.tensor_name
         self.dest_name = dest.tensor_name
         self.transform = transform
+        self.is_internal_wire = True  # RTL wire — skip dtype/shape validation
 
         from vten.kernel.tensor import Tensor
 
@@ -144,6 +145,43 @@ class Connect:
     @property
     def dest_sub(self) -> str:
         return self._dest_proxy.binding_attr_name
+
+
+def _topo_sort(connections: list[Connect], bindings: dict[str, SubKernelBinding]) -> list[str]:
+    """Topological sort of sub-kernels based on connection graph.
+
+    Returns sub-kernel binding names in dependency order (sources before sinks).
+    Sub-kernels with no connections appear at the end.
+    """
+    # Build adjacency: source_sub → dest_sub
+    all_names = set(bindings.keys())
+    in_edges: dict[str, set[str]] = {n: set() for n in all_names}
+    out_edges: dict[str, set[str]] = {n: set() for n in all_names}
+
+    for conn in connections:
+        src, dst = conn.source_sub, conn.dest_sub
+        if src in all_names and dst in all_names and src != dst:
+            out_edges[src].add(dst)
+            in_edges[dst].add(src)
+
+    # Kahn's algorithm
+    queue = [n for n in all_names if not in_edges[n]]
+    queue.sort()  # deterministic order for equal-priority nodes
+    result: list[str] = []
+
+    while queue:
+        node = queue.pop(0)
+        result.append(node)
+        for neighbor in sorted(out_edges[node]):
+            in_edges[neighbor].discard(node)
+            if not in_edges[neighbor]:
+                queue.append(neighbor)
+
+    # Append any remaining (cycle or disconnected) — shouldn't happen in practice
+    for n in sorted(all_names - set(result)):
+        result.append(n)
+
+    return result
 
 
 def _make_composite_kernel():
@@ -179,6 +217,11 @@ def _make_composite_kernel():
 
         def exposed_tensor_defs(self) -> list[tuple[str, ExposedTensorDef]]:
             return list(self.__class__._exposed_tensor_defs.items())
+
+        @classmethod
+        def topo_sort_sub_kernels(cls) -> list[str]:
+            """Return sub-kernel names in topological (dependency) order."""
+            return _topo_sort(cls._connections, cls._sub_kernel_bindings)
 
     return CompositeKernel
 

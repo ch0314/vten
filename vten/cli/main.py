@@ -6,7 +6,10 @@ Spec reference: 06_codegen_and_cli.md §4
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -52,6 +55,8 @@ def main(argv: list[str] | None = None) -> None:
         choices=["xsim", "verilator", "xrt"],
         help="Target backend (default: from vten.toml or xsim)")
     run_parser.add_argument("--waveform", action="store_true", help="Enable waveform dump")
+    run_parser.add_argument("--waveform-on-fail", action="store_true",
+                            help="Dump waveform only on test failure")
     run_parser.add_argument("--gui", action="store_true", help="xsim GUI mode")
     run_parser.add_argument("-v", "--sim-verbose", action="store_true",
                             help="Enable simulator verbose output (+VTEN_VERBOSE)")
@@ -63,6 +68,7 @@ def main(argv: list[str] | None = None) -> None:
     report_parser.add_argument("--format", default="terminal", choices=["terminal", "html", "json"])
 
     args = parser.parse_args(argv)
+    args._parser = parser  # For help in _dispatch
 
     # Configure logging before any command handler runs
     from vten.log import setup_logging
@@ -73,6 +79,34 @@ def main(argv: list[str] | None = None) -> None:
     else:
         log_level = "INFO"
     setup_logging(level=log_level, log_file=args.log_file)
+
+    from vten.errors import VTenError
+
+    try:
+        _dispatch(args, log_level)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except VTenError as e:
+        if args.verbose:
+            logger.error("%s", e, exc_info=True)
+        else:
+            logger.error("%s", e)
+        sys.exit(1)
+    except Exception as e:
+        if args.verbose:
+            logger.error("internal error", exc_info=True)
+        else:
+            logger.error("internal error: %s", e)
+            logger.error("Re-run with -v for full traceback.")
+        sys.exit(2)
+
+
+def _dispatch(args: argparse.Namespace, log_level: str) -> None:
+    """Dispatch to the appropriate subcommand handler."""
+    from vten.log import setup_logging
 
     if args.command == "init":
         from vten.cli.init_cmd import init_project
@@ -118,6 +152,7 @@ def main(argv: list[str] | None = None) -> None:
             test_name=args.test or "",
             backend=args.backend,
             waveform=args.waveform,
+            waveform_on_fail=args.waveform_on_fail,
             gui=args.gui,
             sim_verbose=effective_sim_verbose,
             config_overrides=overrides or None,
@@ -128,8 +163,9 @@ def main(argv: list[str] | None = None) -> None:
         print(generate_report(args.project_dir, format=args.format))
 
     else:
-        parser.print_help()
+        args._parser.print_help()
         sys.exit(1)
+
 
 
 if __name__ == "__main__":

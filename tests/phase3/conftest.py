@@ -59,15 +59,17 @@ requires_verilator = pytest.mark.skipif(
 )
 
 
-# ── SHM Constants ──
+# ── SHM Constants (imported from single source of truth) ──
 
-CONTROL_SIZE = 256
-CMD_SLOT_SIZE = 64
-STATS_SLOT_SIZE = 32
-BUF_DESC_SIZE = 24
-CACHE_LINE = 64
-SHM_MAGIC = 0x5654454E
-PROTOCOL_VERSION = 0x00000003
+from vten.runtime.shm import (  # noqa: E402
+    CACHE_LINE,
+    BUF_DESC_SIZE,
+    CMD_SLOT_SIZE,
+    CONTROL_SIZE,
+    SHM_MAGIC,
+    PROTOCOL_VERSION,
+    STATS_SLOT_SIZE,
+)
 
 
 # ── Compilation helpers ──

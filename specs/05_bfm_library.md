@@ -704,71 +704,27 @@ endmodule
 
 ## 4. Debug and Probe System
 
-### 4.1 Signal-Level Comparison (Probe Mode)
+### 4.1 Probe 모드 분류
 
-표준 검증은 역직렬화된 DUT 출력을 golden 텐서와 비교한다. Probe 모드는 golden 텐서를 직렬화하고 **시뮬레이터 내에서 비트별 비교**를 수행한다.
+Probe는 두 가지 독립적인 모드로 동작한다.
+
+**출력 Probe** — `pull_tensor(probe=True)`
+
+DUT 출력 인터페이스에서 BFM이 수신 비트를 golden 텐서와 직접 비교한다.
 
 ```python
 pull1 = ctx.pull_tensor(kernel.ofm, dep=push1, probe=True)
 ```
 
-`probe=True`일 때 Runtime은:
-1. 동일 PackingScheme으로 golden 텐서 직렬화 → `golden_buffer`로 SHM에 저장
-2. COMPARE 커맨드를 IR에 추가
-3. Backend BFM이 캡처된 각 비트를 golden 비트와 비교
-4. 불일치 시 기록: 사이클 번호, 비트 인덱스, 기대값, 실제값, XOR diff
+Runtime이 처리하는 절차:
+1. golden 텐서를 동일 PackingScheme으로 직렬화 → SHM에 별도 버퍼로 저장
+2. probe BFM에 해당 `buffer_id`를 plusarg로 전달
+3. BFM이 AXI4-Stream 핸드쉐이크마다 SHM golden 데이터와 비트별 비교
+4. 불일치 시 stderr 로그 + `mismatches.jsonl` 기록, `probe_error` 신호 어서트
 
-### 4.2 Probe BFM (SV)
+**내부 Probe** — `Internal(probe=True)` in CompositeKernel
 
-```systemverilog
-module vten_bfm_axi4s_probe #(parameter DATA_W = 256)(
-    input logic clk,
-    input logic [DATA_W-1:0] tdata,
-    input logic              tvalid,
-    output logic             tready,
-    input logic              tlast
-);
-    localparam BYTES_PER_BEAT = DATA_W / 8;
-    int beat_count = 0, cycle_count = 0;
-    byte golden_buf [0:BYTES_PER_BEAT-1];
-
-    always @(posedge clk) begin
-        cycle_count++;
-        if (tvalid && tready) begin
-            vten_read_golden_bulk(buffer_id, beat_count * BYTES_PER_BEAT,
-                                  BYTES_PER_BEAT, golden_buf);
-            if (tdata !== {>>{golden_buf}})
-                vten_log_mismatch(cycle_count, beat_count,
-                                  tdata[DATA_W-1:DATA_W/2], tdata[DATA_W/2-1:0],
-                                  {>>{golden_buf}}[DATA_W-1:DATA_W/2],
-                                  {>>{golden_buf}}[DATA_W/2-1:0]);
-            beat_count++;
-        end
-    end
-endmodule
-```
-
-### 4.3 Mismatch Report
-
-```python
-@dataclass
-class SignalMismatch:
-    cycle: int
-    beat_index: int
-    tensor_coords: tuple   # beat_index → 텐서 차원 역매핑
-    expected: int
-    actual: int
-    diff_bits: int          # XOR 마스크
-
-class ProbeReport:
-    mismatches: list[SignalMismatch]
-    def summary(self): ...
-    def to_heatmap(self, dim_reduce=("D", "H", "W")): ...
-```
-
-### 4.4 Intermediate Checkpoints
-
-CompositeKernel에서 서브모듈 경계의 probe 포인트:
+서브커널 간 내부 배선에 패시브 모니터 BFM을 삽입하여 중간값을 검증한다.
 
 ```python
 class NPUTopKernel(CompositeKernel):
@@ -780,14 +736,136 @@ class NPUTopKernel(CompositeKernel):
     )
 ```
 
-Backend가 probed 내부 인터페이스에 패시브 모니터 BFM을 생성. 캡처 데이터를 서브커널 golden 중간값과 비교.
+테스트 시나리오에서 내부 probe의 golden 데이터를 등록:
+
+```python
+# TestScenario.run() 내부
+ctx.set_internal_probe_golden("mac", "axis_ifm", golden_tensor)
+```
+
+Engine이 내부 probe golden 텐서를 SHM에 직렬화하고, probe BFM이 plusarg를 통해 `buffer_id`를 조회하여 비교를 수행한다.
+
+---
+
+### 4.2 Probe BFM (`vten_bfm_axi4s_probe.sv`)
+
+AXI4-Stream 인터페이스를 패시브하게 모니터링한다. `tready`를 항상 1로 구동하므로 DUT 데이터 흐름에 역압(backpressure)을 가하지 않는다.
+
+```systemverilog
+module vten_bfm_axi4s_probe #(
+    parameter int DATA_W      = 256,
+    parameter int PROBE_INDEX = 0
+)(
+    input  logic clk,
+    input  logic [DATA_W-1:0] tdata,
+    input  logic              tvalid,
+    output logic              tready,
+    input  logic              tlast,
+    output logic              probe_error    // 불일치 발생 시 어서트
+);
+```
+
+**동작 순서:**
+
+1. 시뮬레이션 시작 시 `$value$plusargs("PROBE_GOLDEN_<PROBE_INDEX>=%d", buffer_id)`로 SHM buffer_id 획득
+2. `tvalid && tready` 핸드쉐이크마다 `vten_read_golden_bulk()`로 SHM에서 해당 beat의 golden 데이터 읽기
+3. `tdata !== golden`이면:
+   - `probe_error <= 1'b1` 어서트
+   - `vten_log_mismatch()` 호출 → stderr + `mismatches.jsonl` 기록
+   - `vten_read_flags() & 8` (FLAG_PAUSE_ON_MISMATCH, `--gui` 옵션)이면 `$stop` 실행
+4. `probe_error`가 어서트된 이후에는 `!probe_error` 가드로 추가 비교를 중단
+
+`tready`는 1로 고정된다.
+
+---
+
+### 4.2b Probe 에러 전파 경로
+
+```
+probe_error (각 probe BFM)
+    │
+    ▼ OR 게이트 (tb_top)
+probe_error_any
+    │
+    ▼ Controller probe_error 입력
+Controller S_ERROR (error_code = 8, ERR_PROBE_MISMATCH)
+    │
+    ▼ SHM BACKEND_ERROR 기록
+Python ProbeMismatchError 발생
+```
+
+Controller는 scheduler 에러(BFM 타임아웃 등)와 probe 에러(code=8)를 별도 코드로 구분한다.
+
+---
+
+### 4.3 Mismatch 리포트
+
+C 브릿지 `vten_log_mismatch()`는 두 곳에 기록한다:
+
+1. **stderr** (즉시 출력):
+   ```
+   [PROBE MISMATCH] cmd=0 cycle=46 beat=0 expected=0x000...abc actual=0x000...def
+   ```
+
+2. **`$VTEN_MISMATCH_DIR/mismatches.jsonl`** (JSON Lines 형식):
+   ```json
+   {"cmd_id": 0, "cycle": 46, "beat": 0, "expected_hi": 0, "expected_lo": 2748779069, "actual_hi": 0, "actual_lo": 3735928559}
+   ```
+
+Python 런타임은 시뮬레이션 완료 후 `mismatches.jsonl`을 파싱하여 `ProbeMismatchError(beat_index, mismatches, cmd_id)`를 발생시킨다. 테스트 결과 디렉토리에 `mismatches.json`이 저장된다.
+
+---
+
+### 4.4 내부 Probe Golden 등록 API
+
+```python
+# vten/runtime/context.py
+ctx.set_internal_probe_golden(
+    sub_kernel_name: str,   # CompositeKernel 내 서브커널 이름 ("mac")
+    tensor_name:     str,   # 해당 서브커널의 텐서 이름 ("axis_ifm")
+    golden:          Tensor # 기대값 텐서
+)
+```
+
+Engine Stage 3 (Tensor Serialization)에서 내부 probe golden 텐서를 일반 입출력 텐서와 동일한 방식으로 SHM에 직렬화한다. 생성된 `buffer_id`는 codegen 단계에서 `PROBE_GOLDEN_<INDEX>` plusarg 형태로 xsim 시뮬레이션 명령줄에 삽입된다.
+
+---
 
 ### 4.5 Waveform Dump
 
 ```bash
 $ vten run --test test_conv3d --waveform            # 항상 덤프
 $ vten run --test test_conv3d --waveform-on-fail    # 실패 시에만 덤프
+$ vten run --test test_conv3d --gui                 # 대화형 GUI 모드
+$ vten run --test test_conv3d --gui --waveform      # GUI + waveform 신호 자동 등록
 ```
+
+`templates/waveform.tcl.j2`를 렌더링한 `waveform.tcl`이 생성되며, DUT / BFM / probe / scheduler 신호를 자동 등록한다. 배치 모드에서는 xsim `--tclbatch` 옵션으로 주입된다.
+
+---
+
+### 4.6 GUI 모드 (`--gui`) 와 `$stop` 재시작 핸들링
+
+`--gui` 옵션이 지정되면 SHM flags의 bit 3(`FLAG_PAUSE_ON_MISMATCH = 0x08`)이 세트된다.
+
+**SHM 플래그 정의:**
+
+```python
+FLAG_STATS_ENABLED     = 0x01  # 항상 세트
+FLAG_PROGRESS_ENABLED  = 0x02
+FLAG_WAVEFORM_DUMP     = 0x04
+FLAG_PAUSE_ON_MISMATCH = 0x08  # --gui 옵션 시 세트
+```
+
+**GUI 모드 동작 흐름:**
+
+1. Probe BFM이 불일치 검출 시 `vten_read_flags() & 8` 확인 → `$stop` 실행
+2. xsim이 일시 정지하면 사용자가 waveform을 확인
+3. Python은 24시간 타임아웃으로 대기하며 재시작 사이클을 처리:
+   - **에러 발생:** 에러 로그 기록 → SHM 리셋 → CMD_READY 재전송
+   - **재시작:** `vten_shm_init()` b2h 신호 감지 → CMD_READY 재전송
+   - **xsim 종료:** 누적 결과와 함께 graceful exit
+4. KeyboardInterrupt 발생 시 graceful shutdown
 
 ---
 

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from vten.errors import VTenError
+
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -18,12 +20,12 @@ def load_project_config(project_dir: Path | str) -> dict:
     toml_path = Path(project_dir) / "vten.toml"
 
     if not toml_path.exists():
-        raise FileNotFoundError(f"vten.toml not found in {project_dir}")
+        raise VTenError(f"vten.toml not found in {project_dir}")
 
     with open(toml_path, "rb") as f:
         config = tomllib.load(f)
 
     if "project" not in config:
-        raise ValueError("vten.toml missing required [project] section")
+        raise VTenError("vten.toml missing required [project] section")
 
     return config

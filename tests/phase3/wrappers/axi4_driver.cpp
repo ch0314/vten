@@ -227,11 +227,13 @@ int main() {
 
                 /* R channel: handshake occurred if rvalid was high going
                  * into posedge and rready was high.
-                 * Check POST-tick rlast since the BFM sets rlast via NBA
-                 * at the same posedge as the last handshake. */
+                 * Use PRE-tick rlast (prev_rlast) since in Verilator the
+                 * BFM's NBA for the next beat's rlast is already visible
+                 * in the post-tick state. prev_rlast reflects the rlast
+                 * that was presented with the beat being accepted. */
                 if (prev_rvalid && dut->s_rready) {
                     r_beat_count++;
-                    if (dut->s_rlast) {
+                    if (prev_rlast) {
                         r_rlast_seen = 1;
                         break;
                     }

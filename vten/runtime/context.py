@@ -64,8 +64,13 @@ class VerificationTask:
 
 
 @dataclass
-class BatchResult:
-    """Result of ctx.run(). One Batch execution result."""
+class ExecutionResult:
+    """Result of ctx.run(). User-facing execution result.
+
+    Distinct from ``vten.backend.base.BatchResult`` which is the
+    backend-layer result with only (status, total_cycles,
+    per_command_stats, error).
+    """
 
     status: str
     total_cycles: int = 0
@@ -74,6 +79,10 @@ class BatchResult:
     output_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     verification_count: int = 0
     verification_results: list = field(default_factory=list)  # list[VerificationResult]
+
+
+# Backward-compatible alias
+BatchResult = ExecutionResult
 
 
 # ── ExecutionContext ──
@@ -100,6 +109,8 @@ class ExecutionContext:
         self._config_kernels: list[dict[str, KernelInstance]] = []  # per-group
         self._config_params: list[dict] = []  # per-group project_params
         self._current_config_group: int = 0  # tracks current group index
+        # Internal probe golden (composite internal wires)
+        self._internal_probe_golden: dict[tuple[str, str], torch.Tensor] = {}
         # Session state (multi-batch)
         self._session_open: bool = False
 
@@ -180,7 +191,10 @@ class ExecutionContext:
         )
 
     def configure(self, kernel, dep=None) -> OperationHandle:
-        return self._record(OpKind.CONFIGURE, kernel=kernel, dep=dep)
+        # If passed a Kernel class instance (from kernel.run(ctx)),
+        # resolve to the KernelInstance via back-reference
+        resolved = getattr(kernel, "_kernel_instance", kernel)
+        return self._record(OpKind.CONFIGURE, kernel=resolved, dep=dep)
 
     def barrier(self) -> OperationHandle:
         return self._record(OpKind.BARRIER)
@@ -267,6 +281,67 @@ class ExecutionContext:
             self._verifications.append(
                 VerificationTask(op_handle=op_handle, golden=golden)
             )
+
+    def set_internal_probe_golden(
+        self, sub_kernel_name: str, tensor_name: str, golden: torch.Tensor
+    ) -> None:
+        """Register golden data for a composite internal probe.
+
+        The golden tensor is the expected data on the internal wire
+        (source sub-kernel's output). Used by the passive probe BFM
+        for beat-by-beat comparison during simulation.
+
+        Args:
+            sub_kernel_name: Source sub-kernel attribute name (e.g. "scale").
+            tensor_name: Source tensor name (e.g. "data_out").
+            golden: Expected golden tensor data.
+        """
+        self._internal_probe_golden[(sub_kernel_name, tensor_name)] = golden
+
+    def _collect_probe_golden_tensors(self) -> dict[str, torch.Tensor]:
+        """Collect golden tensors for probe-enabled PULL operations.
+
+        Handles two patterns:
+        1. ctx.verify(h_pull, golden)  — verify directly on probe PULL op
+        2. ctx.verify(h_store, golden) — verify on STORE for the same tensor
+
+        In both cases, the golden tensor is matched by tensor name to the
+        probe-enabled PULL operation.
+
+        Returns:
+            tensor_name → golden torch.Tensor (serialization done by engine).
+        """
+        # Step 1: find tensor names with probe-enabled operations
+        probe_tensor_names: set[str] = set()
+        for op in self._pending_ops:
+            if op.probe and op.tensor is not None:
+                probe_tensor_names.add(op.tensor.name)
+
+        # Step 2: match verifications to probe tensors by name
+        probe_golden: dict[str, torch.Tensor] = {}
+        for task in self._verifications:
+            op = task.op_handle.op
+            if op.tensor is None:
+                continue
+            tensor_name = op.tensor.name
+            if tensor_name in probe_tensor_names and tensor_name not in probe_golden:
+                probe_golden[tensor_name] = task.golden
+        return probe_golden
+
+    def _compute_shm_flags(self) -> int:
+        """Compute SHM control header flags from backend config."""
+        from vten.runtime.shm import (
+            FLAG_PAUSE_ON_MISMATCH,
+            FLAG_WAVEFORM_DUMP,
+        )
+        flags = 0  # FLAG_STATS_ENABLED is always added by engine
+        if self._backend and hasattr(self._backend, "_config"):
+            cfg = self._backend._config
+            if cfg.get("_waveform"):
+                flags |= FLAG_WAVEFORM_DUMP
+            if cfg.get("_gui"):
+                flags |= FLAG_PAUSE_ON_MISMATCH
+        return flags
 
     # ── Buffer Aliasing ──
 
@@ -478,10 +553,35 @@ class ExecutionContext:
         )
 
         if not self._compare(hw_output, golden):
+            # Build dtype-aware message with first differing elements
+            max_diff = self._max_diff(hw_output, golden)
+            dtype_str = str(golden.dtype).replace("torch.", "")
+            diff_mask = hw_output != golden
+            diff_indices = diff_mask.nonzero(as_tuple=False)
+            n_diff = diff_indices.shape[0]
+            detail_parts = []
+            for i in range(min(n_diff, 4)):
+                idx = tuple(diff_indices[i].tolist())
+                idx_str = f"[{','.join(str(x) for x in idx)}]"
+                detail_parts.append(
+                    f"  {idx_str}: expected={golden[idx].item()}, "
+                    f"actual={hw_output[idx].item()}"
+                )
+            if n_diff > 4:
+                detail_parts.append(f"  ... and {n_diff - 4} more elements differ")
+            detail = "\n".join(detail_parts)
+            msg = (
+                f"Verification failed for tensor '{tensor_name}': "
+                f"shape={shape}, dtype={dtype_str}, max_diff={max_diff}, "
+                f"{n_diff}/{hw_output.numel()} elements differ"
+            )
+            if detail:
+                msg += f"\n{detail}"
             raise VerificationError(
+                msg,
                 tensor=tensor_name,
                 shape=shape,
-                max_diff=self._max_diff(hw_output, golden),
+                max_diff=max_diff,
             )
 
     @staticmethod
@@ -584,7 +684,7 @@ class ExecutionContext:
 
         return RuntimeEngine.compile_multi(engines, target=target)
 
-    def run(self) -> BatchResult:
+    def run(self) -> ExecutionResult:
         """Compile pending ops → submit → wait → return BatchResult."""
         from vten.runtime.engine import RuntimeEngine
 
@@ -601,7 +701,14 @@ class ExecutionContext:
                 project_params=self._project_params,
                 alias_registry=self._alias_registry,
             )
-            compiled = engine.compile(target=target)
+            probe_golden_tensors = self._collect_probe_golden_tensors()
+            shm_flags = self._compute_shm_flags()
+            compiled = engine.compile(
+                target=target,
+                probe_golden_tensors=probe_golden_tensors or None,
+                internal_probe_golden=self._internal_probe_golden or None,
+                flags=shm_flags,
+            )
 
         self._last_compiled = compiled
         self._pending_ops = []
@@ -675,7 +782,7 @@ class ExecutionContext:
                          sum(1 for v in verification_results if getattr(v, 'passed', False)),
                          verification_count)
 
-            return BatchResult(
+            return ExecutionResult(
                 verification_count=verification_count,
                 verification_results=verification_results,
                 status=status,
@@ -684,7 +791,7 @@ class ExecutionContext:
                 output_tensors=output_tensors,
             )
 
-        return BatchResult(status="DONE")
+        return ExecutionResult(status="DONE")
 
     # ── Session lifecycle ──
 

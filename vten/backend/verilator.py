@@ -73,9 +73,21 @@ class VerilatorBackend(SimBackend):
         logger.info("launching verilator: %s", " ".join(cmd))
         logger.debug("verilator cwd: %s", cwd)
 
-        self._process = subprocess.Popen(
-            cmd,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        env = os.environ.copy()
+        mismatch_dir = self._config.get("_mismatch_dir")
+        if mismatch_dir:
+            env["VTEN_MISMATCH_DIR"] = str(mismatch_dir)
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            from vten.errors import BackendError
+            raise BackendError(
+                f"simulator binary not found: {binary}\n"
+                f"Build the testbench first with 'vten build'"
+            )

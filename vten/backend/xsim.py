@@ -76,8 +76,27 @@ class XsimBackend(SimBackend):
         if self._config.get("_sim_verbose"):
             cmd.extend(["--testplusarg", "VTEN_VERBOSE"])
 
+        # Probe golden buffer ID plusargs for passive probe BFMs
+        probe_map = getattr(self, "_probe_buffer_map", {})
+        for probe_idx, buf_id in probe_map.items():
+            cmd.extend(["--testplusarg", f"PROBE_GOLDEN_{probe_idx}={buf_id}"])
+
         if self._config.get("_gui"):
             cmd.append("--gui")
+            logger.info("xsim GUI opened. In Tcl console:")
+            logger.info("  run all     — start simulation")
+            logger.info("  run 1000ns  — step forward")
+            if self._config.get("_waveform"):
+                logger.info("  source generated/waveform.tcl  — add waveform signals")
+            logger.info("Probe mismatches will pause with $stop.")
+        elif self._config.get("_waveform"):
+            # Batch waveform: use TCL script for log_wave + run all
+            tcl_path = os.path.join(xsim_cwd, "generated", "waveform.tcl")
+            if os.path.isfile(tcl_path):
+                cmd.extend(["--tclbatch", tcl_path])
+            else:
+                logger.warning("waveform.tcl not found at %s, falling back to --runall", tcl_path)
+                cmd.extend(["--runall", "--onerror", "quit"])
         else:
             cmd.extend(["--runall", "--onerror", "quit"])
 
@@ -86,9 +105,23 @@ class XsimBackend(SimBackend):
 
         # sim_verbose: let xsim $display go directly to terminal
         capture_stdout = not self._config.get("_sim_verbose")
-        self._process = subprocess.Popen(
-            cmd,
-            cwd=xsim_cwd,
-            stdout=subprocess.PIPE if capture_stdout else None,
-            stderr=subprocess.PIPE,
-        )
+        # Build env with optional VTEN_MISMATCH_DIR for probe mismatch logging
+        env = os.environ.copy()
+        mismatch_dir = self._config.get("_mismatch_dir")
+        if mismatch_dir:
+            env["VTEN_MISMATCH_DIR"] = str(mismatch_dir)
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                cwd=xsim_cwd,
+                env=env,
+                stdout=subprocess.PIPE if capture_stdout else None,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            from vten.errors import BackendError
+            raise BackendError(
+                f"xsim not found: {xsim_bin}\n"
+                f"Check that Vivado is installed and "
+                f"vivado_path is set in vten.toml [backend.xsim]"
+            )

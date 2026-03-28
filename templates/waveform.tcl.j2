@@ -1,0 +1,26 @@
+# vten auto-generated waveform setup
+# Usage:
+#   Batch mode: xsim tb_top --tclbatch generated/waveform.tcl
+#   GUI mode:   source generated/waveform.tcl  (in Tcl console)
+
+# Log all DUT signals recursively
+log_wave -recursive /tb_top/dut/*
+
+# Log BFM signals
+{% for bfm in bfms %}
+log_wave /tb_top/{{ bfm.name }}/*
+{% endfor %}
+
+# Log infrastructure
+log_wave /tb_top/shm_ctrl/*
+log_wave /tb_top/scheduler/*
+
+{% if probe_bfms %}
+# Log probe BFMs
+{% for probe in probe_bfms %}
+log_wave /tb_top/probe_{{ probe.probe_index }}/*
+{% endfor %}
+{% endif %}
+
+# Run simulation
+run all

@@ -457,6 +457,7 @@ class XsimBuildPipeline(BuildPipeline):
     def _stage_codegen_composite(self, kernel_dir: Path, force: bool = False) -> None:
         """Composite kernel codegen: auto-build sub-kernels + synthesize spec + generate wrapper."""
         from vten.build.composite import (
+            extract_probe_bfm_info,
             generate_composite_sv,
             load_composite_class,
             synthesize_spec,
@@ -472,6 +473,9 @@ class XsimBuildPipeline(BuildPipeline):
         spec = synthesize_spec(composite_cls, self._project, kernel_name)
         bfm_configs = _derive_bfm_configs(spec)
 
+        # Extract internal probe BFM info for codegen
+        probe_bfms = extract_probe_bfm_info(composite_cls, self._project)
+
         output = kernel_dir / "build" / "generated"
         output.mkdir(parents=True, exist_ok=True)
 
@@ -486,6 +490,7 @@ class XsimBuildPipeline(BuildPipeline):
             kernel_spec=spec,
             bfm_configs=bfm_configs,
             project_config=self._config,
+            probe_bfms=probe_bfms,
         )
         gen.generate(str(output), num_commands=256)
         logger.info("  done")
@@ -522,42 +527,45 @@ class XsimBuildPipeline(BuildPipeline):
         if is_composite_kernel(kernel_dir):
             composite_cls = load_composite_class(kernel_dir)
             sub_names = get_sub_kernel_names(composite_cls)
-            existing = prj_out.read_text()
-            existing_files = {
-                line.split()[-1]
-                for line in existing.splitlines()
-                if line.strip()
-            }
-            sub_lines = []
+            composite_lines = prj_out.read_text().splitlines()
+
+            # Build merged order: sub-kernel orders first (they have
+            # correct dependency ordering), then composite-only files.
+            seen_files: set[str] = set()
+            merged_lines: list[str] = []
+
             for sname in sub_names:
-                # Include files from sub-kernel's compile.prj (RTL + deps)
                 sub_prj = self._project / "kernels" / sname / "build" / "compile.prj"
                 if sub_prj.exists():
                     for line in sub_prj.read_text().splitlines():
                         if not line.strip():
                             continue
                         fpath = line.split()[-1]
-                        # Skip sub-kernel's tb_top.sv and already-included files
                         if Path(fpath).name == "tb_top.sv":
                             continue
-                        if fpath not in existing_files:
-                            sub_lines.append(line)
-                            existing_files.add(fpath)
+                        if fpath not in seen_files:
+                            merged_lines.append(line)
+                            seen_files.add(fpath)
                 else:
-                    # Fallback: include generated files only
                     gen_dir = self._project / "kernels" / sname / "build" / "generated"
                     for sv_file in sorted(gen_dir.glob("*.sv")):
                         if sv_file.name == "tb_top.sv":
                             continue
                         fpath = str(sv_file)
-                        if fpath not in existing_files:
-                            sub_lines.append(f"sv xil_defaultlib {sv_file}")
-                            existing_files.add(fpath)
-            if sub_lines:
-                # Prepend sub-kernel files (with RTL + deps) before composite files
-                prj_out.write_text(
-                    "\n".join(sub_lines) + "\n" + existing
-                )
+                        if fpath not in seen_files:
+                            merged_lines.append(f"sv xil_defaultlib {sv_file}")
+                            seen_files.add(fpath)
+
+            # Append composite-specific files (generated wrappers, etc.)
+            for line in composite_lines:
+                if not line.strip():
+                    continue
+                fpath = line.split()[-1]
+                if fpath not in seen_files:
+                    merged_lines.append(line)
+                    seen_files.add(fpath)
+
+            prj_out.write_text("\n".join(merged_lines) + "\n")
 
         logger.info("  done")
 
@@ -576,13 +584,21 @@ class XsimBuildPipeline(BuildPipeline):
         log_dir.mkdir(parents=True, exist_ok=True)
 
         # xvlog
+        xvlog_cmd = [
+            f"{self._vivado_path}/bin/xvlog", "--sv",
+            "--include", str(self._vten_sv_dir),
+        ]
+        for inc_dir in self._config.get("rtl", {}).get("include_dirs", []):
+            inc_path = Path(inc_dir)
+            if not inc_path.is_absolute():
+                inc_path = self._project / inc_path
+            xvlog_cmd += ["--include", str(inc_path.resolve())]
+        xvlog_cmd += [
+            "--prj", str(prj),
+            "--log", str(log_dir / "xvlog.log"),
+        ]
         result = subprocess.run(
-            [
-                f"{self._vivado_path}/bin/xvlog", "--sv",
-                "--include", str(self._vten_sv_dir),
-                "--prj", str(prj),
-                "--log", str(log_dir / "xvlog.log"),
-            ],
+            xvlog_cmd,
             capture_output=True,
             text=True,
             cwd=str(build_dir),

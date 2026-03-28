@@ -42,6 +42,40 @@ def parse_bit_range(bit_range_str: str) -> tuple[int, int]:
     return hi, lo
 
 
+def resolve_config_registers(view: FlattenedKernelView) -> list[RegisterBindingEntry]:
+    """Resolve config-role registers from ParameterResolver namespace.
+
+    For each register with role="config", look up its name in the sub-kernel's
+    resolved parameter namespace. If found, emit a RegisterBindingEntry.
+    """
+    bindings: list[RegisterBindingEntry] = []
+
+    for top_iface_name in view.external_interfaces():
+        for sub_name, reg, abs_offset in view.registers_for_interface(top_iface_name):
+            if reg.role != "config":
+                continue
+            sub = view.sub_kernels[sub_name]
+            if sub._resolver is None:
+                continue
+            ns = sub._resolver.namespace
+            if reg.name not in ns:
+                continue
+            value = ns[reg.name]
+            if not isinstance(value, (int, float)):
+                continue
+            bindings.append(
+                RegisterBindingEntry(
+                    register_name=f"{sub_name}.{reg.name}",
+                    kernel_path=f"{view.name}.{sub_name}.{top_iface_name}",
+                    interface_name=top_iface_name,
+                    absolute_offset=abs_offset,
+                    auto_bind=AutoBindSpec(param=reg.name),
+                    resolved_value=int(value),
+                )
+            )
+    return bindings
+
+
 def resolve_auto_binds(view: FlattenedKernelView) -> list[RegisterBindingEntry]:
     """Resolve all auto_bind registers for the flattened view."""
     bindings: list[RegisterBindingEntry] = []
