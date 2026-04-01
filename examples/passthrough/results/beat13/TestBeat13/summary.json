@@ -2,7 +2,7 @@
   "test_name": "TestBeat13",
   "kernel": "beat13",
   "status": "PASS",
-  "total_cycles": 90,
+  "total_cycles": 89,
   "configs_run": 1,
   "configs_passed": 1,
   "verification_count": 1,

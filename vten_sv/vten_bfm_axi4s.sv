@@ -91,7 +91,7 @@ module vten_bfm_axi4s #(
                 stall_cycles <= 0;
                 total_beats <= 0;
                 if (verbose)
-                    $display("[AXI4S %0t] %s %s iface=%0d cmd#%0d: buf=%0d, %0d bytes (%0d beats)",
+                    $display("[AXI4S    %t] %s %s iface=%0d cmd#%0d: buf=%0d, %0d bytes (%0d beats)",
                              $time, MODE, current_cmd.opcode.name(),
                              current_cmd.interface_id, current_cmd.cmd_id,
                              current_cmd.buffer_id,
@@ -215,7 +215,7 @@ module vten_bfm_axi4s #(
             cycle_count,
             active_cycles, total_beats, stall_cycles);
         if (verbose)
-            $display("[AXI4S %0t] %s %s iface=%0d cmd#%0d done: %0d beats, %0d stall cyc, %0d active cyc",
+            $display("[AXI4S    %t] %s %s iface=%0d cmd#%0d done: %0d beats, %0d stall cyc, %0d active cyc",
                      $time, MODE, current_cmd.opcode.name(),
                      current_cmd.interface_id, current_cmd.cmd_id,
                      total_beats, stall_cycles, active_cycles);

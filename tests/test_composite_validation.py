@@ -20,15 +20,12 @@ import torch
 
 from vten.errors import (
     ConnectionDtypeMismatchError,
-    ProtocolMismatchError,
     ValidationError,
 )
 from vten.kernel.base import Kernel
 from vten.kernel.composite import (
     CompositeKernel,
-    Connect,
-    Internal,
-    SubKernelBinding,
+    Connection,
 )
 from vten.kernel.register import register
 from vten.kernel.tensor import Tensor
@@ -74,9 +71,12 @@ class TestScaleAddGolden:
         ctx = ExecutionContext(
             project_params={"N": N, "_project_dir": project_dir}
         )
-        k = ctx.instantiate(ScaleAddKernel, N=N)
+        k = ctx.instantiate(
+            ScaleAddKernel, N=N,
+            scale_factor=scale_factor, offset_value=offset_value,
+        )
         k.generate_inputs(seed=seed)
-        return k, k.forward(scale_factor=scale_factor, offset_value=offset_value)
+        return k, k.forward()["data_out"]
 
     def test_default(self):
         """scale=2, offset=1: basic operation."""
@@ -136,9 +136,12 @@ class TestDmaPipelineGolden:
         ctx = ExecutionContext(
             project_params={"N": N, "_project_dir": project_dir}
         )
-        k = ctx.instantiate(DmaPipelineKernel, N=N)
+        k = ctx.instantiate(
+            DmaPipelineKernel, N=N,
+            scale_factor=scale_factor, offset_value=offset_value,
+        )
         k.generate_inputs(seed=seed)
-        return k, k.forward(scale_factor=scale_factor, offset_value=offset_value)
+        return k, k.forward()["data_out"]
 
     def test_default(self):
         k, result = self._run_golden()
@@ -176,9 +179,9 @@ class TestEdgeCaseN:
         ctx = ExecutionContext(
             project_params={"N": N, "_project_dir": self._project_dir()}
         )
-        k = ctx.instantiate(ScaleAddKernel, N=N)
+        k = ctx.instantiate(ScaleAddKernel, N=N, scale_factor=2, offset_value=1)
         k.generate_inputs(seed=42)
-        result = k.forward(scale_factor=2, offset_value=1)
+        result = k.forward()["data_out"]
         assert result.shape == (N,)
         assert result.dtype == torch.int8
 
@@ -187,9 +190,9 @@ class TestEdgeCaseN:
         ctx = ExecutionContext(
             project_params={"N": N, "_project_dir": self._project_dir()}
         )
-        k = ctx.instantiate(DmaPipelineKernel, N=N)
+        k = ctx.instantiate(DmaPipelineKernel, N=N, scale_factor=2, offset_value=1)
         k.generate_inputs(seed=42)
-        result = k.forward(scale_factor=2, offset_value=1)
+        result = k.forward()["data_out"]
         assert result.shape == (N,)
 
 
@@ -203,7 +206,7 @@ class _StreamSrcKernel(Kernel):
     data_out = Tensor(shape=(8,), dtype=torch.int8, interface="output_stream")
     ctrl = register("ctrl")
     def generate_inputs(self, seed=None): pass
-    def forward(self): return torch.zeros(8)
+    def forward(self, **inputs): return {"data_out": torch.zeros(8)}
 
 
 class _StreamDstKernel(Kernel):
@@ -211,7 +214,7 @@ class _StreamDstKernel(Kernel):
     data_in = Tensor(shape=(8,), dtype=torch.int8, interface="input_stream")
     ctrl = register("ctrl")
     def generate_inputs(self, seed=None): pass
-    def forward(self): return torch.zeros(8)
+    def forward(self, **inputs): return {}
 
 
 class _FloatDstKernel(Kernel):
@@ -219,31 +222,26 @@ class _FloatDstKernel(Kernel):
     data_in = Tensor(shape=(8,), dtype=torch.float32, interface="input_stream")
     ctrl = register("ctrl")
     def generate_inputs(self, seed=None): pass
-    def forward(self): return torch.zeros(8)
+    def forward(self, **inputs): return {}
 
 
 class TestConnectionValidationNegative:
     """Negative tests: bad composite configurations should raise errors."""
 
-    def test_dtype_mismatch_raises(self):
-        """int8 → float32 without transform → ConnectionDtypeMismatchError."""
+    def test_dtype_mismatch_allowed_for_internal_wires(self):
+        """int8 → float32 on internal wire is OK (physical bytes on wire)."""
         from vten.runtime.engine import RuntimeEngine
         from vten.runtime.flattener import KernelInstance
         from vten.runtime.resolver import ParameterResolver
         from vten.spec.models import KernelSpec
 
-        # Define composite so binding_attr_name is set properly
-        class _BadDtypeComposite(CompositeKernel):
-            spec = "bad.yaml"
-            src = _StreamSrcKernel.bind(
-                interface_map={"ctrl": "c1", "output_stream": Internal()}
-            )
-            dst = _FloatDstKernel.bind(
-                interface_map={"ctrl": "c2", "input_stream": Internal()}
-            )
-            connections = [Connect(src.data_out, dst.data_in)]
+        class _DtypeMixComposite(CompositeKernel):
+            spec = "mix.yaml"
+            src = _StreamSrcKernel()
+            dst = _FloatDstKernel()
+            connections = [src.data_out >> dst.data_in]
 
-        conn = _BadDtypeComposite.connections[0]
+        conn = _DtypeMixComposite.connections[0]
 
         # Build minimal KernelInstances keyed by binding attr name
         sub_kernels = {}
@@ -262,8 +260,8 @@ class TestConnectionValidationNegative:
             sub_kernels[name] = ki
 
         engine = RuntimeEngine(kernels={}, ops=[], project_params={})
-        with pytest.raises(ConnectionDtypeMismatchError, match="dtype mismatch"):
-            engine._validate_connection_dtypes([conn], sub_kernels)
+        # Internal wire connections skip dtype check
+        engine._validate_connection_dtypes([conn], sub_kernels)
 
     def test_duplicate_source_raises(self):
         """Same source interface in two connections → ValidationError."""
@@ -274,22 +272,16 @@ class TestConnectionValidationNegative:
             data_in = Tensor(shape=(8,), dtype=torch.int8, interface="in2")
             ctrl = register("ctrl")
             def generate_inputs(self, seed=None): pass
-            def forward(self): return torch.zeros(8)
+            def forward(self, **inputs): return {}
 
         class _DupSrcComposite(CompositeKernel):
             spec = "dup.yaml"
-            src = _StreamSrcKernel.bind(
-                interface_map={"ctrl": "c1", "output_stream": Internal()}
-            )
-            dst1 = _StreamDstKernel.bind(
-                interface_map={"ctrl": "c2", "input_stream": Internal()}
-            )
-            dst2 = _Dst2.bind(
-                interface_map={"ctrl": "c3", "in2": Internal()}
-            )
+            src = _StreamSrcKernel()
+            dst1 = _StreamDstKernel()
+            dst2 = _Dst2()
             connections = [
-                Connect(src.data_out, dst1.data_in),
-                Connect(src.data_out, dst2.data_in),
+                src.data_out >> dst1.data_in,
+                src.data_out >> dst2.data_in,
             ]
 
         engine = RuntimeEngine(kernels={}, ops=[], project_params={})

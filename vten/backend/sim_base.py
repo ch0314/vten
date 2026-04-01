@@ -352,7 +352,7 @@ class SimBackend(Backend):
 
         # Step [1]: Create POSIX SHM and write image
         if shm_image is not None:
-            logger.debug("[handshake 1] creating SHM: name=%s, size=%d bytes",
+            logger.log(5, "[handshake 1] creating SHM: name=%s, size=%d bytes",
                          shm_name, len(shm_image))
             self._shm = SharedMemory(name=shm_name, create=True, size=len(shm_image))
             self._shm.buf[:len(shm_image)] = shm_image
@@ -362,18 +362,18 @@ class SimBackend(Backend):
         # Create named semaphore pair
         self._sem_h2b = _PosixSemaphore(f"/vten_{self._session_id}_h2b", create=True)
         self._sem_b2h = _PosixSemaphore(f"/vten_{self._session_id}_b2h", create=True)
-        logger.debug("[handshake 1] semaphores created: h2b, b2h (session=%s)",
+        logger.log(5, "[handshake 1] semaphores created: h2b, b2h (session=%s)",
                      self._session_id)
 
         # Start simulator subprocess
-        logger.debug("[handshake 2] starting simulator")
+        logger.log(5, "[handshake 2] starting simulator")
         self._start_simulator()
-        logger.debug("[handshake 2] simulator process started (pid=%s)",
+        logger.log(5, "[handshake 2] simulator process started (pid=%s)",
                      self._process.pid if self._process else "?")
 
         # Step [3]: Wait for backend ready signal (b2h)
         init_timeout = min(self._submit_timeout_s, 120)
-        logger.debug("[handshake 3] waiting for backend ready (timeout=%ds)", init_timeout)
+        logger.log(5, "[handshake 3] waiting for backend ready (timeout=%ds)", init_timeout)
         if not self._sem_b2h.timedwait(init_timeout):
             # Check if simulator crashed before signaling
             proc_status = self._describe_process_state()
@@ -385,7 +385,7 @@ class SimBackend(Backend):
                 logger.error("simulator output tail:\n%s", sim_output[-2000:])
             raise VTenTimeoutError(msg)
 
-        logger.debug("backend ready (session=%s)", self._session_id)
+        logger.log(5, "backend ready (session=%s)", self._session_id)
 
         # Verify backend_status == IDLE after init
         if self._shm is not None:
@@ -399,7 +399,7 @@ class SimBackend(Backend):
         if self._shm is not None:
             self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_CMD_READY)
         self._sem_h2b.post()
-        logger.debug("[handshake 4] CMD_READY signaled")
+        logger.log(5, "[handshake 4] CMD_READY signaled")
 
     # Progress polling interval (seconds)
     _PROGRESS_POLL_INTERVAL = 2.0
@@ -433,7 +433,7 @@ class SimBackend(Backend):
         gui_last_result: BackendResult | None = None
 
         while True:  # GUI restart loop (single iteration in normal mode)
-            logger.debug("[handshake 8] waiting for backend completion (timeout=%ds)",
+            logger.log(5, "[handshake 8] waiting for backend completion (timeout=%ds)",
                          effective_timeout)
             deadline = time.monotonic() + effective_timeout
             last_progress_str = ""
@@ -471,7 +471,7 @@ class SimBackend(Backend):
                 raise
 
             backend_status = self._read_shm_u32(self.BACKEND_STATUS_OFFSET)
-            logger.debug("[handshake 8] backend status=%d", backend_status)
+            logger.log(5, "[handshake 8] backend status=%d", backend_status)
             process_alive = self._process is None or self._process.poll() is None
 
             # Handle ERROR
@@ -556,7 +556,7 @@ class SimBackend(Backend):
 
             # Normal mode or process exited: return result
             self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_ACK)
-            logger.debug("backend completed: %d command stats read", len(stats))
+            logger.log(5, "backend completed: %d command stats read", len(stats))
 
             return BackendResult(
                 status=backend_status,
@@ -779,7 +779,7 @@ class SimBackend(Backend):
 
         Implements handshake step [9] from 04_backend_xsim.md §3.
         """
-        logger.debug("[handshake 9] sending SHUTDOWN signal")
+        logger.log(5, "[handshake 9] sending SHUTDOWN signal")
         # Signal SHUTDOWN via SHM + semaphore
         if self._shm is not None:
             try:
@@ -793,7 +793,7 @@ class SimBackend(Backend):
         if self._process is not None:
             try:
                 self._process.wait(timeout=10)
-                logger.debug("simulator exited (rc=%d)", self._process.returncode)
+                logger.log(5, "simulator exited (rc=%d)", self._process.returncode)
             except subprocess.TimeoutExpired:
                 logger.warning("simulator did not exit in 10s, sending SIGTERM")
                 self._process.terminate()
@@ -809,7 +809,7 @@ class SimBackend(Backend):
             if self._process.returncode and self._process.returncode != 0:
                 logger.warning("simulator exited with code %d", self._process.returncode)
                 if sim_output:
-                    logger.debug("simulator output:\n%s", sim_output[-2000:])
+                    logger.log(5, "simulator output:\n%s", sim_output[-2000:])
 
     def _describe_process_state(self) -> str:
         """Describe the simulator process state for diagnostics."""
@@ -923,7 +923,7 @@ class SimBackend(Backend):
         self._write_shm_u32(self.BACKEND_STATUS_OFFSET, BACKEND_STATUS_IDLE)
         self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_CMD_READY)
         self._sem_h2b.post()
-        logger.debug("[session] batch submitted (cmds=%d, bufs=%d)",
+        logger.log(5, "[session] batch submitted (cmds=%d, bufs=%d)",
                      layout.num_commands, layout.num_buffers)
 
     def wait_batch(self) -> BackendResult:

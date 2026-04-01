@@ -111,8 +111,12 @@ class ExecutionContext:
         self._current_config_group: int = 0  # tracks current group index
         # Internal probe golden (composite internal wires)
         self._internal_probe_golden: dict[tuple[str, str], torch.Tensor] = {}
+        # Declarative probe support
+        self._declarative_probes: list[str] = []
+        self._internal_probe_requests: list[tuple[str, str]] = []
         # Session state (multi-batch)
         self._session_open: bool = False
+        self._batch_count: int = 0
 
     def instantiate(self, kernel_class: type, spec=None, **params) -> KernelInstance:
         """Create and initialize a kernel instance with eager resolution."""
@@ -327,6 +331,59 @@ class ExecutionContext:
             if tensor_name in probe_tensor_names and tensor_name not in probe_golden:
                 probe_golden[tensor_name] = task.golden
         return probe_golden
+
+    # ── Declarative Probes ──
+
+    def _register_declarative_probes(self, probes: list[str]) -> None:
+        """Store declarative probe specs for processing at run() time."""
+        self._declarative_probes = list(probes)
+
+    def _apply_declarative_probes(self) -> None:
+        """Post-hoc annotation: mark ops as probes based on declarative specs.
+
+        For output probes (simple name like "data_out"): set probe=True on
+        matching PULL/RECV operations.
+        For internal probes (dotted name like "scale.data_out"): store in
+        _internal_probe_requests for golden extraction.
+        """
+        if not self._declarative_probes:
+            return
+        for probe_spec in self._declarative_probes:
+            if "." in probe_spec:
+                # Internal probe: "sub_kernel.tensor_name"
+                sub, tensor = probe_spec.rsplit(".", 1)
+                self._internal_probe_requests.append((sub, tensor))
+            else:
+                # Output probe: find matching PULL/RECV op
+                for op in self._pending_ops:
+                    if (
+                        op.kind in (OpKind.PULL_TENSOR, OpKind.RECV_TENSOR)
+                        and op.tensor is not None
+                        and op.tensor.name == probe_spec
+                    ):
+                        op.probe = True
+
+    def _resolve_internal_probe_golden(self) -> None:
+        """Auto-extract internal probe golden from CompositeKernel forward results.
+
+        v2: Uses _sub_kernel_refs and forward() chain instead of golden_provides/pool.
+        After forward() has run during ki.run(ctx), we can extract intermediate
+        values from the forward chain pool stored on the composite instance.
+        """
+        if not self._internal_probe_requests:
+            return
+        for ki in self._kernels.values():
+            inst = ki.kernel_class_instance
+            pool = getattr(inst, "_golden_pool", None)
+            if pool is None:
+                continue
+            for sub_name, tensor_name in self._internal_probe_requests:
+                if (sub_name, tensor_name) in self._internal_probe_golden:
+                    continue
+                # v2: pool keys are (sub_name, tensor_name) tuples
+                key = (sub_name, tensor_name)
+                if key in pool:
+                    self._internal_probe_golden[key] = pool[key]
 
     def _compute_shm_flags(self) -> int:
         """Compute SHM control header flags from backend config."""
@@ -560,15 +617,16 @@ class ExecutionContext:
             diff_indices = diff_mask.nonzero(as_tuple=False)
             n_diff = diff_indices.shape[0]
             detail_parts = []
-            for i in range(min(n_diff, 4)):
+            _show = min(n_diff, 4)
+            for i in range(_show):
                 idx = tuple(diff_indices[i].tolist())
                 idx_str = f"[{','.join(str(x) for x in idx)}]"
                 detail_parts.append(
                     f"  {idx_str}: expected={golden[idx].item()}, "
                     f"actual={hw_output[idx].item()}"
                 )
-            if n_diff > 4:
-                detail_parts.append(f"  ... and {n_diff - 4} more elements differ")
+            if n_diff > _show:
+                detail_parts.append(f"  ... and {n_diff - _show} more elements differ")
             detail = "\n".join(detail_parts)
             msg = (
                 f"Verification failed for tensor '{tensor_name}': "
@@ -688,7 +746,11 @@ class ExecutionContext:
         """Compile pending ops → submit → wait → return BatchResult."""
         from vten.runtime.engine import RuntimeEngine
 
-        logger.debug("ExecutionContext.run(): %d pending ops", len(self._pending_ops))
+        # Apply declarative probes (post-hoc annotation)
+        self._apply_declarative_probes()
+        self._resolve_internal_probe_golden()
+
+        logger.log(5, "ExecutionContext.run(): %d pending ops", len(self._pending_ops))
 
         target = self._backend.compile_target if self._backend else "sim"
 
@@ -724,7 +786,9 @@ class ExecutionContext:
                 and self._backend.supports_session
                 and self._session_open
             ):
-                logger.debug("submitting batch via session")
+                self._batch_count += 1
+                logger.debug("──── batch #%d submit (session reuse) ────",
+                             self._batch_count)
                 self._backend.submit_batch(compiled)
                 backend_result = self._backend.wait_batch()
             elif (
@@ -732,12 +796,16 @@ class ExecutionContext:
                 and self._backend.supports_session
                 and not self._session_open
             ):
-                logger.debug("opening session + first batch")
+                self._batch_count += 1
+                logger.debug("──── batch #%d submit (new session) ────",
+                             self._batch_count)
                 self._backend.open_session(compiled)
                 backend_result = self._backend.wait_batch()
                 self._session_open = True
             else:
-                logger.debug("submitting to backend (one-shot)")
+                self._batch_count += 1
+                logger.debug("──── batch #%d submit (one-shot) ────",
+                             self._batch_count)
                 backend_result = self._backend.execute(compiled)
             self._last_backend_result = backend_result
 
@@ -763,7 +831,7 @@ class ExecutionContext:
             verification_count = 0
             verification_results: list = []
             if self._verifications:
-                logger.debug("running %d deferred verifications", len(self._verifications))
+                logger.log(5, "running %d deferred verifications", len(self._verifications))
                 try:
                     verification_count, verification_results = (
                         self._run_deferred_verifications()

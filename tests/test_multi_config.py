@@ -32,7 +32,7 @@ class StreamKernel(Kernel):
     data_in = Tensor(shape=("${N}",), dtype=torch.int8, interface="axis_in")
     data_out = Tensor(shape=("${N}",), dtype=torch.int8, interface="axis_out")
 
-    def forward(self):
+    def forward(self, **inputs):
         return self.data_in.data.clone()
 
 

@@ -45,7 +45,7 @@ class PassthroughKernel(Kernel):
     def generate_inputs(self, seed=None):
         self.data_in.fill_random()
 
-    def forward(self):
+    def forward(self, **inputs):
         return self.data_in.data
 
 

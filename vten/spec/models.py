@@ -219,7 +219,7 @@ class RegisterSpec:
     access: str = "rw"  # rw | ro | wo | w1c
     pulse: bool = False  # 1-cycle pulse (only with access=rw/wo)
     reset_value: int = 0
-    role: str = ""  # "config" | "control" | "status" | "" (auto-infer)
+    # v2: role, alias, default 삭제. Register는 순수 HW 맵.
 
     @property
     def width(self) -> int:
@@ -323,6 +323,7 @@ class KernelSpec:
     kernel_name: str
     rtl_top: str
     parameters: dict[str, str | int] = field(default_factory=dict)
+    build_params: dict[str, int | str] = field(default_factory=dict)
     memory_regions: dict[str, MemoryRegion] = field(default_factory=dict)
     interfaces: dict[str, InterfaceSpec] = field(default_factory=dict)
     clock_name: str = "clk"

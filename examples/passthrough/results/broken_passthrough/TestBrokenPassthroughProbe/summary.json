@@ -5,13 +5,17 @@
   "total_cycles": 0,
   "configs_run": 1,
   "configs_passed": 0,
-  "verification_count": 1,
+  "verification_count": 0,
   "verification_passed": 0,
-  "verification_results": [
-    {
-      "tensor": "data_out",
-      "passed": false,
-      "max_diff": 1.0
-    }
+  "error_message": "[Scheduler] error at cmd_id=2 (cmd_id=2)",
+  "error_traceback": [
+    "Traceback (most recent call last):\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/cli/run.py\", line 461, in _run_single_test\n    batch_result = ctx.run()\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/runtime/context.py\", line 706, in run\n    backend_result = self._backend.wait_batch()\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/backend/sim_base.py\", line 814, in wait_batch\n    return self._wait_completion()\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/backend/sim_base.py\", line 441, in _wait_completion\n    self._raise_backend_error(error_code, error_cmd_id, error_msg)\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/backend/sim_base.py\", line 271, in _raise_backend_error\n    raise_backend_error(code, cmd_id, message)\n",
+    "  File \"/home/chanmin/xhw/projects/vten/vten/backend/base.py\", line 56, in raise_backend_error\n    raise exc_cls(full_message, **kwargs)\n",
+    "vten.errors.ProbeMismatchError: [Scheduler] error at cmd_id=2 (cmd_id=2)\n"
   ]
 }

@@ -2,7 +2,7 @@
   "test_name": "TestNarrow8",
   "kernel": "narrow8",
   "status": "PASS",
-  "total_cycles": 1035,
+  "total_cycles": 1034,
   "configs_run": 1,
   "configs_passed": 1,
   "verification_count": 1,

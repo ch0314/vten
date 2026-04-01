@@ -78,53 +78,46 @@ def synthesize_spec(
 ) -> KernelSpec:
     """Synthesize a KernelSpec from sub-kernel specs + Python connectivity.
 
-    With independent ctrl (Pattern 1):
-    - Each sub-kernel's AXI-Lite ctrl becomes a separate top-level interface
-      named "{sub_name}_ctrl"
-    - External stream/MM interfaces are exposed with the mapped name
-    - Internal interfaces are omitted (wired in SV, no BFM)
+    v2: Uses _sub_kernel_refs, _connected_tensors, _auto_exposed.
+    Connected interfaces → internal (omitted from spec).
+    Unconnected interfaces → external (auto-prefixed with sub-kernel name).
+    AXI-Lite ctrl interfaces → independent ctrl pattern.
     """
-    from vten.kernel.composite import Internal
+    sub_kernel_refs = getattr(composite_cls, "_sub_kernel_refs", {})
+    connected_tensors = getattr(composite_cls, "_connected_tensors", set())
+    auto_exposed = getattr(composite_cls, "_auto_exposed", {})
 
-    bindings = dict(composite_cls._sub_kernel_bindings)
     interfaces: dict[str, InterfaceSpec] = {}
     memory_regions: dict = {}
 
-    for sub_name, binding in bindings.items():
-        sub_spec = _load_sub_kernel_spec(binding.kernel_class, project)
+    for sub_name, sub_cls in sub_kernel_refs.items():
+        sub_spec = _load_sub_kernel_spec(sub_cls, project)
         # Merge memory regions from sub-kernel specs
         for region_name, region in sub_spec.memory_regions.items():
             if region_name not in memory_regions:
                 memory_regions[region_name] = region
 
-        for sub_iface_name, mapping in binding.interface_map.items():
+        for sub_iface_name in sub_spec.interface_names():
             sub_iface = sub_spec.interfaces.get(sub_iface_name)
             if sub_iface is None:
-                raise BuildError(
-                    f"Interface '{sub_iface_name}' not found in "
-                    f"sub-kernel '{binding.kernel_class.__name__}'"
-                )
+                continue
 
-            if isinstance(mapping, Internal):
+            # Check if any tensor on this interface is connected (internal)
+            is_internal = False
+            for t_name, t_desc in sub_cls._tensor_descriptors.items():
+                if t_desc.interface == sub_iface_name:
+                    if (sub_name, t_name) in connected_tensors:
+                        is_internal = True
+                        break
+
+            if is_internal:
                 # Internal wire — no top-level interface
                 continue
 
-            if isinstance(mapping, str):
-                # External: direct mapping to top-level interface name
-                top_name = mapping
-            elif isinstance(mapping, tuple) and len(mapping) == 2:
-                # Register banking: ("top_name", "bank_name")
-                # For independent ctrl, each sub-kernel gets its own port
-                top_name = mapping[0]
-                bank_name = mapping[1]
-            else:
-                raise BuildError(
-                    f"Unknown mapping type for {sub_name}.{sub_iface_name}: "
-                    f"{mapping}"
-                )
+            # Auto-expose: external with sub_name prefix
+            top_name = f"{sub_name}_{sub_iface_name}"
 
-            # Clone the interface spec with new name and rtl_port
-            # Never generate_controller — sub-kernel wrappers already have theirs
+            # Clone the interface spec
             new_iface = deepcopy(sub_iface)
             new_iface.name = top_name
             new_iface.generate_controller = False
@@ -132,24 +125,19 @@ def synthesize_spec(
             if sub_iface.protocol == Protocol.AXI4L:
                 new_iface.rtl_port = f"s_axilite_{sub_name}"
                 # Add register bank for independent ctrl pattern
-                if isinstance(mapping, tuple) and len(mapping) == 2:
-                    new_iface.register_banks = [
-                        RegisterBankSpec(name=bank_name, base_offset=0)
-                    ]
-            elif sub_iface.protocol == Protocol.AXI4S:
-                # Preserve direction convention (s_axis for slave, m_axis for master)
-                # determined by the original sub-kernel spec
-                pass
+                new_iface.register_banks = [
+                    RegisterBankSpec(name=sub_name, base_offset=0)
+                ]
             elif sub_iface.protocol == Protocol.AXI4:
-                # AXI4 MM: use composite-unique prefix based on top_name
                 new_iface.rtl_port = f"m_axi_{top_name}"
-            # For stream interfaces, update tensor name from exposed_tensor_defs
+
+            # Update tensor name from auto_exposed
             if new_iface.tensor:
-                exposed_tensor_name = _find_exposed_tensor(
+                exposed_name = _find_exposed_tensor(
                     composite_cls, sub_name, new_iface.tensor
                 )
-                if exposed_tensor_name:
-                    new_iface.tensor = exposed_tensor_name
+                if exposed_name:
+                    new_iface.tensor = exposed_name
 
             if top_name not in interfaces:
                 interfaces[top_name] = new_iface
@@ -178,10 +166,14 @@ def _load_sub_kernel_spec(kernel_class: type, project: Path) -> KernelSpec:
 def _find_exposed_tensor(
     composite_cls: type, sub_name: str, sub_tensor_name: str
 ) -> str | None:
-    """Find the top-level exposed tensor name for a sub-kernel tensor."""
-    for name, edef in composite_cls._exposed_tensor_defs.items():
-        if edef.origin_sub_kernel == sub_name and edef.origin_name == sub_tensor_name:
-            return name
+    """Find the top-level exposed tensor name for a sub-kernel tensor.
+
+    v2: Uses _auto_exposed dict {(sub_name, tensor_name) → tensor_name}.
+    """
+    auto_exposed = getattr(composite_cls, "_auto_exposed", {})
+    key = (sub_name, sub_tensor_name)
+    if key in auto_exposed:
+        return auto_exposed[key]
     return None
 
 
@@ -189,10 +181,14 @@ def _find_exposed_tensor(
 
 
 def get_sub_kernel_names(composite_cls: type) -> list[str]:
-    """Return list of sub-kernel directory names (for build dependency)."""
+    """Return list of sub-kernel directory names (for build dependency).
+
+    v2: Uses _sub_kernel_refs dict {attr_name → kernel_class}.
+    """
+    sub_kernel_refs = getattr(composite_cls, "_sub_kernel_refs", {})
     names = []
-    for _attr_name, binding in composite_cls._sub_kernel_bindings.items():
-        spec_attr = getattr(binding.kernel_class, "spec", None)
+    for _attr_name, sub_cls in sub_kernel_refs.items():
+        spec_attr = getattr(sub_cls, "spec", None)
         if spec_attr:
             # spec = "kernels/scale/kernel_spec.yaml" → "scale"
             parts = Path(spec_attr).parts
@@ -222,8 +218,12 @@ def check_sub_kernels_built(
 def extract_probe_bfm_info(
     composite_cls: type,
     project: Path,
+    extra_probes: list[str] | None = None,
 ) -> list[dict]:
     """Extract probe BFM info from composite class for codegen.
+
+    v2: All connections are probed (no Internal() needed).
+    Uses _sub_kernel_refs, _connections, _connected_tensors.
 
     Returns a list of dicts, one per probed internal connection:
       - probe_index: sequential index (0, 1, ...)
@@ -231,24 +231,37 @@ def extract_probe_bfm_info(
       - data_width: bus width of the internal wire
       - connection_index: index into connections list
     """
-    from vten.kernel.composite import Internal
+    from vten.kernel.tensor import Tensor
 
-    bindings = dict(composite_cls._sub_kernel_bindings)
-    connections = list(composite_cls._connections)
+    sub_kernel_refs = getattr(composite_cls, "_sub_kernel_refs", {})
+    connections = getattr(composite_cls, "_connections", [])
+    connected_tensors = getattr(composite_cls, "_connected_tensors", set())
 
-    # Build set of (sub_name, sub_iface_name) that are Internal(probe=True)
+    # Build set of (sub_name, sub_iface_name) for all connected interfaces
     probed_interfaces: set[tuple[str, str]] = set()
-    for sub_name, binding in bindings.items():
-        for sub_iface_name, mapping in binding.interface_map.items():
-            if isinstance(mapping, Internal) and mapping.probe:
-                probed_interfaces.add((sub_name, sub_iface_name))
+    for sub_name, sub_cls in sub_kernel_refs.items():
+        for t_name, t_desc in sub_cls._tensor_descriptors.items():
+            if (sub_name, t_name) in connected_tensors and t_desc.interface:
+                probed_interfaces.add((sub_name, t_desc.interface))
+
+    # Add extra_probes: "sub_name.tensor_name" → resolve to (sub_name, interface_name)
+    if extra_probes:
+        for probe_spec in extra_probes:
+            if "." not in probe_spec:
+                continue
+            sub_name, tensor_name = probe_spec.rsplit(".", 1)
+            sub_cls = sub_kernel_refs.get(sub_name)
+            if sub_cls is None:
+                continue
+            tensor = getattr(sub_cls, tensor_name, None)
+            if isinstance(tensor, Tensor) and tensor.interface:
+                probed_interfaces.add((sub_name, tensor.interface))
 
     probe_bfms = []
     probe_index = 0
     for conn_idx, conn in enumerate(connections):
-        # A connection is probed if either end's interface is Internal(probe=True)
         src_key = (conn.source_sub, conn.source_interface)
-        dst_iface = _find_dest_interface(conn, bindings)
+        dst_iface = conn.dest_interface
         dst_key = (conn.dest_sub, dst_iface) if dst_iface else None
 
         is_probed = src_key in probed_interfaces or (
@@ -258,21 +271,35 @@ def extract_probe_bfm_info(
             continue
 
         # Get data width from source interface
-        src_binding = bindings[conn.source_sub]
-        src_spec = _load_sub_kernel_spec(src_binding.kernel_class, project)
+        src_cls = sub_kernel_refs[conn.source_sub]
+        src_spec = _load_sub_kernel_spec(src_cls, project)
         src_iface = src_spec.interfaces.get(conn.source_interface)
         data_w = 256
         if src_iface and src_iface.packing:
             data_w = src_iface.packing.bus_width
 
-        wire_name = f"internal_{conn_idx}"
-        probe_bfms.append({
-            "probe_index": probe_index,
-            "wire_name": wire_name,
-            "data_width": data_w,
-            "connection_index": conn_idx,
-        })
-        probe_index += 1
+        wire_base = f"internal_{conn_idx}"
+
+        if src_iface and src_iface.array:
+            # Array interface: one probe per element
+            flat_src = src_iface.array.flat_names(conn.source_interface)
+            for sf in flat_src:
+                suffix = sf[len(conn.source_interface):]
+                probe_bfms.append({
+                    "probe_index": probe_index,
+                    "wire_name": f"{wire_base}{suffix}",
+                    "data_width": data_w,
+                    "connection_index": conn_idx,
+                })
+                probe_index += 1
+        else:
+            probe_bfms.append({
+                "probe_index": probe_index,
+                "wire_name": wire_base,
+                "data_width": data_w,
+                "connection_index": conn_idx,
+            })
+            probe_index += 1
 
     return probe_bfms
 
@@ -288,24 +315,23 @@ def generate_composite_sv(
 ) -> None:
     """Generate composite_top.sv — wrapper-of-wrappers.
 
+    v2: Uses _sub_kernel_refs, _connections.
     Instantiates each sub-kernel's wrapper module and wires:
     - External interfaces to top-level ports
     - Internal connections between sub-kernel wrappers
     """
-    from vten.kernel.composite import Internal
-
-    bindings = dict(composite_cls._sub_kernel_bindings)
-    connections = list(composite_cls._connections)
+    sub_kernel_refs = getattr(composite_cls, "_sub_kernel_refs", {})
+    connections = getattr(composite_cls, "_connections", [])
 
     # Collect sub-kernel info
     sub_kernels = []
-    for sub_name, binding in bindings.items():
-        sub_spec = _load_sub_kernel_spec(binding.kernel_class, project)
+    for sub_name, sub_cls in sub_kernel_refs.items():
+        sub_spec = _load_sub_kernel_spec(sub_cls, project)
         sub_kernels.append({
             "name": sub_name,
             "module_name": sub_spec.kernel_name,
             "spec": sub_spec,
-            "binding": binding,
+            "kernel_class": sub_cls,
         })
 
     # Build internal wire list from connections.
@@ -314,21 +340,21 @@ def generate_composite_sv(
     for idx, conn in enumerate(connections):
         wire_base = f"internal_{idx}"
         src_sub = conn.source_sub
-        src_binding = bindings[src_sub]
-        src_spec = _load_sub_kernel_spec(src_binding.kernel_class, project)
+        src_cls = sub_kernel_refs[src_sub]
+        src_spec = _load_sub_kernel_spec(src_cls, project)
         src_iface = src_spec.interfaces.get(conn.source_interface)
         data_w = 256
         if src_iface and src_iface.packing:
             data_w = src_iface.packing.bus_width
         protocol = src_iface.protocol if src_iface else Protocol.AXI4S
         addr_w = src_iface.addr_width or 64 if src_iface else 64
-        dest_iface_name = _find_dest_interface(conn, bindings)
+        dest_iface_name = conn.dest_interface
 
         if src_iface and src_iface.array:
             flat_src = src_iface.array.flat_names(conn.source_interface)
             # Resolve dest flat names
-            dest_binding = bindings[conn.dest_sub]
-            dest_spec = _load_sub_kernel_spec(dest_binding.kernel_class, project)
+            dest_cls = sub_kernel_refs[conn.dest_sub]
+            dest_spec = _load_sub_kernel_spec(dest_cls, project)
             dest_iface = dest_spec.interfaces.get(dest_iface_name) if dest_iface_name else None
             flat_dst = dest_iface.array.flat_names(dest_iface_name) if (dest_iface and dest_iface.array) else flat_src
             for ei, (sf, df) in enumerate(zip(flat_src, flat_dst)):
@@ -394,10 +420,11 @@ def generate_composite_sv(
         lines.append("")
 
     # Sub-kernel instantiations
+    connected_tensors = getattr(composite_cls, "_connected_tensors", set())
     for sk in sub_kernels:
         lines.append(f"    // ── Sub-kernel: {sk['name']} ({sk['module_name']}) ──")
         inst_lines = _generate_sub_kernel_instance(
-            sk, synthesized_spec, bindings, internal_wires
+            sk, synthesized_spec, connected_tensors, internal_wires
         )
         lines.extend(f"    {l}" for l in inst_lines)
         lines.append("")
@@ -410,18 +437,13 @@ def generate_composite_sv(
     sv_path.write_text("\n".join(lines))
 
 
-def _find_dest_interface(conn, bindings):
-    """Find the destination interface name from connection's dest proxy."""
-    dest_sub = conn.dest_sub
-    dest_tensor = conn.dest_name
-    dest_binding = bindings[dest_sub]
-    # Find which interface this tensor belongs to
-    from vten.kernel.tensor import Tensor
-    for attr_name in dir(dest_binding.kernel_class):
-        attr = getattr(dest_binding.kernel_class, attr_name, None)
-        if isinstance(attr, Tensor) and attr_name == dest_tensor:
-            return attr.interface
-    return None
+def _find_dest_interface(conn):
+    """Find the destination interface name from Connection.
+
+    v2: Connection stores dest TensorRef with kernel_class, so we can
+    directly look up the Tensor descriptor's interface.
+    """
+    return conn.dest_interface
 
 
 def _generate_port_lines(iface_name: str, iface: InterfaceSpec) -> list[str]:
@@ -494,54 +516,75 @@ def _generate_port_lines(iface_name: str, iface: InterfaceSpec) -> list[str]:
         aw = iface.addr_width or 64
         rp = iface.ext_port
         sw = dw // 8
-        lines.append(f"// {iface_name}: AXI4 Master")
-        # AR channel
-        lines.append(f"output logic [{aw-1}:0] {rp}_araddr")
-        lines.append(f"output logic [7:0]          {rp}_arlen")
-        lines.append(f"output logic [2:0]          {rp}_arsize")
-        lines.append(f"output logic [1:0]          {rp}_arburst")
-        lines.append(f"output logic                {rp}_arvalid")
-        lines.append(f"input  logic                {rp}_arready")
-        # R channel
-        lines.append(f"input  logic [{dw-1}:0] {rp}_rdata")
-        lines.append(f"input  logic [1:0]          {rp}_rresp")
-        lines.append(f"input  logic                {rp}_rlast")
-        lines.append(f"input  logic                {rp}_rvalid")
-        lines.append(f"output logic                {rp}_rready")
-        # AW channel
-        lines.append(f"output logic [{aw-1}:0] {rp}_awaddr")
-        lines.append(f"output logic [7:0]          {rp}_awlen")
-        lines.append(f"output logic [2:0]          {rp}_awsize")
-        lines.append(f"output logic [1:0]          {rp}_awburst")
-        lines.append(f"output logic                {rp}_awvalid")
-        lines.append(f"input  logic                {rp}_awready")
-        # W channel
-        lines.append(f"output logic [{dw-1}:0] {rp}_wdata")
-        lines.append(f"output logic [{sw-1}:0] {rp}_wstrb")
-        lines.append(f"output logic                {rp}_wlast")
-        lines.append(f"output logic                {rp}_wvalid")
-        lines.append(f"input  logic                {rp}_wready")
-        # B channel
-        lines.append(f"input  logic [1:0]          {rp}_bresp")
-        lines.append(f"input  logic                {rp}_bvalid")
-        lines.append(f"output logic                {rp}_bready")
+
+        def _axi4_port_set(prefix: str, lines_out: list[str]):
+            # AR channel
+            lines_out.append(f"output logic [{aw-1}:0] {prefix}_araddr")
+            lines_out.append(f"output logic [7:0]          {prefix}_arlen")
+            lines_out.append(f"output logic [2:0]          {prefix}_arsize")
+            lines_out.append(f"output logic [1:0]          {prefix}_arburst")
+            lines_out.append(f"output logic                {prefix}_arvalid")
+            lines_out.append(f"input  logic                {prefix}_arready")
+            # R channel
+            lines_out.append(f"input  logic [{dw-1}:0] {prefix}_rdata")
+            lines_out.append(f"input  logic [1:0]          {prefix}_rresp")
+            lines_out.append(f"input  logic                {prefix}_rlast")
+            lines_out.append(f"input  logic                {prefix}_rvalid")
+            lines_out.append(f"output logic                {prefix}_rready")
+            # AW channel
+            lines_out.append(f"output logic [{aw-1}:0] {prefix}_awaddr")
+            lines_out.append(f"output logic [7:0]          {prefix}_awlen")
+            lines_out.append(f"output logic [2:0]          {prefix}_awsize")
+            lines_out.append(f"output logic [1:0]          {prefix}_awburst")
+            lines_out.append(f"output logic                {prefix}_awvalid")
+            lines_out.append(f"input  logic                {prefix}_awready")
+            # W channel
+            lines_out.append(f"output logic [{dw-1}:0] {prefix}_wdata")
+            lines_out.append(f"output logic [{sw-1}:0] {prefix}_wstrb")
+            lines_out.append(f"output logic                {prefix}_wlast")
+            lines_out.append(f"output logic                {prefix}_wvalid")
+            lines_out.append(f"input  logic                {prefix}_wready")
+            # B channel
+            lines_out.append(f"input  logic [1:0]          {prefix}_bresp")
+            lines_out.append(f"input  logic                {prefix}_bvalid")
+            lines_out.append(f"output logic                {prefix}_bready")
+
+        if iface.array:
+            flat_names = iface.array.flat_names(iface_name)
+            lines.append(f"// {iface_name}: AXI4 Master array[{iface.array.total_elements}]")
+            for fn in flat_names:
+                suffix = fn[len(iface_name):]
+                _axi4_port_set(f"{rp}{suffix}", lines)
+        else:
+            lines.append(f"// {iface_name}: AXI4 Master")
+            _axi4_port_set(rp, lines)
     return lines
 
 
 def _generate_sub_kernel_instance(
     sk: dict,
     top_spec: KernelSpec,
-    bindings: dict,
+    connected_tensors: set,
     internal_wires: list[dict],
 ) -> list[str]:
-    """Generate instance lines for one sub-kernel wrapper."""
-    from vten.kernel.composite import Internal
+    """Generate instance lines for one sub-kernel wrapper.
 
+    v2: Uses connected_tensors set to determine internal vs external.
+    Internal interfaces → wire to internal_wires.
+    External interfaces → wire to top-level ports (auto-prefixed).
+    """
     sub_name = sk["name"]
     mod_name = sk["module_name"]
     sub_spec = sk["spec"]
-    binding = sk["binding"]
+    sub_cls = sk["kernel_class"]
     lines = []
+
+    def _is_internal_iface(iface_name: str) -> bool:
+        for t_name, t_desc in sub_cls._tensor_descriptors.items():
+            if t_desc.interface == iface_name:
+                if (sub_name, t_name) in connected_tensors:
+                    return True
+        return False
 
     # Sub-kernel wrappers with generate_controller use ap_clk/ap_aresetn;
     # plain cores use clk/rst_n.
@@ -558,12 +601,13 @@ def _generate_sub_kernel_instance(
         lines.append("    .rst_n(rst_n),")
 
     port_connections = []
-    for sub_iface_name, mapping in binding.interface_map.items():
+    for sub_iface_name in sub_spec.interface_names():
         sub_iface = sub_spec.interfaces.get(sub_iface_name)
         if sub_iface is None:
             continue
 
-        if isinstance(mapping, Internal):
+        if _is_internal_iface(sub_iface_name):
+            # Internal connection — wire to internal wire
             wire_or_wires = _find_internal_wire(
                 sub_name, sub_iface_name, internal_wires
             )
@@ -576,16 +620,9 @@ def _generate_sub_kernel_instance(
                     port_connections.extend(
                         _wire_to_internal(sub_iface, wire_or_wires)
                     )
-        elif isinstance(mapping, str):
-            # External mapping — connect to top-level ports
-            top_iface = top_spec.interfaces.get(mapping)
-            if top_iface:
-                port_connections.extend(
-                    _wire_to_top(sub_iface, top_iface)
-                )
-        elif isinstance(mapping, tuple):
-            # Independent ctrl — connect to top-level ctrl port
-            top_name = mapping[0]
+        else:
+            # External — connect to top-level ports (auto-prefixed)
+            top_name = f"{sub_name}_{sub_iface_name}"
             top_iface = top_spec.interfaces.get(top_name)
             if top_iface:
                 port_connections.extend(
@@ -794,10 +831,22 @@ def _wire_to_top(
             for sig in ["tdata", "tvalid", "tready", "tlast"]:
                 conns.append(f".{sub_rp}_{sig}({top_rp}_{sig})")
     elif sub_iface.protocol == Protocol.AXI4:
-        for sig in ["araddr", "arlen", "arsize", "arburst", "arvalid", "arready",
-                     "rdata", "rresp", "rlast", "rvalid", "rready",
-                     "awaddr", "awlen", "awsize", "awburst", "awvalid", "awready",
-                     "wdata", "wstrb", "wlast", "wvalid", "wready",
-                     "bresp", "bvalid", "bready"]:
-            conns.append(f".{sub_rp}_{sig}({top_rp}_{sig})")
+        axi4_sigs = ["araddr", "arlen", "arsize", "arburst", "arvalid", "arready",
+                      "rdata", "rresp", "rlast", "rvalid", "rready",
+                      "awaddr", "awlen", "awsize", "awburst", "awvalid", "awready",
+                      "wdata", "wstrb", "wlast", "wvalid", "wready",
+                      "bresp", "bvalid", "bready"]
+        if sub_iface.array:
+            sb = sub_iface.name
+            tb = top_iface.name
+            for sf, tf in zip(
+                sub_iface.array.flat_names(sb),
+                top_iface.array.flat_names(tb) if top_iface.array else sub_iface.array.flat_names(sb),
+            ):
+                ss, ts = sf[len(sb):], tf[len(tb):]
+                for sig in axi4_sigs:
+                    conns.append(f".{sub_rp}{ss}_{sig}({top_rp}{ts}_{sig})")
+        else:
+            for sig in axi4_sigs:
+                conns.append(f".{sub_rp}_{sig}({top_rp}_{sig})")
     return conns

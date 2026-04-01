@@ -1,6 +1,11 @@
 kernel: vector_alu
 rtl_top: rtl/vector_alu_core.sv
 
+runtime_params:
+  op_mode:
+    default: 0
+    register: ctrl.op_mode
+
 memory_regions:
   ddr:
     base: 0x10000000

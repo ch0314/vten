@@ -103,6 +103,7 @@ class TestMainBuildDispatch:
             stage=None,
             upto=None,
             force=False,
+            clean=False,
             skip_compile=False,
             config_overrides=None,
         )

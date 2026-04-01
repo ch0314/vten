@@ -1,17 +1,19 @@
-"""Tests for vten.kernel.composite — CompositeKernel, SubKernelBinding, proxy chain.
+"""Tests for vten.kernel.composite — CompositeKernel, TensorRef, Connection, auto-expose.
 
-Spec reference: 01_kernel_and_dsl.md §4, 00_data_models.md §4
-NPU 3D patterns: npu_3d_analysis.md §2 (6-IP Architecture), §11.1 (CompositeKernel)
+Spec reference: 01_kernel_and_dsl.md §4, 00_data_models.md §4, 10_kernel_v2_design.md §5
+
+v2 API: Sub-kernels declared as Kernel(), connections via >> operator,
+unconnected tensors auto-exposed.
 
 NPU 3D = CompositeKernel with 6 sub-kernels:
-  fmapIO        — ctrl: External, ddr: External, ifm_out/ofm_in: Internal
-  weight_loader — ctrl: External, hbm: External, wgt_out: Internal
-  mac_atu       — ctrl: External, ifm_in/wgt_in/psum_out: Internal
-  psum_buffer   — ctrl: External, psum_in/psum_out: Internal
-  bias_loader   — ctrl: External, ddr: External, bias_out: Internal
-  act_quant     — ctrl: External, psum_in/bias_in/ofm_out: Internal
+  fmapIO        — ctrl, ddr (exposed), ifm_out/ofm_in (connected)
+  weight_loader — ctrl, hbm (exposed), wgt_out (connected)
+  mac_atu       — ctrl, ifm_in/wgt_in/psum_out (connected)
+  psum_buffer   — ctrl, psum_in/out (connected)
+  bias_loader   — ctrl, ddr (exposed), bias_out (connected)
+  act_quant     — ctrl, psum_in/bias_in/ofm_out (connected)
 
-6 Internal connections (npu_3d_analysis.md §2 Internal Interfaces):
+6 Internal connections:
   fmapIO.ifm_out → mac_atu.ifm_in
   weight_loader.wgt_out → mac_atu.wgt_in
   mac_atu.psum_out → psum_buffer.psum_in
@@ -29,15 +31,12 @@ from vten.kernel.tensor import Tensor
 from vten.kernel.base import Kernel, register
 from vten.kernel.composite import (
     CompositeKernel,
-    SubKernelBinding,
-    TensorProxy,
-    ExposedTensorDef,
-    Internal,
-    Connect,
+    TensorRef,
+    Connection,
 )
 
 
-# ── NPU 3D sub-kernels (from test_kernel.py) ──────────────────────
+# ── NPU 3D sub-kernels ──────────────────────────────────────────────
 
 
 class FmapIOKernel(Kernel):
@@ -54,8 +53,8 @@ class FmapIOKernel(Kernel):
 
     def generate_inputs(self, seed=None):
         self.ifm.fill_random(generator=torch.Generator().manual_seed(seed or 0))
-    def forward(self):
-        return self.ifm.to_float()
+    def forward(self, **inputs):
+        return {"ifm_out": inputs.get("ifm", torch.tensor(0))}
 
 
 class WeightLoaderKernel(Kernel):
@@ -67,8 +66,8 @@ class WeightLoaderKernel(Kernel):
 
     def generate_inputs(self, seed=None):
         self.weight.fill_random(generator=torch.Generator().manual_seed(seed or 0))
-    def forward(self):
-        return self.weight.to_float()
+    def forward(self, **inputs):
+        return {"wgt_out": inputs.get("weight", torch.tensor(0))}
 
 
 class MacAtuKernel(Kernel):
@@ -80,8 +79,8 @@ class MacAtuKernel(Kernel):
 
     def generate_inputs(self, seed=None):
         pass
-    def forward(self):
-        return torch.tensor(0)
+    def forward(self, **inputs):
+        return {"psum_out": torch.tensor(0)}
 
 
 class PsumBufferKernel(Kernel):
@@ -92,8 +91,8 @@ class PsumBufferKernel(Kernel):
 
     def generate_inputs(self, seed=None):
         pass
-    def forward(self):
-        return torch.tensor(0)
+    def forward(self, **inputs):
+        return {"out": torch.tensor(0)}
 
 
 class BiasLoaderKernel(Kernel):
@@ -104,8 +103,8 @@ class BiasLoaderKernel(Kernel):
 
     def generate_inputs(self, seed=None):
         self.bias.fill_random(generator=torch.Generator().manual_seed(seed or 0))
-    def forward(self):
-        return self.bias.to_float()
+    def forward(self, **inputs):
+        return {"bias_out": inputs.get("bias", torch.tensor(0))}
 
 
 class ActQuantKernel(Kernel):
@@ -117,276 +116,144 @@ class ActQuantKernel(Kernel):
 
     def generate_inputs(self, seed=None):
         pass
-    def forward(self):
-        return torch.tensor(0)
+    def forward(self, **inputs):
+        return {"ofm_out": torch.tensor(0)}
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §1  Internal marker
+# §1  TensorRef — created by Kernel.__getattr__ in composite body
 # ═══════════════════════════════════════════════════════════════════
 
 
-class TestInternal:
+class TestTensorRef:
 
-    def test_default_no_probe(self):
-        i = Internal()
-        assert i.probe is False
+    def test_rshift_creates_connection(self):
+        """TensorRef >> TensorRef → Connection."""
+        ref_a = TensorRef("src", "data_out", FmapIOKernel)
+        ref_b = TensorRef("dst", "data_in", MacAtuKernel)
+        conn = ref_a >> ref_b
+        assert isinstance(conn, Connection)
+        assert conn.source_sub == "src"
+        assert conn.dest_sub == "dst"
 
-    def test_probe_enabled(self):
-        """mac_atu의 ifm_in에 probe 설정 가능."""
-        i = Internal(probe=True)
-        assert i.probe is True
+    def test_rshift_non_tensorref_raises(self):
+        ref = TensorRef("src", "data", FmapIOKernel)
+        with pytest.raises(TypeError, match="TensorRef"):
+            ref >> "not_a_ref"
 
-
-# ═══════════════════════════════════════════════════════════════════
-# §2  SubKernelBinding — NPU 3D sub-kernel bindings
-# ═══════════════════════════════════════════════════════════════════
-
-
-class TestSubKernelBinding:
-
-    def test_fmapio_binding(self):
-        """fmapIO: ctrl=External, ddr=External, AXIS=Internal."""
-        binding = SubKernelBinding(
-            kernel_class=FmapIOKernel,
-            interface_map={
-                "ctrl": "ctrl_fmapio",
-                "ddr": "ddr_fmap",
-                "ifm_out": Internal(),
-                "ofm_in": Internal(),
-            },
-        )
-        assert binding.kernel_class is FmapIOKernel
-        assert binding.interface_map["ctrl"] == "ctrl_fmapio"
-        assert isinstance(binding.interface_map["ifm_out"], Internal)
-
-    def test_getattr_returns_tensor_proxy(self):
-        """fmapIO.ifm → TensorProxy (IFM exposed)."""
-        binding = SubKernelBinding(kernel_class=FmapIOKernel, interface_map={})
-        binding._attr_name = "fmapIO"
-
-        proxy = binding.ifm
-        assert isinstance(proxy, TensorProxy)
-        assert proxy.binding_attr_name == "fmapIO"
-        assert proxy.tensor_name == "ifm"
-        assert proxy.kernel_class is FmapIOKernel
-
-    def test_getattr_nonexistent_tensor_raises(self):
-        binding = SubKernelBinding(kernel_class=FmapIOKernel, interface_map={})
-        binding._attr_name = "fmapIO"
-        with pytest.raises(AttributeError, match="no tensor"):
-            _ = binding.nonexistent
-
-    def test_getattr_private_raises(self):
-        binding = SubKernelBinding(kernel_class=FmapIOKernel, interface_map={})
-        with pytest.raises(AttributeError):
-            _ = binding._private
-
-    def test_known_fields_accessible(self):
-        binding = SubKernelBinding(
-            kernel_class=FmapIOKernel,
-            interface_map={"ctrl": "x"},
-            params={"IN_CH": 64},
-        )
-        assert binding.kernel_class is FmapIOKernel
-        assert binding.interface_map == {"ctrl": "x"}
-        assert binding.params == {"IN_CH": 64}
+    def test_repr(self):
+        ref = TensorRef("fmapIO", "ifm", FmapIOKernel)
+        assert "fmapIO.ifm" in repr(ref)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §3  TensorProxy — expose (NPU 3D exposed tensors)
+# §2  Connection — properties
 # ═══════════════════════════════════════════════════════════════════
 
 
-class TestTensorProxy:
+class TestConnection:
 
-    def test_expose_ifm_to_ddr(self):
-        """fmapIO.ifm → expose to 'ddr_fmap' top interface."""
-        proxy = TensorProxy("fmapIO", "ifm", FmapIOKernel)
-        exposed = proxy.expose(interface="ddr_fmap")
-        assert isinstance(exposed, ExposedTensorDef)
-        assert exposed.origin_sub_kernel == "fmapIO"
-        assert exposed.origin_name == "ifm"
-        assert exposed.top_interface == "ddr_fmap"
+    def test_source_dest_subs(self):
+        ref_s = TensorRef("fmapIO", "ifm_out", FmapIOKernel)
+        ref_d = TensorRef("mac_atu", "ifm_in", MacAtuKernel)
+        conn = ref_s >> ref_d
+        assert conn.source_sub == "fmapIO"
+        assert conn.dest_sub == "mac_atu"
+        assert conn.source_name == "ifm_out"
+        assert conn.dest_name == "ifm_in"
 
-    def test_expose_weight_to_hbm(self):
-        """weight_loader.weight → expose to 'hbm_wgt'."""
-        proxy = TensorProxy("weight_loader", "weight", WeightLoaderKernel)
-        exposed = proxy.expose(interface="hbm_wgt")
-        assert exposed.origin_sub_kernel == "weight_loader"
-        assert exposed.origin_name == "weight"
-        assert exposed.top_interface == "hbm_wgt"
+    def test_source_interface(self):
+        ref_s = TensorRef("fmapIO", "ifm_out", FmapIOKernel)
+        ref_d = TensorRef("mac_atu", "ifm_in", MacAtuKernel)
+        conn = ref_s >> ref_d
+        assert conn.source_interface == "ifm_out"
 
-    def test_expose_bias_to_ddr(self):
-        """bias_loader.bias → expose to 'ddr_bias'."""
-        proxy = TensorProxy("bias_loader", "bias", BiasLoaderKernel)
-        exposed = proxy.expose(interface="ddr_bias")
-        assert exposed.origin_sub_kernel == "bias_loader"
-        assert exposed.top_interface == "ddr_bias"
+    def test_dest_interface(self):
+        ref_s = TensorRef("fmapIO", "ifm_out", FmapIOKernel)
+        ref_d = TensorRef("mac_atu", "ifm_in", MacAtuKernel)
+        conn = ref_s >> ref_d
+        assert conn.dest_interface == "ifm_in"
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §4  Connect — NPU 3D internal AXIS connections
+# §3  Connection via >> operator in composite body
 # ═══════════════════════════════════════════════════════════════════
 
 
-class TestConnect:
-
-    def _bind(self, cls, name):
-        b = SubKernelBinding(kernel_class=cls, interface_map={})
-        b._attr_name = name
-        return b
+class TestConnectionViaOperator:
 
     def test_fmapio_to_mac(self):
-        """fmapIO.ifm_out → mac_atu.ifm_in (AXIS 256b)."""
-        fmap_b = self._bind(FmapIOKernel, "fmapIO")
-        mac_b = self._bind(MacAtuKernel, "mac_atu")
-        conn = Connect(fmap_b.ifm_out, mac_b.ifm_in)
+        """fmapIO.ifm_out >> mac_atu.ifm_in via __getattr__."""
+        class TestComposite(CompositeKernel):
+            fmapIO = FmapIOKernel()
+            mac_atu = MacAtuKernel()
+            connections = [fmapIO.ifm_out >> mac_atu.ifm_in]
+
+        conn = TestComposite.connections[0]
         assert conn.source_sub == "fmapIO"
         assert conn.source_name == "ifm_out"
         assert conn.dest_sub == "mac_atu"
         assert conn.dest_name == "ifm_in"
 
     def test_weight_to_mac(self):
-        """weight_loader.wgt_out → mac_atu.wgt_in."""
-        wgt_b = self._bind(WeightLoaderKernel, "weight_loader")
-        mac_b = self._bind(MacAtuKernel, "mac_atu")
-        conn = Connect(wgt_b.wgt_out, mac_b.wgt_in)
-        assert conn.source_sub == "weight_loader"
-        assert conn.dest_sub == "mac_atu"
+        class TestComposite(CompositeKernel):
+            wgt = WeightLoaderKernel()
+            mac = MacAtuKernel()
+            connections = [wgt.wgt_out >> mac.wgt_in]
 
-    def test_mac_to_psum(self):
-        """mac_atu.psum_out → psum_buffer.psum_in."""
-        mac_b = self._bind(MacAtuKernel, "mac_atu")
-        psum_b = self._bind(PsumBufferKernel, "psum_buffer")
-        conn = Connect(mac_b.psum_out, psum_b.psum_in)
-        assert conn.source_sub == "mac_atu"
-        assert conn.dest_sub == "psum_buffer"
-
-    def test_act_to_fmapio(self):
-        """act_quant.ofm_out → fmapIO.ofm_in (feedback loop)."""
-        act_b = self._bind(ActQuantKernel, "act_quant")
-        fmap_b = self._bind(FmapIOKernel, "fmapIO")
-        conn = Connect(act_b.ofm_out, fmap_b.ofm_in)
-        assert conn.source_sub == "act_quant"
-        assert conn.dest_sub == "fmapIO"
-        assert conn.transform is None
-
-    def test_source_interface_extracted(self):
-        """Connect는 source tensor의 interface를 추출."""
-        fmap_b = self._bind(FmapIOKernel, "fmapIO")
-        mac_b = self._bind(MacAtuKernel, "mac_atu")
-        conn = Connect(fmap_b.ifm_out, mac_b.ifm_in)
-        assert conn.source_interface == "ifm_out"
-
-    def test_non_proxy_source_raises(self):
-        with pytest.raises(TypeError, match="source must be TensorProxy"):
-            Connect("not_a_proxy", TensorProxy("x", "y", FmapIOKernel))
-
-    def test_non_proxy_dest_raises(self):
-        fmap_b = self._bind(FmapIOKernel, "fmapIO")
-        with pytest.raises(TypeError, match="dest must be TensorProxy"):
-            Connect(fmap_b.ifm_out, "not_a_proxy")
+        conn = TestComposite.connections[0]
+        assert conn.source_sub == "wgt"
+        assert conn.dest_sub == "mac"
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §5  NPU3DKernel CompositeKernel — 6-IP structure
+# §4  NPU3DKernel CompositeKernel — 6-IP structure
 # ═══════════════════════════════════════════════════════════════════
 
 
 class NPU3DKernel(CompositeKernel):
-    """NPU 3D — 6 sub-kernels, 6 internal connections.
-    Per npu_3d_analysis.md §11.1."""
+    """NPU 3D — 6 sub-kernels, 6 internal connections."""
     spec = "npu_3d.yaml"
 
-    # Sub-kernels with interface mappings
-    fmapIO = FmapIOKernel.bind(
-        interface_map={
-            "ctrl": "ctrl_fmapio",
-            "ddr": "ddr_fmap",
-            "ifm_out": Internal(),
-            "ofm_in": Internal(),
-        },
-    )
-    weight_loader = WeightLoaderKernel.bind(
-        interface_map={
-            "ctrl": "ctrl_wgt",
-            "hbm": "hbm_wgt",
-            "wgt_out": Internal(),
-        },
-    )
-    mac_atu = MacAtuKernel.bind(
-        interface_map={
-            "ctrl": "ctrl_mac",
-            "ifm_in": Internal(probe=True),
-            "wgt_in": Internal(),
-            "psum_out": Internal(),
-        },
-    )
-    psum_buffer = PsumBufferKernel.bind(
-        interface_map={
-            "ctrl": "ctrl_psum",
-            "psum_in": Internal(),
-            "out": Internal(),
-        },
-    )
-    bias_loader = BiasLoaderKernel.bind(
-        interface_map={
-            "ctrl": "ctrl_bias",
-            "ddr": "ddr_bias",
-            "bias_out": Internal(),
-        },
-    )
-    act_quant = ActQuantKernel.bind(
-        interface_map={
-            "ctrl": "ctrl_act",
-            "psum_in": Internal(),
-            "bias_in": Internal(),
-            "ofm_out": Internal(),
-        },
-    )
+    fmapIO = FmapIOKernel()
+    weight_loader = WeightLoaderKernel()
+    mac_atu = MacAtuKernel()
+    psum_buffer = PsumBufferKernel()
+    bias_loader = BiasLoaderKernel()
+    act_quant = ActQuantKernel()
 
-    # Exposed tensors — host ↔ DDR/HBM
-    ifm_data = fmapIO.ifm.expose(interface="ddr_fmap")
-    ofm_data = fmapIO.ofm.expose(interface="ddr_fmap")
-    weight_data = weight_loader.weight.expose(interface="hbm_wgt")
-    bias_data = bias_loader.bias.expose(interface="ddr_bias")
-
-    # Internal AXI-Stream connections (no BFM needed)
     connections = [
-        Connect(fmapIO.ifm_out, mac_atu.ifm_in),
-        Connect(weight_loader.wgt_out, mac_atu.wgt_in),
-        Connect(mac_atu.psum_out, psum_buffer.psum_in),
-        Connect(psum_buffer.out, act_quant.psum_in),
-        Connect(bias_loader.bias_out, act_quant.bias_in),
-        Connect(act_quant.ofm_out, fmapIO.ofm_in),
+        fmapIO.ifm_out >> mac_atu.ifm_in,
+        weight_loader.wgt_out >> mac_atu.wgt_in,
+        mac_atu.psum_out >> psum_buffer.psum_in,
+        psum_buffer.out >> act_quant.psum_in,
+        bias_loader.bias_out >> act_quant.bias_in,
+        act_quant.ofm_out >> fmapIO.ofm_in,
     ]
 
 
 class TestNPU3DCompositeDeclaration:
 
     def test_six_sub_kernels(self):
-        """6개 sub-kernel 바인딩이 모두 존재."""
-        bindings = NPU3DKernel().bindings()
-        names = {name for name, _ in bindings}
-        assert names == {
+        """6개 sub-kernel refs가 모두 존재."""
+        assert set(NPU3DKernel._sub_kernel_refs.keys()) == {
             "fmapIO", "weight_loader", "mac_atu",
             "psum_buffer", "bias_loader", "act_quant",
         }
 
-    def test_all_bindings_are_sub_kernel_binding(self):
-        for _, binding in NPU3DKernel().bindings():
-            assert isinstance(binding, SubKernelBinding)
+    def test_sub_kernel_refs_are_classes(self):
+        for name, cls in NPU3DKernel._sub_kernel_refs.items():
+            assert isinstance(cls, type), f"{name} should be a class"
 
     def test_six_connections(self):
-        """6개 internal AXIS 연결."""
-        assert len(NPU3DKernel.connections) == 6
-        for conn in NPU3DKernel.connections:
-            assert isinstance(conn, Connect)
+        """6개 internal connections."""
+        assert len(NPU3DKernel._connections) == 6
+        for conn in NPU3DKernel._connections:
+            assert isinstance(conn, Connection)
 
     def test_connection_chain(self):
         """Pipeline: fmapIO→mac→psum→act→fmapIO 순환 구조."""
-        conns = NPU3DKernel.connections
+        conns = NPU3DKernel._connections
         chain = [(c.source_sub, c.dest_sub) for c in conns]
         assert ("fmapIO", "mac_atu") in chain
         assert ("weight_loader", "mac_atu") in chain
@@ -395,51 +262,32 @@ class TestNPU3DCompositeDeclaration:
         assert ("bias_loader", "act_quant") in chain
         assert ("act_quant", "fmapIO") in chain  # feedback
 
-    def test_four_exposed_tensors(self):
-        """4개 exposed tensor: ifm, ofm, weight, bias."""
-        exposed = NPU3DKernel().exposed_tensor_defs()
-        names = {name for name, _ in exposed}
-        assert names == {"ifm_data", "ofm_data", "weight_data", "bias_data"}
+    def test_connected_tensors(self):
+        """Connected tensor set correctly computed."""
+        ct = NPU3DKernel._connected_tensors
+        assert ("fmapIO", "ifm_out") in ct
+        assert ("mac_atu", "ifm_in") in ct
+        assert ("act_quant", "ofm_out") in ct
+        assert ("fmapIO", "ofm_in") in ct
 
-    def test_exposed_ifm_details(self):
-        for name, edef in NPU3DKernel().exposed_tensor_defs():
-            if name == "ifm_data":
-                assert edef.origin_sub_kernel == "fmapIO"
-                assert edef.origin_name == "ifm"
-                assert edef.top_interface == "ddr_fmap"
-
-    def test_exposed_weight_details(self):
-        for name, edef in NPU3DKernel().exposed_tensor_defs():
-            if name == "weight_data":
-                assert edef.origin_sub_kernel == "weight_loader"
-                assert edef.origin_name == "weight"
-                assert edef.top_interface == "hbm_wgt"
-
-    def test_mac_ifm_probe_enabled(self):
-        """mac_atu.ifm_in에 probe=True — 내부 데이터 검증용."""
-        for name, binding in NPU3DKernel().bindings():
-            if name == "mac_atu":
-                ifm_mapping = binding.interface_map["ifm_in"]
-                assert isinstance(ifm_mapping, Internal)
-                assert ifm_mapping.probe is True
-
-    def test_external_interfaces(self):
-        """External: 6× ctrl + ddr_fmap + hbm_wgt + ddr_bias = 9 interfaces."""
-        externals = set()
-        for _, binding in NPU3DKernel().bindings():
-            for iface_name, mapping in binding.interface_map.items():
-                if isinstance(mapping, str):
-                    externals.add(mapping)
-        expected = {
-            "ctrl_fmapio", "ctrl_wgt", "ctrl_mac",
-            "ctrl_psum", "ctrl_bias", "ctrl_act",
-            "ddr_fmap", "hbm_wgt", "ddr_bias",
-        }
-        assert externals == expected
+    def test_auto_exposed_tensors(self):
+        """Tensors NOT in connections are auto-exposed."""
+        ae = NPU3DKernel._auto_exposed
+        # ifm, ofm, concat should be auto-exposed (not in connections)
+        assert ("fmapIO", "ifm") in ae
+        assert ("fmapIO", "ofm") in ae
+        assert ("fmapIO", "concat") in ae
+        # weight should be auto-exposed
+        assert ("weight_loader", "weight") in ae
+        # bias should be auto-exposed
+        assert ("bias_loader", "bias") in ae
+        # Connected tensors should NOT be auto-exposed
+        assert ("fmapIO", "ifm_out") not in ae
+        assert ("mac_atu", "ifm_in") not in ae
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §6  CompositeKernel is-a Kernel
+# §5  CompositeKernel is-a Kernel
 # ═══════════════════════════════════════════════════════════════════
 
 
@@ -453,132 +301,84 @@ class TestCompositeIsKernel:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §7  Connection validation — protocol, dtype, coverage, duplicates
+# §6  Connection validation — protocol, dtype, coverage, duplicates
 # ═══════════════════════════════════════════════════════════════════
 
 
-class TestConnectDestInterface:
-    """Connect should capture dest_interface at construction time."""
-
-    def test_dest_interface_stored(self):
-        """Connect(fmapIO.ifm_out, mac_atu.ifm_in) → dest_interface='ifm_in'."""
-        conn = Connect(FmapIOKernel.bind(
-            interface_map={"ctrl": "c", "ddr": "d", "ifm_out": Internal(), "ofm_in": Internal()},
-        ).ifm_out, MacAtuKernel.bind(
-            interface_map={"ctrl": "c", "ifm_in": Internal(), "wgt_in": Internal(), "psum_out": Internal()},
-        ).ifm_in)
-        assert conn.dest_interface == "ifm_in"
-
-    def test_source_interface_stored(self):
-        conn = Connect(FmapIOKernel.bind(
-            interface_map={"ctrl": "c", "ddr": "d", "ifm_out": Internal(), "ofm_in": Internal()},
-        ).ifm_out, MacAtuKernel.bind(
-            interface_map={"ctrl": "c", "ifm_in": Internal(), "wgt_in": Internal(), "psum_out": Internal()},
-        ).ifm_in)
-        assert conn.source_interface == "ifm_out"
-
-
 class TestConnectionValidation:
-    """Connection validation through RuntimeEngine._validate_flattened()."""
+    """Connection validation through RuntimeEngine._validate_*()."""
 
     def _make_simple_kernels(self):
-        """Create two simple stream kernels for validation testing."""
-
         class SrcKernel(Kernel):
             spec = "src.yaml"
             data_out = Tensor(shape=(8,), dtype=torch.int8, interface="output_stream")
             ctrl = register("ctrl")
             def generate_inputs(self, seed=None): pass
-            def forward(self): return torch.zeros(8)
+            def forward(self, **inputs): return {"data_out": torch.zeros(8)}
 
         class DstKernel(Kernel):
             spec = "dst.yaml"
             data_in = Tensor(shape=(8,), dtype=torch.int8, interface="input_stream")
             ctrl = register("ctrl")
             def generate_inputs(self, seed=None): pass
-            def forward(self): return torch.zeros(8)
+            def forward(self, **inputs): return {}
 
         return SrcKernel, DstKernel
 
     def _make_dtype_mismatch_kernels(self):
-        """Create kernels with mismatched dtypes."""
-
         class SrcF32(Kernel):
             spec = "src.yaml"
             data_out = Tensor(shape=(8,), dtype=torch.float32, interface="output_stream")
             ctrl = register("ctrl")
             def generate_inputs(self, seed=None): pass
-            def forward(self): return torch.zeros(8)
+            def forward(self, **inputs): return {"data_out": torch.zeros(8)}
 
         class DstI8(Kernel):
             spec = "dst.yaml"
             data_in = Tensor(shape=(8,), dtype=torch.int8, interface="input_stream")
             ctrl = register("ctrl")
             def generate_inputs(self, seed=None): pass
-            def forward(self): return torch.zeros(8)
+            def forward(self, **inputs): return {}
 
         return SrcF32, DstI8
 
-    def test_dtype_mismatch_raises(self):
-        """Connecting float32 → int8 without transform should raise."""
-        from vten.errors import ConnectionDtypeMismatchError
+    def test_dtype_mismatch_allowed_for_internal_wires(self):
+        """Internal wire connections allow dtype mismatch (physical bytes)."""
         from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.flattener import (
-            ExposedTensor, InterfaceMapping, KernelInstance,
-        )
-        from vten.spec.models import Direction, KernelSpec, MappingType
+        from vten.runtime.flattener import KernelInstance
+        from vten.spec.models import KernelSpec
 
         SrcF32, DstI8 = self._make_dtype_mismatch_kernels()
 
-        # Build a minimal composite with dtype mismatch
-        class BadDtypeComposite(CompositeKernel):
-            spec = "bad.yaml"
-            src = SrcF32.bind(interface_map={
-                "ctrl": "ctrl_src",
-                "output_stream": Internal(),
-            })
-            dst = DstI8.bind(interface_map={
-                "ctrl": "ctrl_dst",
-                "input_stream": Internal(),
-            })
-            connections = [Connect(src.data_out, dst.data_in)]
+        class DtypeMixComposite(CompositeKernel):
+            spec = "mix.yaml"
+            src = SrcF32()
+            dst = DstI8()
+            connections = [src.data_out >> dst.data_in]
 
-        conn = BadDtypeComposite.connections[0]
+        conn = DtypeMixComposite.connections[0]
 
         # Build minimal sub-kernel instances for validation
-        src_ki = KernelInstance(
-            name="src",
-            spec=KernelSpec(kernel_name="SrcF32", rtl_top="SrcF32"),
-            kernel_class=SrcF32,
-        )
-        src_ki.kernel_class_instance = SrcF32()
-        dst_ki = KernelInstance(
-            name="dst",
-            spec=KernelSpec(kernel_name="DstI8", rtl_top="DstI8"),
-            kernel_class=DstI8,
-        )
-        dst_ki.kernel_class_instance = DstI8()
-
-        # Resolve tensor shapes (trivial — no params)
-        from vten.runtime.resolver import ParameterResolver
-        for ki in (src_ki, dst_ki):
-            ki._resolver = ParameterResolver({}, {}, {})
+        sub_kernels = {}
+        for name, cls in [("src", SrcF32), ("dst", DstI8)]:
+            ki = KernelInstance(
+                name=name,
+                spec=KernelSpec(kernel_name=cls.__name__, rtl_top=cls.__name__),
+                kernel_class=cls,
+            )
+            ki.kernel_class_instance = cls()
+            from vten.runtime.resolver import ParameterResolver
             import copy
+            ki._resolver = ParameterResolver({}, {}, {})
             for t in ki.kernel_class_instance.tensors():
                 inst_t = copy.copy(t)
                 setattr(ki.kernel_class_instance, t.name, inst_t)
                 inst_t._resolve_shape(ki._resolver)
+            sub_kernels[name] = ki
 
-        sub_kernels = {"src": src_ki, "dst": dst_ki}
-
-        engine = RuntimeEngine(
-            kernels={}, ops=[], project_params={},
-        )
-
-        with pytest.raises(ConnectionDtypeMismatchError, match="dtype mismatch"):
-            engine._validate_connection_dtypes(
-                [conn], sub_kernels,
-            )
+        engine = RuntimeEngine(kernels={}, ops=[], project_params={})
+        # Internal wire connections skip dtype check — physical bytes on wire
+        engine._validate_connection_dtypes([conn], sub_kernels)
 
     def test_duplicate_connection_source_raises(self):
         """Same source interface in two connections should raise."""
@@ -591,23 +391,92 @@ class TestConnectionValidation:
             data_in = Tensor(shape=(8,), dtype=torch.int8, interface="input_stream2")
             ctrl = register("ctrl")
             def generate_inputs(self, seed=None): pass
-            def forward(self): return torch.zeros(8)
+            def forward(self, **inputs): return {}
 
-        src_binding = SrcKernel.bind(interface_map={
-            "ctrl": "c1", "output_stream": Internal(),
-        })
-        dst_binding = DstKernel.bind(interface_map={
-            "ctrl": "c2", "input_stream": Internal(),
-        })
-        dst2_binding = DstKernel2.bind(interface_map={
-            "ctrl": "c3", "input_stream2": Internal(),
-        })
-
-        conn1 = Connect(src_binding.data_out, dst_binding.data_in)
-        conn2 = Connect(src_binding.data_out, dst2_binding.data_in)
+        class DupSrcComposite(CompositeKernel):
+            spec = "dup.yaml"
+            src = SrcKernel()
+            dst1 = DstKernel()
+            dst2 = DstKernel2()
+            connections = [
+                src.data_out >> dst1.data_in,
+                src.data_out >> dst2.data_in,
+            ]
 
         engine = RuntimeEngine(kernels={}, ops=[], project_params={})
         with pytest.raises(Exception, match="Duplicate connection source"):
             engine._validate_no_duplicate_connections(
-                [conn1, conn2], {},
+                DupSrcComposite.connections, {},
             )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §7  CompositeKernel.compute_derived_params auto-chain
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestCompositeComputeDerivedParams:
+    """Auto-chain: composite calls each sub-kernel's compute_derived_params."""
+
+    def test_auto_chain_merges_sub_kernel_results(self):
+        """Composite compute_derived_params merges all sub-kernel results."""
+
+        class SubA(Kernel):
+            spec = "a.yaml"
+            data = Tensor(shape=(8,), dtype=torch.int8, interface="s")
+
+            def compute_derived_params(self):
+                x = getattr(self, "x", 0)
+                return {"a_derived": x * 2}
+
+        class SubB(Kernel):
+            spec = "b.yaml"
+            data = Tensor(shape=(8,), dtype=torch.int8, interface="s")
+
+            def compute_derived_params(self):
+                x = getattr(self, "x", 0)
+                return {"b_derived": x + 10}
+
+        class MyComposite(CompositeKernel):
+            spec = "comp.yaml"
+            a = SubA()
+            b = SubB()
+            connections = []
+
+        inst = MyComposite()
+        inst.x = 5
+        result = inst.compute_derived_params()
+        assert result == {"a_derived": 10, "b_derived": 15}
+
+    def test_auto_chain_empty_sub_kernels(self):
+        """Composite with no sub-kernels returns empty dict."""
+
+        class EmptyComposite(CompositeKernel):
+            spec = "empty.yaml"
+            connections = []
+
+        result = EmptyComposite().compute_derived_params()
+        assert result == {}
+
+    def test_auto_chain_sub_kernel_no_override(self):
+        """Sub-kernel without compute_derived_params returns empty dict."""
+
+        class PlainKernel(Kernel):
+            spec = "plain.yaml"
+            data = Tensor(shape=(8,), dtype=torch.int8, interface="s")
+
+        class WithDerived(Kernel):
+            spec = "wd.yaml"
+            data = Tensor(shape=(8,), dtype=torch.int8, interface="s")
+
+            def compute_derived_params(self):
+                return {"foo": 42}
+
+        class MixedComposite(CompositeKernel):
+            spec = "mix.yaml"
+            plain = PlainKernel()
+            derived = WithDerived()
+            connections = []
+
+        result = MixedComposite().compute_derived_params()
+        assert result == {"foo": 42}

@@ -28,5 +28,16 @@ class StreamDmaKernel(Kernel):
             rng.manual_seed(seed)
         self.data_in.fill_random(generator=rng)
 
-    def forward(self):
-        return self.data_in.data.clone()
+    def run(self, ctx) -> None:
+        h_load = ctx.load_tensor(self.data_in)
+        h_cfg = ctx.configure(self, dep=h_load)
+        h_start = ctx.write_register(self.ctrl, {"start": 1}, dep=h_cfg)
+
+        h_push = ctx.push_tensor(self.data_in, dep=h_start)
+        h_pull = ctx.pull_tensor(self.data_out, dep=h_start)
+        h_poll = ctx.poll_register(self.ctrl, "done", dep=h_start)
+
+        ctx.verify(h_pull, self.forward()["data_out"])
+
+    def forward(self, **inputs) -> dict[str, torch.Tensor]:
+        return {"data_out": self.data_in.data.clone()}

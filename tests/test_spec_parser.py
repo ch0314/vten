@@ -1196,3 +1196,437 @@ class TestFullSubKernelSpecParse:
         assert set(spec.interface_names()) == {"ctrl", "ifm_in", "wgt_in", "psum_out"}
         # No memory region (internal streams only)
         assert spec.memory_regions == {}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §15  Register alias
+# ═══════════════════════════════════════════════════════════════════
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §16  Spec include directive
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestSpecInclude:
+
+    def test_include_basic(self, tmp_path):
+        """Include file provides clock, reset, memory_regions."""
+        base_yaml = tmp_path / "_base.yaml"
+        base_yaml.write_text(yaml.dump({
+            "clock": {"name": "ap_clk"},
+            "reset": {"name": "ap_aresetn", "active_low": True},
+            "memory_regions": {
+                "ddr": {"base": 0x10000000, "size": 0x10000000, "alignment": 4096},
+            },
+        }))
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "include": ["_base.yaml"],
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {
+                    "protocol": "axi4_lite",
+                    "role": "slave",
+                    "registers": [{"name": "vsync", "pulse": True}],
+                },
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        assert spec.clock_name == "ap_clk"
+        assert spec.reset_name == "ap_aresetn"
+        assert spec.reset_active_low is True
+        assert "ddr" in spec.memory_regions
+
+    def test_include_override(self, tmp_path):
+        """Spec values override included values."""
+        base_yaml = tmp_path / "_base.yaml"
+        base_yaml.write_text(yaml.dump({
+            "clock": {"name": "clk_base"},
+        }))
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "include": ["_base.yaml"],
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "clock": {"name": "ap_clk"},
+            "interfaces": {
+                "ctrl": {"protocol": "axi4_lite", "role": "slave"},
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        assert spec.clock_name == "ap_clk"
+
+    def test_include_memory_regions_merge(self, tmp_path):
+        """Memory regions from base and spec are merged."""
+        base_yaml = tmp_path / "_base.yaml"
+        base_yaml.write_text(yaml.dump({
+            "memory_regions": {
+                "ddr": {"base": 0x10000000, "size": 0x10000000},
+            },
+        }))
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "include": ["_base.yaml"],
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "memory_regions": {
+                "hbm": {"base": 0x40000000, "size": 0x80000000},
+            },
+            "interfaces": {
+                "ctrl": {"protocol": "axi4_lite", "role": "slave"},
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        assert "ddr" in spec.memory_regions
+        assert "hbm" in spec.memory_regions
+
+    def test_include_missing_file(self, tmp_path):
+        """SpecValidationError when included file does not exist."""
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "include": ["nonexistent.yaml"],
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {"protocol": "axi4_lite", "role": "slave"},
+            },
+        }))
+        with pytest.raises(SpecValidationError, match="Include file not found"):
+            parse_kernel_spec(str(spec_yaml))
+
+    def test_include_multiple_files(self, tmp_path):
+        """Multiple include files merged left-to-right."""
+        base1 = tmp_path / "_clk.yaml"
+        base1.write_text(yaml.dump({"clock": {"name": "clk1"}}))
+        base2 = tmp_path / "_rst.yaml"
+        base2.write_text(yaml.dump({
+            "clock": {"name": "clk2"},
+            "reset": {"name": "rst_n"},
+        }))
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "include": ["_clk.yaml", "_rst.yaml"],
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {"protocol": "axi4_lite", "role": "slave"},
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        # _rst.yaml overrides _clk.yaml for clock
+        assert spec.clock_name == "clk2"
+        assert spec.reset_name == "rst_n"
+
+    def test_no_include_backward_compat(self, tmp_path):
+        """Specs without include work unchanged."""
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {"protocol": "axi4_lite", "role": "slave"},
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        assert spec.kernel_name == "test"
+
+    def test_include_string_not_list(self, tmp_path):
+        """include: 'file.yaml' (string) works same as list."""
+        base_yaml = tmp_path / "_base.yaml"
+        base_yaml.write_text(yaml.dump({
+            "clock": {"name": "ap_clk"},
+        }))
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "include": "_base.yaml",
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {"protocol": "axi4_lite", "role": "slave"},
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        assert spec.clock_name == "ap_clk"
+
+    def test_include_parameters_merge(self, tmp_path):
+        """Parameters from include are merged with spec parameters."""
+        base_yaml = tmp_path / "_base.yaml"
+        base_yaml.write_text(yaml.dump({
+            "parameters": {"Ti": 32, "To": 32},
+        }))
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "include": ["_base.yaml"],
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "parameters": {"ATU_AXIS_OUT": 6},
+            "interfaces": {
+                "ctrl": {"protocol": "axi4_lite", "role": "slave"},
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        assert spec.parameters["Ti"] == 32
+        assert spec.parameters["ATU_AXIS_OUT"] == 6
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §17  register_include + width shorthand
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestRegisterInclude:
+
+    def test_register_include_basic(self, tmp_path):
+        """External register file is loaded and parsed."""
+        regs_yaml = tmp_path / "_regs.yaml"
+        regs_yaml.write_text(yaml.dump([
+            {"name": "vsync", "pulse": True},
+            {"name": "out_ch", "width": 10},
+        ]))
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {
+                    "protocol": "axi4_lite",
+                    "role": "slave",
+                    "register_include": ["_regs.yaml"],
+                },
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        regs = spec.get_registers("ctrl")
+        assert len(regs) == 2
+        assert regs[0].name == "vsync"
+        assert regs[0].pulse is True
+        assert regs[1].name == "out_ch"
+
+    def test_register_include_with_local(self, tmp_path):
+        """Included registers are prepended before local registers."""
+        regs_yaml = tmp_path / "_shared.yaml"
+        regs_yaml.write_text(yaml.dump([
+            {"name": "vsync", "pulse": True},
+        ]))
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {
+                    "protocol": "axi4_lite",
+                    "role": "slave",
+                    "register_include": ["_shared.yaml"],
+                    "registers": [
+                        {"name": "bias_shift", "width": 5},
+                        {"name": "is_relu", "width": 1},
+                    ],
+                },
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        regs = spec.get_registers("ctrl")
+        assert len(regs) == 3
+        assert regs[0].name == "vsync"
+        assert regs[1].name == "bias_shift"
+        assert regs[2].name == "is_relu"
+
+    def test_register_include_offsets_sequential(self, tmp_path):
+        """Offsets are assigned sequentially across included + local registers."""
+        regs_yaml = tmp_path / "_shared.yaml"
+        regs_yaml.write_text(yaml.dump([
+            {"name": "reg_a"},
+            {"name": "reg_b"},
+        ]))
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {
+                    "protocol": "axi4_lite",
+                    "role": "slave",
+                    "register_include": ["_shared.yaml"],
+                    "registers": [{"name": "reg_c"}],
+                },
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        regs = spec.get_registers("ctrl")
+        assert regs[0].offset == 0x14  # default user_register_base
+        assert regs[1].offset == 0x18
+        assert regs[2].offset == 0x1C
+
+    def test_register_include_missing_file(self, tmp_path):
+        """SpecValidationError when register_include file missing."""
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {
+                    "protocol": "axi4_lite",
+                    "role": "slave",
+                    "register_include": ["nonexistent.yaml"],
+                },
+            },
+        }))
+        with pytest.raises(SpecValidationError, match="register_include file not found"):
+            parse_kernel_spec(str(spec_yaml))
+
+    def test_register_include_string_not_list(self, tmp_path):
+        """register_include: 'file.yaml' (string) works."""
+        regs_yaml = tmp_path / "_regs.yaml"
+        regs_yaml.write_text(yaml.dump([{"name": "out_ch"}]))
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {
+                    "protocol": "axi4_lite",
+                    "role": "slave",
+                    "register_include": "_regs.yaml",
+                },
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        regs = spec.get_registers("ctrl")
+        assert len(regs) == 1
+
+
+class TestWidthShorthand:
+
+    def test_width_to_fields(self, tmp_path):
+        """{ name: out_ch, width: 10 } → fields={out_ch: '9:0'}, width=10."""
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {
+                    "protocol": "axi4_lite",
+                    "role": "slave",
+                    "registers": [
+                        {"name": "out_ch", "width": 10},
+                    ],
+                },
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        reg = spec.get_registers("ctrl")[0]
+        assert reg.fields == {"out_ch": "9:0"}
+        assert reg.width == 10
+
+    def test_width_1bit(self, tmp_path):
+        """width: 1 → fields={name: '0:0'}."""
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {
+                    "protocol": "axi4_lite",
+                    "role": "slave",
+                    "registers": [
+                        {"name": "vsync", "width": 1, "pulse": True},
+                    ],
+                },
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        reg = spec.get_registers("ctrl")[0]
+        assert reg.fields == {"vsync": "0:0"}
+        assert reg.width == 1
+
+    def test_explicit_fields_not_overridden(self, tmp_path):
+        """When both width and fields present, fields takes priority."""
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {
+                    "protocol": "axi4_lite",
+                    "role": "slave",
+                    "registers": [
+                        {"name": "reg", "width": 10, "fields": {"val": "7:0"}},
+                    ],
+                },
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        reg = spec.get_registers("ctrl")[0]
+        assert reg.fields == {"val": "7:0"}
+        assert reg.width == 8  # from explicit fields, not width shorthand
+
+    def test_no_width_no_fields_defaults_32(self, tmp_path):
+        """Register without width or fields defaults to 32-bit."""
+        spec_yaml = tmp_path / "kernel_spec.yaml"
+        spec_yaml.write_text(yaml.dump({
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {
+                    "protocol": "axi4_lite",
+                    "role": "slave",
+                    "registers": [{"name": "big_reg"}],
+                },
+            },
+        }))
+        spec = parse_kernel_spec(str(spec_yaml))
+        reg = spec.get_registers("ctrl")[0]
+        assert reg.fields is None
+        assert reg.width == 32
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §20  build_params parsing
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestBuildParams:
+
+    def test_build_params_parsed(self, tmp_path):
+        """build_params section parsed as flat dict."""
+        spec = _write_spec(tmp_path, {
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "build_params": {"Ti": 32, "To": 32, "AXI_DW": 256},
+            "interfaces": {
+                "ctrl": {"protocol": "axi4_lite", "role": "slave"},
+            },
+        })
+        result = parse_kernel_spec(str(spec))
+        assert result.build_params == {"Ti": 32, "To": 32, "AXI_DW": 256}
+
+    def test_build_params_empty_default(self, tmp_path):
+        """Missing build_params defaults to empty dict."""
+        spec = _write_spec(tmp_path, {
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "interfaces": {
+                "ctrl": {"protocol": "axi4_lite", "role": "slave"},
+            },
+        })
+        result = parse_kernel_spec(str(spec))
+        assert result.build_params == {}
+
+    def test_build_params_null(self, tmp_path):
+        """Explicit null build_params → empty dict."""
+        spec = _write_spec(tmp_path, {
+            "kernel": "test",
+            "rtl_top": "test_top",
+            "build_params": None,
+            "interfaces": {
+                "ctrl": {"protocol": "axi4_lite", "role": "slave"},
+            },
+        })
+        result = parse_kernel_spec(str(spec))
+        assert result.build_params == {}
+
+

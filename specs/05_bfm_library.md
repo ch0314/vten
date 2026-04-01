@@ -708,9 +708,28 @@ endmodule
 
 Probe는 두 가지 독립적인 모드로 동작한다.
 
-**출력 Probe** — `pull_tensor(probe=True)`
+**출력 Probe** — 외부 출력 인터페이스의 데이터를 golden과 비교.
 
-DUT 출력 인터페이스에서 BFM이 수신 비트를 golden 텐서와 직접 비교한다.
+**내부 Probe** — CompositeKernel 내부 배선에 패시브 모니터 BFM을 삽입하여 중간값 검증.
+
+#### 선언적 API (권장)
+
+TestScenario에 `probes` 리스트를 선언하면, 커널 정의 변경 없이 두 모드 모두 적용된다:
+
+```python
+class TestNPUTopProbe(TestScenario):
+    kernel = "npu_top"
+    probes = ["mac.axis_ifm", "mac.axis_ofm", "data_out"]
+```
+
+- `"data_out"` → 출력 probe. PULL op에 `probe=True` 자동 설정.
+- `"mac.axis_ifm"` → 내부 probe. `INTERNAL` → `INTERNAL_PROBE` 동적 업그레이드, golden chain pool에서 golden 자동 추출.
+
+모든 Internal()에 probe BFM이 자동 생성되므로(방안 A) 별도 probe 마커가 불필요하다. 수동 `set_internal_probe_golden()` 호출도 불필요.
+
+#### 수동 API (backward compat)
+
+**출력 Probe:**
 
 ```python
 pull1 = ctx.pull_tensor(kernel.ofm, dep=push1, probe=True)
@@ -722,28 +741,14 @@ Runtime이 처리하는 절차:
 3. BFM이 AXI4-Stream 핸드쉐이크마다 SHM golden 데이터와 비트별 비교
 4. 불일치 시 stderr 로그 + `mismatches.jsonl` 기록, `probe_error` 신호 어서트
 
-**내부 Probe** — `Internal(probe=True)` in CompositeKernel
-
-서브커널 간 내부 배선에 패시브 모니터 BFM을 삽입하여 중간값을 검증한다.
+**내부 Probe:**
 
 ```python
-class NPUTopKernel(CompositeKernel):
-    mac = MACKernel.bind(
-        interface_map={
-            "axis_ifm": Internal(probe=True),
-            "axis_ofm": Internal(probe=True),
-        }
-    )
-```
-
-테스트 시나리오에서 내부 probe의 golden 데이터를 등록:
-
-```python
-# TestScenario.run() 내부
+# 테스트에서 수동 golden 등록 (선언적 API 사용 시 불필요)
 ctx.set_internal_probe_golden("mac", "axis_ifm", golden_tensor)
 ```
 
-Engine이 내부 probe golden 텐서를 SHM에 직렬화하고, probe BFM이 plusarg를 통해 `buffer_id`를 조회하여 비교를 수행한다.
+probe 대상은 선언적 probes 리스트 또는 connection graph를 통해 결정된다. Engine이 내부 probe golden 텐서를 SHM에 직렬화하고, probe BFM이 plusarg를 통해 `buffer_id`를 조회하여 비교를 수행한다.
 
 ---
 
@@ -816,7 +821,19 @@ Python 런타임은 시뮬레이션 완료 후 `mismatches.jsonl`을 파싱하�
 
 ---
 
-### 4.4 내부 Probe Golden 등록 API
+### 4.4 내부 Probe Golden 등록
+
+**선언적 (권장):**
+
+```python
+class TestProbe(TestScenario):
+    kernel = "scale_add"
+    probes = ["scale.data_out"]  # golden chain pool에서 자동 추출
+```
+
+CompositeKernel의 `forward()` 실행 후, connection graph를 통해 각 서브커널 출력의 golden 텐서가 자동 추출된다. 모든 Internal()에 probe BFM이 자동 생성되고(방안 A), Engine이 `INTERNAL` → `INTERNAL_PROBE`로 동적 업그레이드한다.
+
+**수동:**
 
 ```python
 # vten/runtime/context.py
@@ -827,7 +844,7 @@ ctx.set_internal_probe_golden(
 )
 ```
 
-Engine Stage 3 (Tensor Serialization)에서 내부 probe golden 텐서를 일반 입출력 텐서와 동일한 방식으로 SHM에 직렬화한다. 생성된 `buffer_id`는 codegen 단계에서 `PROBE_GOLDEN_<INDEX>` plusarg 형태로 xsim 시뮬레이션 명령줄에 삽입된다.
+Engine Stage 3b에서 내부 probe golden 텐서를 일반 입출력 텐서와 동일한 방식으로 SHM에 직렬화한다. 생성된 `buffer_id`는 codegen 단계에서 `PROBE_GOLDEN_<INDEX>` plusarg 형태로 xsim 시뮬레이션 명령줄에 삽입된다.
 
 ---
 

@@ -75,6 +75,11 @@ class VerilatorBuildPipeline(BuildPipeline):
         else:
             raise BuildError(f"Unknown Verilator build stage: {stage}")
 
+    def _clean_project(self) -> None:
+        """Override: also reset in-memory cache."""
+        super()._clean_project()
+        self._cache.clear()
+
     def build(self, **kwargs) -> None:
         """Override to save cache after build."""
         try:

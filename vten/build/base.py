@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import shutil
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -103,12 +104,27 @@ class BuildPipeline(abc.ABC):
         """Return stage names that run once at project level (not per-kernel)."""
         ...
 
+    def _clean_kernel(self, kernel_dir: Path) -> None:
+        """Remove kernel build artifacts."""
+        build_dir = kernel_dir / "build"
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+            logger.info("  cleaned %s", build_dir)
+
+    def _clean_project(self) -> None:
+        """Remove project-level build artifacts."""
+        build_dir = self._project / "build"
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+            logger.info("  cleaned %s", build_dir)
+
     def build(
         self,
         kernel_name: str | None = None,
         stage: str | None = None,
         upto: str | None = None,
         force: bool = False,
+        clean: bool = False,
         skip_compile: bool = False,
         config_overrides: dict | None = None,
     ) -> None:
@@ -128,6 +144,15 @@ class BuildPipeline(abc.ABC):
         )
         if not target_kernels:
             raise BuildError("No kernels found. Run: vten init --kernel <name>")
+
+        # Clean build artifacts before building
+        if clean:
+            # Clean project-level build if any project stages are targeted
+            if any(s in project_stages for s in target_stages):
+                self._clean_project()
+            # Clean kernel build dirs
+            for kname in target_kernels:
+                self._clean_kernel(self._project / "kernels" / kname)
 
         # Project-level stages (run once)
         for s in target_stages:

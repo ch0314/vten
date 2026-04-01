@@ -1,6 +1,13 @@
 kernel: scale
 rtl_top: rtl/scale_core.sv
 
+runtime_params:
+  scale_factor:
+    default: 2
+    register: ctrl.scale_factor
+  length:
+    register: ctrl.length
+
 interfaces:
   ctrl:
     rtl_port: s_axilite

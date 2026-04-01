@@ -543,3 +543,5 @@ class TestResolveAutoBinds:
         view = _make_view_with_registers(regs)
         bindings = resolve_auto_binds(view)
         assert bindings[0].kernel_path == "SimpleKernel._self.ctrl"
+
+

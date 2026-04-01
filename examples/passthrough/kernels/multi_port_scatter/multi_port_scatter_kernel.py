@@ -26,6 +26,12 @@ class MultiPortScatterKernel(Kernel):
             rng.manual_seed(seed)
         self.data_in.fill_random(generator=rng)
 
-    def forward(self):
+    def run(self, ctx) -> None:
+        h_send = ctx.send_tensor(self.data_in)
+        h_recv = ctx.recv_tensor(self.data_out, dep=h_send)
+
+        ctx.verify(h_recv, self.forward()["data_out"])
+
+    def forward(self, **inputs) -> dict[str, torch.Tensor]:
         """Golden: passthrough (output == input)."""
-        return self.data_in.data.clone()
+        return {"data_out": self.data_in.data.clone()}

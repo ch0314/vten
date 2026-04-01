@@ -1,6 +1,6 @@
 # vTen User API & Workflow
 
-**Version 0.5.0 — March 2026**
+**Version 0.6.0 — March 2026**
 
 ---
 
@@ -14,6 +14,8 @@
 6. [Workflow: Multi-Layer Pipeline](#6-workflow-multi-layer-pipeline)
 7. [CLI Workflow](#7-cli-workflow)
 8. [API Quick Reference](#8-api-quick-reference)
+9. [Config & Parameter System](#9-config--parameter-system)
+10. [Migration Guide](#10-migration-guide)
 
 ---
 
@@ -98,9 +100,9 @@ class PassthroughKernel(Kernel):
             rng.manual_seed(seed)
         self.data_in.fill_random(generator=rng)
 
-    def forward(self):
-        """Golden reference 계산."""
-        return self.data_in.data.clone()
+    def forward(self, data_in) -> dict[str, torch.Tensor]:
+        """Golden reference 계산. 반환값은 {output_tensor_name: data} dict."""
+        return {"data_out": data_in.clone()}
 ```
 
 ### 2.3 CompositeKernel
@@ -108,27 +110,22 @@ class PassthroughKernel(Kernel):
 여러 서브 커널을 하나의 RTL top에 **공간적(spatial)**으로 합성한다.
 
 ```python
-from vten.kernel.composite import CompositeKernel, Connect, Internal
+from vten.kernel.composite import CompositeKernel
 
 class NPUTopKernel(CompositeKernel):
     spec = "kernels/npu_top/kernel_spec.yaml"
 
-    # 서브 커널 바인딩
-    fmapio = FmapIOKernel.bind({"ctrl": "ctrl/fmapio", "ddr": "ddr"})
-    wgt    = WeightLoaderKernel.bind({"ctrl": "ctrl/weight_loader", "hbm": "hbm"})
-    mac    = MACKernel.bind({"ctrl": "ctrl/mac"})
+    # 서브 커널 인스턴스 선언
+    fmapio = FmapIOKernel()
+    wgt    = WeightLoaderKernel()
+    mac    = MACKernel()
 
-    # 내부 RTL 연결 (BFM 불필요)
+    # 내부 RTL 연결 (>> 연산자로 선언)
     connections = [
-        Connect(fmapio.ifm_out, mac.ifm_in, Internal()),
-        Connect(wgt.wgt_out,    mac.wgt_in,  Internal()),
-        Connect(mac.psum_out,   fmapio.ofm_in, Internal(probe=True)),
+        fmapio.ifm_out >> mac.ifm_in,
+        wgt.wgt_out    >> mac.wgt_in,
+        mac.psum_out   >> fmapio.ofm_in,
     ]
-
-    # 외부 노출 텐서
-    ifm    = fmapio.ifm.expose("ddr")
-    weight = wgt.weight.expose("hbm")
-    ofm    = fmapio.ofm.expose("ddr")
 ```
 
 ---
@@ -154,7 +151,7 @@ h_push = ctx.push_tensor(k.data_in, dep=h_load)
 h_pull = ctx.pull_tensor(k.data_out, dep=h_push)
 
 # 검증
-ctx.verify(h_pull, k.forward())
+ctx.verify(h_pull, k.forward()["data_out"])
 
 result = ctx.run()   # → BatchResult
 print(result.status)  # "DONE"
@@ -219,7 +216,7 @@ poll = ctx.poll_register(k.ctrl, "done", dep=cfg)
 pull.add_commit_dependency(poll)      # poll 완료 전까지 pull commit 보류
 
 store = ctx.store_tensor(k.ofm, dep=pull)
-ctx.verify(store, k.forward())
+ctx.verify(store, k.forward()["ofm"])
 ```
 
 ### 3.4 Chunked Receive (`chunks=`)
@@ -268,33 +265,55 @@ result.error             # 에러 정보 (있을 경우)
 
 ### 3.6 Probe 검증
 
-#### 출력 Probe
+Probe는 DUT 데이터를 golden과 실시간 비교하는 검증 메커니즘이다.
+출력 텐서(output probe)와 내부 배선(internal probe) 모두 지원한다.
 
-`probe=True`로 pull_tensor를 호출하면, golden 데이터를 SHM에 올려 BFM이 매 beat마다 실시간 비교한다.
-첫 mismatch에서 시뮬레이션이 즉시 중단되어 timeout을 기다리지 않는다.
+#### 선언적 Probe API (권장)
+
+TestScenario에 `probes` 리스트를 선언하면, 커널 정의 변경 없이 probe가 자동 적용된다.
+golden 데이터는 `forward()`의 golden chain에서 자동 추출된다.
+
+```python
+class TestScaleAddProbe(TestScenario):
+    kernel = "scale_add"
+    probes = ["scale.data_out", "data_out"]  # 선언만 하면 끝
+```
+
+| Probe 형식 | 예시 | 의미 |
+|---|---|---|
+| 단순 이름 | `"data_out"` | 해당 텐서의 PULL/RECV op에 `probe=True` 자동 적용 |
+| 점(.) 구분 | `"scale.data_out"` | 서브커널 내부 텐서. golden chain pool에서 golden 자동 추출, `set_internal_probe_golden` 자동 호출 |
+
+**동작 흐름:**
+
+1. `TestScenario.run()` → `ctx._register_declarative_probes(probes)`
+2. `ki.run(ctx)` 실행 — ops 기록 + `forward()` 호출 (golden chain pool 저장)
+3. `ctx.run()` 시작 시:
+   - `_apply_declarative_probes()`: 출력 probe → `op.probe = True` 사후 설정
+   - `_resolve_internal_probe_golden()`: 내부 probe → `_golden_pool`에서 golden 추출
+   - Engine `_ensure_probe_mappings()`: `INTERNAL` → `INTERNAL_PROBE` 동적 업그레이드
+
+**내부 probe 요구사항:** golden chain이 설정되어 있어야 한다 (각 서브커널의 `forward()` 반환값으로 자동 구성).
+
+#### 수동 Probe API
+
+기존 수동 API도 그대로 사용 가능하다. `run()` override 시에는 수동 API를 사용한다.
+
+**출력 Probe:**
 
 ```python
 h_pull = ctx.pull_tensor(k.data_out, dep=h_push, probe=True)
-ctx.verify(h_pull, k.forward())  # golden이 SHM에도 전달됨
+ctx.verify(h_pull, k.forward()["data_out"])  # golden이 SHM에도 전달됨
+```
+
+**내부 Probe:**
+
+```python
+# 수동 golden 등록
+ctx.set_internal_probe_golden("scale", "data_out", scale_golden)
 ```
 
 Mismatch 발생 시 `ProbeMismatchError`가 raise되며, beat/cycle/expected/actual 정보를 포함한다.
-
-#### 내부 Probe (CompositeKernel)
-
-`Internal(probe=True)` 연결에 패시브 모니터 BFM이 자동 생성된다.
-TestScenario에서 golden을 등록한다:
-
-```python
-# CompositeKernel 정의
-connections = [
-    Connect(scale.data_out, offset.data_in, Internal(probe=True)),
-]
-
-# TestScenario.run()에서 golden 등록
-scale_golden = k.forward_scale_only(scale_factor=2)
-ctx.set_internal_probe_golden("scale", "data_out", scale_golden)
-```
 
 #### GUI 모드: Waveform 디버깅
 
@@ -431,7 +450,7 @@ class TestPassthrough(TestScenario):
         h_load = ctx.load_tensor(k.data_in)
         h_push = ctx.push_tensor(k.data_in, dep=h_load)
         h_pull = ctx.pull_tensor(k.data_out, dep=h_push)
-        ctx.verify(h_pull, k.forward())
+        ctx.verify(h_pull, k.forward()["data_out"])
 ```
 
 **Functional API 방식** (pytest에서 직접 사용 시):
@@ -630,8 +649,7 @@ class MyKernel(Kernel):
     ctrl  = register("ctrl")                       # 레지스터 인터페이스
 
     def generate_inputs(self, seed=None): ...       # 입력 생성
-    def forward(self): ...                          # Golden 계산
-    def verify(self, hw_output, golden): ...        # 커스텀 비교 (선택)
+    def forward(self, **inputs) -> dict[str, torch.Tensor]: ...  # Golden 계산
 ```
 
 ### ExecutionContext (Level 1)
@@ -699,3 +717,740 @@ with KernelExecutor(MyKernel, backend=b, params={...}) as npu:
     assert torch.equal(y2, expected2)
                                     # close_session (context manager exit)
 ```
+
+---
+
+## 9. Config & Parameter System
+
+커널 개발 시 파라미터를 **어디에, 어떻게** 정의하고, 실행 시점에 어떻게 결합되는지 규정한다.
+
+### 9.1 문제 정의
+
+복잡한 가속기 검증에서 반복되는 문제:
+
+1. **HW 상수 하드코딩** — `Ti=32, To=32, AXI_DW=256` 등이 모든 커널 파일에 복사됨
+2. **compute_derived_params 수동 체이닝** — 6개 sub-kernel의 derived shape를 직접 import/호출/merge
+3. **build-time vs runtime 구분 없음** — synthesis-time constant와 per-invocation config가 같은 `parameters:` 사전에 혼재
+4. **register 매핑 분산** — config register 값 결정이 커널/spec/테스트/binder 4곳에 걸쳐 있음
+5. **테스트 boilerplate** — 전체 테스트의 90%가 shape 계산/파라미터 전달 코드
+
+### 9.2 설계 목표
+
+- HW 상수를 한 곳(`kernel_spec.yaml` `build_params:`)에 정의하고 모든 커널이 참조
+- Config register 값을 `runtime_params:` + register 매핑으로 선언적 정의
+- Composite가 sub-kernel derived params를 자동 체이닝
+- TestScenario에서 override할 파라미터만 기술, 나머지는 default cascade
+- `generate_inputs()`는 `self.*`로만 파라미터 접근 (인자 전달 제거)
+
+### 9.3 Config 계층 구조 — 4-Tier Merge
+
+파라미터는 4개 계층에서 merge된다. 나중 계층이 높은 우선순위.
+
+```
+Tier 1 (lowest)  project_params       ← vten.toml [parameters]
+Tier 2            build_params         ← vten.toml [build_params] + kernel_spec build_params:
+Tier 3            kernel_spec_params   ← kernel_spec parameters: + runtime_params defaults
+Tier 4 (highest)  test_override        ← ctx.instantiate() kwargs / TestScenario cfg
+```
+
+**Merge 규칙:**
+
+```python
+namespace = {}
+namespace.update(project_params)          # Tier 1
+namespace.update(build_params)            # Tier 2 (project [build_params] < spec build_params)
+namespace.update(kernel_spec_parameters)  # Tier 3a
+# Tier 3b: runtime_params defaults — setdefault (같은 키가 이미 있으면 유지)
+for k, v in runtime_params_defaults.items():
+    namespace.setdefault(k, v)
+namespace.update(test_override)           # Tier 4
+```
+
+> **주의:** `runtime_params` defaults와 `parameters:`는 **동일 계층** (Tier 3, kernel_spec level).
+> `runtime_params`의 default는 `parameters:`를 **보충** (같은 키가 parameters에 이미 정의되어 있으면 그대로 유지).
+
+**build_params override 정책:** test_override(Tier 4)가 build_param 키를 덮으면 **warning** 출력 후 허용.
+synthesis-time constant를 런타임에 변경하는 것은 위험하지만, 테스트 유연성을 위해 차단하지는 않는다.
+
+### 9.4 kernel_spec.yaml 확장
+
+#### 9.4.1 build_params
+
+RTL 파라미터/synthesis-time 상수. Verilog `parameter`, VHDL `generic`에 해당.
+
+```yaml
+kernel: act_quant
+rtl_top: act_quant_core
+
+build_params:
+  Ti: 32
+  To: 32
+  OUT_GROUP: 2
+  PSUM_BITS: 32
+  BIAS_BITS: 32
+  QUANT_BITS: 8
+  SHIFT_BITS: 4
+  MAX_SHIFT: 16
+
+parameters: {}
+
+runtime_params:
+  # ... (§9.4.2 참조)
+
+interfaces:
+  # ... (기존과 동일)
+```
+
+**규칙:**
+- `build_params`는 flat `dict[str, int | str]`
+- 모든 sub-kernel이 동일한 `build_params` namespace를 공유 (Tier 2에서 merge)
+- 프로젝트 레벨 `vten.toml [build_params]` < kernel_spec `build_params:` (spec이 우선)
+- 커널 Python 코드에서 `self.Ti`, `self.To` 등으로 접근 가능
+
+**vten.toml에서 build_params:**
+
+```toml
+[build_params]
+Ti = 32
+To = 32
+AXI_DW = 256
+
+[parameters]
+# 기존과 동일 — runtime 기본값
+```
+
+#### 9.4.2 runtime_params
+
+Per-invocation config. 각 테스트 실행마다 바뀔 수 있는 파라미터.
+
+**두 가지 형식:**
+
+```yaml
+runtime_params:
+  # 형식 1: scalar — default 값만 지정 (기존 parameters:와 동일 동작)
+  in_depth: 4
+  in_height: 4
+  in_width: 4
+
+  # 형식 2: dict — default + register 매핑
+  in_ch:
+    default: 32
+    register: ctrl.in_ch        # → auto WRITE_REG(ctrl, in_ch, <resolved_value>)
+  out_ch:
+    default: 32
+    register: ctrl.out_ch
+  bias_shift:
+    default: 8
+    register: ctrl.bias_shift
+  is_relu:
+    default: 1
+    register: ctrl.is_relu
+  ifm_stride:
+    default: 1
+    register: ctrl.ifm_stride
+  ofm_stride:
+    default: 1
+    register: ctrl.ofm_stride
+```
+
+**데이터 모델:**
+
+runtime_params 항목은 scalar 값 또는 `{default, register}` dict로 기술한다.
+
+- scalar 값은 backward compat (`parameters:`에 넣은 것과 동일)
+- dict 값은 `default` + `register` 필드를 가지는 매핑으로 파싱
+- `register: ctrl.field_name` → `ctx.configure()` 시 해당 register에 자동 WRITE_REG 생성
+
+**register 매핑 동작:**
+1. `ctx.configure(kernel)` 호출 시 기존 role="config" auto-match **이후에** runtime_params register 매핑을 추가 처리
+2. 동일 register를 role="config"과 runtime_params 둘 다 잡는 경우, runtime_params가 **우선** (나중에 append → 덮어씀)
+3. register 필드 이름은 `kernel_spec.yaml` interfaces 섹션의 register 정의와 정확히 일치해야 함
+
+#### 9.4.3 완전한 kernel_spec.yaml 예시
+
+```yaml
+kernel: act_quant
+rtl_top: act_quant_core
+
+clock:
+  name: ap_clk
+
+reset:
+  name: ap_aresetn
+  active_low: true
+
+build_params:
+  Ti: 32
+  To: 32
+  OUT_GROUP: 2
+  PSUM_BITS: 32
+
+parameters: {}
+
+runtime_params:
+  in_ch:       { default: 32, register: ctrl.out_ch }
+  out_ch:      { default: 32, register: ctrl.out_ch }
+  in_depth:    { default: 4,  register: ctrl.in_depth }
+  in_height:   { default: 4,  register: ctrl.in_height }
+  in_width:    { default: 4,  register: ctrl.in_width }
+  bias_shift:  { default: 8,  register: ctrl.bias_shift }
+  is_relu:     { default: 1,  register: ctrl.is_relu }
+  ifm_stride:  { default: 1,  register: ctrl.ifm_stride }
+  ofm_stride:  { default: 1,  register: ctrl.ofm_stride }
+
+interfaces:
+  ctrl:
+    protocol: axi4_lite
+    role: slave
+    data_width: 32
+    rtl_port: s_axilite_control
+    generate_controller: true
+    registers:
+      - { name: vsync,      width: 1, pulse: true }
+      - { name: in_depth,   width: 8 }
+      - { name: in_height,  width: 8 }
+      - { name: in_width,   width: 8 }
+      - { name: out_ch,     width: 9 }
+      - { name: bias_shift, width: 5 }
+      - { name: is_relu,    width: 1 }
+      - { name: ifm_stride, width: 2 }
+      - { name: ofm_stride, width: 2 }
+
+  psum_in:
+    protocol: axi4_stream
+    role: slave
+    data_width: 64
+    packing:
+      element_width: 32
+      elements_per_beat: 2
+
+  bias_in:
+    protocol: axi4_stream
+    role: slave
+    data_width: 64
+    packing:
+      element_width: 32
+      elements_per_beat: 2
+
+  quant_out:
+    protocol: axi4_stream
+    role: master
+    data_width: 16
+    packing:
+      element_width: 8
+      elements_per_beat: 2
+```
+
+### 9.5 Kernel 클래스 규약
+
+#### 9.5.1 compute_derived_params
+
+텐서 shape에 필요한 derived 파라미터를 계산하는 인스턴스 메서드. `self.*`로 파라미터에 접근한다.
+
+```python
+class ActQuantKernel(Kernel):
+    spec = "kernels/act_quant/kernel_spec.yaml"
+
+    def compute_derived_params(self) -> dict:
+        """build_params + runtime_params에서 텐서 shape용 값 계산."""
+        och_groups = (self.out_ch + self.To - 1) // self.To
+
+        if self.ifm_stride == 2:
+            eff_depth = self.in_depth // 2
+            eff_height = self.in_height // 2
+            eff_width = self.in_width // 2
+        elif self.ofm_stride == 2:
+            eff_depth = self.in_depth * 2
+            eff_height = self.in_height * 2
+            eff_width = self.in_width * 2
+        else:
+            eff_depth = self.in_depth
+            eff_height = self.in_height
+            eff_width = self.in_width
+
+        total_beats = eff_depth * och_groups * eff_height * eff_width * (self.To // self.OUT_GROUP)
+        total_psum_elems = total_beats * self.OUT_GROUP
+
+        return {
+            "total_psum_elems": total_psum_elems,
+            "total_bias_elems": self.out_ch,
+            "total_output_elems": total_psum_elems,
+            "eff_depth": eff_depth,
+            "eff_height": eff_height,
+            "eff_width": eff_width,
+        }
+```
+
+**핵심:** resolver가 build_params + runtime_params를 `self.*` attribute로 주입하므로, `self.To` 등으로 HW 상수에 접근한다. 커널 코드에 상수를 하드코딩할 필요 없음.
+
+#### 9.5.2 generate_inputs — self.* 규약
+
+`generate_inputs()`는 명시적 파라미터 인자를 받지 않는다. 모든 파라미터는 `self.*`를 통해 접근.
+
+```python
+# ✅ 올바른 패턴
+def generate_inputs(self, seed=None):
+    rng = torch.Generator()
+    if seed is not None:
+        rng.manual_seed(seed)
+
+    # 파라미터는 self.* 로 접근 (resolver가 주입)
+    out_ch = self.out_ch
+    total_psum = self.total_psum_elems   # compute_derived_params 결과도 self.*
+
+    psum_data = torch.randint(-50000, 50000, (total_psum,),
+                              dtype=torch.int32, generator=rng)
+    bias_data = torch.randint(-10000, 10000, (out_ch,),
+                              dtype=torch.int32, generator=rng)
+
+    self.psum_in.data = psum_data
+    self.bias_in.data = bias_data
+
+# ❌ 잘못된 패턴 — 파라미터를 인자로 받지 않음
+def generate_inputs(self, seed=None, in_ch=32, out_ch=32, ...):
+    ...
+```
+
+**이유:** `ctx.instantiate()` 시 resolver가 파라미터를 resolve하고 커널 인스턴스의 attribute로 주입한다. `generate_inputs()`에 같은 파라미터를 다시 전달하면 불일치 위험이 생긴다.
+
+#### 9.5.3 forward — `**inputs` + `self.*` 규약
+
+`forward(self, **inputs)` 는 입력 텐서를 키워드 인자로 받고, `self.*`로 파라미터에 접근한다.
+반환값은 `dict[str, torch.Tensor]` — 출력 텐서 이름을 키로 하는 딕셔너리.
+
+```python
+def forward(self, psum_in, bias_in) -> dict[str, torch.Tensor]:
+    och_groups = (self.out_ch + self.To - 1) // self.To
+    psum = psum_in.to(torch.int64).reshape(
+        self.eff_depth, och_groups, self.eff_height * self.eff_width, self.To)
+    bias = bias_in.to(torch.int64)
+    biased = psum + bias.reshape(1, och_groups, 1, self.To)
+    activated = torch.clamp(biased, min=0) if self.is_relu else biased
+    shifted = activated >> self.bias_shift
+    clipped = shifted.clamp(0, 255) if self.is_relu else shifted.clamp(-128, 127)
+    return {"quant_out": (clipped & 0xFF).flatten().to(torch.uint8)}
+```
+
+### 9.6 CompositeKernel — 자동 체이닝
+
+#### 9.6.1 compute_derived_params 자동 체이닝
+
+`CompositeKernel`은 모든 sub-kernel의 `compute_derived_params()`를 자동 호출하고 결과를 merge한다.
+v2에서 `compute_derived_params`는 인스턴스 메서드이므로, composite는 각 sub-kernel 인스턴스의 메서드를 순차 호출한다.
+
+```python
+class CompositeKernel(Kernel):
+    def compute_derived_params(self) -> dict:
+        """Auto-chain: 모든 sub-kernel의 compute_derived_params()를 호출하고 merge."""
+        derived = {}
+        for attr_name in self._sub_kernel_names:
+            sub = getattr(self, attr_name)
+            sub_derived = sub.compute_derived_params()
+            derived.update(sub_derived)
+        return derived
+```
+
+**효과:**
+- `ctx.instantiate(NpuPipelineKernel, in_ch=128, out_ch=128)` 만으로 동작
+- 6개 sub-kernel의 compute_derived_params 결과가 composite namespace에 자동 merge
+- sub-kernel 텐서의 `${...}` 참조가 모두 resolve됨
+- `_run_pipeline()` 같은 수동 shape merge helper **불필요**
+
+#### 9.6.2 Composite에서의 파라미터 흐름
+
+```
+ctx.instantiate(NpuPipelineKernel, in_ch=128, out_ch=128, bias_shift=10)
+     │
+     ▼ Tier 4: test_override = {in_ch: 128, out_ch: 128, bias_shift: 10}
+     │
+     ▼ ParameterResolver 4-tier merge
+     │  → namespace = {Ti: 32, To: 32, ..., in_ch: 128, out_ch: 128, bias_shift: 10, ...}
+     │
+     ▼ composite.compute_derived_params()
+     │  → calls each sub-kernel instance's compute_derived_params()
+     │  → merges {total_psum_elems, ifm_total_bytes, ddr_wgt_bytes, ...}
+     │
+     ▼ Sub-kernel resolver에 composite namespace 전파
+     │  → 각 sub-kernel의 텐서 shape ${...} 참조 resolve
+     │
+     ▼ configure() 시:
+        → role="config" auto-match + runtime_params register 매핑
+        → 각 sub-kernel의 ctrl register에 resolved 값 기록
+```
+
+### 9.7 TestScenario — Override-Only Config
+
+TestScenario에서는 default와 **다른** 파라미터만 override하면 된다.
+
+#### 9.7.1 기본 테스트 (default config)
+
+```python
+class TestActQuant(TestScenario):
+    """Default config (all runtime_params defaults)."""
+    kernel = "act_quant"
+    # run() 미정의 → 기본 run() 사용:
+    #   1. kernel auto-discover
+    #   2. ctx.instantiate(kernel_cls, **cfg)
+    #   3. k.generate_inputs(seed=42)
+    #   4. k.run(ctx)
+```
+
+이것만으로 `act_quant`의 default config (in_ch=32, out_ch=32, ...) 전체 검증이 완료된다.
+
+#### 9.7.2 Override 테스트
+
+```python
+class TestActQuantLargeChannel(TestScenario):
+    """Large channel count."""
+    kernel = "act_quant"
+    cfg = {"in_ch": 128, "out_ch": 256}
+
+class TestActQuantStride2(TestScenario):
+    """IFM stride=2 downsampling."""
+    kernel = "act_quant"
+    cfg = {"ifm_stride": 2, "in_depth": 8, "in_height": 8, "in_width": 8}
+
+class TestActQuantNoRelu(TestScenario):
+    """Signed output (no ReLU)."""
+    kernel = "act_quant"
+    cfg = {"is_relu": 0}
+```
+
+**Before vs After 비교** (NPU pipeline 테스트):
+
+```python
+# ── BEFORE: 391줄 중 실제 로직 10줄, 나머지 boilerplate ──
+
+class TestNpuPipeline(TestScenario):
+    kernel = "npu_pipeline"
+
+    def run(self, ctx, cfg):
+        from weight_loader.weight_loader_kernel import compute_shapes as wgt_cs
+        from fmapIO.fmapIO_kernel import compute_shapes as fmap_cs
+        from act_quant.act_quant_kernel import compute_shapes as aq_cs
+        from psum_buffer.psum_buffer_kernel import compute_shapes as psb_cs
+        from mac_atu.mac_atu_kernel import compute_shapes as mac_cs
+        from bias_loader.bias_loader_kernel import compute_shapes as bl_cs
+
+        p = self._run_pipeline(cfg)   # 40줄: 6개 compute_shapes 호출/merge
+        k = ctx.instantiate(NpuPipelineKernel, **p)
+        k.generate_inputs(
+            seed=42, in_ch=p["in_ch"], out_ch=p["out_ch"],
+            in_width=p["in_width"], in_height=p["in_height"],
+            in_depth=p["in_depth"], kernel_size=p["kernel_size"],
+            ifm_stride=p["ifm_stride"], ofm_stride=p["ofm_stride"],
+            bias_shift=p["bias_shift"], is_relu=p["is_relu"],
+        )
+        k.run(ctx)
+
+# ── AFTER: override만 ──
+
+class TestNpuPipeline(TestScenario):
+    kernel = "npu_pipeline"
+    # default run() 사용 — 자동으로 모든 sub-kernel shape 계산
+
+class TestNpuPipelineLarge(TestScenario):
+    kernel = "npu_pipeline"
+    cfg = {"in_ch": 128, "out_ch": 128, "in_depth": 8}
+
+class TestNpuPipelineStride2(TestScenario):
+    kernel = "npu_pipeline"
+    cfg = {"ifm_stride": 2}
+```
+
+### 9.8 ParameterResolver 내부 동작
+
+```python
+class ParameterResolver:
+    def __init__(
+        self,
+        project_params: dict,
+        kernel_params: dict,
+        runtime_params: dict,
+        build_params: dict | None = None,
+        default_params: dict | None = None,
+    ) -> None:
+        self._build_param_keys: set[str] = set()
+        self.namespace = {}
+
+        # Tier 1
+        self.namespace.update(project_params)
+
+        # Tier 2
+        if build_params:
+            self.namespace.update(build_params)
+            self._build_param_keys = set(build_params.keys())
+
+        # Tier 3a
+        self.namespace.update(kernel_params)
+
+        # Tier 3b: runtime_params defaults (setdefault — 보충만)
+        if default_params:
+            for k, v in default_params.items():
+                self.namespace.setdefault(k, v)
+
+        # Tier 4: test override (build_param 키 override 시 warning)
+        if self._build_param_keys:
+            for k in runtime_params:
+                if k in self._build_param_keys:
+                    logger.warning(
+                        "runtime param '%s' overrides build_param "
+                        "(synthesis-time constant)", k
+                    )
+        self.namespace.update(runtime_params)
+
+        self._resolve_namespace()
+```
+
+**Backward compatibility:**
+- `build_params=None`, `default_params=None` 기본값
+- 기존 3인자 호출 `ParameterResolver(proj, kern, rt)` 그대로 작동
+- 새 필드가 없는 kernel_spec은 빈 dict → 기존 동작
+
+### 9.9 Binder — runtime_params Register 매핑
+
+`ctx.configure(kernel)` 호출 시, 기존 role="config" auto-match에 **추가하여** runtime_params의 `register:` 필드를 처리한다.
+
+```python
+def resolve_runtime_param_registers(view: FlattenedKernelView) -> list[RegisterBindingEntry]:
+    """runtime_params.register 필드 기반 명시적 register 매핑."""
+    result = []
+    for sub_name, sub_ki in view.sub_kernels.items():
+        spec = sub_ki.spec
+        for param_name, param_spec in spec.runtime_params.items():
+            if not isinstance(param_spec, dict) or not param_spec.get("register"):
+                continue
+            # "ctrl.field_name" → interface="ctrl", field="field_name"
+            iface_name, field_name = param_spec["register"].split(".", 1)
+            value = sub_ki._resolver.namespace.get(param_name)
+            if value is None:
+                continue
+            # register offset lookup → absolute offset → RegisterBindingEntry
+            ...
+    return result
+```
+
+**Engine 통합:**
+
+```python
+# _resolve_auto_binds() 내부
+runtime_param_bindings = resolve_runtime_param_registers(view)
+view._register_bindings = (
+    auto_bindings + config_bindings + composite_config_bindings
+    + runtime_param_bindings   # ← 마지막에 추가 → 같은 register가 있으면 덮어씀
+)
+```
+
+**우선순위:** role="config" auto-match < runtime_params register 매핑 (리스트 뒤쪽이 우선)
+
+### 9.10 Flattener — build_params 전달
+
+`KernelInstance.initialize()`에서 build_params를 merge하여 ParameterResolver에 전달한다.
+
+```python
+def initialize(self, project_params: dict) -> None:
+    # project [build_params] < kernel_spec build_params
+    project_build = project_params.get("build_params", {})
+    spec_build = self.spec.build_params
+    merged_build = {**project_build, **spec_build} if (project_build or spec_build) else None
+
+    self._resolver = ParameterResolver(
+        project_params,
+        self.spec.parameters,
+        self.runtime_params,
+        build_params=merged_build,
+        default_params=self.spec.default_params,
+    )
+```
+
+### 9.11 기존 기능과의 공존
+
+| 기존 기능 | 상태 | 비고 |
+|-----------|------|------|
+| `parameters:` flat dict | **유지** | Tier 3a에서 그대로 작동 |
+| role="config" auto-match | **유지** | runtime_params register 매핑과 공존 |
+| `compute_derived_params()` instance method | **유지** | composite에 auto-chain 추가 |
+| `TestScenario.run()` override | **유지** | default run()과 선택적 사용 |
+| `ctx.instantiate(K, **kwargs)` | **유지** | kwargs가 Tier 4 test_override |
+
+**삭제 없음.** 모든 신규 기능은 additive only. 기존 코드는 변경 없이 작동한다.
+
+---
+
+## 10. Migration Guide
+
+기존 NPU_3D 커널 코드를 새 config system으로 이전하는 가이드.
+
+### 10.1 kernel_spec.yaml
+
+**Before:**
+
+```yaml
+kernel: act_quant
+rtl_top: act_quant_core
+
+parameters: {}
+
+interfaces:
+  ctrl:
+    # ... registers 정의 ...
+```
+
+**After:**
+
+```yaml
+kernel: act_quant
+rtl_top: act_quant_core
+
+build_params:
+  Ti: 32
+  To: 32
+  OUT_GROUP: 2
+
+parameters: {}
+
+runtime_params:
+  in_ch:       { default: 32, register: ctrl.out_ch }
+  out_ch:      { default: 32, register: ctrl.out_ch }
+  in_depth:    { default: 4,  register: ctrl.in_depth }
+  in_height:   { default: 4,  register: ctrl.in_height }
+  in_width:    { default: 4,  register: ctrl.in_width }
+  bias_shift:  { default: 8,  register: ctrl.bias_shift }
+  is_relu:     { default: 1,  register: ctrl.is_relu }
+  ifm_stride:  { default: 1,  register: ctrl.ifm_stride }
+  ofm_stride:  { default: 1,  register: ctrl.ofm_stride }
+
+interfaces:
+  # ... (기존과 동일)
+```
+
+### 10.2 Kernel Python 코드
+
+**Before:**
+
+```python
+# 모든 커널 파일에 하드코딩
+Ti = 32
+To = 32
+OUT_GROUP = 2
+PSUM_BITS = 32
+
+def compute_shapes(in_ch=32, out_ch=32, ...):
+    och_groups = (out_ch + To - 1) // To
+    ...
+
+class ActQuantKernel(Kernel):
+    @staticmethod
+    def compute_derived_params(params: dict) -> dict:
+        return compute_shapes(**params)
+
+    def generate_inputs(self, seed=None):
+        out_ch = self.out_ch
+        ...
+```
+
+**After:**
+
+```python
+# 하드코딩 제거 — build_params에서 자동 주입
+
+class ActQuantKernel(Kernel):
+    spec = "kernels/act_quant/kernel_spec.yaml"
+
+    def compute_derived_params(self) -> dict:
+        och_groups = (self.out_ch + self.To - 1) // self.To  # self.*로 접근
+        ...
+        return {"total_psum_elems": ..., "eff_depth": ..., ...}
+
+    def generate_inputs(self, seed=None):
+        out_ch = self.out_ch              # resolver가 주입
+        total_psum = self.total_psum_elems  # compute_derived_params 결과
+        ...
+```
+
+### 10.3 Composite 테스트
+
+**Before (391줄):**
+
+```python
+class TestNpuPipeline(TestScenario):
+    kernel = "npu_pipeline"
+
+    def _run_pipeline(self, cfg):
+        """6개 sub-kernel compute_shapes 수동 호출 + merge."""
+        from weight_loader.weight_loader_kernel import compute_shapes as wgt_cs
+        from fmapIO.fmapIO_kernel import compute_shapes as fmap_cs
+        # ... 4개 더 import ...
+
+        params = {**DEFAULT_PARAMS, **cfg}
+        wgt = wgt_cs(**params)
+        fmap = fmap_cs(**params)
+        # ... 4개 더 호출 ...
+        params.update(wgt)
+        params.update(fmap)
+        # ... merge ...
+        return params
+
+    def run(self, ctx, cfg):
+        p = self._run_pipeline(cfg)
+        k = ctx.instantiate(NpuPipelineKernel, **p)
+        k.generate_inputs(
+            seed=42,
+            in_ch=p["in_ch"], out_ch=p["out_ch"],
+            in_width=p["in_width"], in_height=p["in_height"],
+            in_depth=p["in_depth"], kernel_size=p["kernel_size"],
+            ifm_stride=p["ifm_stride"], ofm_stride=p["ofm_stride"],
+            bias_shift=p["bias_shift"], is_relu=p["is_relu"],
+        )
+        k.run(ctx)
+```
+
+**After (3줄):**
+
+```python
+class TestNpuPipeline(TestScenario):
+    kernel = "npu_pipeline"
+    # default run() 자동 사용:
+    #   ctx.instantiate() → compute_derived_params auto-chain
+    #   → generate_inputs(seed=42) → k.run(ctx)
+
+class TestNpuPipelineLarge(TestScenario):
+    kernel = "npu_pipeline"
+    cfg = {"in_ch": 128, "out_ch": 128}
+
+class TestNpuPipelineK1(TestScenario):
+    kernel = "npu_pipeline"
+    cfg = {"kernel_size": 1}
+```
+
+### 10.4 vten.toml
+
+**Before:**
+
+```toml
+[parameters]
+Ti = 32
+To = 32
+```
+
+**After:**
+
+```toml
+[build_params]
+Ti = 32
+To = 32
+AXI_DW = 256
+
+[parameters]
+# runtime defaults — 프로젝트 공통
+```
+
+### 10.5 마이그레이션 순서
+
+1. `kernel_spec.yaml`에 `build_params:` + `runtime_params:` 추가
+2. `vten.toml`에 `[build_params]` 섹션 추가
+3. 커널 코드에서 하드코딩된 상수 제거, `self.Ti` 패턴으로 전환
+4. `generate_inputs()`에서 명시적 파라미터 인자 제거, `self.*` 사용
+5. 테스트에서 `_run_pipeline()` helper 제거, override-only `cfg` 사용
+6. 기존 테스트 통과 확인 (`pytest`)
+7. (선택) `parameters:`에 남은 값을 `runtime_params:`로 이전

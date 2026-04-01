@@ -322,6 +322,7 @@ class KernelInstance:
     # ── Verification ──
 
     def verify(self, op_handle, golden):
+        """golden: Tensor (직접 비교) 또는 dict (forward() 반환값, 자동 추출)."""
         self._verifications.append(VerificationTask(
             op_handle=op_handle, golden=golden))
 
@@ -398,6 +399,11 @@ class KernelInstance:
         ctx.run() 이후에 호출: 즉시(eager) 검증 수행.
             → SHM에서 버퍼 데이터를 읽어 golden과 비교.
             → VerificationError 시 즉시 raise.
+
+        golden 인자:
+            - Tensor: 직접 비교 대상 (후방호환).
+            - dict: forward() 반환값 dict. 프레임워크가 op_handle에 대응하는
+              텐서 이름을 key로 사용하여 올바른 golden 텐서를 자동 추출.
         """
         if self._last_compiled is not None:
             # Eager mode: run() 이후 호출
@@ -552,94 +558,56 @@ def _flatten_composite(self, composite):
             params=binding.params or {},
         )
 
-    # Phase B: 인터페이스 매핑 구축
-    interface_mappings = []
-    for name, binding in composite.bindings():
-        sub_spec = sub_kernels[name].spec
-        for sub_iface_name in sub_spec.interface_names():
-            if sub_iface_name not in binding.interface_map:
-                raise ValidationError(
-                    f"Sub-kernel '{name}': interface '{sub_iface_name}' "
-                    f"has no mapping in interface_map.")
-            interface_mappings.append(
-                self._parse_mapping(name, sub_iface_name,
-                                    binding.interface_map[sub_iface_name],
-                                    top_spec))
+    # Phase B: 연결 그래프에서 내부/외부 텐서 분류
+    #   v2: interface_map 대신 _sub_kernel_refs, _connections,
+    #       _connected_tensors, _auto_exposed를 사용한다.
+    connected_tensors = composite._connected_tensors  # set of (sub_name, tensor_name)
+    connections = composite._connections               # list of Connection
 
-    # Phase C: 노출 텐서 수집
+    # Phase C: 노출 텐서 수집 (auto-expose)
+    #   v2: 연결된 텐서 → internal (노출되지 않음)
+    #       연결되지 않은 텐서 → auto-exposed (sub_name prefix 부여)
     exposed_tensors = {}
-    for name, tensor_def in composite.exposed_tensor_defs():
-        origin_tensor = sub_kernels[tensor_def.origin_sub_kernel].get_tensor(
-            tensor_def.origin_name)
-        exposed_tensors[name] = ExposedTensor(
-            name=name,
-            origin_path=f"{tensor_def.origin_sub_kernel}.{tensor_def.origin_name}",
-            origin_tensor=origin_tensor,
-            top_interface=tensor_def.top_interface,
-            direction=self._infer_direction(
-                tensor_def.origin_sub_kernel, origin_tensor, interface_mappings),
-        )
+    for sub_name, sub_kernel in sub_kernels.items():
+        for tensor in sub_kernel.tensors():
+            if (sub_name, tensor.name) in connected_tensors:
+                continue  # 내부 연결 → 노출 안 함
+            exposed_name = f"{sub_name}_{tensor.name}"
+            # _auto_exposed에 사용자 지정 이름이 있으면 사용
+            if hasattr(composite, '_auto_exposed'):
+                for ae in composite._auto_exposed:
+                    if ae.sub_name == sub_name and ae.tensor_name == tensor.name:
+                        exposed_name = ae.exposed_name or exposed_name
+                        break
+            exposed_tensors[exposed_name] = ExposedTensor(
+                name=exposed_name,
+                origin_path=f"{sub_name}.{tensor.name}",
+                origin_tensor=tensor,
+                top_interface=tensor.interface,
+                direction=self._infer_direction_from_tensor(
+                    sub_name, tensor, sub_kernels[sub_name].spec),
+            )
 
     # Phase D: Probe 포인트 수집
+    #   v2: 연결 그래프에서 probe 대상 식별
     probe_points = []
-    for mapping in interface_mappings:
-        if mapping.mapping_type == MappingType.INTERNAL_PROBE:
-            conn = self._find_connection_for_interface(
-                composite.connections, mapping.sub_kernel, mapping.sub_interface)
-            probe_points.append(ProbePoint(
-                connection=conn, interface_mapping=mapping))
+    for conn in connections:
+        if conn.probe:
+            probe_points.append(ProbePoint(connection=conn))
 
     # Phase E: 빌드 시점 검증
-    self._validate_flattened(interface_mappings, exposed_tensors,
-                             composite.connections, top_spec, sub_kernels)
+    self._validate_flattened(exposed_tensors,
+                             connections, top_spec, sub_kernels)
 
     return FlattenedKernelView(
         name=top_spec.kernel_name, top_spec=top_spec,
-        sub_kernels=sub_kernels, interface_mappings=interface_mappings,
+        sub_kernels=sub_kernels,
         exposed_tensors=exposed_tensors, probe_points=probe_points,
-        connections=composite.connections,
+        connections=connections,
     )
 ```
 
-### 5.2 Mapping Parser
-
-```python
-def _parse_mapping(self, sub_kernel_name, sub_iface_name,
-                   mapping_value, top_spec):
-    if isinstance(mapping_value, Internal):
-        return InterfaceMapping(
-            sub_kernel=sub_kernel_name, sub_interface=sub_iface_name,
-            mapping_type=(MappingType.INTERNAL_PROBE
-                         if mapping_value.probe
-                         else MappingType.INTERNAL),
-            top_interface=None, bank_name=None, bank_offset=0)
-
-    elif isinstance(mapping_value, str):
-        self._validate_protocol_compat(
-            sub_kernel_name, sub_iface_name, mapping_value, top_spec)
-        return InterfaceMapping(
-            sub_kernel=sub_kernel_name, sub_interface=sub_iface_name,
-            mapping_type=MappingType.EXTERNAL,
-            top_interface=mapping_value, bank_name=None, bank_offset=0)
-
-    elif isinstance(mapping_value, tuple) and len(mapping_value) == 2:
-        top_iface, bank_name = mapping_value
-        bank_offset = top_spec.get_bank_offset(top_iface, bank_name)
-        self._validate_protocol_compat(
-            sub_kernel_name, sub_iface_name, top_iface, top_spec)
-        return InterfaceMapping(
-            sub_kernel=sub_kernel_name, sub_interface=sub_iface_name,
-            mapping_type=MappingType.EXTERNAL_BANK,
-            top_interface=top_iface, bank_name=bank_name,
-            bank_offset=bank_offset)
-
-    else:
-        raise ValidationError(
-            f"Sub-kernel '{sub_kernel_name}', interface "
-            f"'{sub_iface_name}': invalid mapping value {mapping_value!r}")
-```
-
-### 5.3 Direction Resolution
+### 5.2 Direction Resolution
 
 텐서의 데이터 전송 방향은 다음 우선순위로 결정한다:
 
@@ -670,9 +638,11 @@ ofm = Tensor(shape, torch.int8, "ddr_port", direction=Direction.DEV_TO_HOST)
 
 | 우선순위 | 스코프 | 소스 | 예 |
 |----------|--------|------|-----|
-| 1 (최고) | Runtime Object | 테스트 `Config()` | `Config(C=32, D=4)` |
-| 2 | Kernel Template | `kernel_spec.yaml` | `K: 128, STRIDE: 1` |
-| 3 (최저) | Project Defaults | `vten.toml [parameters]` | `C=64, BUS_WIDTH=256` |
+| 1 (최고) | Runtime | 테스트 `Config()` | `Config(C=32, D=4)` |
+| 2 | kernel_spec | `kernel_spec.yaml` parameters | `K: 128, STRIDE: 1` |
+| 3 | default_params | Kernel 클래스 `default_params` | `default_params = {"C": 64}` |
+| 4 | build_params | 빌드 시 전달 파라미터 | CLI `--param C=32` |
+| 5 (최저) | project_params | `vten.toml [parameters]` | `C=64, BUS_WIDTH=256` |
 
 ### 6.2 Composite 동작
 
@@ -707,11 +677,15 @@ def _resolve_parameters(self, view):
 
 ```python
 class ParameterResolver:
-    def __init__(self, project_params, kernel_params, runtime_params):
+    def __init__(self, project_params, build_params, default_params,
+                 kernel_spec_params, runtime_params):
+        # 낮은 우선순위부터 적용 (나중에 update하는 것이 높은 우선순위)
         self.namespace = {}
-        self.namespace.update(project_params)
-        self.namespace.update(kernel_params)
-        self.namespace.update(runtime_params)
+        self.namespace.update(project_params)     # 5: vten.toml
+        self.namespace.update(build_params)        # 4: CLI --param
+        self.namespace.update(default_params)      # 3: Kernel.default_params
+        self.namespace.update(kernel_spec_params)  # 2: kernel_spec.yaml
+        self.namespace.update(runtime_params)      # 1: Config()
 
     def resolve(self, expr):
         if not isinstance(expr, str) or "${" not in expr:
@@ -735,6 +709,23 @@ shape=("${N}", "${C}", "${D}", "${H}", "${W}")                    # 단순 치�
 shape=("${N}", "${K}", "(${D}-${KD})//${STRIDE}+1", ...)         # 산술
 shape=("${N}", "${C}//${TILE_C}", "${D}", "${H}", "${W}", "${TILE_C}")  # 교차
 ```
+
+### 6.4 compute_derived_params
+
+커널이 `compute_derived_params`를 정의한 경우, 파라미터 해석 후 호출하여
+파생 파라미터를 namespace에 추가한다.
+
+v2에서 `compute_derived_params`는 **인스턴스 메서드**이다 (v1의 `@staticmethod(params) -> dict`에서 변경).
+
+```python
+# v2: 인스턴스 메서드
+class MyKernel(Kernel):
+    def compute_derived_params(self) -> dict:
+        return {"TOTAL": self.params["C"] * self.params["H"]}
+```
+
+Stage 1에서 커널 인스턴스의 `compute_derived_params()`를 호출하고,
+반환된 dict를 resolver namespace에 병합한다.
 
 ---
 
@@ -1000,63 +991,89 @@ def _block_split_data(serialized, flat_names, serialized_size) -> dict[str, byte
 
 ## 9. Stage 3b: Probe Golden Serialization
 
-### 9.1 두 가지 전략
+### 9.1 Golden 소스: 세 가지 경로
 
-| 전략 | 트리거 | 장점 | 단점 |
-|------|--------|------|------|
-| **Explicit** | 사용자가 `forward_with_intermediates()` 정의 | 임의 Python 동작. 캡처 대상 제어. | 사용자 노력 필요. |
-| **Automatic** | 미정의 시; Runtime이 `connections` DAG 순회 | 단순 선형 파이프라인에서 노력 제로. | 분기, 조건, 상태 있으면 실패. |
+| 경로 | 트리거 | 설명 |
+|------|--------|------|
+| **선언적 (probes)** | TestScenario에 `probes = [...]` 선언 | Golden chain pool에서 자동 추출. 커널 정의 변경 불필요. |
+| **수동 등록** | `ctx.set_internal_probe_golden()` 호출 | 사용자가 직접 golden 텐서를 등록. |
+| **Kernel 정의 (deprecated)** | `Internal(probe=True)` | Deprecated. 모든 Internal()에 probe BFM 자동 생성 (방안 A). |
 
-Explicit이 정의되면 우선. 미정의 시 Automatic 시도. golden 데이터 미발견 시 `ProbeError`.
+### 9.2 선언적 Probe 처리 흐름
 
-### 9.2 Implementation
+```
+TestScenario.run():
+  ctx._register_declarative_probes(["scale.data_out", "data_out"])
+  ki.run(ctx)  → forward() 실행
 
-```python
-def _serialize_probe_golden(self, view):
-    if not view.probe_points:
-        return
+ctx.run():
+  1. _apply_declarative_probes()
+     - "data_out" (출력): PULL op에 op.probe = True 설정
+     - "scale.data_out" (내부): _internal_probe_requests에 추가
 
-    kernel_instance = self._kernels[view.name]
-    if hasattr(kernel_instance, 'forward_with_intermediates'):
-        intermediates = kernel_instance.forward_with_intermediates()
-    else:
-        intermediates = self._auto_collect_intermediates(view)
+  2. _resolve_internal_probe_golden()
+     - v2: composite forward()가 연결 그래프를 따라 서브커널 forward()를
+       topological 순서로 호출하여 중간값을 수집
+     - pool key는 (sub_name, tensor_name) 튜플
+     - ctx._internal_probe_golden에 등록
 
-    for probe in view.probe_points:
-        key = (f"{probe.interface_mapping.sub_kernel}"
-               f".{probe.interface_mapping.sub_interface}")
-        if key not in intermediates:
-            raise ProbeError(f"Probe point '{key}' has no golden data.")
-        probe.golden_data = intermediates[key]
+  3. Engine._ensure_probe_mappings(view, internal_probe_golden)
+     - 연결 그래프에서 probe 대상 연결을 찾아 ProbePoint 생성
+     - view.probe_points에 추가
 
-        sub = view.sub_kernels[probe.interface_mapping.sub_kernel]
-        sub_iface = sub.spec.get_interface(probe.interface_mapping.sub_interface)
-        serializer = StreamSerializer(sub_iface.packing)
-        probe.serialized_golden = serializer.serialize(probe.golden_data)
+  4. Engine._serialize_probe_golden(view, internal_probe_golden)
+     - ProbePoint의 golden 텐서를 StreamSerializer로 직렬화
+     - serialized_golden + golden_buffer_id 할당
 ```
 
-### 9.3 Automatic Collection via Topological Sort
+### 9.3 Golden Chain Pool
+
+v2에서 `CompositeKernel.forward()`는 연결 그래프(connection graph)를 따라
+서브커널의 `forward()` 메서드를 topological sort 순서로 호출한다.
+각 서브커널의 출력을 pool에 `(sub_name, tensor_name)` 튜플 키로 저장한다.
+
+선언적 probe의 golden 해석:
+1. `probes = ["scale.data_out"]` → `(sub_name="scale", tensor_name="data_out")`
+2. `pool[(\"scale\", \"data_out\")]` → golden tensor (직접 매칭)
+
+`ctx.set_internal_probe_golden(sub_name, tensor_name, golden_tensor)`로
+수동 등록도 여전히 지원한다.
+
+### 9.4 Probe 포인트 생성
+
+`_ensure_probe_mappings(view, internal_probe_golden)`:
 
 ```python
-def _auto_collect_intermediates(self, view):
-    intermediates = {}
-    probed = {(p.interface_mapping.sub_kernel, p.interface_mapping.sub_interface)
-              for p in view.probe_points}
-    order = self._topo_sort_sub_kernels(view.connections, view.sub_kernels)
-
-    for sub_name in order:
-        sub = view.sub_kernels[sub_name]
-        output = sub.kernel_class_instance.forward()
+def _ensure_probe_mappings(self, view, internal_probe_golden):
+    existing = {(p.connection.source_sub, p.connection.source_name)
+                for p in view.probe_points if p.connection}
+    for (sub_name, tensor_name) in internal_probe_golden:
+        if (sub_name, tensor_name) in existing:
+            continue
         for conn in view.connections:
-            if conn.source_sub != sub_name:
-                continue
-            data = conn.transform(output) if conn.transform else output
-            key = (conn.source_sub, conn.source_interface)
-            if key in probed:
-                intermediates[f"{key[0]}.{key[1]}"] = data.clone()
-            dest = view.sub_kernels[conn.dest_sub].get_tensor(conn.dest_name)
-            dest.data = data
-    return intermediates
+            if conn.source_sub == sub_name and conn.source_name == tensor_name:
+                view.probe_points.append(
+                    ProbePoint(connection=conn)
+                )
+                break
+```
+
+### 9.5 Serialization
+
+```python
+def _serialize_probe_golden(self, view, internal_probe_golden):
+    for probe in view.probe_points:
+        if probe.connection is None:
+            continue
+        conn = probe.connection
+        key = (conn.source_sub, conn.source_name)
+        golden_tensor = internal_probe_golden.get(key)
+        if golden_tensor is None:
+            continue
+        sub = view.sub_kernels[conn.source_sub]
+        sub_iface = sub.spec.get_interface(conn.source_interface)
+        serializer = StreamSerializer(sub_iface.packing)
+        probe.serialized_golden = serializer.serialize(golden_tensor)
 ```
 
 ---
@@ -1874,13 +1891,6 @@ Unit 커널은 `_self` 서브커널 하나로 래핑하여 동일한 FlattenedKe
 
 ```python
 def _wrap_unit_as_flat(self, kernel):
-    mappings = [
-        InterfaceMapping(
-            sub_kernel="_self", sub_interface=iface.name,
-            mapping_type=MappingType.EXTERNAL,
-            top_interface=iface.name, bank_name=None, bank_offset=0)
-        for iface in kernel.spec.interfaces.values()
-    ]
     exposed = {}
     for tensor in kernel.tensors():
         exposed[tensor.name] = ExposedTensor(
@@ -1891,7 +1901,7 @@ def _wrap_unit_as_flat(self, kernel):
     return FlattenedKernelView(
         name=kernel.spec.kernel_name, top_spec=kernel.spec,
         sub_kernels={"_self": kernel},
-        interface_mappings=mappings, exposed_tensors=exposed,
+        exposed_tensors=exposed,
         probe_points=[], connections=[])
 ```
 
@@ -1905,7 +1915,7 @@ def _wrap_unit_as_flat(self, kernel):
 
 | 규칙 | 검사 | 에러 |
 |------|------|------|
-| V1: 완전 매핑 | 모든 서브커널 인터페이스가 interface_map에 존재 | ValidationError |
+| V1: 텐서 분류 | 모든 서브커널 텐서가 연결(internal) 또는 노출(auto-exposed)로 분류 | ValidationError |
 | V2: 프로토콜 호환 | 서브커널 인터페이스 프로토콜 = 최상위 인터페이스 프로토콜 | ProtocolMismatchError |
 | V3: 뱅크 비겹침 | 같은 AXI-Lite 인터페이스의 레지스터 뱅크 주소 비겹침 | BankOverlapError |
 | V4: 연결 호환 | 연결된 텐서 쌍의 원소 수 일치 (형상 해결 후) | ConnectionShapeMismatchError |

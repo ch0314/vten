@@ -33,6 +33,7 @@ class TestScenario:
 
     kernel: str = ""
     configs: list[dict] | None = None
+    probes: list[str] | None = None
 
     def run(self, ctx, cfg) -> None:
         """Default run: auto-discover kernel class, instantiate, run."""
@@ -44,6 +45,11 @@ class TestScenario:
             )
         k = ctx.instantiate(kernel_cls, **cfg)
         ki = k.kernel_class_instance
+
+        # Register declarative probes before kernel execution
+        if self.probes:
+            ctx._register_declarative_probes(self.probes)
+
         ki.generate_inputs(seed=cfg.get("seed", 42))
         ki.run(ctx)
 
@@ -86,6 +92,8 @@ class TestScenario:
                     module = importlib.util.module_from_spec(spec)
                     sys.modules[mod_name] = module
                     spec.loader.exec_module(module)
+                    # Prefer classes defined in this module over imports
+                    candidates = []
                     for attr_name in dir(module):
                         obj = getattr(module, attr_name)
                         if (
@@ -93,7 +101,14 @@ class TestScenario:
                             and issubclass(obj, Kernel)
                             and obj is not Kernel
                         ):
-                            return obj
+                            candidates.append(obj)
+                    # Filter to locally-defined classes first
+                    local = [c for c in candidates
+                             if c.__module__ == mod_name]
+                    if local:
+                        return local[0]
+                    if candidates:
+                        return candidates[0]
         return None
 
 
@@ -509,6 +524,7 @@ def _run_single_test(
 
     last_error: Exception | None = None
     session_open = False  # Track session state across configs
+    batch_count = 0      # Track batch number across configs
     try:
         for cfg_idx, cfg in enumerate(run_cfgs):
             logger.debug("config %d/%d: %s", cfg_idx + 1, len(run_cfgs), cfg)
@@ -517,12 +533,17 @@ def _run_single_test(
                 # the full lifecycle: compile → execute → verify
                 from vten.runtime.context import ExecutionContext
 
+                # Include build_params so resolver Tier 2 can access them
+                if "build_params" not in cfg and "build_params" in config:
+                    cfg["build_params"] = config["build_params"]
+
                 ctx = ExecutionContext(
                     backend=backend_inst,
                     project_params=cfg,
                 )
                 # Share session state across configs for multi-batch mode
                 ctx._session_open = session_open
+                ctx._batch_count = batch_count
                 scenario.run(ctx, cfg)
 
                 if ctx._pending_ops:
@@ -530,6 +551,7 @@ def _run_single_test(
                     # including deferred verifications
                     batch_result = ctx.run()
                     session_open = ctx._session_open
+                    batch_count = ctx._batch_count
                     configs_passed += 1
 
                     if batch_result.per_command_stats:
@@ -752,7 +774,10 @@ def run_test(
     prev_cwd = os.getcwd()
     os.chdir(str(project))
     try:
-        for scenario_name, scenario in scenarios:
+        for test_idx, (scenario_name, scenario) in enumerate(scenarios, 1):
+            logger.info("")
+            logger.info("════ test %d/%d: %s/%s ════",
+                        test_idx, len(scenarios), kernel_name, scenario_name)
             _run_single_test(
                 project=project,
                 config=config,

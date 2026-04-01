@@ -31,7 +31,13 @@ class BrokenPassthroughKernel(Kernel):
             rng.manual_seed(seed)
         self.data_in.fill_random(generator=rng)
 
-    def forward(self):
+    def forward(self, **inputs) -> dict[str, torch.Tensor]:
         # Return correct passthrough (data unchanged).
         # The RTL will corrupt data, so verify/probe will detect mismatches.
-        return self.data_in.data.clone()
+        return {"data_out": self.data_in.data.clone()}
+
+    def run(self, ctx) -> None:
+        h_load = ctx.load_tensor(self.data_in)
+        h_push = ctx.push_tensor(self.data_in, dep=h_load)
+        h_pull = ctx.pull_tensor(self.data_out, dep=h_load)
+        ctx.verify(h_pull, self.forward()["data_out"])

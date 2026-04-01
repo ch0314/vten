@@ -4,6 +4,9 @@ Data structures: InterfaceMapping, ExposedTensor, ProbePoint,
 KernelInstance, FlattenedKernelView.
 
 Spec reference: 00_data_models.md §7, 02_runtime_engine.md §5
+
+v2: SubKernelBinding → _sub_kernel_refs, auto-expose,
+    KernelInstance.initialize() order change for compute_derived_params(self).
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from vten.spec.models import (
 )
 
 if TYPE_CHECKING:
-    from vten.kernel.composite import Connect
+    from vten.kernel.composite import Connection
     from vten.runtime.resolver import ParameterResolver
 
 
@@ -49,7 +52,7 @@ class InterfaceMapping:
 
 @dataclass
 class ExposedTensor:
-    """Tensor exposed from CompositeKernel via .expose()."""
+    """Tensor exposed from CompositeKernel (auto-exposed or manually)."""
 
     name: str
     origin_path: str  # "dma_ifm.src"
@@ -94,6 +97,16 @@ class ExposedTensor:
     def dtype(self):
         return self.origin_tensor.dtype
 
+    # ── Logical data proxy ──
+
+    @property
+    def logical_data(self):
+        return self.origin_tensor._logical_data
+
+    @logical_data.setter
+    def logical_data(self, value):
+        self.origin_tensor._logical_data = value
+
 
 # ── ProbePoint ──
 
@@ -107,7 +120,7 @@ class ProbePoint:
     - Single kernel probe (probe=True on PULL): tensor_name set.
     """
 
-    connection: Connect | None = None
+    connection: Connection | None = None
     interface_mapping: InterfaceMapping | None = None
     tensor_name: str | None = None
     golden_data: object = None  # torch.Tensor
@@ -131,57 +144,72 @@ class KernelInstance:
     _sub_kernel_instances: dict[str, KernelInstance] | None = None
 
     def initialize(self, project_params: dict) -> None:
-        """Initialize: resolve parameters + shapes, create Kernel instance."""
+        """Initialize: resolve parameters + shapes, create Kernel instance.
+
+        v2 order:
+        1. Create ParameterResolver (with default_params from Kernel class)
+        2. Create kernel instance
+        3. Set base param attrs on instance
+        4. Call instance.compute_derived_params() → merge derived
+        5. Set derived attrs on instance
+        6. Copy tensors and resolve shapes
+        7. Resolve exposed tensors for CompositeKernel
+        """
         from vten.runtime.resolver import ParameterResolver
+
+        # Merge build_params: project [build_params] < kernel_spec build_params
+        project_build = project_params.get("build_params", {}) or {}
+        spec_build = self.spec.build_params or {}
+        merged_build = {**project_build, **spec_build} if (project_build or spec_build) else None
+
+        # Get default_params from kernel class
+        default_params = getattr(self.kernel_class, "default_params", None) or None
 
         self._resolver = ParameterResolver(
             project_params,
             self.spec.parameters,
             self.runtime_params,
+            build_params=merged_build,
+            default_params=default_params,
         )
 
-        # Compute derived params (conditional shape logic etc.) and merge
-        derived = self.kernel_class.compute_derived_params(self._resolver.namespace)
-        if derived:
-            self._resolver.namespace.update(derived)
-
+        # Create instance first (v2: before compute_derived_params)
         self.kernel_class_instance = self.kernel_class()
         self.kernel_class_instance._kernel_instance = self
 
+        # Set base param attrs on instance
+        for key, value in self._resolver.namespace.items():
+            if not hasattr(self.kernel_class_instance, key) or not key.startswith("_"):
+                setattr(self.kernel_class_instance, key, value)
+
+        # Compute derived params (v2: instance method, self.* access)
+        derived = self.kernel_class_instance.compute_derived_params()
+        if derived:
+            self._resolver.namespace.update(derived)
+            # Set derived attrs on instance
+            for key, value in derived.items():
+                setattr(self.kernel_class_instance, key, value)
+
+        # Copy tensors and resolve shapes (logical)
         for tensor in self.kernel_class_instance.tensors():
             instance_tensor = copy.copy(tensor)
             setattr(self.kernel_class_instance, tensor.name, instance_tensor)
             instance_tensor._resolve_shape(self._resolver)
 
-        # Resolve ExposedTensorDef → ExposedTensor for CompositeKernel
+        # Resolve ExposedTensor for CompositeKernel
         self._resolve_exposed_tensors(project_params)
 
-        # Expose resolved params as instance attributes
-        for key, value in self._resolver.namespace.items():
-            if not hasattr(self.kernel_class_instance, key):
-                setattr(self.kernel_class_instance, key, value)
-
     def _resolve_exposed_tensors(self, project_params: dict) -> None:
-        """For CompositeKernel: resolve ExposedTensorDef to ExposedTensor.
-
-        Creates proper KernelInstance objects for each sub-kernel and stores
-        them in self._sub_kernel_instances so _flatten_composite() can reuse
-        them instead of creating duplicates.
-        """
-        from vten.kernel.composite import ExposedTensorDef, SubKernelBinding
-
+        """For CompositeKernel: create sub-kernel instances for auto-exposed tensors."""
         inst = self.kernel_class_instance
-        exposed_defs = getattr(inst.__class__, "_exposed_tensor_defs", {})
-        if not exposed_defs:
+        sub_kernel_refs = getattr(inst.__class__, "_sub_kernel_refs", {})
+        if not sub_kernel_refs:
             return
 
         # Instantiate sub-kernels as proper KernelInstance objects
         self._sub_kernel_instances = {}
-        bindings = getattr(inst.__class__, "_sub_kernel_bindings", {})
-        for attr_name, binding in bindings.items():
-            sub_cls = binding.kernel_class
-            sub_params = binding.params or {}
-            merged_params = {**self.runtime_params, **sub_params}
+        for attr_name, sub_cls in sub_kernel_refs.items():
+            merged_params = dict(self.runtime_params)
             sub_spec_path = getattr(sub_cls, "spec", "")
             sub_spec = None
             if sub_spec_path:
@@ -210,26 +238,34 @@ class KernelInstance:
             sub_ki.initialize(project_params)
             self._sub_kernel_instances[attr_name] = sub_ki
 
-        # Replace ExposedTensorDef with ExposedTensor on the instance
-        for attr_name, edef in exposed_defs.items():
-            sub_attr = edef.origin_sub_kernel
-            tensor_name = edef.origin_name
+        # Create ExposedTensor proxies for auto-exposed tensors
+        auto_exposed = getattr(inst.__class__, "_auto_exposed", {})
+        for (sub_attr, tensor_name), _t_name in auto_exposed.items():
             sub_ki = self._sub_kernel_instances.get(sub_attr)
             if sub_ki is None:
                 continue
             origin_tensor = sub_ki.get_tensor(tensor_name)
-            # Infer direction from origin tensor
             direction = getattr(origin_tensor, "direction", None)
             if direction is None:
                 direction = Direction.HOST_TO_DEV
             exposed = ExposedTensor(
-                name=attr_name,
+                name=tensor_name,
                 origin_path=f"{sub_attr}.{tensor_name}",
                 origin_tensor=origin_tensor,
-                top_interface=edef.top_interface,
+                top_interface=origin_tensor.interface,
                 direction=direction,
             )
-            setattr(inst, attr_name, exposed)
+            setattr(inst, f"_exposed_{sub_attr}_{tensor_name}", exposed)
+            # Also set short name so user code can access self.data_in directly
+            if not hasattr(inst, tensor_name) or isinstance(
+                getattr(type(inst), tensor_name, None), Tensor
+            ):
+                setattr(inst, tensor_name, exposed)
+
+        # Also set sub-kernel instances accessible via composite
+        for attr_name, sub_ki in self._sub_kernel_instances.items():
+            # Set sub-kernel instance so composite can access sub.tensor
+            setattr(inst, attr_name, sub_ki.kernel_class_instance)
 
     def tensors(self) -> list[Tensor]:
         if self.kernel_class_instance:
@@ -273,7 +309,7 @@ class FlattenedKernelView:
     interface_mappings: list[InterfaceMapping]
     exposed_tensors: dict[str, ExposedTensor]
     probe_points: list[ProbePoint]
-    connections: list[Connect]
+    connections: list[Connection]
 
     _top_resolver: ParameterResolver | None = None
     _register_bindings: list | None = None  # list[RegisterBindingEntry]
@@ -322,7 +358,5 @@ class FlattenedKernelView:
                 return exposed
         raise BindingError(
             f"auto_bind references tensor '{tensor_name}' in sub-kernel "
-            f"'{sub_kernel_name}', but no matching exposed tensor found. "
-            f"Ensure the tensor is exposed via .expose() in the "
-            f"CompositeKernel definition."
+            f"'{sub_kernel_name}', but no matching exposed tensor found."
         )

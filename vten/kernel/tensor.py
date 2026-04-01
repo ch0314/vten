@@ -1,6 +1,9 @@
 """Tensor descriptor class.
 
 Spec reference: 00_data_models.md §2
+
+v2: shape/dtype are logical (algorithmic). Layout is handled by
+kernel methods layout_{name}() / unlayout_{name}().
 """
 
 from __future__ import annotations
@@ -25,19 +28,42 @@ class Tensor:
         direction: Any | None = None,
     ) -> None:
         # Declaration time (Kernel class body)
-        self.shape = shape
-        self.dtype = dtype
+        self.shape = shape          # logical (algorithmic) shape
+        self.dtype = dtype          # logical (algorithmic) dtype
         self.interface = interface
         self.direction = direction  # None → inferred from protocol/role at Stage 0
         self.name: str = ""
 
-        # instantiate() time (eager resolution)
+        # instantiate() time (eager resolution) — logical shape
         self._resolved_shape: tuple[int, ...] | None = None
         self._element_count: int = 0
 
-        # compile() time (stages 1-4)
+        # Logical data (algorithmic level)
+        self._logical_data: torch.Tensor | None = None
+
+        # compile() time (stages 1-4) — physical data
         self.data: torch.Tensor | None = None
         self._address: int | None = None
+
+    # ── Logical data ──
+
+    @property
+    def logical_data(self) -> torch.Tensor | None:
+        """Algorithmic-level data. Primary user interface."""
+        return self._logical_data
+
+    @logical_data.setter
+    def logical_data(self, value: torch.Tensor) -> None:
+        self._logical_data = value
+
+    @property
+    def resolved_shape(self) -> tuple[int, ...]:
+        """Resolved logical shape (read-only)."""
+        if self._resolved_shape is None:
+            raise RuntimeError("shape not resolved")
+        return self._resolved_shape
+
+    # ── Shape resolution ──
 
     def _resolve_shape(self, resolver: Any) -> None:
         """Resolve parametric shape dimensions using resolver.resolve()."""
@@ -91,6 +117,24 @@ class Tensor:
         if self._resolved_shape is None:
             raise RuntimeError("shape not resolved")
         return self._element_count
+
+    def describe(self) -> dict:
+        """Human-readable tensor state for debugging."""
+        info: dict[str, Any] = {
+            "name": self.name,
+            "shape": self._resolved_shape,
+            "dtype": str(self.dtype),
+            "has_data": self.data is not None,
+        }
+        if self._logical_data is not None:
+            info["has_logical_data"] = True
+            info["logical_data_range"] = (
+                float(self._logical_data.min()),
+                float(self._logical_data.max()),
+            )
+        if self.data is not None:
+            info["data_range"] = (float(self.data.min()), float(self.data.max()))
+        return info
 
     def __repr__(self) -> str:
         parts = (

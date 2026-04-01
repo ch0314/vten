@@ -340,6 +340,8 @@ class IRLowering:
         # Multi-port (array or split): per-port PUSH commands
         if exposed._port_buffers:
             commands: list[Command] = []
+            base_addr = exposed.address or 0
+            addr_offset = 0
             for port_name, port_data in exposed._port_buffers.items():
                 cmd = Command(
                     op=OpCode.PUSH,
@@ -347,13 +349,14 @@ class IRLowering:
                     interface_id=self._get_iface_id(port_name),
                     buffer_id=self._buffer_ids[f"{exposed.name}:{port_name}"],
                     protocol=iface.protocol,
-                    phys_addr=exposed.address or 0,
+                    phys_addr=base_addr + addr_offset,
                     size=len(port_data),
                     role=_determine_role(iface.protocol, OpCode.PUSH),
                     probe=op.probe,
                     dep=dep_ids if not commands else [],
                 )
                 commands.append(cmd)
+                addr_offset += len(port_data)
                 next_cmd_id += 1
             return commands, next_cmd_id
 
@@ -380,6 +383,8 @@ class IRLowering:
         # Multi-port (array or split): per-port PULL commands
         if exposed._port_buffers:
             commands: list[Command] = []
+            base_addr = exposed.address or 0
+            addr_offset = 0
             for port_name, port_data in exposed._port_buffers.items():
                 cmd = Command(
                     op=OpCode.PULL,
@@ -387,13 +392,14 @@ class IRLowering:
                     interface_id=self._get_iface_id(port_name),
                     buffer_id=self._buffer_ids[f"{exposed.name}:{port_name}"],
                     protocol=iface.protocol,
-                    phys_addr=exposed.address or 0,
+                    phys_addr=base_addr + addr_offset,
                     size=len(port_data),
                     role=_determine_role(iface.protocol, OpCode.PULL),
                     probe=op.probe,
                     dep=dep_ids if not commands else [],
                 )
                 commands.append(cmd)
+                addr_offset += len(port_data)
                 if self._alias_registry:
                     self._alias_registry.record_write_cmd(exposed.name, next_cmd_id)
                 next_cmd_id += 1
@@ -535,6 +541,8 @@ class IRLowering:
 
         # Multi-port (array or split): per-port LOAD + PUSH
         if exposed._port_buffers:
+            base_addr = exposed.address or 0
+            addr_offset = 0
             for i, (port_name, port_data) in enumerate(
                 exposed._port_buffers.items()
             ):
@@ -559,12 +567,13 @@ class IRLowering:
                     interface_id=self._get_iface_id(port_name),
                     buffer_id=bid,
                     protocol=iface.protocol,
-                    phys_addr=exposed.address or 0,
+                    phys_addr=base_addr + addr_offset,
                     size=len(port_data),
                     role=_determine_role(iface.protocol, OpCode.PUSH),
                     dep=push_dep,
                 )
                 commands.append(push_cmd)
+                addr_offset += len(port_data)
                 next_cmd_id += 1
             return commands, next_cmd_id
 
@@ -619,6 +628,8 @@ class IRLowering:
 
         # Multi-port (array or split): per-port PULL + STORE
         if exposed._port_buffers:
+            base_addr = exposed.address or 0
+            addr_offset = 0
             for i, (port_name, port_data) in enumerate(
                 exposed._port_buffers.items()
             ):
@@ -629,12 +640,13 @@ class IRLowering:
                     interface_id=self._get_iface_id(port_name),
                     buffer_id=bid,
                     protocol=iface.protocol,
-                    phys_addr=exposed.address or 0,
+                    phys_addr=base_addr + addr_offset,
                     size=len(port_data),
                     role=_determine_role(iface.protocol, OpCode.PULL),
                     dep=dep_ids if i == 0 else [],
                 )
                 commands.append(pull_cmd)
+                addr_offset += len(port_data)
                 pull_id = next_cmd_id
                 next_cmd_id += 1
 
@@ -718,6 +730,7 @@ class IRLowering:
             port_names = list(exposed._port_buffers.keys())
             n_elems = len(port_names)
             per_elem_size = chunk_size // n_elems
+            base_addr = exposed.address or 0
 
             for j, fname in enumerate(port_names):
                 bid = self._buffer_ids[f"{name}:chunk_{ci}:{fname}"]
@@ -727,7 +740,7 @@ class IRLowering:
                     interface_id=self._get_iface_id(fname),
                     buffer_id=bid,
                     protocol=iface.protocol,
-                    phys_addr=exposed.address or 0,
+                    phys_addr=base_addr + j * per_elem_size,
                     size=per_elem_size,
                     role=_determine_role(iface.protocol, OpCode.PULL),
                     dep=dep_ids if j == 0 else [],

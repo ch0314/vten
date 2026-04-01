@@ -33,21 +33,58 @@ def parse_kernel_spec(yaml_path: str | Path) -> KernelSpec:
     return load_kernel_spec(yaml_path)
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursive dict merge. override wins for scalar/list values."""
+    result = dict(base)
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
+def _resolve_includes(raw: dict, spec_dir: Path) -> dict:
+    """Process 'include' directive: deep-merge included files as defaults."""
+    includes = raw.pop("include", None)
+    if not includes:
+        return raw
+    if isinstance(includes, str):
+        includes = [includes]
+
+    base: dict = {}
+    for inc_path_str in includes:
+        inc_path = (spec_dir / inc_path_str).resolve()
+        if not inc_path.exists():
+            raise SpecValidationError(
+                f"Include file not found: {inc_path} "
+                f"(referenced from {spec_dir})"
+            )
+        with open(inc_path) as f:
+            inc_data = yaml.safe_load(f) or {}
+        base = _deep_merge(base, inc_data)
+
+    # Merge: base (from includes) is defaults, raw (the spec) overrides
+    return _deep_merge(base, raw)
+
+
 def load_kernel_spec(yaml_path: str | Path) -> KernelSpec:
     """Parse kernel_spec.yaml → KernelSpec dataclass."""
     path = Path(yaml_path)
     with open(path) as f:
         raw = yaml.safe_load(f)
 
+    raw = _resolve_includes(raw, path.parent)
     _validate_top_level(raw, path)
 
     parameters = raw.get("parameters", {}) or {}
+    build_params = raw.get("build_params", {}) or {}
     memory_regions = {
         name: _parse_memory_region(name, spec)
         for name, spec in (raw.get("memory_regions") or {}).items()
     }
     interfaces = {
-        name: _parse_interface(name, spec, memory_regions)
+        name: _parse_interface(name, spec, memory_regions, spec_dir=path.parent)
         for name, spec in raw["interfaces"].items()
     }
 
@@ -59,6 +96,7 @@ def load_kernel_spec(yaml_path: str | Path) -> KernelSpec:
         kernel_name=raw["kernel"],
         rtl_top=raw["rtl_top"],
         parameters=parameters,
+        build_params=build_params,
         memory_regions=memory_regions,
         interfaces=interfaces,
         clock_name=clock_cfg.get("name", "clk"),
@@ -96,7 +134,10 @@ def _parse_memory_region(name: str, spec: dict) -> MemoryRegion:
 
 
 def _parse_interface(
-    name: str, spec: dict, memory_regions: dict[str, MemoryRegion]
+    name: str,
+    spec: dict,
+    memory_regions: dict[str, MemoryRegion],
+    spec_dir: Path | None = None,
 ) -> InterfaceSpec:
     if "protocol" not in spec:
         raise SpecValidationError(
@@ -120,7 +161,33 @@ def _parse_interface(
     packing = _parse_packing(spec.get("packing")) if "packing" in spec else None
     split = spec.get("split")  # Store as raw dict for dict-style access
     user_register_base = spec.get("user_register_base", 0x14)
-    registers = _parse_registers(spec.get("registers"), name, user_register_base) if "registers" in spec else None
+
+    # register_include: load external register definitions, prepend before local
+    reg_includes = spec.get("register_include") or []
+    if isinstance(reg_includes, str):
+        reg_includes = [reg_includes]
+    included_regs: list[dict] = []
+    for inc_path_str in reg_includes:
+        if spec_dir is None:
+            raise SpecValidationError(
+                f"Interface '{name}': register_include requires spec_dir"
+            )
+        inc_path = (spec_dir / inc_path_str).resolve()
+        if not inc_path.exists():
+            raise SpecValidationError(
+                f"Interface '{name}': register_include file not found: {inc_path}"
+            )
+        with open(inc_path) as f:
+            inc_regs = yaml.safe_load(f)
+        if not isinstance(inc_regs, list):
+            raise SpecValidationError(
+                f"Interface '{name}': register_include file must contain a YAML list"
+            )
+        included_regs.extend(inc_regs)
+
+    local_regs = spec.get("registers") or []
+    combined_regs = included_regs + local_regs
+    registers = _parse_registers(combined_regs, name, user_register_base) if combined_regs else None
     register_banks = _parse_register_banks(spec.get("register_banks")) if "register_banks" in spec else None
 
     # Determine data_width and addr_width defaults
@@ -295,6 +362,12 @@ def _parse_registers(
     registers = []
     next_offset = user_register_base
     for r in raw:
+        # width shorthand: { name: foo, width: 10 } → fields: { foo: "9:0" }
+        if "width" in r and "fields" not in r:
+            w = r["width"]
+            r = dict(r)  # avoid mutating original
+            r["fields"] = {r["name"]: f"{w - 1}:0"}
+
         auto_bind = None
         if "auto_bind" in r:
             ab = r["auto_bind"]
@@ -323,15 +396,6 @@ def _parse_registers(
         else:
             offset = next_offset
             next_offset += 4
-        # Role: explicit or auto-inferred
-        role = r.get("role", "")
-        if not role:
-            if pulse:
-                role = "control"
-            elif auto_bind:
-                role = "auto_bind"
-            else:
-                role = "config"
 
         registers.append(
             RegisterSpec(
@@ -343,7 +407,6 @@ def _parse_registers(
                 access=access,
                 pulse=pulse,
                 reset_value=r.get("reset_value", 0),
-                role=role,
             )
         )
     return registers

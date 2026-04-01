@@ -49,7 +49,7 @@ class FmapIOKernel(Kernel):
     def generate_inputs(self, seed=None):
         self.ifm.fill_random(generator=torch.Generator().manual_seed(seed or 0))
 
-    def forward(self):
+    def forward(self, **inputs):
         return self.ifm.to_float()
 
 
@@ -62,7 +62,7 @@ class BiasLoaderKernel(Kernel):
     def generate_inputs(self, seed=None):
         self.bias.fill_random(generator=torch.Generator().manual_seed(seed or 0))
 
-    def forward(self):
+    def forward(self, **inputs):
         return self.bias.to_float()
 
 
@@ -78,7 +78,7 @@ class WeightLoaderKernel(Kernel):
     def generate_inputs(self, seed=None):
         self.weight.fill_random(generator=torch.Generator().manual_seed(seed or 0))
 
-    def forward(self):
+    def forward(self, **inputs):
         return self.weight.to_float()
 
 
@@ -103,7 +103,7 @@ class MacAtuKernel(Kernel):
         self.ifm.fill_random(generator=torch.Generator().manual_seed(seed or 0))
         self.weight.fill_random(generator=torch.Generator().manual_seed((seed or 0) + 1))
 
-    def forward(self):
+    def forward(self, **inputs):
         return self.ifm.to_float()
 
 
@@ -115,7 +115,7 @@ class PsumBufferKernel(Kernel):
     def generate_inputs(self, seed=None):
         pass
 
-    def forward(self):
+    def forward(self, **inputs):
         return torch.tensor(0)
 
 
@@ -127,7 +127,7 @@ class ActQuantKernel(Kernel):
     def generate_inputs(self, seed=None):
         pass
 
-    def forward(self):
+    def forward(self, **inputs):
         return torch.tensor(0)
 
 
@@ -239,18 +239,6 @@ class TestKernelInstanceMethods:
         with pytest.raises(NotImplementedError):
             k.forward()
 
-    def test_verify_default_allclose(self):
-        """기본 verify는 torch.allclose."""
-        k = FmapIOKernel()
-        a = torch.tensor([1.0, 2.0, 3.0])
-        b = torch.tensor([1.0, 2.0, 3.0])
-        assert k.verify(a, b) is True
-
-    def test_verify_mismatch(self):
-        k = FmapIOKernel()
-        a = torch.tensor([1.0, 2.0, 3.0])
-        b = torch.tensor([1.0, 2.0, 999.0])
-        assert k.verify(a, b) is False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -314,61 +302,3 @@ class TestSubKernelInputsForward:
         assert torch.equal(_make(), _make())
 
 
-# ═══════════════════════════════════════════════════════════════════
-# §5  Kernel.bind() — NPU 3D 6-IP binding patterns
-# ═══════════════════════════════════════════════════════════════════
-
-
-class TestKernelBind:
-
-    def test_fmapio_bind_external(self):
-        """fmapIO: ctrl → External, ddr → External, AXIS → Internal."""
-        from vten.kernel.composite import SubKernelBinding, Internal
-
-        binding = FmapIOKernel.bind(
-            interface_map={
-                "ctrl": "ctrl_fmapio",
-                "ddr": "ddr_fmap",
-                "ifm_out": Internal(),
-                "ofm_in": Internal(),
-            },
-        )
-        assert isinstance(binding, SubKernelBinding)
-        assert binding.kernel_class is FmapIOKernel
-        assert binding.interface_map["ctrl"] == "ctrl_fmapio"
-        assert isinstance(binding.interface_map["ifm_out"], Internal)
-
-    def test_weight_loader_bind_with_split(self):
-        """weight_loader: hbm → External (32-port split)."""
-        from vten.kernel.composite import SubKernelBinding
-
-        binding = WeightLoaderKernel.bind(
-            interface_map={
-                "ctrl": "ctrl_wgt",
-                "hbm": "hbm_wgt",
-                "wgt_out": "internal_wgt",
-            },
-        )
-        assert binding.interface_map["hbm"] == "hbm_wgt"
-
-    def test_mac_atu_bind_all_internal(self):
-        """mac_atu: ctrl만 External, 나머지 모두 Internal."""
-        from vten.kernel.composite import SubKernelBinding, Internal
-
-        binding = MacAtuKernel.bind(
-            interface_map={
-                "ctrl": "ctrl_mac",
-                "ifm_in": Internal(),
-                "wgt_in": Internal(),
-                "psum_out": Internal(),
-            },
-        )
-        assert binding.interface_map["ctrl"] == "ctrl_mac"
-        assert isinstance(binding.interface_map["ifm_in"], Internal)
-        assert isinstance(binding.interface_map["psum_out"], Internal)
-
-    def test_bind_no_params(self):
-        from vten.kernel.composite import SubKernelBinding
-
-        binding = PsumBufferKernel.bind(interface_map={"ctrl": "ctrl_psum"})
-        assert binding.params is None

@@ -21,6 +21,7 @@ _COMPONENT_MAP: dict[str, str] = {
     "vten.runtime.context": "context",
     "vten.backend.sim_base": "backend",
     "vten.backend.xsim": "xsim",
+    "vten.xsim": "sim",
     "vten.backend.verilator": "verilator",
     "vten.backend.xrt": "xrt",
     "vten.build.base": "build",

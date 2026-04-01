@@ -43,6 +43,8 @@ def main(argv: list[str] | None = None) -> None:
     build_parser.add_argument("--stage", help="Run specific stage only")
     build_parser.add_argument("--upto", help="Run stages up to (inclusive)")
     build_parser.add_argument("--force", action="store_true", help="Ignore cache, full rebuild")
+    build_parser.add_argument("--clean", action="store_true",
+                              help="Remove build artifacts before building")
     build_parser.add_argument("--skip-compile", action="store_true", help="Run codegen only")
     build_parser.add_argument("--config", nargs="*", help="Config overrides (K=V)")
 
@@ -131,6 +133,7 @@ def _dispatch(args: argparse.Namespace, log_level: str) -> None:
             stage=args.stage,
             upto=args.upto,
             force=args.force,
+            clean=args.clean,
             skip_compile=args.skip_compile,
             config_overrides=overrides or None,
         )

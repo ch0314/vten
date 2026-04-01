@@ -451,7 +451,12 @@ class SVGenerator:
         """
         from vten.spec.models import Protocol
 
-        params: dict[str, int] = dict(spec_params)  # type: ignore[arg-type]
+        # Filter out unresolved template references (${...}) — they are
+        # runtime parameters set via registers, not compile-time constants.
+        params: dict[str, int] = {
+            k: v for k, v in spec_params.items()
+            if not (isinstance(v, str) and "${" in v)
+        }  # type: ignore[arg-type]
 
         # Collect unique data/addr widths across non-ctrl interfaces
         bus_ifaces = {

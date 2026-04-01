@@ -623,7 +623,7 @@ class TestDataRegion:
     def test_probe_golden_data_populated(self):
         """Probe golden buffers have serialized golden data in SHM."""
         # ProbePoint.serialized_golden → data region with flags=0x01
-        # This requires a Composite kernel with Internal(probe=True)
+        # This requires a Composite kernel with Internal() + declarative probes
         # which is complex to set up. Verify the mechanism exists.
         from vten.runtime.flattener import ProbePoint
         pp = ProbePoint(connection=None, interface_mapping=None)

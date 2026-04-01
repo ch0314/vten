@@ -48,7 +48,7 @@ class StreamKernel(Kernel):
     def generate_inputs(self, seed=None):
         self.data_in.fill_random()
 
-    def forward(self):
+    def forward(self, **inputs):
         return self.data_in.data.clone()
 
 
@@ -59,7 +59,7 @@ class TwoInputStreamKernel(Kernel):
     wgt = Tensor(shape=(32,), dtype=torch.int8, interface="wgt_port")
     ofm = Tensor(shape=(32,), dtype=torch.int8, interface="ofm_port")
 
-    def forward(self):
+    def forward(self, **inputs):
         return (self.ifm.data.to(torch.int16) + self.wgt.data.to(torch.int16)).clamp(-128, 127).to(torch.int8)
 
 

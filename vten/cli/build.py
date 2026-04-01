@@ -23,6 +23,7 @@ def build_project(
     stage: str | None = None,
     upto: str | None = None,
     force: bool = False,
+    clean: bool = False,
     skip_compile: bool = False,
     config_overrides: dict | None = None,
 ) -> None:
@@ -37,6 +38,7 @@ def build_project(
         stage=stage,
         upto=upto,
         force=force,
+        clean=clean,
         skip_compile=skip_compile,
         config_overrides=config_overrides,
     )

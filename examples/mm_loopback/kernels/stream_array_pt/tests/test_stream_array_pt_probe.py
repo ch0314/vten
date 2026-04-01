@@ -32,4 +32,4 @@ class TestStreamArrayPtProbe(TestScenario):
         h_pull = ctx.pull_tensor(k.data_out, dep=h_load, probe=True)
 
         h_store = ctx.store_tensor(k.data_out, dep=h_pull)
-        ctx.verify(h_store, k.forward())
+        ctx.verify(h_store, k.forward()["data_out"])

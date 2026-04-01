@@ -1,6 +1,13 @@
 kernel: offset
 rtl_top: rtl/offset_core.sv
 
+runtime_params:
+  offset_value:
+    default: 1
+    register: ctrl.offset_value
+  length:
+    register: ctrl.length
+
 interfaces:
   ctrl:
     rtl_port: s_axilite

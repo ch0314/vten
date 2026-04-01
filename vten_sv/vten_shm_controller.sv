@@ -51,9 +51,14 @@ module vten_shm_controller #(
 
     // Runtime session ID: plusarg overrides parameter default.
     string runtime_session_id;
+    // Batch timing and numbering
+    longint unsigned batch_start_time;
+    int batch_number;
     // Runtime verbose: +VTEN_VERBOSE plusarg (xsim) or +define+VTEN_VERBOSE (verilator)
     bit verbose;
     initial begin
+        // Global: show time in ns, no decimals, 8-char min width
+        $timeformat(-9, 0, " ns", 8);
         if (!$value$plusargs("SESSION_ID=%s", runtime_session_id))
             runtime_session_id = SESSION_ID;
 `ifdef VTEN_VERBOSE
@@ -70,11 +75,12 @@ module vten_shm_controller #(
     // ── Single always_ff: state transitions + datapath + DPI-C ──
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state      <= S_INIT;
-            feed_valid <= 0;
-            feed_done  <= 0;
-            feed_idx   <= 0;
-            batch_init <= 0;
+            state        <= S_INIT;
+            feed_valid   <= 0;
+            feed_done    <= 0;
+            feed_idx     <= 0;
+            batch_init   <= 0;
+            batch_number <= 0;
         end else begin
             // Default: deassert every cycle
             feed_valid <= 0;
@@ -86,11 +92,11 @@ module vten_shm_controller #(
                 S_INIT: begin
                     if (vten_shm_init(runtime_session_id) == 0) begin
                         if (verbose)
-                            $display("[CTRL %0t] INIT ok → WAIT_HOST (session=%s)", $time, runtime_session_id);
+                            $display("[CTRL     %t] INIT ok → WAIT_HOST (session=%s)", $time, runtime_session_id);
                         state <= S_WAIT_HOST;
                     end else begin
                         if (verbose)
-                            $display("[CTRL %0t] INIT failed → ERROR", $time);
+                            $display("[CTRL     %t] INIT failed → ERROR", $time);
                         state <= S_ERROR;
                     end
                 end
@@ -105,12 +111,12 @@ module vten_shm_controller #(
                         case (vten_read_host_status())
                             1: begin
                                 if (verbose)
-                                    $display("[CTRL %0t] CMD_READY → LOAD_BATCH", $time);
+                                    $display("[CTRL     %t] CMD_READY → LOAD_BATCH", $time);
                                 state <= S_LOAD_BATCH;
                             end
                             3: begin
                                 if (verbose)
-                                    $display("[CTRL %0t] SHUTDOWN signal → SHUTDOWN", $time);
+                                    $display("[CTRL     %t] SHUTDOWN signal → SHUTDOWN", $time);
                                 state <= S_SHUTDOWN;
                             end
                             default: ;
@@ -123,16 +129,15 @@ module vten_shm_controller #(
                     // Re-mmap if host grew the SHM (dynamic resize)
                     if (vten_shm_remap() != 0) begin
                         if (verbose)
-                            $display("[CTRL %0t] LOAD_BATCH: remap failed → ERROR", $time);
+                            $display("[CTRL     %t] LOAD_BATCH: remap failed → ERROR", $time);
                         state <= S_ERROR;
                     end else begin
                         batch_init   <= 1;  // Reset scheduler for new batch
                         num_commands <= vten_read_num_commands();
                         timeout_ms   <= vten_read_timeout_ms();
+                        batch_start_time <= $time;
+                        batch_number <= batch_number + 1;
                         vten_set_backend_status(BACKEND_RUNNING);
-                        if (verbose)
-                            $display("[CTRL %0t] LOAD_BATCH: %0d commands, timeout=%0d ms",
-                                     $time, vten_read_num_commands(), vten_read_timeout_ms());
 
                         // Bulk copy all commands to local cache in one cycle
                         for (int i = 0; i < vten_read_num_commands(); i++) begin
@@ -184,20 +189,20 @@ module vten_shm_controller #(
                     if (sched_error || probe_error) begin
                         if (verbose) begin
                             if (probe_error && !sched_error)
-                                $display("[CTRL %0t] EXECUTE → ERROR (probe mismatch, code=%0d)",
+                                $display("[CTRL     %t] EXECUTE → ERROR (probe mismatch, code=%0d)",
                                          $time, 8);
                             else
-                                $display("[CTRL %0t] EXECUTE → ERROR (cmd=%0d, code=%0d)",
+                                $display("[CTRL     %t] EXECUTE → ERROR (cmd=%0d, code=%0d)",
                                          $time, sched_error_cmd_id, sched_error_code);
                         end
                         state <= S_ERROR;
                     end else if (sched_all_drained) begin
                         if (verbose)
-                            $display("[CTRL %0t] EXECUTE → COMPLETE (all drained)", $time);
+                            $display("[CTRL     %t] EXECUTE → COMPLETE (all drained)", $time);
                         state <= S_COMPLETE;  // Skip S_DRAIN
                     end else if (sched_all_committed) begin
                         if (verbose)
-                            $display("[CTRL %0t] EXECUTE → DRAIN (all committed, waiting BFM idle)", $time);
+                            $display("[CTRL     %t] EXECUTE → DRAIN (all committed, waiting BFM idle)", $time);
                         state <= S_DRAIN;
                     end
                 end
@@ -208,7 +213,7 @@ module vten_shm_controller #(
                         state <= S_ERROR;
                     end else if (sched_all_drained) begin
                         if (verbose)
-                            $display("[CTRL %0t] DRAIN → COMPLETE", $time);
+                            $display("[CTRL     %t] DRAIN → COMPLETE", $time);
                         state <= S_COMPLETE;
                     end
                 end
@@ -217,7 +222,8 @@ module vten_shm_controller #(
                 S_COMPLETE: begin
                     vten_signal_complete();  // backend_status=DONE + sem_post
                     if (verbose)
-                        $display("[CTRL %0t] COMPLETE → WAIT_HOST", $time);
+                        $display("[CTRL     %t] ──── batch #%0d done: %0d cmds, %0d ns elapsed ────",
+                                 $time, batch_number, num_commands, $time - batch_start_time);
                     state <= S_WAIT_HOST;
                 end
 
@@ -226,14 +232,14 @@ module vten_shm_controller #(
                     if (probe_error && !sched_error) begin
                         // Probe mismatch: use ERR_PROBE_MISMATCH (8)
                         if (verbose)
-                            $display("[CTRL %0t] ERROR: probe mismatch code=8 → WAIT_HOST", $time);
+                            $display("[CTRL     %t] ERROR: probe mismatch code=8 → WAIT_HOST", $time);
                         vten_signal_error_with_cmd(
                             8, 0,
                             "[Probe] mismatch detected on internal wire"
                         );
                     end else begin
                         if (verbose)
-                            $display("[CTRL %0t] ERROR: cmd=%0d code=%0d → WAIT_HOST",
+                            $display("[CTRL     %t] ERROR: cmd=%0d code=%0d → WAIT_HOST",
                                      $time, sched_error_cmd_id, sched_error_code);
                         vten_signal_error_with_cmd(
                             sched_error_code,
@@ -248,7 +254,7 @@ module vten_shm_controller #(
                 // ── Shutdown ──
                 S_SHUTDOWN: begin
                     if (verbose)
-                        $display("[CTRL %0t] SHUTDOWN → $finish", $time);
+                        $display("[CTRL     %t] SHUTDOWN → $finish", $time);
                     vten_cleanup();
                     $finish;
                 end

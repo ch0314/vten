@@ -1,6 +1,10 @@
-"""Stage 5: auto_bind & Bank Offset Resolution.
+"""Stage 5: Register Resolution.
 
 Spec reference: 02_runtime_engine.md §11
+
+v2: Unified resolve_registers() replaces resolve_config_registers,
+    resolve_composite_config_registers, resolve_runtime_param_registers.
+    Register name matching replaces role/alias/config_map.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class RegisterBindingEntry:
-    """Result of auto_bind resolution."""
+    """Result of register resolution."""
 
     register_name: str
     kernel_path: str
@@ -42,62 +46,61 @@ def parse_bit_range(bit_range_str: str) -> tuple[int, int]:
     return hi, lo
 
 
-def resolve_config_registers(view: FlattenedKernelView) -> list[RegisterBindingEntry]:
-    """Resolve config-role registers from ParameterResolver namespace.
+def resolve_registers(view: FlattenedKernelView) -> list[RegisterBindingEntry]:
+    """Unified register resolution: auto_bind first, then param-name matching.
 
-    For each register with role="config", look up its name in the sub-kernel's
-    resolved parameter namespace. If found, emit a RegisterBindingEntry.
+    v2 rules:
+    1. auto_bind → compute value from tensor addr/size/param/expr
+    2. pulse or access="ro" → skip
+    3. register name in param namespace → write param value
+    4. else → skip (no matching param)
     """
     bindings: list[RegisterBindingEntry] = []
 
     for top_iface_name in view.external_interfaces():
         for sub_name, reg, abs_offset in view.registers_for_interface(top_iface_name):
-            if reg.role != "config":
-                continue
-            sub = view.sub_kernels[sub_name]
-            if sub._resolver is None:
-                continue
-            ns = sub._resolver.namespace
-            if reg.name not in ns:
-                continue
-            value = ns[reg.name]
-            if not isinstance(value, (int, float)):
-                continue
-            bindings.append(
-                RegisterBindingEntry(
-                    register_name=f"{sub_name}.{reg.name}",
-                    kernel_path=f"{view.name}.{sub_name}.{top_iface_name}",
-                    interface_name=top_iface_name,
-                    absolute_offset=abs_offset,
-                    auto_bind=AutoBindSpec(param=reg.name),
-                    resolved_value=int(value),
+            if reg.auto_bind:
+                value = _compute_auto_bind_value(
+                    reg.auto_bind, sub_name, view
                 )
-            )
+                bindings.append(
+                    RegisterBindingEntry(
+                        register_name=f"{sub_name}.{reg.name}",
+                        kernel_path=f"{view.name}.{sub_name}.{top_iface_name}",
+                        interface_name=top_iface_name,
+                        absolute_offset=abs_offset,
+                        auto_bind=reg.auto_bind,
+                        resolved_value=value,
+                    )
+                )
+            elif reg.pulse or reg.access == "ro":
+                continue
+            else:
+                # Name matching: look up reg.name in param namespace
+                sub = view.sub_kernels[sub_name]
+                if sub._resolver is None:
+                    continue
+                ns = sub._resolver.namespace
+                if reg.name in ns and isinstance(ns[reg.name], (int, float)):
+                    bindings.append(
+                        RegisterBindingEntry(
+                            register_name=f"{sub_name}.{reg.name}",
+                            kernel_path=f"{view.name}.{sub_name}.{top_iface_name}",
+                            interface_name=top_iface_name,
+                            absolute_offset=abs_offset,
+                            auto_bind=AutoBindSpec(param=reg.name),
+                            resolved_value=int(ns[reg.name]),
+                        )
+                    )
+
     return bindings
 
 
-def resolve_auto_binds(view: FlattenedKernelView) -> list[RegisterBindingEntry]:
-    """Resolve all auto_bind registers for the flattened view."""
-    bindings: list[RegisterBindingEntry] = []
-
-    for top_iface_name in view.external_interfaces():
-        for sub_name, reg, abs_offset in view.registers_for_interface(top_iface_name):
-            if not reg.auto_bind:
-                continue
-            value = _compute_auto_bind_value(
-                reg.auto_bind, sub_name, view
-            )
-            bindings.append(
-                RegisterBindingEntry(
-                    register_name=f"{sub_name}.{reg.name}",
-                    kernel_path=f"{view.name}.{sub_name}.{top_iface_name}",
-                    interface_name=top_iface_name,
-                    absolute_offset=abs_offset,
-                    auto_bind=reg.auto_bind,
-                    resolved_value=value,
-                )
-            )
-    return bindings
+# Keep legacy names as aliases for backward compatibility during migration
+resolve_auto_binds = resolve_registers
+resolve_config_registers = lambda view: []
+resolve_composite_config_registers = lambda view: []
+resolve_runtime_param_registers = lambda view: []
 
 
 def _compute_auto_bind_value(
@@ -109,9 +112,6 @@ def _compute_auto_bind_value(
         exposed = view.resolve_auto_bind_tensor(sub_kernel_name, bind_spec.tensor)
         addr = exposed.address
         if addr is None:
-            # HW path: AXI4 MM tensors get real addresses at runtime
-            # via BO allocation. Use placeholder 0; CommandInterpreter
-            # substitutes with bo.address() through addr_bindings.
             addr = 0
         if bind_spec.bits:
             hi, lo = parse_bit_range(bind_spec.bits)
@@ -143,3 +143,16 @@ def _compute_auto_bind_value(
         raise BindingError(
             f"auto_bind spec has no resolvable value: {bind_spec}"
         )
+
+
+def _find_register_absolute_offset(
+    view: FlattenedKernelView,
+    sub_name: str,
+    iface_name: str,
+    reg_offset: int,
+) -> tuple[int, str] | None:
+    """Find the absolute offset and top-level interface name for a sub-kernel register."""
+    for m in view.interface_mappings:
+        if m.sub_kernel == sub_name and m.sub_interface == iface_name:
+            return m.bank_offset + reg_offset, m.top_interface
+    return None

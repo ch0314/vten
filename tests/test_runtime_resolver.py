@@ -343,3 +343,106 @@ class TestEdgeCases:
         r = resolver_cls({}, {"K": "3"}, {})
         # Should resolve ${K} to integer 3
         assert r.resolve("${K}") == 3
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §6.5 — build_params tier
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestBuildParamsTier:
+    """build_params sit between project_params and kernel_params."""
+
+    def test_build_params_available(self, resolver_cls):
+        """build_params values accessible in namespace."""
+        r = resolver_cls(
+            {}, {}, {},
+            build_params={"Ti": 32, "To": 32},
+        )
+        assert r.resolve("${Ti}") == 32
+        assert r.resolve("${To}") == 32
+
+    def test_build_params_below_kernel_params(self, resolver_cls):
+        """kernel_params (Tier 3) override build_params (Tier 2)."""
+        r = resolver_cls(
+            {},
+            {"Ti": 64},  # kernel_params
+            {},
+            build_params={"Ti": 32},
+        )
+        assert r.resolve("${Ti}") == 64
+
+    def test_build_params_above_project_params(self, resolver_cls):
+        """build_params (Tier 2) override project_params (Tier 1)."""
+        r = resolver_cls(
+            {"Ti": 16},  # project_params
+            {},
+            {},
+            build_params={"Ti": 32},
+        )
+        assert r.resolve("${Ti}") == 32
+
+    def test_build_params_override_warning(self, resolver_cls, caplog):
+        """Test override warning when runtime overrides build_param."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="vten.runtime.resolver"):
+            r = resolver_cls(
+                {},
+                {},
+                {"Ti": 64},  # runtime override
+                build_params={"Ti": 32},
+            )
+        assert "overrides build_param" in caplog.text
+        # Override still works
+        assert r.resolve("${Ti}") == 64
+
+    def test_build_params_none_backward_compat(self, resolver_cls):
+        """build_params=None → backward compatible 3-tier."""
+        r = resolver_cls({"A": 1}, {"B": 2}, {"C": 3})
+        assert r.resolve("${A}") == 1
+        assert r.resolve("${B}") == 2
+        assert r.resolve("${C}") == 3
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §6.6 — runtime_param_specs defaults
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestDefaultParamsDefaults:
+    """default_params (Kernel.default_params) use setdefault (Tier 3)."""
+
+    def test_default_params_applied(self, resolver_cls):
+        """default_params fills in missing params."""
+        r = resolver_cls(
+            {}, {}, {},
+            default_params={"in_depth": 4},
+        )
+        assert r.resolve("${in_depth}") == 4
+
+    def test_default_params_does_not_override_kernel_params(self, resolver_cls):
+        """default_params doesn't override kernel_params (Tier 4)."""
+        r = resolver_cls(
+            {},
+            {"in_depth": 8},  # kernel_params already has it
+            {},
+            default_params={"in_depth": 4},
+        )
+        assert r.resolve("${in_depth}") == 8
+
+    def test_default_params_scalar(self, resolver_cls):
+        """Scalar default_params value used as setdefault."""
+        r = resolver_cls(
+            {}, {}, {},
+            default_params={"in_width": 4},
+        )
+        assert r.resolve("${in_width}") == 4
+
+    def test_test_override_wins_over_default_params(self, resolver_cls):
+        """Tier 5 test override beats default_params."""
+        r = resolver_cls(
+            {}, {},
+            {"in_depth": 16},  # test override
+            default_params={"in_depth": 4},
+        )
+        assert r.resolve("${in_depth}") == 16

@@ -2,7 +2,7 @@
   "test_name": "TestVectorAluProbe",
   "kernel": "vector_alu",
   "status": "PASS",
-  "total_cycles": 589,
+  "total_cycles": 522,
   "configs_run": 1,
   "configs_passed": 1,
   "verification_count": 1,

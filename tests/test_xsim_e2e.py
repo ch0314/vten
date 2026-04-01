@@ -237,7 +237,7 @@ class TestMultiConfigE2E:
                 h_load = ctx.load_tensor(ki.data_in)
                 ctx.push_tensor(ki.data_in, dep=h_load)
                 h_pull = ctx.pull_tensor(ki.data_out, dep=h_load)
-                goldens.append(ki.forward())
+                goldens.append(ki.forward()["data_out"])
                 ctx.verify(h_pull, goldens[-1])
                 ctx.config_boundary()
 
@@ -266,7 +266,7 @@ class TestMultiConfigE2E:
                 h_load = ctx.load_tensor(ki.data_in)
                 ctx.push_tensor(ki.data_in, dep=h_load)
                 h_pull = ctx.pull_tensor(ki.data_out, dep=h_load)
-                ctx.verify(h_pull, ki.forward())
+                ctx.verify(h_pull, ki.forward()["data_out"])
                 ctx.config_boundary()
 
             result = ctx.run()
@@ -295,36 +295,27 @@ class TestMultiConfigE2E:
             ctx = ExecutionContext(backend=backend, project_params={"N": N})
 
             for cfg in configs:
-                ki = ctx.instantiate(KernelClass, N=N)
+                off_val = cfg["offset_value"] & 0xFF  # 8-bit register
+                ki = ctx.instantiate(
+                    KernelClass, N=N,
+                    scale_factor=cfg["scale_factor"],
+                    offset_value=off_val,
+                )
                 ki.generate_inputs(seed=42)
 
                 h_load = ctx.load_tensor(ki.data_in)
 
-                # Configure scale sub-kernel
-                h_sf = ctx.write_register(
-                    ki.scale_ctrl, {"scale_factor": cfg["scale_factor"]}, dep=h_load,
-                )
-                h_len_s = ctx.write_register(
-                    ki.scale_ctrl, {"length": total_beats}, dep=h_sf,
-                )
+                # ctx.configure auto-writes runtime_params with register mappings
+                h_cfg = ctx.configure(ki, dep=h_load)
 
-                # Configure offset sub-kernel
-                off_val = cfg["offset_value"] & 0xFF  # 8-bit register
-                h_ov = ctx.write_register(
-                    ki.offset_ctrl, {"offset_value": off_val}, dep=h_load,
-                )
-                h_len_o = ctx.write_register(
-                    ki.offset_ctrl, {"length": total_beats}, dep=h_ov,
-                )
-
-                h_push = ctx.push_tensor(ki.data_in, dep=[h_len_s, h_len_o])
-                h_pull = ctx.pull_tensor(ki.data_out, dep=[h_len_s, h_len_o])
+                h_push = ctx.push_tensor(ki.data_in, dep=h_cfg)
+                h_pull = ctx.pull_tensor(ki.data_out, dep=h_cfg)
 
                 h_start_s = ctx.write_register(
-                    ki.scale_ctrl, {"start": 1}, dep=[h_len_s, h_len_o],
+                    ki.scale_ctrl, {"start": 1}, dep=h_cfg,
                 )
                 h_start_o = ctx.write_register(
-                    ki.offset_ctrl, {"start": 1}, dep=[h_len_s, h_len_o],
+                    ki.offset_ctrl, {"start": 1}, dep=h_cfg,
                 )
 
                 h_poll_s = ctx.poll_register(ki.scale_ctrl, "done", dep=h_start_s)
@@ -332,10 +323,7 @@ class TestMultiConfigE2E:
                 h_pull.add_commit_dependency(h_poll_s)
                 h_pull.add_commit_dependency(h_poll_o)
 
-                ctx.verify(h_pull, ki.forward(
-                    scale_factor=cfg["scale_factor"],
-                    offset_value=cfg["offset_value"],
-                ))
+                ctx.verify(h_pull, ki.forward()["data_out"])
                 ctx.config_boundary()
 
             result = ctx.run()
@@ -367,7 +355,7 @@ class TestMultiBatchSessionE2E:
                 h_load = ctx.load_tensor(ki.data_in)
                 ctx.push_tensor(ki.data_in, dep=h_load)
                 h_pull = ctx.pull_tensor(ki.data_out, dep=h_load)
-                ctx.verify(h_pull, ki.forward())
+                ctx.verify(h_pull, ki.forward()["data_out"])
                 result = ctx.run()
                 session_open = ctx._session_open
                 assert result.status == "DONE"
@@ -485,7 +473,7 @@ class TestMultiBatchSessionE2E:
                 h_load = ctx.load_tensor(ki.data_in)
                 ctx.push_tensor(ki.data_in, dep=h_load)
                 h_pull = ctx.pull_tensor(ki.data_out, dep=h_load)
-                ctx.verify(h_pull, ki.forward())
+                ctx.verify(h_pull, ki.forward()["data_out"])
                 result = ctx.run()
                 session_open = ctx._session_open
                 assert result.status == "DONE", f"Failed at N={N}"
@@ -552,7 +540,7 @@ class TestEdgeCases:
             ctx.push_tensor(ki.data_in, dep=h_load)
             h_pull = ctx.pull_tensor(ki.data_out, dep=h_load)
             # forward() returns correct data, but RTL XORs with 0x01
-            ctx.verify(h_pull, ki.forward())
+            ctx.verify(h_pull, ki.forward()["data_out"])
 
             with pytest.raises(VerificationError):
                 ctx.run()
@@ -586,7 +574,7 @@ class TestEdgeCases:
             ctx.push_tensor(ki.data_in, dep=h_load)
             # probe=True triggers COMPARE command in BFM
             h_pull = ctx.pull_tensor(ki.data_out, dep=h_load, probe=True)
-            ctx.verify(h_pull, ki.forward())
+            ctx.verify(h_pull, ki.forward()["data_out"])
 
             with pytest.raises(Exception):
                 # Either VerificationError from host or BackendError

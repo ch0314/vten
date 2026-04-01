@@ -21,6 +21,7 @@ BFM이 DUT를 구동하여 RTL 수준 검증을 자동화한다.
 9. [CompositeKernel (멀티 IP)](#9-compositekernel-멀티-ip)
 10. [고급 기능](#10-고급-기능)
 11. [트러블슈팅](#11-트러블슈팅)
+12. [DataLayout — Logical/Physical 텐서 분리](#12-datalayout--logicalphysical-텐서-분리)
 
 ---
 
@@ -866,3 +867,164 @@ ERROR cli       | Not found: no test scenario matching 'TestFoo'
 | Poll 타임아웃 | DUT done 신호 미발생 | RTL의 done 레지스터 로직 확인 |
 | `ProbeMismatchError` | Probe가 golden과 RTL 출력 불일치 감지 | `--gui`로 mismatch 시점 waveform 확인 |
 | `internal error` | vTen 내부 버그 | `-v`로 traceback 확인 후 보고 |
+
+---
+
+## 12. DataLayout — Logical/Physical 텐서 분리
+
+### 12.1 문제
+
+`Tensor.data`가 HW-packed bytes를 담으므로:
+- Golden 계산용 algorithmic data를 private attr(`_ifm_raw`, `_wgt_raw`)로 이중 관리
+- CompositeKernel이 sub-kernel의 pack 함수를 직접 import해서 중복 호출
+- 디버깅 시 packed bytes만 보여서 의미 파악 어려움
+
+### 12.2 해결: 2-Layer 변환
+
+```
+generate_inputs() → tensor.logical_data (algorithmic shape/dtype)
+                          ↓
+[Layer 1] Stage 3 pre-step: DataLayout.pack(logical_data, params) → tensor.data
+                          ↓
+[Layer 2] Stage 3:        StreamSerializer.serialize(tensor.data) → bytes
+```
+
+Layer 1(DataLayout)은 사용자가 정의. Layer 2(StreamSerializer)는 기존 그대로.
+
+### 12.3 DataLayout Protocol
+
+```python
+from vten.kernel.layout import DataLayout
+import torch
+
+class DDRBiasLayout:
+    """int32 bias → AXI-word-aligned uint8 DDR layout."""
+
+    logical_shape = ("${out_ch}",)        # 파라미터화 가능
+    logical_dtype = torch.int32
+
+    def pack(self, logical: torch.Tensor, params: dict) -> torch.Tensor:
+        """logical → physical. params = resolved namespace."""
+        out_ch = logical.numel()
+        total_bytes = out_ch * 4
+        padded = ((total_bytes + 31) // 32) * 32
+        buf = torch.zeros(padded, dtype=torch.uint8)
+        buf[:total_bytes] = torch.frombuffer(
+            logical.numpy().tobytes(), dtype=torch.uint8
+        )
+        return buf
+
+    def unpack(self, physical: torch.Tensor, params: dict) -> torch.Tensor:
+        """physical → logical. Optional (lossy면 NotImplementedError)."""
+        import numpy as np
+        out_ch = params["out_ch"]
+        raw = physical[:out_ch * 4].numpy().view(np.int32)
+        return torch.from_numpy(raw.copy())
+```
+
+필수 프로토콜:
+- `logical_shape`: 파라미터화된 논리 shape tuple
+- `logical_dtype`: 논리 dtype
+- `pack(logical, params)`: logical → physical 변환
+- `unpack(physical, params)`: physical → logical (optional, lossy면 `NotImplementedError`)
+
+### 12.4 Tensor에 Layout 부착
+
+```python
+class BiasLoaderKernel(Kernel):
+    bias_mem = Tensor(
+        shape=("${ddr_bias_bytes}",),
+        dtype=torch.uint8,
+        interface="bias_dma",
+        direction=Direction.HOST_TO_DEV,
+        layout=DDRBiasLayout(),          # ← NEW
+    )
+
+    def generate_inputs(self, seed=None):
+        # logical_data만 설정 → Stage 3에서 자동 pack
+        self.bias_mem.logical_data = torch.randint(
+            -10000, 10000, self.bias_mem.logical_resolved_shape,
+            dtype=torch.int32,
+        )
+        # self.bias_mem.data는 None → engine이 자동 pack
+```
+
+### 12.5 Auto-pack 동작
+
+Engine Stage 3 pre-step에서 자동 실행:
+```python
+if (tensor.layout is not None
+        and tensor._logical_data is not None
+        and tensor.data is None):  # data가 이미 있으면 skip (backward compat)
+    tensor.data = tensor.layout.pack(tensor._logical_data, params)
+```
+
+**Backward compat**: `layout=None`이면 기존과 100% 동일. `data`를 직접 설정하면 auto-pack 스킵.
+
+### 12.6 Composite Golden Seeds에서 활용
+
+`golden_seeds` 값이 텐서 이름이면 `tensor.logical_data` 우선 사용:
+
+```python
+# BEFORE: private attr 이중 저장
+class NpuPipeline(CompositeKernel):
+    golden_seeds = {"ifm_raw": "_ifm_raw"}  # private attr 참조
+    _ifm_raw = None
+
+    def generate_inputs(self):
+        ifm_raw = torch.randint(...)
+        self.ifm_mem.data = pack_ifm_to_ddr(ifm_raw, ...)  # 직접 pack
+        self._ifm_raw = ifm_raw                              # 이중 저장
+
+# AFTER: DataLayout으로 깔끔하게
+class NpuPipeline(CompositeKernel):
+    golden_seeds = {"ifm_raw": "ifm_mem"}   # 텐서 이름 → logical_data
+
+    def generate_inputs(self):
+        self.ifm_mem.logical_data = torch.randint(...)  # 한 번만 저장
+        # pack은 engine이 자동 처리
+```
+
+### 12.7 Tensor.describe() 디버깅
+
+```python
+t.describe()
+# {
+#   "name": "bias_mem",
+#   "shape": (128,),
+#   "dtype": "torch.uint8",
+#   "has_data": True,
+#   "logical_shape": (32,),
+#   "logical_dtype": "torch.int32",
+#   "has_logical_data": True,
+#   "data_range": (0.0, 255.0),
+#   "logical_data_range": (-9876.0, 9543.0),
+# }
+```
+
+### 12.8 Golden Chain Trace
+
+```python
+golden = ki.forward(trace=True)
+# 출력:
+#   [wl] WeightLoaderKernel
+#   [fmap] FmapIOKernel
+#   [psum] PsumBufferKernel
+#     in  ifm_raw: shape=(32, 4, 4, 4) range=[0.00, 99.00]
+#     in  wgt_raw: shape=(32, 32, 3, 3, 3) range=[-100.00, 99.00]
+#     out psum_flat: shape=(131072,) range=[-50000.00, 48000.00]
+#   [act] ActQuantKernel
+#     in  psum_flat: shape=(131072,) range=[-50000.00, 48000.00]
+#     out quant_out: shape=(131072,) range=[0.00, 255.00]
+```
+
+### 12.9 ExposedTensor에서의 접근
+
+CompositeKernel에서 expose된 텐서도 동일하게 logical_data 접근 가능:
+
+```python
+# ExposedTensor proxy
+exposed.logical_data          # → origin_tensor._logical_data
+exposed.logical_resolved_shape # → origin_tensor._logical_shape
+exposed.layout                 # → origin_tensor.layout
+```

@@ -169,7 +169,7 @@ module vten_bfm_axi4 #(
             entry.total_beats      = 0;
             active_table.push_back(entry);
             if (verbose)
-                $display("[AXI4 %0t] %s iface=%0d cmd#%0d: buf=%0d, %0d bytes, phys=0x%016h",
+                $display("[AXI4     %t] %s iface=%0d cmd#%0d: buf=%0d, %0d bytes, phys=0x%016h",
                          $time, cmd_if.cmd_data.opcode.name(),
                          cmd_if.cmd_data.interface_id, cmd_if.cmd_data.cmd_id,
                          cmd_if.cmd_data.buffer_id,
@@ -437,7 +437,7 @@ module vten_bfm_axi4 #(
             vten_write_cmd_stats(cid, CMD_COMMITTED, iss_cycle, cycle_count,
                 first_act, last_act, act_cycles, tot_beats, stl_cycles);
             if (verbose)
-                $display("[AXI4 %0t] %s iface=%0d cmd#%0d done: %0d beats, %0d stall cyc, %0d active cyc",
+                $display("[AXI4     %t] %s iface=%0d cmd#%0d done: %0d beats, %0d stall cyc, %0d active cyc",
                          $time, active_table[idx].cmd.opcode.name(),
                          active_table[idx].cmd.interface_id, cid,
                          tot_beats, stl_cycles, act_cycles);

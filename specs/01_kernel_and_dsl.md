@@ -165,7 +165,12 @@ from vten import Kernel, Tensor, register
 class Conv3DKernel(Kernel):
     spec = "specs/conv3d_top.yaml"
 
-    # ── 텐서 선언 (사양 역할) ──
+    # ── 파라미터 기본값 ──
+    default_params = {
+        "N": 1, "C": 32, "D": 4, "H": 4, "W": 4, "K": 64,
+    }
+
+    # ── 텐서 선언 (logical shape, logical dtype) ──
     ifm = Tensor(
         shape=("${N}", "${C}", "${D}", "${H}", "${W}"),
         dtype=torch.int8,
@@ -184,6 +189,10 @@ class Conv3DKernel(Kernel):
 
     ctrl = register("ctrl")
 
+    # ── 파생 파라미터 (선택적, instance method) ──
+    def compute_derived_params(self) -> dict:
+        return {"total_elements": self.N * self.C * self.D * self.H * self.W}
+
     # ── 입력 생성 (자유 형식 Python) ──
     def generate_inputs(self, seed=None):
         rng = torch.Generator()
@@ -192,13 +201,10 @@ class Conv3DKernel(Kernel):
         self.ifm.fill_random(generator=rng)
         self.weight.fill_random(generator=rng)
 
-    # ── Golden reference (자유 형식 Python) ──
-    def forward(self):
-        return F.conv3d(self.ifm.to_float(), self.weight.to_float())
-
-    # ── 커스텀 검증 (선택적 오버라이드) ──
-    def verify(self, hw_output, golden):
-        return torch.allclose(hw_output, golden, atol=1e-2)
+    # ── Golden reference (logical 공간) ──
+    def forward(self, ifm, weight) -> dict[str, torch.Tensor]:
+        """인자명 = input tensor 이름, 반환값 = {output tensor 이름: logical data}"""
+        return {"ofm": F.conv3d(ifm.to_float(), weight.to_float())}
 ```
 
 ### 2.2 Tiling Responsibility
@@ -236,12 +242,12 @@ class ComplexPipelineKernel(Kernel):
         tiled = quantized.reshape(N, C//C2, C2, D, H, W)
         self.ifm.data = tiled.permute(0,1,3,4,5,2).contiguous()
 
-    def forward(self):
-        x = self.ifm.to_float()
+    def forward(self, ifm, weight) -> dict[str, torch.Tensor]:
+        x = ifm.to_float()
         x = custom_padding(x, mode='replicate')
-        x = F.conv3d(x, self.weight.to_float())
+        x = F.conv3d(x, weight.to_float())
         x = batch_norm_reference(x, self.bn_params)
-        return F.relu(x)
+        return {"ofm": F.relu(x)}
 ```
 
 ---
@@ -307,7 +313,7 @@ def run(self, ctx, cfg):
 
     # Phase 6: Device Memory → Host + 검증
     s1 = ctx.store_tensor(kernel.ofm, dep=pull1)
-    ctx.verify(s1, kernel.forward())
+    ctx.verify(s1)  # golden 자동 계산 (forward(**inputs) 호출)
 ```
 
 ### 3.4 사용 예시: Stream Interface (Shorthand)
@@ -320,7 +326,7 @@ def run(self, ctx, cfg):
     w0 = ctx.write_register(kernel.ctrl, {"start": 1})
     push1 = ctx.push_tensor(kernel.ifm, dep=w0)
     pull1 = ctx.pull_tensor(kernel.ofm, dep=push1)
-    ctx.verify(pull1, kernel.forward())
+    ctx.verify(pull1)  # golden 자동 계산
 ```
 
 ### 3.5 configure() 동작
@@ -472,10 +478,11 @@ def run(self, ctx, cfg):
     ctx.run()
 
     # ── Golden ──
-    golden = layers[0].forward()
+    golden = layers[0].forward(ifm=layers[0].ifm.logical_data,
+                                weight=layers[0].weight.logical_data)["ofm"]
     for i in range(1, 5):
-        layers[i].ifm.data = golden
-        golden = layers[i].forward()
+        golden = layers[i].forward(ifm=golden,
+                                    weight=layers[i].weight.logical_data)["ofm"]
     ctx.verify(recv0, golden)
 ```
 
@@ -514,7 +521,7 @@ def run(self, ctx, cfg):
 
         ctx.run()  # chunk마다 Batch 제출, Data Region 보존
 
-    golden = compute_golden_chain(layers)
+    golden = compute_golden_chain(layers)  # forward(**inputs) chain
     ctx.verify(prev_recv, golden)
 ```
 
@@ -549,8 +556,14 @@ def run(self, ctx, cfg):
         stats = ctx.run()
 
         hw_output = result.to_tensor()
-        golden = layers[i].forward() if golden is None else (
-            setattr(layers[i], 'ifm_data', golden) or layers[i].forward())
+        if golden is None:
+            golden = layers[i].forward(
+                ifm=layers[i].ifm.logical_data,
+                weight=layers[i].weight.logical_data)["ofm"]
+        else:
+            golden = layers[i].forward(
+                ifm=golden,
+                weight=layers[i].weight.logical_data)["ofm"]
 
         if compute_confidence(hw_output) > cfg["early_exit_threshold"]:
             ctx.verify(result, golden)
@@ -594,7 +607,7 @@ def run(self, ctx, cfg):
     result1.add_commit_dependency(poll)
     ctx.run()
 
-    golden1 = compute_requantized_golden(layer0, layer1, scale)
+    golden1 = compute_requantized_golden(layer0, layer1, scale)  # forward(**inputs) chain
     ctx.verify(result1, golden1)
 ```
 
@@ -633,16 +646,17 @@ Composed (NPUTop):
 
 **핵심:** `connections`는 **이미 존재하는 RTL 내부 와이어**를 서술한다. vTen이 와이어를 생성하지 않으며, 어떤 인터페이스에 BFM이 붙고 어떤 것이 내부인지만 결정한다.
 
-### 4.2 interface_map
+### 4.2 Sub-kernel 선언 — `bind()` 없이
 
-`interface_map`은 합성의 핵심 메커니즘이다. 각 서브커널 인터페이스를 세 가지 상태 중 하나로 매핑:
+v2에서는 `interface_map`과 `bind()` 메커니즘이 삭제된다. 서브커널은 단순히 인스턴스로 선언하고, `connections` 리스트와 자동 추론 규칙으로 Internal/External을 결정한다.
 
-| 매핑 유형 | 구문 | 의미 |
-|-----------|------|------|
-| External | `"top_interface"` | 최상위 인터페이스에 매핑. BFM 생성. |
-| External + Bank | `("top_interface", "bank_name")` | 최상위 인터페이스 + 레지스터 뱅크 오프셋 |
-| Internal | `Internal()` | BFM 없음. RTL 와이어. |
-| Internal + Probe | `Internal(probe=True)` | BFM 없음, 패시브 모니터 부착. |
+```python
+# v1 (삭제됨):
+# dma_ifm = DMAKernel.bind(interface_map={...})
+
+# v2:
+dma_ifm = DMAKernel()  # 인스턴스 선언만
+```
 
 ### 4.3 CompositeKernel 정의
 
@@ -653,8 +667,10 @@ class DMAKernel(Kernel):
     dst = Tensor(shape=("${SIZE}",), dtype=torch.int8, interface="stream_out")
     ctrl = register("ctrl_lite")
 
-    def forward(self):
-        return self.src.data.clone()
+    default_params = {"SIZE": 1024}
+
+    def forward(self, src) -> dict[str, torch.Tensor]:
+        return {"dst": src.clone()}
 
 class MACKernel(Kernel):
     spec = "specs/mac.yaml"
@@ -663,88 +679,101 @@ class MACKernel(Kernel):
     ofm = Tensor(..., interface="axis_ofm")
     ctrl = register("ctrl_lite")
 
-    def forward(self):
-        return F.conv3d(self.ifm.to_float(), self.weight.to_float())
+    def forward(self, ifm, weight) -> dict[str, torch.Tensor]:
+        return {"ofm": F.conv3d(ifm.to_float(), weight.to_float())}
 ```
 
 ```python
 class NPUTopKernel(CompositeKernel):
     spec = "specs/npu_top.yaml"
 
-    # ── 서브커널 바인딩 + interface_map ──
-    dma_ifm = DMAKernel.bind(
-        interface_map={
-            "axi_master": "ddr_port",           # External → BFM
-            "stream_out": Internal(),            # Internal → BFM 없음
-            "ctrl_lite": ("ctrl", "dma_ifm"),    # External + 레지스터 뱅크
-        }
-    )
+    # ── 서브커널 선언 (인스턴스만) ──
+    dma_ifm = DMAKernel()
+    dma_weight = DMAKernel()
+    mac = MACKernel()
+    dma_ofm = DMAKernel()
 
-    dma_weight = DMAKernel.bind(
-        interface_map={
-            "axi_master": "ddr_port",           # dma_ifm과 공유
-            "stream_out": Internal(),
-            "ctrl_lite": ("ctrl", "dma_weight"),
-        }
-    )
-
-    mac = MACKernel.bind(
-        interface_map={
-            "axis_ifm": Internal(probe=True),    # Internal + 모니터
-            "axis_weight": Internal(),
-            "axis_ofm": Internal(probe=True),
-            "ctrl_lite": ("ctrl", "mac"),
-        }
-    )
-
-    dma_ofm = DMAKernel.bind(
-        interface_map={
-            "axi_master": "ddr_port",
-            "stream_out": Internal(),
-            "ctrl_lite": ("ctrl", "dma_ofm"),
-        }
-    )
-
-    # ── 최상위 텐서 노출 ──
-    ifm = dma_ifm.src.expose(interface="ddr_port")
-    weight = dma_weight.src.expose(interface="ddr_port")
-    ofm = dma_ofm.dst.expose(interface="ddr_port")
-
-    # ── 내부 연결 (golden 모델 체이닝용) ──
+    # ── 내부 연결: >> 연산자로 Connection 생성 ──
     connections = [
-        Connect(dma_ifm.dst, mac.ifm),
-        Connect(dma_weight.dst, mac.weight),
-        Connect(mac.ofm, dma_ofm.src),
+        dma_ifm.dst   >> mac.ifm,
+        dma_weight.dst >> mac.weight,
+        mac.ofm       >> dma_ofm.src,
     ]
 
-    # ── Golden 모델 ──
-    def forward(self):
-        ifm_loaded = self.dma_ifm.forward()
-        wgt_loaded = self.dma_weight.forward()
-        self.mac.ifm.data = ifm_loaded
-        self.mac.weight.data = wgt_loaded
-        mac_out = self.mac.forward()
-        self.dma_ofm.src.data = mac_out
-        return self.dma_ofm.forward()
+    # ── forward() 자동 chain ──
+    # connections graph 기반으로 framework가 자동으로 forward chain을 수행한다.
+    # 오버라이드 없이도 CompositeKernel.forward()가 multi-round
+    # dataflow evaluation으로 sub-kernel forward()를 순서대로 호출한다.
+    # 사용자가 원하면 오버라이드 가능.
 ```
 
-### 4.4 connections 역할
+**자동 추론 규칙:**
 
-`connections`는 RTL 와이어를 **생성하지 않는다**. 목적:
+| v1 수동 | v2 자동 규칙 |
+|---------|------------|
+| `interface_map={"stream_out": Internal()}` | `connections`에 등장하는 tensor의 interface → Internal |
+| `interface_map={"axi_master": "ddr_port"}` | `connections`에 없는 tensor의 interface → auto expose |
+| `register("ctrl")` 뱅크 매핑 | sub-kernel의 register interface → `{sub_name}_{iface_name}` 자동 prefix |
+| `.expose("ddr_port")` | 자동 expose (이름 = `{sub_name}_{tensor_name}` 또는 원본 유지) |
 
-1. **Golden 모델 체이닝**: `forward()` 데이터 흐름 순서 결정
-2. **Probe 포인트**: `Internal(probe=True)` 연결에 패시브 모니터 부착
-3. **문서화**: RTL 내부 구조를 Python으로 서술
-4. **검증**: 런타임이 연결 쌍의 호환 형상/dtype 확인
+위 예시에서 `connections`에 등장하지 않는 텐서 — `dma_ifm.src`, `dma_weight.src`, `dma_ofm.dst`, 각 `ctrl` — 는 자동으로 최상위에 expose된다.
 
-연결에 중간 변환 함수도 가능:
+### 4.4 `>>` 연산자와 Connection
+
+`connections`는 RTL 와이어를 **생성하지 않는다**. 이미 존재하는 RTL 내부 와이어를 서술한다.
+
+#### 4.4.1 TensorRef와 `>>` 연산자
+
+CompositeKernel class body에서 `sub_kernel.tensor_name`에 접근하면 `TensorRef` 객체가 반환된다. `>>` 연산자로 두 TensorRef를 연결하여 `Connection` 객체를 생성한다:
 
 ```python
-connections = [
-    Connect(mac.ofm, dma_ofm.src,
-            transform=lambda x: quantize(x, bits=8)),
-]
+class TensorRef:
+    """Sub-kernel tensor reference."""
+    def __init__(self, sub_kernel_name: str, tensor_name: str, kernel_class: type):
+        self.sub_kernel_name = sub_kernel_name
+        self.tensor_name = tensor_name
+        self.kernel_class = kernel_class
+
+    def __rshift__(self, other: TensorRef) -> Connection:
+        return Connection(source=self, dest=other)
 ```
+
+`SubKernelRef` (서브커널 인스턴스 선언)가 `__getattr__`로 TensorRef를 반환한다:
+
+```python
+class SubKernelRef:
+    """CompositeKernel class body에서 sub-kernel 참조."""
+    def __init__(self, kernel_class: type):
+        self.kernel_class = kernel_class
+
+    def __set_name__(self, owner, name):
+        self._attr_name = name
+
+    def __getattr__(self, name) -> TensorRef:
+        attr = getattr(self.kernel_class, name, None)
+        if isinstance(attr, Tensor):
+            return TensorRef(self._attr_name, name, self.kernel_class)
+        raise AttributeError(...)
+```
+
+#### 4.4.2 connections의 역할
+
+1. **Internal/External 결정**: connections에 등장하는 tensor → Internal (BFM 없음). 등장하지 않는 tensor → auto expose (BFM 생성).
+2. **Golden 모델 체이닝**: `forward()` 데이터 흐름 순서 결정 + golden chain pool 저장 (선언적 probe의 golden 소스).
+3. **Probe 포인트**: 모든 Internal 연결에 패시브 probe BFM 자동 생성. 선언적 `probes` API로 런타임 활성화.
+4. **문서화**: RTL 내부 구조를 Python으로 서술.
+5. **검증**: 런타임이 연결 쌍의 호환 형상/dtype/protocol 확인.
+
+#### 4.4.3 CompositeKernel 내부 속성
+
+`__init_subclass__`에서 자동으로 구성되는 내부 속성:
+
+| 속성 | 타입 | 설명 |
+|------|------|------|
+| `_sub_kernel_refs` | `dict[str, SubKernelRef]` | 서브커널 이름 → SubKernelRef 매핑 |
+| `_connections` | `list[Connection]` | 선언된 Connection 목록 |
+| `_connected_tensors` | `set[tuple[str, str]]` | connections에 등장하는 `(sub_name, tensor_name)` 집합 |
+| `_auto_exposed` | `dict[str, ExposedTensor]` | connections에 없는 tensor → 자동 expose 결과 |
 
 ### 4.5 Register Bank Offset
 
@@ -785,8 +814,29 @@ ddr_port 메모리 레이아웃:
 
 ### 4.7 테스트 레벨에서의 합성
 
+커널이 `run(self, ctx)` 메서드를 구현하면, TestScenario는 `kernel`과 선택적 `probes`만 선언하면 된다:
+
 ```python
 class TestNPUTop(TestScenario):
+    kernel = "npu_top"
+    # default run: ki.run(ctx) 자동 호출
+
+class TestNPUTopProbe(TestScenario):
+    kernel = "npu_top"
+    probes = ["mac.axis_ifm", "mac.axis_ofm", "data_out"]
+    # 커널 정의 변경 없이 probe 적용
+    # 모든 internal 연결(connections)에 probe BFM 자동 생성
+    # golden chain pool에서 golden 자동 추출
+```
+
+`probes` 리스트의 각 항목은:
+- `"data_out"`: 출력 텐서의 PULL op에 `probe=True` 자동 적용
+- `"mac.axis_ifm"`: 서브커널 내부 텐서. INTERNAL → INTERNAL_PROBE 동적 업그레이드, golden chain에서 golden 자동 추출
+
+**수동 run() override도 여전히 가능하다:**
+
+```python
+class TestNPUTopCustom(TestScenario):
     kernel = "npu_top"
 
     def run(self, ctx, cfg):
@@ -807,34 +857,43 @@ class TestNPUTop(TestScenario):
         pull1.add_commit_dependency(p1)
 
         s1 = ctx.store_tensor(npu.ofm, dep=pull1)
-        ctx.verify(s1, npu.forward())
+        ctx.verify(s1)  # golden 자동 계산 (forward(**inputs) chain)
 ```
 
 MACKernel 코드는 **수정 없이** NPUTopKernel 내에서 재사용된다.
 
 **참고:** 이 예시는 서플리먼트 §18.3의 errata 해결 결과를 반영한다. Memory-mapped 인터페이스에서도 `push_tensor`/`pull_tensor`를 명시적으로 사용해야 한다 (Interpretation A 채택).
 
-### 4.8 interface_map 검증
+### 4.8 Connection 검증
 
-빌드 시점에 `InterfaceMapValidator`가 수행하는 검사:
+빌드 시점에 `ConnectionValidator`가 수행하는 검사:
 
-- 모든 서브커널 인터페이스가 매핑되어야 함 (미매핑 인터페이스 불허)
-- External 매핑은 호환 프로토콜이어야 함 (예: AXI4 → AXI4)
-- 메모리 영역 용량이 초과되지 않아야 함
-- 레지스터 뱅크가 겹치지 않아야 함
-- 연결된 텐서(via `connections`)가 호환 원소 수를 가져야 함
+- **프로토콜 호환성**: 연결된 두 텐서의 protocol이 호환되어야 함 (예: AXI4-Stream ↔ AXI4-Stream)
+- **형상 호환성**: 연결된 텐서의 원소 수가 일치하거나 호환 가능해야 함
+- **dtype 호환성**: source dtype과 dest dtype이 일치하거나 암묵적 변환 가능해야 함
+- **메모리 영역 용량**: auto expose된 텐서가 메모리 영역 한계를 초과하지 않아야 함
+- **레지스터 뱅크 겹침**: 동일 AXI-Lite 인터페이스를 공유하는 서브커널의 뱅크가 겹치지 않아야 함
+- **댕글링 참조**: connections에서 참조하는 텐서가 실제로 서브커널에 존재해야 함
 
 ### 4.9 Cross-Kernel Parameter Sharing
 
-CompositeKernel에서 상위 파라미터가 서브커널로 전파되며, 명시적 `params=`로 계산된 포워딩 가능:
+CompositeKernel에서 상위 파라미터가 서브커널로 자동 전파된다. 서브커널의 `default_params`보다 상위 CompositeKernel의 resolved params가 우선한다:
 
 ```python
 class NPUTopKernel(CompositeKernel):
-    dma = DMAKernel.bind(
-        params={"TRANSFER_SIZE": "${N}*${C}*${D}*${H}*${W}"}
-    )
-    mac = MACKernel.bind()
+    dma = DMAKernel()
+    mac = MACKernel()
     # 둘 다 project/runtime 스코프에서 C, D, H, W를 상속
+
+    default_params = {
+        "TRANSFER_SIZE": "${N}*${C}*${D}*${H}*${W}",
+    }
+```
+
+파라미터 해결 우선순위:
+
+```
+runtime (test config)  >  Kernel.default_params  >  vten.toml [parameters]
 ```
 
 ---

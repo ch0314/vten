@@ -149,7 +149,7 @@ module vten_bfm_axilite #(
         if (m_bvalid && m_bready) begin
             m_bready <= 0;
             if (verbose)
-                $display("[AXILITE %0t] WRITE_REG iface=%0d cmd#%0d done: addr=0x%04h, val=0x%08h, resp=%0b",
+                $display("[AXILITE  %t] WRITE_REG iface=%0d cmd#%0d done: addr=0x%04h, val=0x%08h, resp=%0b",
                          $time, current_cmd.interface_id, current_cmd.cmd_id,
                          current_cmd.reg_offset[ADDR_W-1:0],
                          current_cmd.reg_value[DATA_W-1:0], m_bresp);
@@ -200,7 +200,7 @@ module vten_bfm_axilite #(
             if ((m_rdata & current_cmd.reg_mask[DATA_W-1:0]) ==
                 current_cmd.reg_expected[DATA_W-1:0]) begin
                 if (verbose)
-                    $display("[AXILITE %0t] POLL_REG iface=%0d cmd#%0d: match after %0d polls (addr=0x%04h, got=0x%08h, mask=0x%08h, expected=0x%08h)",
+                    $display("[AXILITE  %t] POLL_REG iface=%0d cmd#%0d: match after %0d polls (addr=0x%04h, got=0x%08h, mask=0x%08h, expected=0x%08h)",
                              $time, current_cmd.interface_id, current_cmd.cmd_id, poll_count,
                              current_cmd.reg_offset[ADDR_W-1:0], m_rdata,
                              current_cmd.reg_mask[DATA_W-1:0],
@@ -210,7 +210,7 @@ module vten_bfm_axilite #(
                 poll_count <= poll_count + 1;
                 if (poll_count >= POLL_TIMEOUT) begin
                     if (verbose)
-                        $display("[AXILITE %0t] POLL_REG iface=%0d cmd#%0d TIMEOUT: %0d polls exhausted (addr=0x%04h, last=0x%08h, mask=0x%08h, expected=0x%08h)",
+                        $display("[AXILITE  %t] POLL_REG iface=%0d cmd#%0d TIMEOUT: %0d polls exhausted (addr=0x%04h, last=0x%08h, mask=0x%08h, expected=0x%08h)",
                                  $time, current_cmd.interface_id, current_cmd.cmd_id, POLL_TIMEOUT,
                                  current_cmd.reg_offset[ADDR_W-1:0], m_rdata,
                                  current_cmd.reg_mask[DATA_W-1:0],

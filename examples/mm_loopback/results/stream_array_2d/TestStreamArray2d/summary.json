@@ -1,0 +1,17 @@
+{
+  "test_name": "TestStreamArray2d",
+  "kernel": "stream_array_2d",
+  "status": "PASS",
+  "total_cycles": 24,
+  "configs_run": 1,
+  "configs_passed": 1,
+  "verification_count": 1,
+  "verification_passed": 1,
+  "verification_results": [
+    {
+      "tensor": "data_out",
+      "passed": true,
+      "max_diff": 0.0
+    }
+  ]
+}

@@ -116,7 +116,7 @@ module vten_command_scheduler #(
             // from prior error where batch_active never drained)
             if (batch_init) begin
                 if (verbose && batch_active)
-                    $display("[SCHED %0t] batch_init: force-clearing stuck batch (error_flag=%0d)",
+                    $display("[SCHED    %t] batch_init: force-clearing stuck batch (error_flag=%0d)",
                              $time, error_flag);
                 batch_active <= 0;
                 error_flag   <= 0;
@@ -132,8 +132,8 @@ module vten_command_scheduler #(
                 batch_active <= 1;
                 stats_enabled <= (vten_read_flags() & 1) != 0;
                 if (verbose)
-                    $display("[SCHED %0t] batch start: %0d commands, stats=%0b",
-                             $time, num_loaded, (vten_read_flags() & 1) != 0);
+                    $display("[SCHED    %t] ──── batch start: %0d commands ────",
+                             $time, num_loaded);
                 preprocess_batch(num_loaded);
             end
             if (batch_active && all_drained) begin
@@ -341,7 +341,7 @@ module vten_command_scheduler #(
     // ── Error report ──
     task automatic report_error(int cmd_id, int code_val);
         if (verbose)
-            $display("[SCHED %0t] ERROR: cmd_id=%0d, code=%0d, first=%0b",
+            $display("[SCHED    %t] ERROR: cmd_id=%0d, code=%0d, first=%0b",
                      $time, cmd_id, code_val, !error_flag);
         if (!error_flag) begin  // Only record first error
             error_flag   <= 1'b1;

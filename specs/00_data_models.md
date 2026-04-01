@@ -1,6 +1,6 @@
 # vTen Shared Data Models
 
-**Version 0.5.0 — March 2026**
+**Version 0.6.0 — March 2026 (Kernel v2 API)**
 **Role: 모든 스펙 파일의 공유 타입 정의 (Single Source of Truth)**
 
 ---
@@ -355,23 +355,39 @@ for tensor_name in self.kernel_class._tensor_descriptors:
 ```python
 class CompositeKernel(Kernel):
     """복합 커널 베이스 클래스."""
-    
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        
-        # 추가: SubKernelBinding과 ExposedTensorDef 수집
-        cls._sub_kernel_bindings = {}
-        cls._exposed_tensor_defs = {}
+
+        # v2: 서브커널 인스턴스(Kernel subclass)와 Connection 수집
+        cls._sub_kernel_refs = {}     # attr_name → Kernel subclass type
         cls._connections = []
-        
+        cls._connected_tensors = set()
+        cls._auto_exposed = {}
+
         for attr_name, attr_value in vars(cls).items():
-            if isinstance(attr_value, SubKernelBinding):
-                attr_value._attr_name = attr_name
-                cls._sub_kernel_bindings[attr_name] = attr_value
-            elif isinstance(attr_value, ExposedTensorDef):
-                cls._exposed_tensor_defs[attr_name] = attr_value
+            if isinstance(attr_value, Kernel) and not isinstance(attr_value, CompositeKernel.__class__):
+                cls._sub_kernel_refs[attr_name] = type(attr_value)
             elif attr_name == 'connections' and isinstance(attr_value, list):
                 cls._connections = attr_value
+
+        # connections에서 connected tensors 수집
+        for conn in cls._connections:
+            if isinstance(conn, Connection):
+                cls._connected_tensors.add((conn.source_sub, conn.source_tensor))
+                cls._connected_tensors.add((conn.dest_sub, conn.dest_tensor))
+
+        # 자동 expose: connections에 등장하지 않는 tensor
+        used_names = set()
+        for sub_name, sub_cls in cls._sub_kernel_refs.items():
+            for tensor_name in getattr(sub_cls, '_tensor_descriptors', {}):
+                if (sub_name, tensor_name) not in cls._connected_tensors:
+                    # 이름 충돌 시 prefix 추가
+                    exposed_name = tensor_name
+                    if exposed_name in used_names:
+                        exposed_name = f"{sub_name}_{tensor_name}"
+                    cls._auto_exposed[(sub_name, tensor_name)] = exposed_name
+                    used_names.add(exposed_name)
 ```
 
 ---
@@ -452,16 +468,43 @@ class Kernel:
         따라서 self.ifm.fill_random()이나 직접 shape 참조가 모두 가능."""
         raise NotImplementedError
 
-    def forward(self) -> torch.Tensor:
+    # ── 파라미터 기본값 (v2) ──
+    default_params: dict = {}
+    """커널 파라미터 기본값. 서브클래스에서 오버라이드.
+    Resolution 우선순위: runtime (test config) > default_params > vten.toml [parameters]"""
+
+    def forward(self, **inputs: torch.Tensor) -> dict[str, torch.Tensor]:
         """Golden reference 계산. 사용자 오버라이드.
-        임의의 PyTorch/Python 코드 사용 가능."""
+
+        Args:
+            **inputs: 입력 텐서. 키 = Kernel 클래스에 선언된 input tensor의 name.
+                      Framework가 자동으로 input tensor의 logical_data를 수집하여 전달.
+
+        Returns:
+            dict[str, torch.Tensor]: {output_tensor_name: logical_data}
+            출력 텐서 이름과 logical 공간의 golden 데이터.
+
+        규칙:
+        - logical 공간에서만 동작 — physical packing 일절 없음
+        - params는 self.* 로 접근 (resolved params가 instance attrs로 노출)
+        - 임의의 PyTorch/Python 코드 사용 가능
+        """
         raise NotImplementedError
 
-    def verify(self, hw_output: torch.Tensor,
-               golden: torch.Tensor) -> bool:
-        """커스텀 비교 로직 (선택적 오버라이드).
-        기본값: torch.allclose(hw_output, golden)"""
-        return torch.allclose(hw_output, golden)
+    def compute_derived_params(self) -> dict:
+        """조건부 파생 파라미터 계산 (선택적 오버라이드).
+
+        KernelInstance.initialize() 순서:
+        Resolver → Instance 생성 → attrs 설정 → self.compute_derived_params()
+        → derived attrs 설정.
+
+        self.* 로 resolved params에 접근하여 파생값을 계산한다.
+        반환된 dict의 키가 인스턴스 속성으로 추가 설정된다.
+
+        Returns:
+            dict: {param_name: derived_value}. 빈 dict이면 파생 파라미터 없음.
+        """
+        return {}
 
     # ── 프레임워크 제공 메서드 ──
 
@@ -477,220 +520,163 @@ class Kernel:
             raise AttributeError(f"No tensor '{name}' in {self.__class__.__name__}")
         return getattr(self, name)
 
-    # ── 서브커널 바인딩 (CompositeKernel에서 사용) ──
-
-    @classmethod
-    def bind(cls, interface_map: dict,
-             params: dict | None = None) -> 'SubKernelBinding':
-        """이 Kernel 클래스를 CompositeKernel의 서브커널로 바인딩.
-        CompositeKernel 클래스 본문에서 호출.
-
-        Kernel 베이스 클래스에 정의되는 이유: 바인딩 **대상**이 일반 Kernel
-        서브클래스(DMAKernel, MACKernel 등)이므로, 이들이 bind()에 접근
-        가능해야 한다. CompositeKernel에 두면 Kernel 서브클래스에서
-        MRO상 접근 불가.
-
-        Usage:
-            class NPUTopKernel(CompositeKernel):
-                dma_ifm = DMAKernel.bind(
-                    interface_map={
-                        "axi_master": "ddr_port",
-                        "stream_out": Internal(),
-                        "ctrl_lite": ("ctrl", "dma_ifm"),
-                    }
-                )
-
-        Returns:
-            SubKernelBinding — 메타클래스가 수집하여 CompositeKernel에 등록.
-        """
-        return SubKernelBinding(
-            kernel_class=cls,
-            interface_map=interface_map,
-            params=params,
-        )
 ```
 
-### 5.2 TensorProxy & expose() Mechanism
+### 5.2 TensorRef & Connection (v2)
 
-`SubKernelBinding`에서 서브커널의 텐서에 접근하고 `expose()`를 호출하는 프록시 체인.
-이 코드는 **클래스 본문 평가 시점**(인스턴스 생성 전)에 동작해야 한다.
+CompositeKernel 클래스 본문에서 서브커널의 텐서를 참조하고 `>>` 연산자로
+내부 연결을 선언하는 메커니즘. 클래스 본문 평가 시점(인스턴스 생성 전)에 동작한다.
 
 ```python
-class TensorProxy:
-    """SubKernelBinding.__getattr__이 반환하는 프록시.
-    아직 인스턴스화되지 않은 서브커널의 텐서를 참조한다.
+class TensorRef:
+    """서브커널 텐서 참조. CompositeKernel 클래스 본문에서 생성된다.
+    서브커널 인스턴스(Kernel subclass)의 __getattr__이 반환한다.
 
-    두 가지 용도:
-    1. expose(interface=...) → ExposedTensorDef 생성
-    2. Connect()의 인자로 사용 → 소스/목적 텐서 식별
+    용도:
+    1. >> 연산자로 Connection 생성 (내부 연결 선언)
+    2. connections 리스트에 등장하지 않는 tensor → 자동 expose
+
+    Args:
+        sub_kernel_name: CompositeKernel 내 서브커널 속성명 (예: "fmap")
+        tensor_name: 서브커널의 텐서 이름 (예: "ifm_out")
+        kernel_class: 서브커널 클래스 (예: FmapIOKernel)
     """
 
-    def __init__(self, binding_attr_name: str, tensor_name: str,
+    def __init__(self, sub_kernel_name: str, tensor_name: str,
                  kernel_class: type):
-        """
-        Args:
-            binding_attr_name: CompositeKernel 클래스 내 바인딩 속성명 (예: "dma_ifm")
-            tensor_name: 서브커널의 텐서 이름 (예: "src")
-            kernel_class: 서브커널 클래스 (예: DMAKernel)
-        """
-        self.binding_attr_name = binding_attr_name
+        self.sub_kernel_name = sub_kernel_name
         self.tensor_name = tensor_name
         self.kernel_class = kernel_class
 
-    def expose(self, interface: str) -> 'ExposedTensorDef':
-        """이 텐서를 CompositeKernel의 최상위 텐서로 노출.
-
-        Usage:
-            class NPUTopKernel(CompositeKernel):
-                dma_ifm = DMAKernel.bind(interface_map={...})
-                ifm = dma_ifm.src.expose(interface="ddr_port")
-        """
-        return ExposedTensorDef(
-            origin_sub_kernel=self.binding_attr_name,
-            origin_name=self.tensor_name,
-            top_interface=interface,
-        )
-
-
-@dataclass
-class ExposedTensorDef:
-    """expose() 호출의 결과. 메타클래스가 수집하여 FlattenedKernelView에 등록."""
-    origin_sub_kernel: str   # "dma_ifm"
-    origin_name: str         # "src"
-    top_interface: str       # "ddr_port"
-```
-
-### 5.3 SubKernelBinding
-
-```python
-@dataclass
-class SubKernelBinding:
-    """Kernel.bind()의 결과. CompositeKernel 클래스 본문에서 속성으로 저장된다."""
-    kernel_class: type           # Kernel 서브클래스 (예: DMAKernel)
-    interface_map: dict          # {sub_iface: "top_iface" | ("top", "bank") | Internal()}
-    params: dict | None = None   # 파라미터 포워딩 표현식
-
-    # 메타클래스에 의해 설정됨 (CompositeKernel 클래스 정의 시)
-    _attr_name: str = ""         # CompositeKernel 내 속성 이름 (예: "dma_ifm")
-
-    def __getattr__(self, name: str) -> TensorProxy:
-        """서브커널의 텐서에 프록시로 접근.
-        클래스 본문 평가 시점에서 호출됨.
-
-        Usage:
-            dma_ifm = DMAKernel.bind(...)
-            ifm = dma_ifm.src.expose(interface="ddr_port")
-            #     ^^^^^^^^^ __getattr__("src") → TensorProxy
-
-        검증: kernel_class에 해당 이름의 Tensor가 존재하는지 확인.
-        """
-        # dataclass 내부 필드 접근은 정상 처리 (무한 재귀 방지)
-        if name.startswith('_') or name in ('kernel_class', 'interface_map',
-                                             'params'):
-            raise AttributeError(name)
-
-        # 서브커널 클래스에서 텐서 검색
-        attr = getattr(self.kernel_class, name, None)
-        if isinstance(attr, Tensor):
-            return TensorProxy(
-                binding_attr_name=self._attr_name,
-                tensor_name=name,
-                kernel_class=self.kernel_class,
-            )
-        raise AttributeError(
-            f"Sub-kernel '{self.kernel_class.__name__}' has no tensor '{name}'. "
-            f"Available: {[k for k, v in vars(self.kernel_class).items() if isinstance(v, Tensor)]}"
-        )
-```
-
-**메타클래스의 역할:** CompositeKernel 서브클래스 정의 시, 메타클래스(또는 `__init_subclass__`)가
-모든 `SubKernelBinding` 속성을 찾아 `_attr_name`을 설정한다:
-
-```python
-# 메타클래스 의사 코드
-for attr_name, attr_value in namespace.items():
-    if isinstance(attr_value, SubKernelBinding):
-        attr_value._attr_name = attr_name  # "dma_ifm", "mac", ...
-```
-
-### 5.4 Connect (프록시 기반)
-
-```python
-class Connect:
-    """CompositeKernel의 connections에서 RTL 내부 와이어를 서술.
-    실제 RTL 와이어를 생성하지 않음 — golden 체이닝과 probe 수집용.
-
-    TensorProxy 2개를 받아서 소스/목적의 서브커널 이름과 텐서 이름을 추출한다.
-    """
-
-    def __init__(self, source: TensorProxy, dest: TensorProxy,
-                 transform: callable | None = None):
-        """
-        Args:
-            source: 소스 텐서 프록시 (예: dma_ifm.dst)
-            dest: 목적 텐서 프록시 (예: mac.ifm)
-            transform: 중간 변환 함수 (선택)
+    def __rshift__(self, other: 'TensorRef') -> 'Connection':
+        """>> 연산자: 내부 연결 생성.
 
         Usage:
             connections = [
-                Connect(dma_ifm.dst, mac.ifm),
-                Connect(mac.ofm, dma_ofm.src, transform=lambda x: quantize(x, 8)),
+                fmap.ifm_out >> mac.ifmap,
+                mac.partial_sum >> psum.psum_in,
             ]
         """
-        if not isinstance(source, TensorProxy):
-            raise TypeError(
-                f"Connect source must be TensorProxy, got {type(source).__name__}. "
-                f"Use sub_kernel_binding.tensor_name syntax.")
-        if not isinstance(dest, TensorProxy):
-            raise TypeError(
-                f"Connect dest must be TensorProxy, got {type(dest).__name__}.")
+        return Connection(source=self, dest=other)
 
-        self.source_sub: str = source.binding_attr_name   # "dma_ifm"
-        self.source_name: str = source.tensor_name         # "dst"
-        self.dest_sub: str = dest.binding_attr_name        # "mac"
-        self.dest_name: str = dest.tensor_name             # "ifm"
 
-        # probe key 생성을 위해 소스 텐서의 인터페이스 이름도 추출
-        source_tensor = getattr(source.kernel_class, source.tensor_name, None)
-        self.source_interface: str | None = (
-            source_tensor.interface if isinstance(source_tensor, Tensor) else None
-        )
+@dataclass
+class Connection:
+    """>> 연산자의 결과. 두 서브커널 텐서 간의 RTL 내부 연결을 서술.
+    실제 RTL 와이어를 생성하지 않음 — golden 체이닝과 probe 수집용.
 
-        self.transform = transform
+    이전 Connect 클래스를 대체한다.
+    """
+    source: TensorRef
+    dest: TensorRef
+
+    @property
+    def source_sub(self) -> str:
+        return self.source.sub_kernel_name
+
+    @property
+    def source_tensor(self) -> str:
+        return self.source.tensor_name
+
+    @property
+    def source_interface(self) -> str | None:
+        """소스 텐서의 인터페이스 이름 (probe key 생성용)."""
+        t = getattr(self.source.kernel_class, self.source.tensor_name, None)
+        return t.interface if isinstance(t, Tensor) else None
+
+    @property
+    def dest_sub(self) -> str:
+        return self.dest.sub_kernel_name
+
+    @property
+    def dest_tensor(self) -> str:
+        return self.dest.tensor_name
+
+    @property
+    def dest_interface(self) -> str | None:
+        t = getattr(self.dest.kernel_class, self.dest.tensor_name, None)
+        return t.interface if isinstance(t, Tensor) else None
 ```
 
-### 5.5 Internal
+### 5.3 Sub-kernel 선언 & 자동 추론 (v2)
+
+v2에서는 `bind()`, `SubKernelBinding`, `interface_map`, `config_map`이 삭제되었다.
+서브커널은 Kernel 서브클래스의 **인스턴스**를 CompositeKernel 클래스 본문에 선언하는 것만으로 등록된다.
 
 ```python
-class Internal:
-    """interface_map에서 내부 와이어(BFM 없음)를 표시."""
-    def __init__(self, probe: bool = False):
-        self.probe = probe
+class NpuPipelineKernel(CompositeKernel):
+    wl   = WeightLoaderKernel()    # 서브커널 인스턴스 선언
+    fmap = FmapIOKernel()
+    mac  = MacAtuKernel()
 ```
 
-### 5.6 CompositeKernel
+**자동 추론 규칙:**
+
+| 현재 수동 | v2 자동 규칙 |
+|----------|------------|
+| `interface_map={"wgt_out": Internal()}` | connections에 등장하는 tensor의 interface → Internal |
+| `interface_map={"wgt_dma": "wgt_dma"}` | connections에 없는 tensor의 interface → auto expose |
+| `register("wl_ctrl")` | sub-kernel의 register interface → `{sub_name}_{iface_name}` 자동 prefix |
+| `wl.wgt_mem.expose("wgt_dma")` | 자동 expose (이름 = tensor 원본명 유지, 충돌 시 `{sub_name}_{tensor_name}`) |
+| `config_map` | 파라미터 이름 매칭 자동, RTL register 이름 통일 |
+
+**`__init_subclass__`의 역할:** CompositeKernel 서브클래스 정의 시, 모든 Kernel 인스턴스 속성을
+수집하여 `_sub_kernel_refs`에 등록하고, TensorRef 접근을 위해 `__getattr__`을 설정한다.
+
+서브커널 인스턴스의 `__getattr__`이 TensorRef를 반환:
+
+```python
+# 서브커널 인스턴스에서 tensor 접근 시 TensorRef 반환
+# fmap.ifm_out → TensorRef(sub_kernel_name="fmap", tensor_name="ifm_out",
+#                           kernel_class=FmapIOKernel)
+```
+
+### 5.4 Connection 사용법 (v2)
+
+Connection 클래스는 §5.2에서 정의되었다. `>>` 연산자로 생성한다:
+
+```python
+connections = [
+    fmap.ifm_out   >> mac.ifmap,        # FmapIO → MAC
+    mac.partial_sum >> psum.psum_in,     # MAC → PSUM
+    act.quant_out  >> fmap.ofm_in,      # ActQuant → FmapIO (OFM write-back)
+]
+```
+
+connections에 등장하는 tensor의 인터페이스는 자동으로 Internal(RTL 내부 와이어, BFM 없음)로 처리된다.
+connections에 등장하지 않는 tensor의 인터페이스는 자동으로 External(BFM 생성)로 expose된다.
+
+> **v1 Internal 클래스 삭제:** v2에서는 `Internal()` 마커가 불필요하다.
+> connections 리스트에 등장 여부로 internal/external이 자동 결정된다.
+
+### 5.6 CompositeKernel (v2)
 
 ```python
 class CompositeKernel(Kernel):
     """여러 서브커널을 조합한 상위 검증 단위.
-    
-    bind()는 Kernel 베이스 클래스에 정의되어 있다 (§4.1).
-    DMAKernel.bind(...)처럼 일반 Kernel 서브클래스에서 호출된다.
+
+    v2에서는 서브커널을 Kernel 인스턴스로 직접 선언하고,
+    >> 연산자로 Connection을 기술한다. bind()/expose()는 삭제되었다.
     """
 
-    connections: list[Connect] = []
+    connections: list[Connection] = []
 
-    def bindings(self) -> list[tuple[str, SubKernelBinding]]:
-        """선언된 모든 서브커널 바인딩 반환.
-        Returns: [(name, SubKernelBinding), ...]"""
-        return [(k, v) for k, v in vars(self.__class__).items()
-                if isinstance(v, SubKernelBinding)]
+    # ── __init_subclass__에 의해 설정되는 메타데이터 ──
+    _sub_kernel_refs: dict[str, type] = {}
+    """서브커널 속성명 → Kernel 서브클래스.
+    예: {"wl": WeightLoaderKernel, "fmap": FmapIOKernel, ...}"""
 
-    def exposed_tensor_defs(self) -> list[tuple[str, ExposedTensorDef]]:
-        """expose()로 노출된 텐서 정의 반환.
-        Returns: [(name, ExposedTensorDef), ...]"""
-        return [(k, v) for k, v in vars(self.__class__).items()
-                if isinstance(v, ExposedTensorDef)]
+    _connections: list[Connection] = []
+    """>> 연산자로 선언된 내부 연결 리스트."""
+
+    _connected_tensors: set[tuple[str, str]] = set()
+    """connections에 등장하는 (sub_kernel_name, tensor_name) 집합.
+    이 집합에 포함된 텐서는 Internal(BFM 없음)로 처리된다."""
+
+    _auto_exposed: dict[tuple[str, str], str] = {}
+    """자동 expose된 텐서. (sub_kernel_name, tensor_name) → exposed_name.
+    _connected_tensors에 포함되지 않은 텐서가 자동 expose된다.
+    이름 충돌 시 "{sub_name}_{tensor_name}" 형식으로 prefix."""
 
     # ── Probe support ──
 
@@ -704,61 +690,87 @@ class CompositeKernel(Kernel):
         forward_with_intermediates() 내에서 호출."""
         self._probe_data[interface_key] = data.clone()
 
+    def forward(self, **inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Connection graph 기반 자동 forward chain.
+
+        사용자가 오버라이드 가능하지만, 대부분의 경우 자동 chain으로 충분.
+        기본 구현은 multi-round dataflow evaluation을 수행한다:
+
+        1. exposed input tensor → pool에 넣기
+        2. 각 라운드에서 available inputs가 있는 sub-kernel의 forward() 호출
+        3. connection을 통해 downstream으로 결과 전파
+        4. exposed output tensor 수집하여 반환
+        """
+        raise NotImplementedError
+
     def forward_with_intermediates(self) -> dict[str, torch.Tensor]:
         """Probe golden 데이터를 명시적으로 제공하려면 오버라이드.
-        self.probe()를 각 Internal(probe=True) 인터페이스에 호출해야 함.
-        미구현 시 Runtime이 connections DAG를 자동 순회."""
+        미구현 시 golden chain + 선언적 probes API로 자동 처리."""
         raise NotImplementedError
 ```
 
-### 5.7 전체 프록시 체인 예시
+### 5.7 전체 CompositeKernel 예시 (v2)
 
 ```python
 # ── 서브커널 정의 ──
-class DMAKernel(Kernel):
-    spec = "specs/dma.yaml"
-    src = Tensor(shape=("${SIZE}",), dtype=torch.int8, interface="axi_master")
-    dst = Tensor(shape=("${SIZE}",), dtype=torch.int8, interface="stream_out")
-    ctrl = register("ctrl_lite")
+class WeightLoaderKernel(Kernel):
+    spec = "kernels/weight_loader/kernel_spec.yaml"
+    wgt_mem = Tensor(shape=("${wgt_size}",), dtype=torch.int8, interface="wgt_dma")
+    wgt_out = Tensor(shape=("${wgt_size}",), dtype=torch.int8, interface="wgt_stream")
+    ctrl = register("wl_ctrl")
 
-# ── CompositeKernel 정의 (클래스 본문 평가 시점) ──
-class NPUTopKernel(CompositeKernel):
-    spec = "specs/npu_top.yaml"
+    def forward(self, wgt_mem) -> dict[str, torch.Tensor]:
+        return {"wgt_out": wgt_mem}  # passthrough
 
-    # Step 1: bind() → SubKernelBinding 생성
-    #   DMAKernel.bind()는 Kernel.bind()를 호출 (Issue 1 해결)
-    #   메타클래스가 _attr_name = "dma_ifm" 설정
-    dma_ifm = DMAKernel.bind(
-        interface_map={
-            "axi_master": "ddr_port",
-            "stream_out": Internal(),
-            "ctrl_lite": ("ctrl", "dma_ifm"),
-        }
-    )
+class FmapIOKernel(Kernel):
+    spec = "kernels/fmap_io/kernel_spec.yaml"
+    ifm_mem = Tensor(shape=("${in_ch}", "${in_depth}", "${in_height}", "${in_width}"),
+                     dtype=torch.int32, interface="ifm_dma")
+    ifm_out = Tensor(shape=("${in_ch}", "${in_depth}", "${in_height}", "${in_width}"),
+                     dtype=torch.int32, interface="ifm_stream")
+    ofm_in  = Tensor(shape=("${out_size}",), dtype=torch.uint8, interface="ofm_stream_in")
+    ofm_mem = Tensor(shape=("${out_size}",), dtype=torch.uint8, interface="ofm_dma")
+    ctrl = register("fmap_ctrl")
 
-    # Step 2: dma_ifm.src → SubKernelBinding.__getattr__("src")
-    #   DMAKernel에서 Tensor "src"를 찾아 TensorProxy 반환
-    #   TensorProxy(binding_attr_name="dma_ifm", tensor_name="src", ...)
+    def forward(self, ifm_mem=None, ofm_in=None) -> dict[str, torch.Tensor]:
+        result = {}
+        if ifm_mem is not None:
+            result["ifm_out"] = ifm_mem
+        if ofm_in is not None:
+            result["ofm_mem"] = ofm_in
+        return result
 
-    # Step 3: .expose(interface="ddr_port") → ExposedTensorDef 생성
-    #   ExposedTensorDef(origin_sub_kernel="dma_ifm", origin_name="src",
-    #                    top_interface="ddr_port")
-    ifm = dma_ifm.src.expose(interface="ddr_port")
+class MacAtuKernel(Kernel):
+    spec = "kernels/mac/kernel_spec.yaml"
+    ifmap  = Tensor(shape=("${mac_ifm_size}",), dtype=torch.int32, interface="ifm_in")
+    weight = Tensor(shape=("${wgt_size}",), dtype=torch.int8, interface="wgt_in")
+    partial_sum = Tensor(shape=("${psum_size}",), dtype=torch.int32, interface="psum_out")
 
-    mac = MACKernel.bind(interface_map={...})
-    dma_ofm = DMAKernel.bind(interface_map={...})
+    def forward(self, ifmap, weight) -> dict[str, torch.Tensor]:
+        return {"partial_sum": self._mac_compute(ifmap, weight)}
 
-    weight = dma_weight.src.expose(interface="ddr_port")
-    ofm = dma_ofm.dst.expose(interface="ddr_port")
+# ── CompositeKernel 정의 (v2: bind()/expose() 불필요) ──
+class NpuPipelineKernel(CompositeKernel):
+    spec = "kernels/npu_pipeline/kernel_spec.yaml"
 
-    # Step 4: Connect(dma_ifm.dst, mac.ifm) → TensorProxy 2개 받음
-    #   Connect가 내부에서 source_sub="dma_ifm", source_name="dst",
-    #   dest_sub="mac", dest_name="ifm"을 추출
+    # Step 1: 서브커널 인스턴스 선언 (bind() 삭제)
+    wl   = WeightLoaderKernel()
+    fmap = FmapIOKernel()
+    mac  = MacAtuKernel()
+
+    # Step 2: >> 연산자로 내부 연결 선언
+    #   fmap.ifm_out → TensorRef(sub_kernel_name="fmap", tensor_name="ifm_out", ...)
+    #   mac.ifmap    → TensorRef(sub_kernel_name="mac",  tensor_name="ifmap", ...)
+    #   >> 연산자가 Connection(source=..., dest=...) 생성
     connections = [
-        Connect(dma_ifm.dst, mac.ifm),
-        Connect(dma_weight.dst, mac.weight),
-        Connect(mac.ofm, dma_ofm.src),
+        wl.wgt_out    >> mac.weight,     # WeightLoader → MAC
+        fmap.ifm_out  >> mac.ifmap,      # FmapIO → MAC
     ]
+
+    # 자동 추론 결과:
+    # - wl.wgt_out, mac.weight, fmap.ifm_out, mac.ifmap → Internal (connections에 등장)
+    # - wl.wgt_mem, fmap.ifm_mem, fmap.ofm_mem, mac.partial_sum → auto expose
+    # - wl.ctrl, fmap.ctrl → register interface auto prefix ("wl_ctrl", "fmap_ctrl")
 ```
 
 ---
@@ -860,12 +872,19 @@ class RegisterField:
 
 @dataclass
 class RegisterSpec:
-    """단일 레지스터 정의."""
+    """단일 레지스터 정의 (v2: 순수 HW 맵).
+
+    v2 변경: role, alias, config_map 삭제.
+    width, pulse, access 필드 추가.
+    configure() 통합 규칙에 의해 param register 자동 처리."""
     name: str
     offset: int
+    width: int = 32                          # 레지스터 비트 폭
     fields: dict[str, str] | None = None     # {field_name: "hi:lo"}
     auto_bind: AutoBindSpec | None = None
-    interface_name: str = ""  # 소속 인터페이스 (파서가 설정)
+    pulse: bool = False                      # True이면 configure() skip, run()에서 수동
+    access: str = "rw"                       # "rw" | "ro" — ro이면 configure() skip
+    interface_name: str = ""                 # 소속 인터페이스 (파서가 설정)
 ```
 
 ### 6.5 MemoryRegion
@@ -1031,9 +1050,15 @@ class ExposedTensor:
 ```python
 @dataclass
 class ProbePoint:
-    """Internal(probe=True)인 인터페이스의 golden 데이터 컨테이너."""
-    connection: Connect
-    interface_mapping: InterfaceMapping
+    """Probe golden 데이터 컨테이너.
+
+    두 가지 생성 경로:
+    1. 선언적 probes의 내부 probe → connection 기반 (모든 Internal()에 probe BFM 자동 생성)
+    2. 출력 probe (pull_tensor probe=True) → tensor_name 기반
+    """
+    connection: Connection | None = None         # 내부 probe: 연결 정보
+    interface_mapping: InterfaceMapping | None = None
+    tensor_name: str | None = None              # 출력 probe: 텐서 이름
     golden_data: torch.Tensor | None = None
     serialized_golden: bytes | None = None
     golden_buffer_id: int | None = None
@@ -1120,7 +1145,7 @@ class FlattenedKernelView:
     interface_mappings: list[InterfaceMapping]
     exposed_tensors: dict[str, ExposedTensor]
     probe_points: list[ProbePoint]
-    connections: list[Connect]
+    connections: list[Connection]
 
     # ── 컴파일 중 설정 ──
     _top_resolver: 'ParameterResolver | None' = None
@@ -1173,8 +1198,8 @@ class FlattenedKernelView:
         raise BindingError(
             f"auto_bind references tensor '{tensor_name}' in sub-kernel "
             f"'{sub_kernel_name}', but no matching exposed tensor found. "
-            f"Ensure the tensor is exposed via .expose() in the "
-            f"CompositeKernel definition."
+            f"Ensure the tensor is not connected (appears in connections) "
+            f"and is auto-exposed in the CompositeKernel definition."
         )
 ```
 
@@ -1944,10 +1969,10 @@ vten run --test test_conv3d --config C=32
 | Terminology Hierarchy | §2 | 모든 파일 |
 | Tensor | §3 | 01, 02 |
 | RegisterHandle | §4 | 01, 02 |
-| Kernel, bind() | §5.1 | 01, 02 |
-| TensorProxy, ExposedTensorDef | §5.2 | 01, 02 |
-| SubKernelBinding | §5.3 | 01, 02 |
-| Connect, Internal | §5.4-5.5 | 01, 02 |
+| Kernel, default_params, compute_derived_params | §5.1 | 01, 02 |
+| TensorRef, Connection | §5.2 | 01, 02 |
+| Sub-kernel 선언 & 자동 추론 | §5.3 | 01, 02 |
+| Connection 사용법 | §5.4 | 01, 02 |
 | CompositeKernel | §5.6 | 01, 02 |
 | KernelSpec, InterfaceSpec | §6 | 02, 03, 04, 06 |
 | PackingScheme | §6.1 | 02, 03 |

@@ -42,7 +42,7 @@ class FmapIOStub(Kernel):
     def generate_inputs(self, seed=None):
         self.ifm.fill_random(generator=torch.Generator().manual_seed(seed or 0))
 
-    def forward(self):
+    def forward(self, **inputs):
         return self.ifm.to_float()
 
 
@@ -55,7 +55,7 @@ class BiasLoaderStub(Kernel):
     def generate_inputs(self, seed=None):
         self.bias.fill_random(generator=torch.Generator().manual_seed(seed or 0))
 
-    def forward(self):
+    def forward(self, **inputs):
         return self.bias.to_float()
 
 
@@ -71,7 +71,7 @@ class WeightLoaderStub(Kernel):
     def generate_inputs(self, seed=None):
         self.weight.fill_random(generator=torch.Generator().manual_seed(seed or 0))
 
-    def forward(self):
+    def forward(self, **inputs):
         return self.weight.to_float()
 
 

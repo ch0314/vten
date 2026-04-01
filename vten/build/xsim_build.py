@@ -38,6 +38,32 @@ from vten.spec.parser import parse_kernel_spec
 
 logger = logging.getLogger(__name__)
 
+_MAX_ERROR_LINES = 30
+
+
+def _extract_errors(stdout: str, stderr: str) -> str:
+    """Extract ERROR lines from Vivado tool output for readable diagnostics.
+
+    Returns up to _MAX_ERROR_LINES error lines from stdout/stderr,
+    showing the first errors (root cause) rather than the last N chars.
+    Falls back to last 500 chars if no ERROR lines found.
+    """
+    error_lines: list[str] = []
+    for src in (stdout, stderr):
+        if not src:
+            continue
+        for line in src.splitlines():
+            if "ERROR" in line:
+                error_lines.append(line.strip())
+    if error_lines:
+        result = "\n".join(error_lines[:_MAX_ERROR_LINES])
+        if len(error_lines) > _MAX_ERROR_LINES:
+            result += f"\n... and {len(error_lines) - _MAX_ERROR_LINES} more errors (see log file)"
+        return result
+    # Fallback: no ERROR keyword found — show tail
+    combined = stdout or stderr or "(no output)"
+    return combined[-500:]
+
 
 # ── Split interface expansion ──
 
@@ -176,6 +202,11 @@ class XsimBuildPipeline(BuildPipeline):
             self._update_kernel_cache(kernel_name, stage, kernel_dir)
         else:
             raise BuildError(f"Unknown stage: {stage}")
+
+    def _clean_project(self) -> None:
+        """Override: also reset in-memory cache."""
+        super()._clean_project()
+        self._cache.clear()
 
     def build(self, **kwargs) -> None:
         """Override to save cache after build."""
@@ -546,8 +577,11 @@ class XsimBuildPipeline(BuildPipeline):
                         if fpath not in seen_files:
                             merged_lines.append(line)
                             seen_files.add(fpath)
-                else:
-                    gen_dir = self._project / "kernels" / sname / "build" / "generated"
+
+                # Always include generated wrapper/axilite files
+                # (compile.prj from resolve_order.tcl doesn't include them)
+                gen_dir = self._project / "kernels" / sname / "build" / "generated"
+                if gen_dir.exists():
                     for sv_file in sorted(gen_dir.glob("*.sv")):
                         if sv_file.name == "tb_top.sv":
                             continue
@@ -607,7 +641,8 @@ class XsimBuildPipeline(BuildPipeline):
             logger.debug("xvlog stdout:\n%s", result.stdout)
             logger.debug("xvlog stderr:\n%s", result.stderr)
             logger.error("xvlog log: %s", log_dir / "xvlog.log")
-            raise BuildError(f"xvlog failed:\n{result.stderr[-500:]}")
+            detail = _extract_errors(result.stdout, result.stderr)
+            raise BuildError(f"xvlog failed:\n{detail}")
 
         # Compile glbl.v if backend.xsim.glbl is set (Xilinx primitive library support)
         xsim_cfg = self._config.get("backend", {}).get("xsim", {})
@@ -628,7 +663,8 @@ class XsimBuildPipeline(BuildPipeline):
             )
             if result.returncode != 0:
                 logger.debug("xvlog glbl stderr:\n%s", result.stderr)
-                raise BuildError(f"xvlog glbl.v failed:\n{result.stderr[-500:]}")
+                detail = _extract_errors(result.stdout, result.stderr)
+                raise BuildError(f"xvlog glbl.v failed:\n{detail}")
 
         # Determine elab top from compile.prj
         elab_top = "tb_top"
@@ -680,7 +716,7 @@ class XsimBuildPipeline(BuildPipeline):
             logger.debug("xelab stdout:\n%s", result.stdout)
             logger.debug("xelab stderr:\n%s", result.stderr)
             logger.error("xelab log: %s", log_dir / "xelab.log")
-            detail = result.stdout[-500:] if result.stdout else result.stderr[-500:]
+            detail = _extract_errors(result.stdout, result.stderr)
             raise BuildError(f"xelab failed:\n{detail}")
 
         # Clean up stray vivado/xsim files from build dir
