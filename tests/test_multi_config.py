@@ -15,7 +15,7 @@ import torch
 
 from vten.kernel.base import Kernel
 from vten.kernel.tensor import Tensor
-from vten.runtime.context import BatchResult, ExecutionContext
+from vten.runtime.context import ExecutionContext, ExecutionResult
 from vten.spec.models import (
     InterfaceSpec,
     KernelSpec,
@@ -288,7 +288,7 @@ class TestConfigBoundary:
                 )
                 compiled = engine.compile(target="sim")
             compiled_results.append(compiled)
-            return BatchResult(status="DONE")
+            return ExecutionResult(status="DONE")
 
         from unittest.mock import patch
 
@@ -333,7 +333,7 @@ class TestConfigBoundary:
                 )
                 compiled = engine.compile(target="sim")
             compiled_results.append(compiled)
-            return BatchResult(status="DONE")
+            return ExecutionResult(status="DONE")
 
         from unittest.mock import patch
 

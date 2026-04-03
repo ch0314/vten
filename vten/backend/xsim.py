@@ -155,6 +155,11 @@ class XsimBackend(SimBackend):
             )
         except FileNotFoundError:
             from vten.errors import BackendError
+            if not os.path.isdir(xsim_cwd):
+                raise BackendError(
+                    f"build directory not found: {xsim_cwd}\n"
+                    f"Run 'vten build' first to compile the simulation snapshot"
+                )
             raise BackendError(
                 f"xsim not found: {xsim_bin}\n"
                 f"Check that Vivado is installed and "

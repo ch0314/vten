@@ -80,10 +80,15 @@ class TestScenario:
 
             if kernel_file.exists():
                 mod_name = f"_vten_kernel_{self.kernel}"
-                # Add parent dir to sys.path for imports within the kernel
+                # Add kernel dir and kernels base to sys.path so that
+                # both intra-kernel and sibling-kernel imports resolve
+                # (e.g., CompositeKernel importing sub-kernel modules).
                 parent = str(kernel_file.parent)
                 if parent not in sys.path:
                     sys.path.insert(0, parent)
+                kernels_base = str(kernel_file.parent.parent)
+                if kernels_base not in sys.path:
+                    sys.path.insert(0, kernels_base)
 
                 spec = importlib.util.spec_from_file_location(
                     mod_name, kernel_file,
@@ -537,6 +542,11 @@ def _run_single_test(
                 if "build_params" not in cfg and "build_params" in config:
                     cfg["build_params"] = config["build_params"]
 
+                # Propagate project-level paths into per-config params
+                for _pk in ("_project_dir", "_kernel_build_dir"):
+                    if _pk in config and _pk not in cfg:
+                        cfg[_pk] = config[_pk]
+
                 ctx = ExecutionContext(
                     backend=backend_inst,
                     project_params=cfg,
@@ -658,10 +668,11 @@ def _run_single_test(
                 backend_inst.shutdown()
             except Exception:
                 pass
-            try:
-                backend_inst.cleanup()
-            except Exception:
-                pass
+        # Always cleanup (releases XRT resources, removes hw_emu .run/<PID>)
+        try:
+            backend_inst.cleanup()
+        except Exception:
+            pass
 
     logger.info("result: %s (%d/%d configs passed)", status, configs_passed, len(run_cfgs))
 
@@ -743,6 +754,12 @@ def run_test(
     if not spec_path.exists() and not is_composite_kernel(kernel_dir):
         raise VTenError(f"kernel_spec.yaml not found: {spec_path}")
 
+    # Add kernels base to sys.path so test files can import shared modules
+    # (e.g., model_configs.py, _common.py) from the kernels/ directory.
+    kernels_base = str(kernel_dir.parent)
+    if kernels_base not in sys.path:
+        sys.path.insert(0, kernels_base)
+
     # Test discovery
     tests_dir = kernel_dir / "tests"
     if test_name:
@@ -769,10 +786,18 @@ def run_test(
     backend_name = resolve_backend_name(config, cli_backend=backend)
     backend_inst = get_backend(backend_name, config)
 
-    # Change to project directory so relative paths in kernel specs resolve correctly
+    # Change CWD so relative paths resolve correctly.
+    # For XRT backend, use kernel build/xrt/ to contain runtime artifacts
+    # (emconfig.json, device_trace, run_summary, etc.) that XRT dumps to CWD.
+    # For sim backends, use project root for kernel_spec relative paths.
     import os
     prev_cwd = os.getcwd()
-    os.chdir(str(project))
+    if backend_name == "xrt":
+        xrt_cwd = kernel_dir / "build" / "xrt"
+        xrt_cwd.mkdir(parents=True, exist_ok=True)
+        os.chdir(str(xrt_cwd))
+    else:
+        os.chdir(str(project))
     try:
         for test_idx, (scenario_name, scenario) in enumerate(scenarios, 1):
             logger.info("")

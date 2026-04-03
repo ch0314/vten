@@ -3,8 +3,7 @@
 Verifies:
 1. Backend session protocol (open/submit/wait/close)
 2. ExecutionContext session-aware run()
-3. KernelExecutor session reuse + close()
-4. Backward compatibility (execute() still works)
+3. Backward compatibility (execute() still works)
 """
 
 from __future__ import annotations
@@ -16,10 +15,9 @@ import pytest
 import torch
 
 from vten.backend.base import Backend, BackendResult
-from vten.functional import KernelExecutor, run_kernel
 from vten.kernel.base import Kernel
 from vten.kernel.tensor import Tensor
-from vten.runtime.context import BatchResult, ExecutionContext
+from vten.runtime.context import ExecutionContext, ExecutionResult
 from vten.spec.models import (
     InterfaceSpec,
     KernelSpec,
@@ -241,63 +239,3 @@ class TestBackwardCompat:
         assert result.status == "DONE"
 
 
-# ── KernelExecutor session tests ──
-
-
-class TestKernelExecutorSession:
-
-    def test_executor_opens_session_on_first_call(self):
-        """KernelExecutor opens session on first call."""
-        backend = MockSessionBackend()
-        npu = KernelExecutor(StreamKernel, backend=backend, spec=_stream_spec(),
-                             params={"N": 32})
-        x = torch.zeros(32, dtype=torch.int8)
-        npu(data_in=x)
-
-        assert "open_session" in backend.calls
-        assert npu._session_open is True
-
-    def test_executor_submits_batch_on_second_call(self):
-        """KernelExecutor submits batch (not open) on subsequent calls."""
-        backend = MockSessionBackend()
-        npu = KernelExecutor(StreamKernel, backend=backend, spec=_stream_spec(),
-                             params={"N": 32})
-
-        npu(data_in=torch.zeros(32, dtype=torch.int8))
-        npu(data_in=torch.ones(32, dtype=torch.int8))
-
-        assert backend.calls.count("open_session") == 1
-        assert backend.calls.count("submit_batch") == 1
-        assert backend.calls.count("wait_batch") == 2
-
-    def test_executor_close(self):
-        """KernelExecutor.close() closes the session."""
-        backend = MockSessionBackend()
-        npu = KernelExecutor(StreamKernel, backend=backend, spec=_stream_spec(),
-                             params={"N": 32})
-        npu(data_in=torch.zeros(32, dtype=torch.int8))
-        npu.close()
-
-        assert "close_session" in backend.calls
-        assert npu._session_open is False
-
-    def test_executor_context_manager(self):
-        """KernelExecutor works as context manager."""
-        backend = MockSessionBackend()
-        with KernelExecutor(StreamKernel, backend=backend, spec=_stream_spec(),
-                            params={"N": 32}) as npu:
-            npu(data_in=torch.zeros(32, dtype=torch.int8))
-            npu(data_in=torch.ones(32, dtype=torch.int8))
-
-        assert "close_session" in backend.calls
-        assert backend.calls.count("open_session") == 1
-        assert backend.calls.count("submit_batch") == 1
-        assert backend.calls.count("wait_batch") == 2
-
-    def test_executor_close_without_calls(self):
-        """close() on unused executor is safe."""
-        backend = MockSessionBackend()
-        npu = KernelExecutor(StreamKernel, backend=backend, spec=_stream_spec(),
-                             params={"N": 32})
-        npu.close()  # No calls made, no session to close
-        assert "close_session" not in backend.calls

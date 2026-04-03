@@ -1,8 +1,7 @@
-"""xsim E2E tests for Functional API, Multi-Config, Multi-Batch Session.
+"""xsim E2E tests for Multi-Config and Multi-Batch Session.
 
-Category D: Functional API (run_kernel / KernelExecutor) with real xsim backend
 Category E: Multi-invocation (single-batch multi-config + multi-batch session)
-Category F: Edge cases (broken passthrough, tensor size boundaries)
+Category F: Edge cases (broken passthrough)
 
 Requires xsim (Vivado simulator) to be available.
 Run with: pytest tests/test_xsim_e2e.py -v -m xsim
@@ -21,7 +20,6 @@ import torch
 from vten.backend.registry import get_backend, resolve_backend_name
 from vten.cli.config import load_project_config
 from vten.errors import VerificationError
-from vten.functional import KernelExecutor, run_kernel
 from vten.runtime.context import ExecutionContext
 from vten.spec.parser import parse_kernel_spec
 
@@ -66,23 +64,6 @@ def _get_passthrough_kernel(project: Path):
     return PassthroughKernel
 
 
-def _get_narrow8_kernel(project: Path):
-    _add_kernel_path(project / "kernels" / "narrow8")
-    from narrow8_kernel import Narrow8Kernel
-    return Narrow8Kernel
-
-
-def _get_wide512_kernel(project: Path):
-    _add_kernel_path(project / "kernels" / "wide512")
-    from wide512_kernel import Wide512Kernel
-    return Wide512Kernel
-
-
-def _get_unaligned_kernel(project: Path):
-    _add_kernel_path(project / "kernels" / "unaligned")
-    from unaligned_kernel import UnalignedKernel
-    return UnalignedKernel
-
 
 def _get_broken_passthrough_kernel(project: Path):
     _add_kernel_path(project / "kernels" / "broken_passthrough")
@@ -94,120 +75,6 @@ def _get_scale_add_kernel(project: Path):
     _add_kernel_path(project / "kernels" / "scale_add")
     from scale_add_kernel import ScaleAddKernel
     return ScaleAddKernel
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Category D: Functional API xsim E2E
-# ═══════════════════════════════════════════════════════════════════
-
-
-class TestRunKernel:
-    """D1: run_kernel() one-shot with real xsim backend."""
-
-    @pytest.mark.xsim
-    def test_run_kernel_passthrough(self):
-        """D1.1: Basic passthrough via run_kernel() — 256-bit bus."""
-        project, config, backend = _load_passthrough_env()
-        spec = parse_kernel_spec(project / "kernels" / "passthrough" / "kernel_spec.yaml")
-        KernelClass = _get_passthrough_kernel(project)
-
-        prev_cwd = os.getcwd()
-        os.chdir(str(project))
-        try:
-            x = torch.randint(-128, 127, (1024,), dtype=torch.int8)
-            outputs = run_kernel(
-                KernelClass, {"data_in": x},
-                backend=backend, spec=spec, params={"N": 1024},
-            )
-            assert torch.equal(outputs["data_out"], x)
-        finally:
-            os.chdir(prev_cwd)
-            backend.cleanup()
-
-    @pytest.mark.xsim
-    def test_run_kernel_narrow8(self):
-        """D1.2: Narrowest bus width (8-bit, 1 element/beat)."""
-        project, config, backend = _load_passthrough_env()
-        spec = parse_kernel_spec(project / "kernels" / "narrow8" / "kernel_spec.yaml")
-        KernelClass = _get_narrow8_kernel(project)
-
-        prev_cwd = os.getcwd()
-        os.chdir(str(project))
-        try:
-            x = torch.randint(-128, 127, (512,), dtype=torch.int8)
-            outputs = run_kernel(
-                KernelClass, {"data_in": x},
-                backend=backend, spec=spec, params={"N": 512},
-            )
-            assert torch.equal(outputs["data_out"], x)
-        finally:
-            os.chdir(prev_cwd)
-            backend.cleanup()
-
-    @pytest.mark.xsim
-    def test_run_kernel_wide512(self):
-        """D1.3: Widest bus (512-bit, 64 elements/beat)."""
-        project, config, backend = _load_passthrough_env()
-        spec = parse_kernel_spec(project / "kernels" / "wide512" / "kernel_spec.yaml")
-        KernelClass = _get_wide512_kernel(project)
-
-        prev_cwd = os.getcwd()
-        os.chdir(str(project))
-        try:
-            x = torch.randint(-128, 127, (1024,), dtype=torch.int8)
-            outputs = run_kernel(
-                KernelClass, {"data_in": x},
-                backend=backend, spec=spec, params={"N": 1024},
-            )
-            assert torch.equal(outputs["data_out"], x)
-        finally:
-            os.chdir(prev_cwd)
-            backend.cleanup()
-
-    @pytest.mark.xsim
-    def test_run_kernel_unaligned(self):
-        """D1.4: Non-beat-aligned tensor (N=100 on 256-bit bus)."""
-        project, config, backend = _load_passthrough_env()
-        spec = parse_kernel_spec(project / "kernels" / "unaligned" / "kernel_spec.yaml")
-        KernelClass = _get_unaligned_kernel(project)
-
-        prev_cwd = os.getcwd()
-        os.chdir(str(project))
-        try:
-            x = torch.randint(-128, 127, (100,), dtype=torch.int8)
-            outputs = run_kernel(
-                KernelClass, {"data_in": x},
-                backend=backend, spec=spec, params={"N": 100},
-            )
-            assert torch.equal(outputs["data_out"], x)
-        finally:
-            os.chdir(prev_cwd)
-            backend.cleanup()
-
-
-class TestKernelExecutorSingle:
-    """D3: KernelExecutor single-call with real xsim backend."""
-
-    @pytest.mark.xsim
-    def test_executor_single_passthrough(self):
-        """D3.1: KernelExecutor single call — same as run_kernel but via executor."""
-        project, config, backend = _load_passthrough_env()
-        spec = parse_kernel_spec(project / "kernels" / "passthrough" / "kernel_spec.yaml")
-        KernelClass = _get_passthrough_kernel(project)
-
-        prev_cwd = os.getcwd()
-        os.chdir(str(project))
-        try:
-            npu = KernelExecutor(
-                KernelClass, backend=backend, spec=spec, params={"N": 1024},
-            )
-            x = torch.randint(-128, 127, (1024,), dtype=torch.int8)
-            outputs = npu(data_in=x)
-            assert torch.equal(outputs["data_out"], x)
-            npu.close()
-        finally:
-            os.chdir(prev_cwd)
-            backend.cleanup()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -371,85 +238,6 @@ class TestMultiBatchSessionE2E:
                 pass
 
     @pytest.mark.xsim
-    def test_session_executor_2call(self):
-        """E2.2: KernelExecutor context manager with 2 sequential calls."""
-        project, config, backend = _load_passthrough_env()
-        spec = parse_kernel_spec(project / "kernels" / "passthrough" / "kernel_spec.yaml")
-        KernelClass = _get_passthrough_kernel(project)
-
-        prev_cwd = os.getcwd()
-        os.chdir(str(project))
-        try:
-            with KernelExecutor(
-                KernelClass, backend=backend, spec=spec, params={"N": 1024},
-            ) as npu:
-                x1 = torch.randint(-128, 127, (1024,), dtype=torch.int8)
-                y1 = npu(data_in=x1)["data_out"]
-                assert torch.equal(y1, x1)
-
-                x2 = torch.randint(-128, 127, (1024,), dtype=torch.int8)
-                y2 = npu(data_in=x2)["data_out"]
-                assert torch.equal(y2, x2)
-        finally:
-            os.chdir(prev_cwd)
-            try:
-                backend.cleanup()
-            except Exception:
-                pass
-
-    @pytest.mark.xsim
-    def test_session_different_data(self):
-        """E2.3: Multi-batch with different random data each batch."""
-        project, config, backend = _load_passthrough_env()
-        spec = parse_kernel_spec(project / "kernels" / "passthrough" / "kernel_spec.yaml")
-        KernelClass = _get_passthrough_kernel(project)
-
-        prev_cwd = os.getcwd()
-        os.chdir(str(project))
-        try:
-            with KernelExecutor(
-                KernelClass, backend=backend, spec=spec, params={"N": 1024},
-            ) as npu:
-                for seed in [1, 2, 3, 4, 5]:
-                    rng = torch.Generator().manual_seed(seed)
-                    x = torch.randint(-128, 127, (1024,), dtype=torch.int8, generator=rng)
-                    y = npu(data_in=x)["data_out"]
-                    assert torch.equal(y, x), f"Mismatch at seed={seed}"
-        finally:
-            os.chdir(prev_cwd)
-            try:
-                backend.cleanup()
-            except Exception:
-                pass
-
-    @pytest.mark.xsim
-    def test_session_cross_batch_alias(self):
-        """E2.4: Output from batch 1 passed as input to batch 2 (auto-alias)."""
-        project, config, backend = _load_passthrough_env()
-        spec = parse_kernel_spec(project / "kernels" / "passthrough" / "kernel_spec.yaml")
-        KernelClass = _get_passthrough_kernel(project)
-
-        prev_cwd = os.getcwd()
-        os.chdir(str(project))
-        try:
-            with KernelExecutor(
-                KernelClass, backend=backend, spec=spec, params={"N": 1024},
-            ) as npu:
-                x = torch.randint(-128, 127, (1024,), dtype=torch.int8)
-                y1 = npu(data_in=x)["data_out"]
-                assert torch.equal(y1, x)
-
-                # Pass output as input — triggers auto-alias (buffer reuse)
-                y2 = npu(data_in=y1)["data_out"]
-                assert torch.equal(y2, x)  # passthrough: output == input
-        finally:
-            os.chdir(prev_cwd)
-            try:
-                backend.cleanup()
-            except Exception:
-                pass
-
-    @pytest.mark.xsim
     def test_session_growing_tensor_sizes(self):
         """E2.6: Multi-batch with increasing tensor sizes triggers SHM resize.
 
@@ -486,31 +274,6 @@ class TestMultiBatchSessionE2E:
             except Exception:
                 pass
 
-    @pytest.mark.xsim
-    def test_session_executor_close(self):
-        """E2.5: Open session, execute once, close cleanly."""
-        project, config, backend = _load_passthrough_env()
-        spec = parse_kernel_spec(project / "kernels" / "passthrough" / "kernel_spec.yaml")
-        KernelClass = _get_passthrough_kernel(project)
-
-        prev_cwd = os.getcwd()
-        os.chdir(str(project))
-        try:
-            npu = KernelExecutor(
-                KernelClass, backend=backend, spec=spec, params={"N": 1024},
-            )
-            x = torch.randint(-128, 127, (1024,), dtype=torch.int8)
-            y = npu(data_in=x)["data_out"]
-            assert torch.equal(y, x)
-            assert npu._session_open is True
-            npu.close()
-            assert npu._session_open is False
-        finally:
-            os.chdir(prev_cwd)
-            try:
-                backend.cleanup()
-            except Exception:
-                pass
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -591,42 +354,3 @@ class TestEdgeCases:
             except Exception:
                 pass
 
-    @pytest.mark.xsim
-    def test_small_tensor_n32(self):
-        """F3: Minimum tensor size (N=32, exactly 1 beat on 256-bit bus)."""
-        project, config, backend = _load_passthrough_env()
-        spec = parse_kernel_spec(project / "kernels" / "passthrough" / "kernel_spec.yaml")
-        KernelClass = _get_passthrough_kernel(project)
-
-        prev_cwd = os.getcwd()
-        os.chdir(str(project))
-        try:
-            x = torch.randint(-128, 127, (32,), dtype=torch.int8)
-            outputs = run_kernel(
-                KernelClass, {"data_in": x},
-                backend=backend, spec=spec, params={"N": 32},
-            )
-            assert torch.equal(outputs["data_out"], x)
-        finally:
-            os.chdir(prev_cwd)
-            backend.cleanup()
-
-    @pytest.mark.xsim
-    def test_large_tensor_n4096(self):
-        """F4: Large tensor (N=4096, 128 beats on 256-bit bus)."""
-        project, config, backend = _load_passthrough_env()
-        spec = parse_kernel_spec(project / "kernels" / "passthrough" / "kernel_spec.yaml")
-        KernelClass = _get_passthrough_kernel(project)
-
-        prev_cwd = os.getcwd()
-        os.chdir(str(project))
-        try:
-            x = torch.randint(-128, 127, (4096,), dtype=torch.int8)
-            outputs = run_kernel(
-                KernelClass, {"data_in": x},
-                backend=backend, spec=spec, params={"N": 4096},
-            )
-            assert torch.equal(outputs["data_out"], x)
-        finally:
-            os.chdir(prev_cwd)
-            backend.cleanup()

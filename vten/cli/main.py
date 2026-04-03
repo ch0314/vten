@@ -46,6 +46,8 @@ def main(argv: list[str] | None = None) -> None:
     build_parser.add_argument("--clean", action="store_true",
                               help="Remove build artifacts before building")
     build_parser.add_argument("--skip-compile", action="store_true", help="Run codegen only")
+    build_parser.add_argument("-v", "--verbose", action="store_true",
+                              dest="build_verbose", help="Verbose output (DEBUG level)")
     build_parser.add_argument("--config", nargs="*", help="Config overrides (K=V)")
 
     # vten run
@@ -121,6 +123,8 @@ def _dispatch(args: argparse.Namespace, log_level: str) -> None:
 
     elif args.command == "build":
         from vten.cli.build import build_project
+        if getattr(args, "build_verbose", False) and log_level != "DEBUG":
+            setup_logging(level="DEBUG", log_file=args.log_file)
         overrides = {}
         if args.config:
             for item in args.config:
