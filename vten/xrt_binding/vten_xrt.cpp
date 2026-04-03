@@ -44,12 +44,27 @@ PYBIND11_MODULE(vten_xrt, m) {
             return static_cast<bool>(u);
         });
 
+    // ── xrt::xclbin::ip ──
+    py::class_<xrt::xclbin::ip>(m, "xclbin_ip")
+        .def("get_name", &xrt::xclbin::ip::get_name,
+            "Get IP/CU name (e.g., 'weight_loader:weight_loader_1')");
+
+    // ── xrt::xclbin::kernel ──
+    py::class_<xrt::xclbin::kernel>(m, "xclbin_kernel")
+        .def("get_name", &xrt::xclbin::kernel::get_name,
+            "Get kernel name")
+        .def("get_cus",
+            py::overload_cast<>(&xrt::xclbin::kernel::get_cus, py::const_),
+            "Get list of compute units (xclbin_ip objects)");
+
     // ── xrt::xclbin ──
     py::class_<xrt::xclbin>(m, "xclbin")
         .def(py::init<const std::string&>(), py::arg("fnm"),
             "Load xclbin from file path")
         .def("get_uuid", &xrt::xclbin::get_uuid,
-            "Get UUID of the xclbin");
+            "Get UUID of the xclbin")
+        .def("get_kernels", &xrt::xclbin::get_kernels,
+            "Get list of kernels in the xclbin");
 
     // ── xrt::device ──
     py::class_<xrt::device>(m, "device")

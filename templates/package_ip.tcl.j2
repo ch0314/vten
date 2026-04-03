@@ -20,6 +20,11 @@ create_project package_ip $project_dir/package_ip_proj -force{{ " -part " ~ part
 add_files $project_root/{{ src }}
 {% endfor %}
 
+{% if include_dirs %}
+# Set include directories for headers (.svh, .vh)
+set_property include_dirs [list{% for inc_dir in include_dirs %} $project_root/{{ inc_dir }}{% endfor %}] [current_fileset]
+{% endif %}
+
 # Add codegen-generated files (wrapper + axilite controller)
 {% for gen_file in generated_files %}
 add_files $project_dir/{{ gen_file }}
@@ -90,6 +95,10 @@ if {$ctrl_map ne ""} {
 set_property xpm_libraries {XPM_MEMORY XPM_FIFO} [ipx::current_core]
 set_property sdx_kernel true [ipx::current_core]
 set_property sdx_kernel_type rtl [ipx::current_core]
+{% if ctrl_protocol == "user_managed" %}
+set_property ipi_drc {ignore_freq_hz true} [ipx::current_core]
+set_property vitis_drc {ctrl_protocol user_managed} [ipx::current_core]
+{% endif %}
 
 set_property core_revision 2 [ipx::current_core]
 ipx::create_xgui_files [ipx::current_core]

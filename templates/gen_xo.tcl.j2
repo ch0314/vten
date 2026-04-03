@@ -11,6 +11,7 @@ if {[file exists "$script_dir/{{ kernel_name }}.xo"]} {
 package_xo -xo_path $script_dir/{{ kernel_name }}.xo \
     -kernel_name {{ kernel_name }} \
     -ip_directory $script_dir/ip_repo \
-    -kernel_xml $script_dir/kernel.xml
+    -kernel_xml $script_dir/kernel.xml \
+    -ctrl_protocol {{ ctrl_protocol }}
 
 puts "XO generated: $script_dir/{{ kernel_name }}.xo"

@@ -10,7 +10,7 @@
 {% elif iface.protocol == "axi4_lite" %}
       <port name="{{ iface.ext_port }}" mode="slave" range="0x{{ '%04X' | format(iface.addr_range | default(4096)) }}" dataWidth="{{ iface.data_width | default(32) }}" portType="addressable" base="0x0"/>
 {% elif iface.protocol == "axi4_stream" %}
-      <port name="{{ iface.ext_port }}" mode="{{ 'read_only' if iface.direction == 'input' else 'write_only' }}" dataWidth="{{ iface.data_width | default(256) }}"/>
+      <port name="{{ iface.ext_port }}" mode="{{ 'read_only' if iface.direction == 'input' else 'write_only' }}" dataWidth="{{ iface.data_width | default(256) }}" portType="stream"/>
 {% endif %}
 {% endfor %}
     </ports>

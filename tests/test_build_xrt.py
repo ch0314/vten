@@ -77,8 +77,8 @@ class TestXrtBuildPipelineInit:
     def test_stages_returns_correct_list(self, pipeline: XrtBuildPipeline) -> None:
         expected = [
             "gen_codegen", "gen_xrt_packaging",
-            "package_ip", "gen_xo", "vpp_link",
-            "validate",
+            "package_ip", "gen_xo", "gen_link_config",
+            "vpp_link", "validate",
         ]
         assert pipeline.stages() == expected
 

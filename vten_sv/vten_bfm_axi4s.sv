@@ -176,7 +176,9 @@ module vten_bfm_axi4s #(
                         // Don't signal error — let user resume and observe more mismatches
                         $display("[PROBE MISMATCH] cycle=%0d beat=%0d cmd_id=%0d — $stop for inspection",
                                  cycle_count, beat_count, current_cmd.cmd_id);
+`ifndef VERILATOR
                         $stop;
+`endif
                     end else begin
                         // Batch mode: early abort — signal error to scheduler
                         s_tready <= 1'b0;

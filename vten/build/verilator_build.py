@@ -48,6 +48,14 @@ class VerilatorBuildPipeline(BuildPipeline):
         self._vten_sv_dir = self._vten_root / "vten_sv"
         self._cache = load_cache(project / "build" / ".cache.json")
 
+        # Vivado path for UNISIM/XPM library resolution
+        self._vivado_path = veri_cfg.get("vivado_path", "")
+        if not self._vivado_path:
+            # Fallback: try xsim backend config
+            self._vivado_path = (
+                config.get("backend", {}).get("xsim", {}).get("vivado_path", "")
+            )
+
     def stages(self) -> list[str]:
         return list(self._STAGES)
 
@@ -163,11 +171,18 @@ class VerilatorBuildPipeline(BuildPipeline):
         # Collect all SV source files
         sv_files = sorted(self._vten_sv_dir.glob("*.sv"))
 
-        # RTL sources from project config
+        # RTL sources from project config, excluding Vivado IP directories
         rtl_patterns = self._config.get("rtl", {}).get("sources", [])
         rtl_files: list[Path] = []
         for pat in rtl_patterns:
-            rtl_files.extend(sorted(self._project.glob(pat)))
+            for f in sorted(self._project.glob(pat)):
+                # Exclude files under build/ip/ (Vivado-generated, may be encrypted)
+                try:
+                    f.relative_to(self._project / "build" / "ip")
+                    continue  # skip Vivado IP files
+                except ValueError:
+                    pass
+                rtl_files.append(f)
 
         # DPI-C wrapper
         dpi_cpp = self._vten_sv_dir / "vten_shm_bridge_verilator.cpp"
@@ -186,10 +201,55 @@ class VerilatorBuildPipeline(BuildPipeline):
             "-Wno-TIMESCALEMOD",
         ]
 
+        # RTL include directories from project config
+        include_dirs = self._config.get("rtl", {}).get("include_dirs", [])
+        for inc_dir in include_dirs:
+            inc_path = self._project / inc_dir
+            if inc_path.is_dir():
+                cmd.append("-I" + str(inc_path))
+
         if self._trace:
             cmd.append("--trace")
 
         cmd.extend(self._extra_args)
+
+        # ── IP simulation models ──
+        # Priority: 1) project sim_models/, 2) framework vten_sv/verilator/
+        # Project-level sim_models override framework defaults (same module name wins)
+        verilator_cfg = self._config.get("backend", {}).get("verilator", {})
+        sim_models_rel = verilator_cfg.get("sim_models", "sim_models")
+        project_sim_models = self._project / sim_models_rel
+        framework_sim_models = self._vten_sv_dir / "verilator"
+
+        # Collect sim model files: project overrides framework
+        sim_model_files: list[Path] = []
+        project_model_names: set[str] = set()
+
+        if project_sim_models.is_dir():
+            for f in sorted(project_sim_models.glob("*.v")):
+                sim_model_files.append(f)
+                project_model_names.add(f.stem)
+                logger.info("  sim_model (project): %s", f.name)
+            for f in sorted(project_sim_models.glob("*.sv")):
+                sim_model_files.append(f)
+                project_model_names.add(f.stem)
+                logger.info("  sim_model (project): %s", f.name)
+
+        if framework_sim_models.is_dir():
+            for f in sorted(framework_sim_models.glob("*.v")):
+                if f.stem not in project_model_names:
+                    sim_model_files.append(f)
+                    logger.info("  sim_model (framework): %s", f.name)
+            for f in sorted(framework_sim_models.glob("*.sv")):
+                if f.stem not in project_model_names:
+                    sim_model_files.append(f)
+                    logger.info("  sim_model (framework): %s", f.name)
+
+        for f in sim_model_files:
+            cmd.append(str(f))
+
+        # Suppress warnings common in IP behavioral models
+        cmd.extend(["-Wno-PINMISSING", "-Wno-UNOPTFLAT"])
 
         # Add source files: all generated SV (tb_top, wrapper, controller)
         gen_dir = kernel_dir / "build" / "generated"
@@ -209,6 +269,7 @@ class VerilatorBuildPipeline(BuildPipeline):
         cmd.extend(["-CFLAGS", f"-I{self._vten_sv_dir} -fcoroutines"])
         cmd.extend(["-LDFLAGS", "-lrt -lpthread"])
 
+        logger.debug("verilator cmd: %s", " ".join(cmd))
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -216,7 +277,7 @@ class VerilatorBuildPipeline(BuildPipeline):
             cwd=str(build_dir),
         )
         if result.returncode != 0:
-            detail = result.stderr[-1000:] if result.stderr else result.stdout[-1000:]
+            detail = result.stderr[-2000:] if result.stderr else result.stdout[-2000:]
             raise BuildError(f"verilator failed:\n{detail}")
 
         logger.info("  done")

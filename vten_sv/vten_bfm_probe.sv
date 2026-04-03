@@ -78,7 +78,9 @@ module vten_bfm_axi4s_probe #(
                 if (vten_read_flags() & 8) begin
                     $display("[PROBE %0d] $stop at cycle %0d beat %0d — inspect waveform",
                              PROBE_INDEX, cycle_count, beat_count);
+`ifndef VERILATOR
                     $stop;
+`endif
                 end
             end
 

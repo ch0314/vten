@@ -44,10 +44,31 @@ set_property -dict [list CONFIG.{{ prop }} {{ val }}] [get_ips {{ ip.name }}]
 add_files {{ xci }}
 {% endfor %}
 
-# 5-c) 시뮬레이션 소스 생성
+# 5-c) IP 합성 체크포인트 + 시뮬레이션 소스 생성
 {% if ip_sources or ip_create %}
-generate_target simulation [get_ips *]
+foreach ip_inst [get_ips *] {
+    set ip_file [get_files -of_objects $ip_inst -filter {FILE_TYPE == IP}]
+    if {$ip_file ne ""} {
+        set_property generate_synth_checkpoint true $ip_file
+    }
+}
+generate_target all [get_ips *]
 {% endif %}
+
+# 5-d) Verilator용 sim_netlist 생성
+#      합성된 IP를 UNISIM primitive 기반 넷리스트로 export
+file mkdir $project_root/build/ip_sim_netlist
+foreach ip_inst [get_ips *] {
+    set ip_name [get_property NAME $ip_inst]
+    set netlist_path "$project_root/build/ip_sim_netlist/${ip_name}_sim_netlist.v"
+    if {[catch {
+        open_checkpoint [get_property DCP_FILE $ip_inst]
+        write_verilog -mode funcsim $netlist_path -force
+        close_design
+    } err]} {
+        puts "WARNING: sim_netlist generation failed for $ip_name: $err"
+    }
+}
 
 # 6) 종료
 close_project
