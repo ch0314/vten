@@ -83,8 +83,7 @@ interfaces:
 ### 2.2 Kernel 클래스
 
 ```python
-from vten.kernel.base import Kernel
-from vten.kernel.tensor import Tensor
+from vten import Kernel, Tensor  # 통합 import
 
 class PassthroughKernel(Kernel):
     spec = "kernels/passthrough/kernel_spec.yaml"
@@ -110,7 +109,7 @@ class PassthroughKernel(Kernel):
 여러 서브 커널을 하나의 RTL top에 **공간적(spatial)**으로 합성한다.
 
 ```python
-from vten.kernel.composite import CompositeKernel
+from vten import CompositeKernel
 
 class NPUTopKernel(CompositeKernel):
     spec = "kernels/npu_top/kernel_spec.yaml"
@@ -438,7 +437,7 @@ my_project/
 **TestScenario 방식** (CLI `vten run` 사용 시):
 
 ```python
-from vten.cli.run import TestScenario
+from vten import TestScenario
 
 class TestPassthrough(TestScenario):
     kernel = "passthrough"
@@ -639,16 +638,28 @@ $ vten report
 
 ## 8. API Quick Reference
 
+### Import
+
+```python
+# 모든 사용자 API는 from vten import ... 한 줄로 접근
+from vten import Kernel, Tensor, Direction, register     # 커널 정의
+from vten import CompositeKernel                         # 컴포지트
+from vten import TestScenario                            # 테스트
+from vten import run_kernel, KernelExecutor              # 고급 API
+```
+
 ### Kernel Definition
 
 ```python
+from vten import Kernel, Tensor, register
+
 class MyKernel(Kernel):
     spec = "kernels/my_kernel/kernel_spec.yaml"
     t_in  = Tensor(shape=(...), dtype=torch.int8, interface="iface_name")
     t_out = Tensor(shape=(...), dtype=torch.int8, interface="iface_name")
     ctrl  = register("ctrl")                       # 레지스터 인터페이스
 
-    def generate_inputs(self, seed=None): ...       # 입력 생성
+    def generate_inputs(self, seed=None): ...       # 입력 생성 (auto-chain 가능)
     def forward(self, **inputs) -> dict[str, torch.Tensor]: ...  # Golden 계산
 ```
 
@@ -1013,23 +1024,109 @@ def generate_inputs(self, seed=None, in_ch=32, out_ch=32, ...):
 
 **이유:** `ctx.instantiate()` 시 resolver가 파라미터를 resolve하고 커널 인스턴스의 attribute로 주입한다. `generate_inputs()`에 같은 파라미터를 다시 전달하면 불일치 위험이 생긴다.
 
-#### 9.5.3 forward — `**inputs` + `self.*` 규약
+#### 9.5.2.1 Auto-chain generate_inputs (Composite Registry)
 
-`forward(self, **inputs)` 는 입력 텐서를 키워드 인자로 받고, `self.*`로 파라미터에 접근한다.
-반환값은 `dict[str, torch.Tensor]` — 출력 텐서 이름을 키로 하는 딕셔너리.
+CompositeKernel의 서브 커널이 자체 `generate_inputs()`를 정의하지 않은 경우,
+framework가 자동으로 upstream 체인을 실행하여 입력을 생성한다.
 
 ```python
-def forward(self, psum_in, bias_in) -> dict[str, torch.Tensor]:
-    och_groups = (self.out_ch + self.To - 1) // self.To
-    psum = psum_in.to(torch.int64).reshape(
-        self.eff_depth, och_groups, self.eff_height * self.eff_width, self.To)
-    bias = bias_in.to(torch.int64)
-    biased = psum + bias.reshape(1, och_groups, 1, self.To)
-    activated = torch.clamp(biased, min=0) if self.is_relu else biased
-    shifted = activated >> self.bias_shift
-    clipped = shifted.clamp(0, 255) if self.is_relu else shifted.clamp(-128, 127)
+# PsumBufferKernel은 NpuPipelineKernel의 서브커널
+# generate_inputs()를 정의하지 않아도 standalone 검증 가능
+
+psum = ctx.instantiate(PsumBufferKernel, **params)
+psum.generate_inputs(seed=42)
+# → _lookup_composite()로 NpuPipelineKernel 발견
+#   (실패 시 _discover_composite()로 sibling 디렉토리 자동 스캔)
+# → reverse-BFS: upstream = {wl, fmap, mac} (target 제외, 사이클 회피)
+# → upstream-only topo sort: [wl, fmap, mac]
+# → wl.generate_inputs() + wl.forward() 실행
+# → fmap.generate_inputs() + fmap.forward() 실행
+# → mac.forward(ifmap=pool, weight=pool) 실행
+#   → mac.forward()는 HW와 동일한 21-bit packed stream bytes 반환
+# → psum.psum_in.data = pool[mac.partial_sum]  (physical format)
+```
+
+**동작 방식:**
+1. `__init_subclass__`에서 `_composite_registry`에 sub-kernel → composite 매핑 자동 등록
+2. `Kernel.generate_inputs()`가 자체 구현 없으면:
+   - `_lookup_composite()`로 registry 조회 (class identity tolerance — re-import 허용)
+   - 실패 시 `_discover_composite()`로 sibling 커널 디렉토리 자동 스캔
+3. `_generate_inputs_for()`에서:
+   - `_same_kernel_class()`로 target의 sub-ref name 매칭
+   - reverse-BFS로 **upstream 의존성만** 수집 (target 제외 → 사이클 회피)
+   - target의 resolved params (`_resolver.namespace`)를 upstream에 전달
+   - upstream 순회: `generate_inputs()` → pool에서 connected inputs 설정 → `forward()`
+4. target 커널의 connected input 텐서에 `data` + `logical_data` 설정
+
+**데이터 흐름 (composite forward()와 동일):**
+- Exposed inputs: `logical_data` → `layout_{name}()` → physical
+- Connected inputs: pool에서 직접 전달 (forward() 출력 = HW physical format)
+- forward() 출력 → pool로 전파 → downstream connected inputs로 전달
+
+**사용자 작업:** source 커널(incoming connection 없는 커널)만 `generate_inputs()` 구현.
+나머지 커널은 `forward()`만 구현하면 standalone 검증에서도 자동으로 입력을 얻는다.
+
+**NPU 파이프라인 예시:**
+```python
+# source 커널: generate_inputs() 구현
+class WeightLoaderKernel(Kernel):
+    def generate_inputs(self, seed=None): ...  # ✅ 외부 입력 직접 생성
+
+# downstream 커널: forward()만 구현, generate_inputs() 불필요
+class PsumBufferKernel(Kernel):
+    def forward(self, **inputs): ...           # ✅ auto-chain이 입력 전파
+
+class ActQuantKernel(Kernel):
+    def forward(self, **inputs): ...           # ✅ auto-chain이 입력 전파
+```
+
+#### 9.5.3 forward — HW Behavioral Model
+
+`forward(self, **inputs)` 는 **HW의 동작을 그대로 서술하는 behavioral model**이다.
+입력과 출력 모두 HW I/O와 동일한 physical format을 사용한다.
+
+```python
+def forward(self, **inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+    """인자명 = input tensor 이름, 반환값 = {output tensor 이름: data}
+    입출력은 HW와 동일한 physical format."""
+```
+
+**핵심 규칙:**
+1. **인자 이름** = input tensor의 `name` (Kernel class에서 선언한 attribute 이름)
+2. **반환값** = `{output_tensor_name: data}` dict — HW 출력과 동일한 format
+3. **HW physical format** — forward()는 HW의 I/O를 그대로 재현
+4. **params**는 `self.*`로 접근 (resolved params가 instance attrs로 노출)
+
+**예시 — act_quant (단순 연산):**
+```python
+def forward(self, **inputs) -> dict[str, torch.Tensor]:
+    psum_flat = inputs.get("psum_in", self.psum_in.logical_data)
+    bias_data = inputs.get("bias_in", self.bias_in.logical_data)
+    # ... ReLU → shift → clip ...
     return {"quant_out": (clipped & 0xFF).flatten().to(torch.uint8)}
 ```
+
+**예시 — mac_atu (serialization 포함):**
+```python
+def forward(self, **inputs) -> dict[str, torch.Tensor]:
+    """HW behavioral model: physical IFM/weight streams → packed psum streams."""
+    mac_result = self._compute_einsum(**inputs)  # MAC 연산
+    packed = self._serialize_psum(mac_result)     # 21-bit packed stream bytes
+    return {"partial_sum": packed}                # HW 출력 format 그대로
+```
+
+**예시 — psum_buffer (deserialization + accumulation):**
+```python
+def forward(self, **inputs) -> dict[str, torch.Tensor]:
+    """HW behavioral model: packed psum streams → accumulated output."""
+    mac_result = self._deserialize_psum(inputs["psum_in"])  # 21-bit unpack
+    # ... accumulation, stride handling ...
+    return {"psum_out": result.flatten().to(torch.int32)}
+```
+
+**auto-chain과의 관계:** forward()가 HW physical format을 반환하므로,
+upstream.forward() 출력이 connection을 통해 downstream에 전달될 때
+별도의 layout/unlayout 변환 없이 직접 사용된다.
 
 ### 9.6 CompositeKernel — 자동 체이닝
 

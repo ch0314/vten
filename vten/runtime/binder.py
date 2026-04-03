@@ -113,6 +113,13 @@ def _compute_auto_bind_value(
         addr = exposed.address
         if addr is None:
             addr = 0
+        # Apply byte offset (supports parameter expressions)
+        if bind_spec.offset is not None:
+            if isinstance(bind_spec.offset, int):
+                addr += bind_spec.offset
+            else:
+                sub = view.sub_kernels[sub_kernel_name]
+                addr += int(sub._resolver.resolve(bind_spec.offset))
         if bind_spec.bits:
             hi, lo = parse_bit_range(bind_spec.bits)
             return (addr >> lo) & ((1 << (hi - lo + 1)) - 1)

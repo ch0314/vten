@@ -221,6 +221,7 @@ class CompiledResult:
     shm_layout: SHMLayout | None = None
     views: list[FlattenedKernelView] | None = None  # multi-config: all views
     probe_buffer_map: dict[int, int] = field(default_factory=dict)  # probe_index → golden_buffer_id
+    prebound_buffers: dict[int, object] = field(default_factory=dict)  # buffer_id → xrt.bo (inference)
 
 
 # ── RuntimeEngine ──
@@ -515,16 +516,24 @@ class RuntimeEngine:
         sub_kernels: dict[str, KernelInstance] = {}
         sub_kernel_refs = getattr(composite_cls, "_sub_kernel_refs", {})
 
+        import os
+        from pathlib import Path as _P
+        _proj_dir = _P(
+            self._project_params.get("_project_dir", os.getcwd())
+        )
+
         for ref_name, sub_cls in sub_kernel_refs.items():
             if existing_subs and ref_name in existing_subs:
                 sub_ki = existing_subs[ref_name]
                 sub_spec_path = getattr(sub_cls, "spec", "")
                 if sub_spec_path and not sub_ki.spec.interfaces:
-                    sub_ki.spec = load_kernel_spec(sub_spec_path)
+                    resolved = _proj_dir / sub_spec_path if not _P(sub_spec_path).is_absolute() else _P(sub_spec_path)
+                    sub_ki.spec = load_kernel_spec(resolved)
             else:
                 sub_spec_path = getattr(sub_cls, "spec", "")
                 if sub_spec_path:
-                    sub_spec = load_kernel_spec(sub_spec_path)
+                    resolved = _proj_dir / sub_spec_path if not _P(sub_spec_path).is_absolute() else _P(sub_spec_path)
+                    sub_spec = load_kernel_spec(resolved)
                 else:
                     sub_spec = KernelSpec(
                         kernel_name=sub_cls.__name__,
@@ -970,42 +979,6 @@ class RuntimeEngine:
     # ── Stage 3: Tensor Serialization ──
 
     def _serialize_tensors(self, view: FlattenedKernelView) -> None:
-        # Stage 3 pre-step: auto-pack logical → physical via kernel layout methods
-        for _name, exposed in view.exposed_tensors.items():
-            tensor = exposed.origin_tensor
-            logger.log(
-                5, "Stage 3 check: name=%s logical=%s data=%s",
-                _name, tensor._logical_data is not None, tensor.data is not None,
-            )
-            if tensor._logical_data is not None and tensor.data is None:
-                sub_name = exposed.origin_path.split(".")[0]
-                sub_ki = view.sub_kernels.get(sub_name) or view.sub_kernels.get(
-                    "_self"
-                )
-                kernel_inst = sub_ki.kernel_class_instance if sub_ki else None
-                layout_method = (
-                    getattr(kernel_inst, f"layout_{tensor.name}", None)
-                    if kernel_inst
-                    else None
-                )
-                logger.log(
-                    5, "Stage 3 tensor=%s sub=%s kernel_inst=%s layout_fn=%s",
-                    tensor.name, sub_name,
-                    type(kernel_inst).__name__ if kernel_inst else "None",
-                    f"layout_{tensor.name}" if layout_method else "None",
-                )
-                if layout_method is not None:
-                    tensor.data = layout_method(tensor._logical_data)
-                    _d = tensor.data
-                    logger.log(
-                        5, "Stage 3 layout_%s applied: %d bytes, first8=%s",
-                        tensor.name, len(_d) if hasattr(_d, '__len__') else 0,
-                        list(_d.flatten()[:8].numpy()) if hasattr(_d, 'numpy') else "?"
-                    )
-                else:
-                    # Identity: logical == physical
-                    tensor.data = tensor._logical_data
-
         for name, exposed in view.exposed_tensors.items():
             try:
                 iface_spec = view.top_spec.get_interface(exposed.top_interface)
@@ -1017,13 +990,33 @@ class RuntimeEngine:
                 continue
 
             if exposed.direction == Direction.HOST_TO_DEV:
+                # Zero-element tensors: skip entirely (e.g. concat_mem when not concat)
+                if exposed.origin_tensor._element_count == 0:
+                    exposed._serialized = None
+                    exposed._serialized_size = 0
+                    continue
+
                 # Alias targets share buffer with source — skip serialization
                 is_alias = (
                     self._alias_registry
                     and self._alias_registry.is_alias_target(name)
                 )
+                # Check if this tensor's send op has _skip_data (inference: BO on device)
+                skip_data = any(
+                    getattr(op, '_skip_data', False)
+                    for op in self._ops
+                    if op.tensor is not None and op.tensor.name == name
+                )
                 if is_alias and exposed.origin_tensor.data is None:
                     # Will use source tensor's buffer; compute size only
+                    num_beats = math.ceil(
+                        exposed.origin_tensor._element_count
+                        / packing.elements_per_beat
+                    )
+                    exposed._serialized = None
+                    exposed._serialized_size = num_beats * (packing.bus_width // 8)
+                elif skip_data and exposed.origin_tensor.data is None:
+                    # Inference: device tensor, skip serialization, compute size only
                     num_beats = math.ceil(
                         exposed.origin_tensor._element_count
                         / packing.elements_per_beat
@@ -1036,10 +1029,12 @@ class RuntimeEngine:
                         f"Call generate_inputs() before run()."
                     )
                 else:
-                    serializer = StreamSerializer(packing)
-                    exposed._serialized = serializer.serialize(
-                        exposed.origin_tensor.data
+                    # Auto-layout: if kernel has layout_{name}(), apply it
+                    serialize_data = self._apply_layout(
+                        view, exposed, exposed.origin_tensor.data
                     )
+                    serializer = StreamSerializer(packing)
+                    exposed._serialized = serializer.serialize(serialize_data)
                     exposed._serialized_size = len(exposed._serialized)
             else:
                 num_beats = math.ceil(
@@ -1099,6 +1094,50 @@ class RuntimeEngine:
                         exposed._serialized, flat_names, exposed._serialized_size
                     )
                     exposed._port_mode = "block"
+
+    # ── Layout helpers ──
+
+    @staticmethod
+    def _apply_layout(
+        view: FlattenedKernelView,
+        exposed: ExposedTensor,
+        data: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply layout_{name}() if the owning kernel defines it.
+
+        Returns physical data for serialization, or the original data if
+        no layout method exists.
+        """
+        sub_name = exposed.origin_path.split(".")[0]
+        ki = view.sub_kernels.get(sub_name)
+        if ki is None or ki.kernel_class_instance is None:
+            return data
+        tensor_name = exposed.origin_tensor.name
+        layout_fn = getattr(ki.kernel_class_instance, f"layout_{tensor_name}", None)
+        if layout_fn is not None and callable(layout_fn):
+            return layout_fn(data)
+        return data
+
+    @staticmethod
+    def _apply_unlayout(
+        view: FlattenedKernelView,
+        exposed: ExposedTensor,
+        data: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply unlayout_{name}() if the owning kernel defines it.
+
+        Returns logical data for user output, or the original data if
+        no unlayout method exists.
+        """
+        sub_name = exposed.origin_path.split(".")[0]
+        ki = view.sub_kernels.get(sub_name)
+        if ki is None or ki.kernel_class_instance is None:
+            return data
+        tensor_name = exposed.origin_tensor.name
+        unlayout_fn = getattr(ki.kernel_class_instance, f"unlayout_{tensor_name}", None)
+        if unlayout_fn is not None and callable(unlayout_fn):
+            return unlayout_fn(data)
+        return data
 
     # ── Stage 3b: Dynamic Probe Mapping + Golden Serialization ──
 

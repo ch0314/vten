@@ -388,6 +388,74 @@ class CompositeKernel(Kernel):
                         exposed_name = f"{sub_name}_{tensor_name}"
                     cls._auto_exposed[(sub_name, tensor_name)] = exposed_name
                     used_names.add(exposed_name)
+
+        # Composite Registry: sub-kernel → composite 역방향 매핑 등록
+        # Kernel.generate_inputs()의 auto-chain이 이 매핑을 사용하여
+        # standalone 커널 검증 시 upstream 체인을 자동 실행한다.
+        for ref_class in cls._sub_kernel_refs.values():
+            _composite_registry[ref_class] = cls
+```
+
+**Composite Registry (`_composite_registry`):**
+
+모듈 레벨 dict로, `{sub_kernel_class: CompositeKernel_class}` 매핑을 저장한다.
+CompositeKernel.__init_subclass__에서 자동으로 채워진다.
+
+Kernel.generate_inputs()에서 자체 구현이 없을 때 이 레지스트리를 조회하여
+CompositeKernel._generate_inputs_for()를 호출, upstream chain을 자동 실행한다.
+
+```python
+# 모듈 레벨 (vten.kernel.composite)
+_composite_registry: dict[type, type] = {}
+
+# 사용 예:
+# MacAtuKernel이 NpuPipelineKernel의 서브커널이면:
+#   _composite_registry[MacAtuKernel] → NpuPipelineKernel
+# mac.generate_inputs(seed=42) 호출 시:
+#   NpuPipelineKernel._generate_inputs_for(mac, seed=42) 자동 실행
+#   → WeightLoaderKernel.generate_inputs() + forward()
+#   → FmapIOKernel.generate_inputs() + forward()
+#   → connection 따라 mac의 입력 텐서에 데이터 전파
+```
+
+**Class Identity Tolerance (`_same_kernel_class`, `_lookup_composite`):**
+
+같은 `.py` 파일이 서로 다른 모듈 이름으로 로드될 수 있다 (예: `_vten_kernel_act_quant` vs
+`act_quant.act_quant_kernel`). Python은 별도의 class 객체를 생성하므로 `dict.get()`이나
+`is` 비교가 실패한다. 이를 해결하는 두 유틸리티:
+
+```python
+def _same_kernel_class(a: type, b: type) -> bool:
+    """클래스 이름 + 소스 파일 경로로 동일 커널인지 판단.
+    re-import로 인한 중복 class 객체를 허용."""
+    if a is b:
+        return True
+    if a.__name__ != b.__name__:
+        return False
+    # 소스 파일 경로 비교
+    fa = Path(sys.modules[a.__module__].__file__).resolve()
+    fb = Path(sys.modules[b.__module__].__file__).resolve()
+    return fa == fb
+
+def _lookup_composite(kernel_cls: type) -> type | None:
+    """_composite_registry에서 composite를 조회.
+    exact identity match 실패 시 소스 파일 경로로 fallback 매칭.
+    성공 시 캐싱하여 이후 조회 가속."""
+```
+
+**Auto-discovery (`Kernel._discover_composite`):**
+
+Registry가 비어 있을 때 (CompositeKernel이 아직 import되지 않은 경우),
+커널의 소스 파일 위치에서 sibling 디렉토리를 스캔하여 CompositeKernel을 자동 발견한다.
+이로써 conftest.py에서 CompositeKernel을 수동 import할 필요가 없다.
+
+```python
+# Kernel._discover_composite() 동작:
+# 1. cls의 소스 파일 → kernels/<name>/ → kernels/ 기준 디렉토리
+# 2. kernels/ 하위의 모든 sibling 디렉토리를 순회
+# 3. 각 sibling에서 <name>_kernel.py 파일을 동적 import
+# 4. import 후 _lookup_composite()로 registry에 등록되었는지 확인
+# 5. 발견되면 해당 CompositeKernel 클래스 반환
 ```
 
 ---
@@ -460,13 +528,43 @@ class Kernel:
                 cls._register_handles[attr_name] = attr_value
 
     def generate_inputs(self, seed: int | None = None):
-        """입력 텐서 데이터 생성. 사용자 오버라이드.
-        타일링, 양자화 등 가속기 특화 로직 포함 가능.
+        """입력 텐서 데이터 생성.
 
         이 메서드 호출 시점에 파라미터와 형상이 이미 해결되어 있다.
         (instantiate() 시점에 eager resolution 수행됨)
-        따라서 self.ifm.fill_random()이나 직접 shape 참조가 모두 가능."""
-        raise NotImplementedError
+        따라서 self.ifm.fill_random()이나 직접 shape 참조가 모두 가능.
+
+        자동 체인 (auto-chain):
+        커널이 CompositeKernel의 서브 커널로 등록되어 있고 자체
+        generate_inputs()를 정의하지 않은 경우:
+        1. _lookup_composite()로 _composite_registry 조회 (class identity tolerance)
+        2. 실패 시 _discover_composite()로 sibling 디렉토리 스캔하여 자동 발견
+        3. CompositeKernel._generate_inputs_for() 호출
+        → upstream 커널의 generate_inputs() + forward() 호출
+        → connection을 따라 이 커널의 connected input에 데이터 전파
+
+        이로써 파이프라인의 source 커널만 generate_inputs()를 구현하면
+        downstream 커널은 standalone 검증에서도 자동으로 입력을 얻는다."""
+        from vten.kernel.composite import _lookup_composite
+        composite_cls = _lookup_composite(type(self))
+        if composite_cls is None:
+            composite_cls = self._discover_composite()
+        if composite_cls is not None:
+            composite_cls._generate_inputs_for(self, seed=seed)
+        else:
+            raise NotImplementedError
+
+    @classmethod
+    def _discover_composite(cls) -> type | None:
+        """Sibling 커널 디렉토리를 스캔하여 이 커널을 포함하는
+        CompositeKernel을 자동 발견.
+
+        cls의 소스 파일 → kernels/<name>/ → kernels/ 를 기준으로
+        sibling 디렉토리의 *_kernel.py를 동적 import하고,
+        _lookup_composite()로 registry 등록 여부를 확인한다.
+
+        conftest.py에서 수동 import 없이도 auto-chain이 동작하게 한다."""
+        ...
 
     # ── 파라미터 기본값 (v2) ──
     default_params: dict = {}
@@ -689,6 +787,34 @@ class CompositeKernel(Kernel):
         interface_key: "sub_kernel_name.interface_name"
         forward_with_intermediates() 내에서 호출."""
         self._probe_data[interface_key] = data.clone()
+
+    @classmethod
+    def _generate_inputs_for(cls, target_kernel: Kernel, seed: int | None = None):
+        """Standalone 커널 검증용 auto-chain generate_inputs.
+
+        target_kernel이 이 CompositeKernel의 서브커널일 때,
+        connection graph를 역추적하여 upstream 체인을 실행한다:
+
+        1. _same_kernel_class()로 target의 sub-ref name 매칭 (re-import 허용)
+        2. target에서 reverse-BFS로 upstream 의존성만 수집 (target 제외)
+           — 사이클(예: act.quant_out >> fmap.ofm_in)을 피하기 위함
+        3. upstream만으로 topo sort, target을 마지막에 추가
+        4. target의 resolved params (KernelInstance._resolver.namespace)를
+           runtime_params로 사용하여 upstream 커널 인스턴스 생성
+        5. 각 upstream 커널의 generate_inputs() + forward() chain 실행:
+           - generate_inputs() 먼저 호출 (exposed inputs 생성)
+           - pool에서 connected inputs 설정 (generate_inputs 후, 덮어쓰기 방지)
+           - forward(**inputs) 호출, 결과를 pool에 저장
+        6. target 커널의 connected input 텐서에 data + logical_data 설정
+
+        데이터 흐름 (composite forward()와 동일):
+          - Exposed inputs: logical_data → layout_{name}() → physical
+          - Connected inputs: pool에서 직접 전달 (이미 physical)
+          - forward() 출력 → pool로 전파
+
+        이 메서드는 Kernel.generate_inputs()에서 _lookup_composite()를
+        통해 자동으로 호출된다. 사용자가 직접 호출할 필요 없음."""
+        ...  # 구현: vten/kernel/composite.py 참조
 
     def forward(self, **inputs: torch.Tensor) -> dict[str, torch.Tensor]:
         """Connection graph 기반 자동 forward chain.

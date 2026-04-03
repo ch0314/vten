@@ -57,7 +57,7 @@ class AliasRegistry:
 @dataclass
 class VerificationTask:
     op_handle: OperationHandle
-    golden: torch.Tensor
+    golden: torch.Tensor | None = None
 
 
 # ── Result types ──
@@ -81,9 +81,6 @@ class ExecutionResult:
     verification_results: list = field(default_factory=list)  # list[VerificationResult]
 
 
-# Backward-compatible alias
-BatchResult = ExecutionResult
-
 
 # ── ExecutionContext ──
 
@@ -95,12 +92,15 @@ class ExecutionContext:
         self,
         backend: object | None = None,
         project_params: dict | None = None,
+        mode: str = "verification",
     ) -> None:
         self._pending_ops: list[Operation] = []
         self._kernels: dict[str, KernelInstance] = {}
         self._backend = backend
         self._project_params = project_params or {}
+        self._mode = mode  # "verification" or "inference"
         self._verifications: list[VerificationTask] = []
+        self._bound_bos: dict[str, object] = {}  # tensor_name → xrt.bo
         self._alias_registry = AliasRegistry()
         self._last_compiled: object | None = None
         self._last_backend_result: object | None = None
@@ -111,6 +111,8 @@ class ExecutionContext:
         self._current_config_group: int = 0  # tracks current group index
         # Internal probe golden (composite internal wires)
         self._internal_probe_golden: dict[tuple[str, str], torch.Tensor] = {}
+        # Auto-golden cache: id(kernel_instance) → forward() result dict
+        self._golden_cache: dict[int, dict[str, torch.Tensor]] = {}
         # Declarative probe support
         self._declarative_probes: list[str] = []
         self._internal_probe_requests: list[tuple[str, str]] = []
@@ -232,6 +234,10 @@ class ExecutionContext:
     # ── Shorthands ──
 
     def send_tensor(self, tensor, dep=None) -> OperationHandle:
+        if self._mode == "inference" and tensor.name in self._bound_bos:
+            # Device BO already present — record no-op placeholder
+            return self._record(OpKind.SEND_TENSOR, tensor=tensor, dep=dep,
+                                _skip_data=True)
         return self._record(OpKind.SEND_TENSOR, tensor=tensor, dep=dep)
 
     def recv_tensor(
@@ -249,7 +255,12 @@ class ExecutionContext:
                 between chunks.
                 Returns list[OperationHandle] when chunks is specified.
                 TODO: axis= parameter for arbitrary axis split.
+
+        In inference mode: emits PULL only (no STORE) — data stays on device.
         """
+        if self._mode == "inference":
+            return self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep,
+                                _pull_only=True)
         if chunks is None:
             return self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep)
 
@@ -273,13 +284,20 @@ class ExecutionContext:
 
     # ── Verification ──
 
-    def verify(self, op_handle, golden) -> None:
+    def verify(self, op_handle, golden=None) -> None:
         """Register or execute verification.
 
         Before run(): deferred — stored as VerificationTask, executed after run().
         After run(): eager — immediately compares HW output vs golden.
+
+        If golden is None, auto-golden is computed from the kernel's forward().
+        In inference mode: no-op (skip all verification).
         """
+        if self._mode == "inference":
+            return
         if self._last_compiled is not None:
+            if golden is None:
+                golden = self._compute_auto_golden(op_handle)
             self._verify_immediate(op_handle, golden)
         else:
             self._verifications.append(
@@ -329,7 +347,11 @@ class ExecutionContext:
                 continue
             tensor_name = op.tensor.name
             if tensor_name in probe_tensor_names and tensor_name not in probe_golden:
-                probe_golden[tensor_name] = task.golden
+                golden = task.golden
+                if golden is None:
+                    # Auto-golden for probe: compute eagerly
+                    golden = self._compute_auto_golden(task.op_handle)
+                probe_golden[tensor_name] = golden
         return probe_golden
 
     # ── Declarative Probes ──
@@ -400,6 +422,16 @@ class ExecutionContext:
                 flags |= FLAG_PAUSE_ON_MISMATCH
         return flags
 
+    # ── Inference mode: device buffer binding ──
+
+    def bind_device_buffer(self, tensor: Tensor, bo: object) -> None:
+        """Bind an existing device BO to a tensor (inference mode).
+
+        When a tensor has a bound BO, send_tensor() skips LOAD+PUSH
+        and the BO is injected into CompiledResult.prebound_buffers.
+        """
+        self._bound_bos[tensor.name] = bo
+
     # ── Buffer Aliasing ──
 
     def alias(self, src, dst) -> None:
@@ -431,11 +463,16 @@ class ExecutionContext:
             if iface.packing is None:
                 continue
             serializer = StreamSerializer(iface.packing)
-            output_tensors[name] = serializer.deserialize(
+            hw_tensor = serializer.deserialize(
                 raw_bytes,
                 exposed.origin_tensor._element_count,
                 exposed.origin_tensor._resolved_shape,
                 dtype=exposed.origin_tensor.dtype,
+            )
+            # Auto-unlayout: convert physical → logical if unlayout exists
+            from vten.runtime.engine import RuntimeEngine
+            output_tensors[name] = RuntimeEngine._apply_unlayout(
+                compiled.flattened_view, exposed, hw_tensor,
             )
         return output_tensors
 
@@ -536,6 +573,140 @@ class ExecutionContext:
         bid = compiled.buffer_ids[key]
         return backend_result.read_buffer(bid)
 
+    # ── Auto-golden ──
+
+    def _find_kernel_for_tensor(self, tensor_name: str) -> object | None:
+        """Find the kernel class instance that owns the given tensor name."""
+        for ki in self._kernels.values():
+            inst = ki.kernel_class_instance
+            if inst is None:
+                continue
+            try:
+                inst.get_tensor(tensor_name)
+                return inst
+            except AttributeError:
+                pass
+            # Check auto-exposed tensors (CompositeKernel)
+            auto_exposed = getattr(type(inst), "_auto_exposed", {})
+            for (_sub, _tname), exposed_name in auto_exposed.items():
+                if exposed_name == tensor_name:
+                    return inst
+        return None
+
+    def _run_forward(self, kernel_inst: object) -> dict[str, torch.Tensor]:
+        """Run forward() on a kernel instance, handling Composite vs Simple.
+
+        CompositeKernel: forward() with no args (auto-chain with layout).
+        Simple Kernel: collect H2D tensor data, apply layout, forward(**inputs).
+        """
+        from vten.kernel.composite import CompositeKernel
+
+        if isinstance(kernel_inst, CompositeKernel):
+            return kernel_inst.forward()
+
+        # Simple kernel: collect H2D inputs with layout
+        inputs: dict[str, torch.Tensor] = {}
+        for tensor in kernel_inst.tensors():
+            if tensor.data is None:
+                continue
+            direction = getattr(tensor, "direction", None)
+            if direction is None or direction.value == "host_to_dev":
+                # Apply layout if available
+                layout_fn = getattr(kernel_inst, f"layout_{tensor.name}", None)
+                if layout_fn is not None and callable(layout_fn):
+                    inputs[tensor.name] = layout_fn(tensor.data)
+                else:
+                    inputs[tensor.name] = tensor.data
+
+        return kernel_inst.forward(**inputs)
+
+    def _compute_auto_golden(self, op_handle) -> torch.Tensor:
+        """Compute golden tensor automatically from kernel's forward().
+
+        1. Find kernel that owns the tensor
+        2. Run forward() (cached per kernel instance)
+        3. Extract the relevant output
+        4. Handle format conversion (e.g., packed uint8 → int32)
+        5. Handle chunk slicing
+        """
+        from vten.runtime.serializer import StreamSerializer
+
+        op = op_handle.op
+        tensor_name = op.tensor.name
+
+        # Find owning kernel
+        kernel_inst = self._find_kernel_for_tensor(tensor_name)
+        if kernel_inst is None:
+            raise VerificationError(
+                f"Auto-golden: cannot find kernel for tensor '{tensor_name}'",
+                tensor=tensor_name,
+            )
+
+        # Run forward() with caching
+        cache_key = id(kernel_inst)
+        if cache_key not in self._golden_cache:
+            self._golden_cache[cache_key] = self._run_forward(kernel_inst)
+        fwd_result = self._golden_cache[cache_key]
+
+        if tensor_name not in fwd_result:
+            raise VerificationError(
+                f"Auto-golden: forward() did not produce '{tensor_name}'. "
+                f"Available: {list(fwd_result.keys())}",
+                tensor=tensor_name,
+            )
+
+        golden = fwd_result[tensor_name]
+
+        # Format conversion: if forward() dtype differs from tensor dtype
+        origin_tensor = op.tensor
+        target_dtype = origin_tensor.dtype
+        if golden.dtype != target_dtype:
+            # Check if this is a packed → unpacked case (e.g., uint8 → int32)
+            # Try deserializing via the interface's packing scheme
+            if self._last_compiled is not None:
+                compiled = self._last_compiled
+                config_group = getattr(op, "config_group", 0)
+                if config_group > 0 and compiled.views and config_group < len(compiled.views):
+                    view = compiled.views[config_group]
+                else:
+                    view = compiled.flattened_view
+
+                exposed = view.exposed_tensors.get(tensor_name)
+                if exposed is not None:
+                    try:
+                        iface = view.top_spec.get_interface(exposed.top_interface)
+                        if iface.packing is not None:
+                            serializer = StreamSerializer(iface.packing)
+                            raw_bytes = serializer.serialize(golden)
+                            element_count = origin_tensor._element_count
+                            shape = origin_tensor._resolved_shape
+                            golden = serializer.deserialize(
+                                raw_bytes, element_count, shape,
+                                dtype=target_dtype,
+                            )
+                    except (KeyError, AttributeError):
+                        pass
+
+            # Fallback: simple dtype cast
+            if golden.dtype != target_dtype:
+                golden = golden.to(target_dtype)
+
+        # Flatten for comparison
+        golden = golden.flatten()
+
+        # Chunk slicing
+        if op.chunk_index is not None:
+            total_elems = origin_tensor._element_count
+            if isinstance(op.chunks_spec, list):
+                chunk_elems = op.chunks_spec[op.chunk_index]
+                start = sum(op.chunks_spec[:op.chunk_index])
+            else:
+                chunk_elems = total_elems // op.chunk_total
+                start = op.chunk_index * chunk_elems
+            golden = golden[start:start + chunk_elems]
+
+        return golden
+
     # ── Verification internals ──
 
     def _verify_immediate(self, op_handle, golden) -> None:
@@ -609,6 +780,9 @@ class ExecutionContext:
             dtype=golden.dtype if golden is not None else None,
         )
 
+        # Flatten to match golden (which is flattened in _compute_auto_golden)
+        hw_output = hw_output.flatten()
+
         if not self._compare(hw_output, golden):
             # Build dtype-aware message with first differing elements
             max_diff = self._max_diff(hw_output, golden)
@@ -670,7 +844,10 @@ class ExecutionContext:
         for task in self._verifications:
             tensor_name = task.op_handle.op.tensor.name
             try:
-                self._verify_immediate(task.op_handle, task.golden)
+                golden = task.golden
+                if golden is None:
+                    golden = self._compute_auto_golden(task.op_handle)
+                self._verify_immediate(task.op_handle, golden)
                 results.append(VerificationResult(
                     tensor_name=tensor_name,
                     passed=True,
@@ -706,7 +883,9 @@ class ExecutionContext:
     @staticmethod
     def _max_diff(hw_output: torch.Tensor, golden: torch.Tensor) -> float:
         """Maximum element-wise absolute difference."""
-        return (hw_output.float() - golden.float()).abs().max().item()
+        a, b = hw_output.flatten().float(), golden.flatten().float()
+        n = min(a.numel(), b.numel())
+        return (a[:n] - b[:n]).abs().max().item()
 
     # ── Execution ──
 
@@ -743,7 +922,7 @@ class ExecutionContext:
         return RuntimeEngine.compile_multi(engines, target=target)
 
     def run(self) -> ExecutionResult:
-        """Compile pending ops → submit → wait → return BatchResult."""
+        """Compile pending ops → submit → wait → return ExecutionResult."""
         from vten.runtime.engine import RuntimeEngine
 
         # Apply declarative probes (post-hoc annotation)
@@ -778,6 +957,13 @@ class ExecutionContext:
         self._config_kernels = []
         self._config_params = []
         self._current_config_group = 0
+
+        # Inject prebound device buffers (inference mode)
+        if self._bound_bos:
+            for tensor_name, bo in self._bound_bos.items():
+                bid = compiled.buffer_ids.get(tensor_name)
+                if bid is not None:
+                    compiled.prebound_buffers[bid] = bo
 
         if self._backend is not None:
             # Session mode: use open_session/submit_batch/wait_batch
@@ -844,6 +1030,8 @@ class ExecutionContext:
                         "verification_results", []
                     )
                     raise
+
+            self._golden_cache.clear()
 
             logger.debug("execution complete: status=%s, cycles=%d, verifications=%d/%d",
                          status, total_cycles,

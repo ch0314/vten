@@ -2,14 +2,15 @@
 
 Spec reference: 00_data_models.md §2
 
-v2: shape/dtype are logical (algorithmic). Layout is handled by
-kernel methods layout_{name}() / unlayout_{name}().
+v2: shape/dtype are declared shape. If layout_{name}() exists on the kernel,
+the shape is logical and the framework auto-calls layout before serialization.
+Otherwise the shape is physical (HW/DDR) and data is serialized as-is.
 """
 
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
@@ -34,27 +35,21 @@ class Tensor:
         self.direction = direction  # None → inferred from protocol/role at Stage 0
         self.name: str = ""
 
-        # instantiate() time (eager resolution) — logical shape
+        # instantiate() time (eager resolution)
         self._resolved_shape: tuple[int, ...] | None = None
         self._element_count: int = 0
 
-        # Logical data (algorithmic level)
-        self._logical_data: torch.Tensor | None = None
-
-        # compile() time (stages 1-4) — physical data
+        # Runtime data — logical if layout_{name}() exists, physical otherwise
         self.data: torch.Tensor | None = None
         self._address: int | None = None
 
-    # ── Logical data ──
+        # Device state (inference mode)
+        self._bo: Any = None                          # xrt.bo instance
+        self._bo_size: int = 0                        # serialized byte count
+        self._deserialize_fn: Callable[[bytes], torch.Tensor] | None = None
 
-    @property
-    def logical_data(self) -> torch.Tensor | None:
-        """Algorithmic-level data. Primary user interface."""
-        return self._logical_data
-
-    @logical_data.setter
-    def logical_data(self, value: torch.Tensor) -> None:
-        self._logical_data = value
+        # Golden data for verified inference chain (logical format)
+        self._golden_data: torch.Tensor | None = None
 
     @property
     def resolved_shape(self) -> tuple[int, ...]:
@@ -118,6 +113,51 @@ class Tensor:
             raise RuntimeError("shape not resolved")
         return self._element_count
 
+    # ── Device state (inference) ──
+
+    @property
+    def on_device(self) -> bool:
+        """True if tensor data resides on FPGA device memory."""
+        return self._bo is not None
+
+    def cpu(self) -> torch.Tensor:
+        """Transfer data from device to host and return torch.Tensor.
+
+        If data is already on host, returns it directly.
+        Applies unlayout (deserialize_fn) automatically if set.
+        """
+        if self._bo is None:
+            if self.data is not None:
+                return self.data
+            raise RuntimeError("no data on host or device")
+        # Sync FROM_DEVICE — import xrt constants lazily
+        self._bo.sync(2)  # XCL_BO_SYNC_BO_FROM_DEVICE = 2
+        raw = bytes(self._bo.read(self._bo_size))
+        if self._deserialize_fn is not None:
+            return self._deserialize_fn(raw)
+        return torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+
+    def numpy(self):
+        """Transfer to host and return as numpy array."""
+        return self.cpu().numpy()
+
+    def _bind_bo(
+        self,
+        bo: Any,
+        size: int,
+        deserialize_fn: Callable[[bytes], torch.Tensor] | None = None,
+    ) -> None:
+        """Bind an XRT buffer object (called by InferenceSession)."""
+        self._bo = bo
+        self._bo_size = size
+        self._deserialize_fn = deserialize_fn
+
+    def _unbind_bo(self) -> None:
+        """Release device buffer binding."""
+        self._bo = None
+        self._bo_size = 0
+        self._deserialize_fn = None
+
     def describe(self) -> dict:
         """Human-readable tensor state for debugging."""
         info: dict[str, Any] = {
@@ -125,13 +165,8 @@ class Tensor:
             "shape": self._resolved_shape,
             "dtype": str(self.dtype),
             "has_data": self.data is not None,
+            "on_device": self.on_device,
         }
-        if self._logical_data is not None:
-            info["has_logical_data"] = True
-            info["logical_data_range"] = (
-                float(self._logical_data.min()),
-                float(self._logical_data.max()),
-            )
         if self.data is not None:
             info["data_range"] = (float(self.data.min()), float(self.data.max()))
         return info

@@ -1,5 +1,27 @@
 """vTen — Tensor-centric DSA verification framework."""
 
-from vten.functional import KernelExecutor, run_kernel
+# Level 0: Kernel Definition
+from vten.kernel.base import Kernel, register
+from vten.kernel.composite import CompositeKernel
+from vten.kernel.tensor import Tensor
+from vten.spec.models import Direction
 
-__all__ = ["run_kernel", "KernelExecutor"]
+# Level 1: Test
+from vten.cli.run import TestScenario
+
+# Level 2: Inference
+from vten.inference import InferenceModule, InferenceSession
+
+__all__ = [
+    # Kernel definition
+    "Kernel",
+    "Tensor",
+    "Direction",
+    "register",
+    "CompositeKernel",
+    # Test
+    "TestScenario",
+    # Inference
+    "InferenceSession",
+    "InferenceModule",
+]
