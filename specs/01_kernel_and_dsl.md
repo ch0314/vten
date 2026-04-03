@@ -764,7 +764,41 @@ class SubKernelRef:
 4. **문서화**: RTL 내부 구조를 Python으로 서술.
 5. **검증**: 런타임이 연결 쌍의 호환 형상/dtype/protocol 확인.
 
-#### 4.4.3 CompositeKernel 내부 속성
+#### 4.4.3 Auto-chain generate_inputs (Composite Registry)
+
+CompositeKernel.__init_subclass__에서 `_composite_registry`에 서브커널 → composite 매핑을 자동 등록한다. 이를 통해 standalone 커널 검증 시 upstream 체인을 자동 실행할 수 있다.
+
+**동작 과정:**
+1. `Kernel.generate_inputs()`에서 `_lookup_composite()`로 registry 조회
+2. 실패 시 `_discover_composite()`로 sibling 커널 디렉토리 스캔하여 auto-discovery
+3. `_generate_inputs_for()`에서 reverse-BFS로 upstream 의존성만 수집 (target 제외, 사이클 회피)
+4. upstream-only topo sort 후 순차 실행: `generate_inputs()` → pool에서 connected inputs 설정 → `forward()`
+5. target 커널의 connected input 텐서에 `data` + `logical_data` 설정
+
+```python
+# _composite_registry: {MacAtuKernel: NpuPipelineKernel, ...}
+# 자동 등록: __init_subclass__에서 sub_kernel_refs의 각 class를 key로 등록
+
+# standalone 검증 시:
+psum = ctx.instantiate(PsumBufferKernel, **params)
+psum.generate_inputs(seed=42)
+# → _lookup_composite()로 NpuPipelineKernel 발견
+#   (실패 시 _discover_composite()로 sibling 디렉토리 자동 스캔)
+# → reverse-BFS: psum의 upstream = {wl, fmap, mac}
+# → upstream-only topo sort: [wl, fmap, mac]
+# → wl.generate_inputs() + wl.forward() → pool에 weight, ifmap_coord 저장
+# → fmap.generate_inputs() + fmap.forward() → pool에 ifmap 저장
+# → mac.forward(ifmap=pool, weight=pool) → pool에 partial_sum, psum_coord 저장
+# → psum.psum_in.data = pool[mac.partial_sum]  (HW physical format)
+```
+
+**source 커널만 generate_inputs() 구현하면 된다.** downstream 커널은 forward()만 구현하면 standalone에서도 자동으로 입력을 얻는다.
+
+**Class identity tolerance:** 같은 .py 파일이 다른 모듈 이름으로 로드되어 별도 class 객체가 생성되는 경우, `_same_kernel_class()`가 클래스 이름 + 소스 파일 경로로 동일성을 판단하고, `_lookup_composite()`가 fallback 매칭 + 캐싱을 수행한다.
+
+**Auto-discovery:** `_discover_composite()`가 커널의 sibling 디렉토리를 스캔하여 CompositeKernel을 자동 import. conftest.py에서 수동 import할 필요 없음.
+
+#### 4.4.4 CompositeKernel 내부 속성
 
 `__init_subclass__`에서 자동으로 구성되는 내부 속성:
 

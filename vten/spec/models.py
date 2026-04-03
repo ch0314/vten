@@ -204,6 +204,7 @@ class AutoBindSpec:
     bits: str | None = None
     param: str | None = None
     expr: str | None = None
+    offset: str | int | None = None  # byte offset added to address
 
 
 # ── Register (§5.4) ──

@@ -377,6 +377,7 @@ def _parse_registers(
                 bits=ab.get("bits"),
                 param=ab.get("param"),
                 expr=ab.get("expr"),
+                offset=ab.get("offset"),
             )
         access = r.get("access", "rw")
         if access not in ("rw", "ro", "wo", "w1c"):

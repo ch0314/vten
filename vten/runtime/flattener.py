@@ -97,15 +97,6 @@ class ExposedTensor:
     def dtype(self):
         return self.origin_tensor.dtype
 
-    # ── Logical data proxy ──
-
-    @property
-    def logical_data(self):
-        return self.origin_tensor._logical_data
-
-    @logical_data.setter
-    def logical_data(self, value):
-        self.origin_tensor._logical_data = value
 
 
 # ── ProbePoint ──

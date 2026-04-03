@@ -8,6 +8,7 @@ v2: forward(**inputs)->dict, compute_derived_params(self), default_params,
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -148,16 +149,76 @@ class Kernel:
         return {}
 
     def generate_inputs(self, seed: int | None = None) -> None:
-        """User-overrideable: generate input tensors."""
-        raise NotImplementedError
+        """Generate input tensors.
+
+        If this kernel is registered as a sub-kernel of a CompositeKernel
+        and does not define its own generate_inputs, the framework
+        automatically runs the upstream chain (generate_inputs + forward
+        of predecessor kernels) to populate this kernel's connected inputs.
+        """
+        from vten.kernel.composite import _lookup_composite
+
+        composite_cls = _lookup_composite(type(self))
+        if composite_cls is None:
+            # Auto-discover: scan sibling kernel dirs for composites
+            composite_cls = self._discover_composite()
+        if composite_cls is not None:
+            composite_cls._generate_inputs_for(self, seed=seed)
+        else:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not implement generate_inputs() "
+                f"and is not registered in any CompositeKernel."
+            )
+
+    @classmethod
+    def _discover_composite(cls) -> type | None:
+        """Scan sibling kernel directories for CompositeKernel that contains this class."""
+        import importlib.util
+        from pathlib import Path
+
+        from vten.kernel.composite import _lookup_composite
+
+        src = getattr(sys.modules.get(cls.__module__, None), "__file__", None)
+        if src is None:
+            return None
+        kernel_dir = Path(src).resolve().parent  # kernels/<name>/
+        kernels_base = kernel_dir.parent          # kernels/
+        if not kernels_base.is_dir():
+            return None
+
+        for sibling in sorted(kernels_base.iterdir()):
+            if not sibling.is_dir():
+                continue
+            candidate = sibling / f"{sibling.name}_kernel.py"
+            if not candidate.exists():
+                continue
+            mod_name = f"_vten_composite_scan_{sibling.name}"
+            if mod_name in sys.modules:
+                continue
+            try:
+                spec = importlib.util.spec_from_file_location(mod_name, candidate)
+                if spec and spec.loader:
+                    parent = str(candidate.parent)
+                    if parent not in sys.path:
+                        sys.path.insert(0, parent)
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[mod_name] = module
+                    spec.loader.exec_module(module)
+            except Exception:
+                continue
+            # Check if registry now has our class
+            result = _lookup_composite(cls)
+            if result is not None:
+                return result
+        return None
 
     def forward(self, **inputs: torch.Tensor) -> dict[str, torch.Tensor]:
         """Compute golden reference outputs from inputs.
 
         Args:
-            **inputs: {input_tensor_name: logical_data} for each input tensor.
+            **inputs: {input_tensor_name: data} for each input tensor.
         Returns:
-            {output_tensor_name: logical_data} for each output tensor.
+            {output_tensor_name: data} for each output tensor.
         """
         raise NotImplementedError
 

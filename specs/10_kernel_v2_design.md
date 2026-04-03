@@ -157,15 +157,19 @@ def _auto_pack_tensors(self, kernel, view: FlattenedKernelView):
 ```python
 class Kernel:
     def forward(self, **inputs: torch.Tensor) -> dict[str, torch.Tensor]:
-        """인자명 = input tensor 이름, 반환값 = {output tensor 이름: logical data}"""
+        """인자명 = input tensor 이름, 반환값 = {output tensor 이름: data}
+        HW의 I/O를 그대로 재현하는 behavioral model."""
         raise NotImplementedError
 ```
 
 ### 2.2 규칙
 
 1. **인자 이름** = input tensor의 `name` (Kernel class에서 선언한 attribute 이름)
-2. **반환값** = `{output_tensor_name: logical_data}` dict
-3. **logical 공간**에서만 동작 — physical packing 일절 없음
+2. **반환값** = `{output_tensor_name: data}` dict — HW 출력과 동일한 format
+3. **HW behavioral model** — forward()는 HW의 동작을 그대로 서술한다.
+   입출력 모두 HW I/O와 동일한 physical format을 사용.
+   이로써 auto-chain에서 upstream.forward() 출력이 downstream에
+   별도 변환 없이 직접 전달된다.
 4. **params**는 `self.*`로 접근 (resolved params가 instance attrs로 노출)
 
 ### 2.3 Before → After 예시
@@ -185,19 +189,59 @@ def forward(self) -> torch.Tensor:
         bias_shift=self.bias_shift, ...
     )["quant_out"]
 
-# ── AFTER ──
-def forward(self, psum_in, bias_in) -> dict[str, torch.Tensor]:
-    och_groups = (self.out_ch + self.To - 1) // self.To
-    psum = psum_in.to(torch.int64).reshape(
-        self.eff_depth, och_groups, self.eff_height * self.eff_width, self.To)
-    bias = bias_in.to(torch.int64)
-    if (self.To - self.out_ch % self.To) % self.To > 0:
-        bias = F.pad(bias, (0, (self.To - self.out_ch % self.To) % self.To))
-    biased = psum + bias.reshape(1, och_groups, 1, self.To)
-    activated = torch.clamp(biased, min=0) if self.is_relu else biased
-    shifted = activated >> self.bias_shift
-    clipped = shifted.clamp(0, 255) if self.is_relu else shifted.clamp(-128, 127)
+# ── AFTER (act_quant) — HW behavioral model ──
+def forward(self, **inputs) -> dict[str, torch.Tensor]:
+    """Golden: psum + bias → ReLU → shift → clip."""
+    psum_flat = inputs.get("psum_in", self.psum_in.logical_data)
+    bias_data = inputs.get("bias_in", self.bias_in.logical_data)
+    # ... ReLU → shift → clip ...
     return {"quant_out": (clipped & 0xFF).flatten().to(torch.uint8)}
+```
+
+### 2.3.1 HW Behavioral Model 예시
+
+forward()는 HW의 I/O를 그대로 재현한다. 파이프라인에서 upstream의 출력이
+downstream의 입력으로 직접 전달되므로, 중간 변환이 불필요하다.
+
+```python
+# ── mac_atu: MAC 연산 + serialization ──
+class MacAtuKernel(Kernel):
+    def _compute_einsum(self, **inputs) -> torch.Tensor:
+        """Core MAC: physical streams → einsum tensor."""
+        ifm = self._parse_physical_ifmap(inputs["ifmap"])
+        wgt = self._parse_physical_weight(inputs["weight"])
+        return torch.einsum("gcdhw,gcotuxyz->uxdgohwtyz", ifm, wgt)
+
+    def _serialize_psum(self, mac_result: torch.Tensor) -> torch.Tensor:
+        """Einsum tensor → 21-bit packed stream bytes (HW output format)."""
+        ...  # PSUM_IN_DW 비트로 pack → (total_beats * ATU_AXIS_OUT, BYTES_PER_BEAT) uint8
+
+    def forward(self, **inputs) -> dict[str, torch.Tensor]:
+        """HW behavioral model: physical IFM/weight → packed psum streams."""
+        mac_result = self._compute_einsum(**inputs)
+        packed = self._serialize_psum(mac_result)
+        return {"partial_sum": packed}  # HW 출력 format 그대로
+
+# ── psum_buffer: deserialization + accumulation ──
+class PsumBufferKernel(Kernel):
+    def _deserialize_psum(self, packed_bytes: torch.Tensor) -> torch.Tensor:
+        """21-bit packed stream bytes → einsum tensor."""
+        ...  # (total_beats * ATU_AXIS_OUT, BYTES_PER_BEAT) → einsum
+
+    def forward(self, **inputs) -> dict[str, torch.Tensor]:
+        """HW behavioral model: packed psum streams → accumulated output."""
+        mac_result = self._deserialize_psum(inputs["psum_in"])
+        # ... accumulation, stride handling ...
+        return {"psum_out": result.flatten().to(torch.int32)}
+```
+
+auto-chain에서의 데이터 흐름:
+```
+mac.forward(ifmap=physical, weight=physical)
+  → {"partial_sum": packed_bytes}  (21-bit packed stream)
+  → connection: mac.partial_sum >> psum.psum_in
+  → psum.forward(psum_in=packed_bytes)  (변환 없이 직접 전달)
+  → {"psum_out": accumulated_result}
 ```
 
 ### 2.4 삭제되는 것
@@ -537,6 +581,65 @@ class NpuPipelineKernel(CompositeKernel):
         # framework auto-pack
 ```
 
+### 5.6.1 Auto-chain generate_inputs (Composite Registry)
+
+Standalone 커널 검증 시 upstream 체인을 자동 실행하여 입력을 생성한다.
+
+**메커니즘:**
+1. `__init_subclass__`에서 `_composite_registry`에 sub-kernel → composite 매핑 등록
+2. `Kernel.generate_inputs()`가 자체 구현 없으면:
+   - `_lookup_composite()`로 registry 조회 (class identity tolerance)
+   - 실패 시 `_discover_composite()`로 sibling 커널 디렉토리 자동 스캔
+3. `_generate_inputs_for()`에서:
+   - `_same_kernel_class()`로 target의 sub-ref name 매칭 (re-import 허용)
+   - reverse-BFS로 **upstream 의존성만** 수집 (target 제외 → 사이클 회피)
+   - target의 resolved params를 upstream에 전달
+   - upstream 순회: `generate_inputs()` → pool에서 connected inputs 설정 → `forward()`
+4. target 커널의 connected input 텐서에 `data` + `logical_data` 설정
+
+```python
+# source 커널만 generate_inputs 구현
+class WeightLoaderKernel(Kernel):
+    def generate_inputs(self, seed=None): ...  # ✅ source — 직접 구현
+    def forward(self, **inputs): ...
+
+class MacAtuKernel(Kernel):
+    # generate_inputs 불필요 — auto-chain이 해결
+    def forward(self, **inputs): ...           # ✅ forward만 구현 (HW behavioral model)
+
+class PsumBufferKernel(Kernel):
+    def forward(self, **inputs): ...           # ✅ forward만 구현 (HW behavioral model)
+
+class ActQuantKernel(Kernel):
+    def forward(self, **inputs): ...           # ✅ forward만 구현
+
+# standalone 검증:
+psum = ctx.instantiate(PsumBufferKernel, **params)
+psum.generate_inputs(seed=42)
+# → _lookup_composite() → NpuPipelineKernel 발견
+# → reverse-BFS: upstream = {wl, fmap, mac}
+# → upstream-only topo sort: [wl, fmap, mac]
+# → wl.generate_inputs() + wl.forward()
+# → fmap.generate_inputs() + fmap.forward()
+# → mac.forward() → packed psum streams (HW format)
+# → psum.psum_in.data = packed psum streams
+```
+
+**데이터 흐름:**
+- Exposed inputs: `logical_data` → `layout_{name}()` → physical
+- Connected inputs: forward() 출력 (HW physical format) → 직접 전달
+- target에 `data` + `logical_data` 모두 설정
+
+**Auto-discovery (`_discover_composite`):**
+Registry가 비어 있을 때 (CompositeKernel이 아직 import되지 않은 경우),
+커널의 소스 파일 위치에서 sibling 디렉토리를 스캔하여 CompositeKernel을
+자동 발견한다. conftest.py에서 수동 import할 필요 없음.
+
+**Class identity tolerance:**
+같은 .py 파일이 다른 모듈 이름으로 로드될 때 (`_vten_kernel_X` vs `X.X_kernel`),
+`_same_kernel_class()`가 클래스 이름 + 소스 파일 경로로 동일성을 판단하고,
+`_lookup_composite()`가 fallback 매칭 + 캐싱을 수행한다.
+
 ### 5.7 Composite forward() — 자동 chain
 
 CompositeKernel.forward() 기본 구현:
@@ -607,31 +710,115 @@ ctx.verify(h_ofm, golden)
 
 # AFTER — golden 생략 시 framework가 자동 계산
 ctx.verify(h_ofm)
+
+# 기존 2-arg도 유지 (backward compat)
+ctx.verify(h_ofm, explicit_golden)
 ```
 
-### 6.2 Framework verify 동작
+### 6.2 Framework verify 동작 (구현)
+
+`vten/runtime/context.py`의 `_compute_auto_golden()`:
 
 ```python
-def verify(handle, golden=None):
-    if golden is not None:
-        # 명시적 golden → 현재 동작 유지
-        _compare(hw_output, golden)
+def verify(self, op_handle, golden=None):
+    if self._last_compiled is not None:
+        # eager: 즉시 검증
+        if golden is None:
+            golden = self._compute_auto_golden(op_handle)
+        self._verify_immediate(op_handle, golden)
     else:
-        # 자동 golden 계산:
-        # 1. handle → 어떤 tensor인지 확인
-        # 2. kernel.forward(**inputs) 호출 (standalone)
-        #    또는 composite forward chain (composite)
-        # 3. golden_output = forward_result[tensor_name]
-        # 4. layout이 있으면: unpack(hw_output) vs golden_output (logical 비교)
-        #    layout이 없으면: hw_output vs golden_output (physical 비교)
-        tensor = handle.tensor
-        golden = _compute_golden(tensor)
-        unlayout = getattr(kernel, f"unlayout_{tensor.name}", None)
-        if unlayout is not None:
-            hw_logical = unlayout(hw_output)
-            _compare(hw_logical, golden)
-        else:
-            _compare(hw_output, golden)
+        # deferred: run() 후 일괄 검증
+        self._verifications.append(VerificationTask(op_handle, golden))
+```
+
+### 6.3 Auto-golden 계산 파이프라인
+
+```
+op_handle → tensor_name → _find_kernel_for_tensor()
+  → kernel_inst 찾기 (_kernels 순회, tensors() 및 _auto_exposed 매칭)
+  → _run_forward(kernel_inst) 호출 (결과는 _golden_cache에 캐싱)
+    → CompositeKernel: forward() no args (auto-chain이 layout + 연결 처리)
+    → Simple Kernel: H2D 텐서 수집 + layout 적용 + forward(**inputs)
+  → fwd_result[tensor_name] 추출
+  → 형식 변환 (필요시)
+  → chunk 슬라이싱 (필요시)
+  → golden 반환
+```
+
+### 6.4 형식 변환 규칙
+
+forward() 출력 dtype과 tensor dtype이 다를 때 자동 변환:
+
+| forward() dtype | tensor dtype | 처리 |
+|---|---|---|
+| 동일 | 동일 | 그대로 비교 |
+| uint8 (packed) | int32 (unpacked) | serialize → deserialize 왕복 (packing scheme 적용) |
+| 다름 | 다름 | dtype cast |
+
+**mac_atu 케이스**: forward() → packed uint8, tensor dtype = int32
+→ auto-golden이 forward() 출력을 `StreamSerializer.serialize()` → `deserialize()`로 왕복
+→ 21-bit truncation이 반영된 int32 golden 생성
+→ SHM deserialize 결과와 정확히 일치
+
+### 6.5 chunk 지원
+
+`recv_tensor(tensor, chunks=N)`으로 분할된 출력도 auto-golden 지원:
+```python
+psum_handles = ctx.recv_tensor(self.partial_sum, chunks=self.in_depth)
+for h in psum_handles:
+    ctx.verify(h)  # 각 chunk에 대해 golden 자동 슬라이싱
+```
+
+golden 전체를 계산한 뒤, `chunk_index`와 `chunk_total`로 구간 슬라이싱.
+
+### 6.6 golden 캐싱
+
+동일 커널의 여러 출력 텐서에 대해 forward()를 한 번만 호출:
+```python
+# _golden_cache: dict[int, dict[str, torch.Tensor]]
+# key = id(kernel_inst), value = forward() 결과 dict
+# run() 완료 후 clear
+```
+
+### 6.7 NPU 커널 run() 간소화 결과
+
+```python
+# ── weight_loader: 수동 layout + forward → auto-golden ──
+# BEFORE:
+physical = self.layout_wgt_mem(self.wgt_mem.data)
+ctx.verify(h_out, self.forward(wgt_mem=physical)["wgt_out"])
+# AFTER:
+ctx.verify(h_out)
+
+# ── mac_atu: 수동 einsum + per-depth 슬라이싱 → auto-golden + chunk ──
+# BEFORE (12줄):
+mac_result = self._compute_einsum(ifmap=self.ifmap.data, weight=self.weight.data)
+for d in range(self.in_depth):
+    golden_slices = []
+    for u in range(mac_result.shape[0]):
+        for x in range(mac_result.shape[1]):
+            golden_slices.append(mac_result[u, x, d].flatten())
+    golden_d = torch.cat(golden_slices).to(torch.int32)
+    ctx.verify(psum_handles[d], golden_d)
+# AFTER (2줄):
+for h in psum_handles:
+    ctx.verify(h)
+
+# ── fmapIO: 수동 layout + 2개 verify → auto-golden ──
+# BEFORE:
+physical = self.layout_ifm_mem(self.ifm_mem.data)
+golden = self.forward(ifm_mem=physical)
+ctx.verify(h_ifm, golden["ifm_out"])
+ctx.verify(h_coo, golden["coo_out"])
+# AFTER:
+ctx.verify(h_ifm)
+ctx.verify(h_coo)
+
+# ── composite (mac_psum, npu_pipeline) ──
+# BEFORE:
+ctx.verify(h_out, self.forward()["psum_out"])
+# AFTER:
+ctx.verify(h_out)
 ```
 
 ---
@@ -846,7 +1033,7 @@ class NpuPipelineKernel(CompositeKernel):
 ### 8.3 Test (변경 거의 없음)
 
 ```python
-from vten.cli.run import TestScenario
+from vten import TestScenario
 
 class TestForwardK3(TestScenario):
     kernel = "npu_pipeline"
@@ -860,108 +1047,150 @@ class TestForwardK3(TestScenario):
 
 ---
 
-## 9. 구현 순서
+## 9. 구현 순서 및 현황
 
-### Phase A: Tensor logical-first + Parameter 통일 (vten/kernel/)
+### Phase A: Tensor logical-first + Parameter 통일 — ✅ 완료
 
 수정 파일:
-- `vten/kernel/tensor.py` — shape=logical, resolved_shape=logical, layout 필드 삭제
-- `vten/kernel/layout.py` — **삭제** (Layout 클래스 제거, 커널 메서드로 대체)
-- `vten/kernel/base.py` — forward(**inputs)→dict, golden 관련 삭제, default_params, compute_derived_params(self), layout_*/unlayout_* convention
+- `vten/kernel/tensor.py` — shape=logical, resolved_shape=logical
+- `vten/kernel/base.py` — forward(**inputs)→dict, default_params, compute_derived_params(self), layout_*/unlayout_* convention
+- `vten/runtime/flattener.py` — KernelInstance.initialize() 순서 변경
 
-영향:
-- `_resolved_shape`의 의미가 logical로 변경
-- `fill_random()`이 logical shape 기준으로 생성
-- layout 변환 시점이 generate_inputs() → compile Stage 3로 이동 (framework가 kernel.layout_{name}() 호출)
-- KernelInstance.initialize() 순서 변경:
+구현 노트:
+- `logical_data` 별도 필드 대신, `tensor.data`를 primary로 유지 (설계 대비 단순화)
+- generate_inputs()에서 `tensor.data = logical_value` 설정 → Stage 3에서 `layout_{name}()` 자동 호출
+- KernelInstance.initialize() 순서:
   Resolver → Instance 생성 → base params를 attrs로 설정 → self.compute_derived_params() → derived attrs 설정 → Tensor shape resolve
 
-### Phase B: forward() 통합 (vten/kernel/, vten/runtime/)
+### Phase B: forward() 통합 — ✅ 완료
 
 수정 파일:
 - `vten/kernel/base.py` — forward(**inputs) → dict 시그니처
-- `vten/kernel/composite.py` — golden chain 삭제, auto forward chain 구현
-- `vten/runtime/engine.py` — auto-pack Stage 3 pre-step, golden 계산 로직
-- `vten/runtime/context.py` — verify() golden 자동 계산
+- `vten/kernel/composite.py` — auto forward chain (multi-round dataflow)
+- `vten/runtime/engine.py` — auto-pack Stage 3 pre-step (`_apply_layout`), `_apply_unlayout`
+- `vten/runtime/context.py` — verify(golden=None) auto-golden 계산
 
-### Phase C: Parameter & Register 통합 (vten/spec/, vten/runtime/)
+### Phase C: Parameter & Register 통합 — ✅ 완료
 
 수정 파일:
-- `vten/spec/models.py` — RuntimeParamSpec 삭제, RegisterSpec 단순화
-- `vten/spec/parser.py` — runtime_params 파싱 삭제, register default 삭제
-- `vten/runtime/binder.py` — 3개 함수 → 1개 `resolve_registers()` 통합
+- `vten/spec/models.py` — RegisterSpec 단순화
+- `vten/spec/parser.py` — register default 삭제
+- `vten/runtime/binder.py` — `resolve_registers()` 통합
 - `vten/runtime/resolver.py` — Kernel.default_params 참조 추가
-- `vten/runtime/flattener.py` — interface_map/config_map 로직 제거
 
-### Phase D: Composition 자동 추론 (vten/kernel/, vten/runtime/)
-
-수정 파일:
-- `vten/kernel/composite.py` — SubKernelRef, TensorRef, >> 연산자
-  - `SubKernelBinding` → `SubKernelRef` 교체
-  - `ExposedTensorDef`, `TensorProxy` → `TensorRef` 통합
-  - `bind()`, `expose()`, `Internal()` 삭제
-  - auto-expose, auto-prefix 로직
-- `vten/runtime/flattener.py` — auto-expose 기반 flatten 로직
-- `vten/runtime/engine.py` — auto forward chain, multi-round evaluation
-
-### Phase E: Tests & Examples 마이그레이션
+### Phase D: Composition 자동 추론 — ✅ 완료
 
 수정 파일:
-- `tests/test_composite*.py` — 새 API로 전환
-- `tests/test_runtime_*.py` — 새 resolver/binder/flattener 테스트
-- `examples/passthrough/kernels/` — forward() 시그니처 변경
-- `examples/scale_add/kernels/` — default_params, forward() 변경
-- `examples/mm_loopback/kernels/` — forward() 변경
+- `vten/kernel/composite.py` — `>>` 연산자, TensorRef, auto-expose, auto-prefix, auto-chain forward(), _generate_inputs_for(), _discover_composite()
+- `vten/runtime/flattener.py` — auto-expose 기반 flatten 로직, sub-kernel instances
 
-### Phase F: Spec 문서 업데이트
+### Phase E: Tests & Examples 마이그레이션 — ✅ 완료
 
-수정 파일:
-- `specs/00_data_models.md`
-- `specs/01_kernel_and_dsl.md`
-- `specs/02_runtime_engine.md`
-- `specs/09_user_api.md`
+- vten 테스트: 1841/1841 통과
+- NPU 3D 커널 9개 마이그레이션 완료 (mac_atu, psum_buffer, weight_loader, bias_loader, fmapIO, act_quant, mac_psum, npu_pipeline + _common utilities)
+
+### Phase F: Spec 문서 업데이트 — 진행 중
 
 ---
 
-## 10. 열린 결정 사항
+## 10. 결정된 사항
 
-### 10.1 Composite에서 exposed tensor 이름 규칙
+### 10.1 Composite에서 exposed tensor 접근 → Option C 확정
 
 ```python
-# Option A: sub_kernel.tensor_name 그대로 (충돌 가능)
-self.wgt_mem   # wl.wgt_mem
-self.ifm_mem   # fmap.ifm_mem
-
-# Option B: sub_name prefix (항상 고유)
-self.wl_wgt_mem
-self.fmap_ifm_mem
-
-# Option C: sub_kernel 객체를 통해 접근 (현재 제안)
-self.wl.wgt_mem
-self.fmap.ifm_mem
+self.wl.wgt_mem       # sub-kernel 객체를 통해 접근
+self.fmap.ifm_mem     # 명시적이고 충돌 없음
 ```
 
-→ **Option C** 채택: 명시적이고 충돌 없음.
+`__init_subclass__`에서 `_auto_exposed`를 computed하고,
+`KernelInstance._resolve_exposed_tensors()`에서 ExposedTensor 프록시를 생성하여
+composite 인스턴스의 attribute로 등록.
 
-### 10.2 Weight tiling의 소속
+### 10.2 Weight tiling → layout_wgt_mem()에 통합 확정
 
-weight_loader의 DDR에는 depth 반복이 필요:
-```python
-# 현재: npu_pipeline_kernel.py generate_inputs()에서 수동 tiling
-for ti in range(Ti):
-    for d in range(in_depth):
-        ddr_data[offset:offset+size] = unique_per_ti[ti]
-```
-
-→ **layout_wgt_mem(self, logical) 메서드에 통합**:
 ```python
 class WeightLoaderKernel(Kernel):
-    def layout_wgt_mem(self, logical):
-        # self.in_depth, self.Ti 등 직접 접근 가능
-        return weight_tiled_pack(logical, self.Ti, self.To, self.in_depth)
+    def layout_wgt_mem(self, logical: torch.Tensor) -> torch.Tensor:
+        """(out_ch, in_ch, K, K, K) int32 → flat uint8 DDR layout.
+        channel padding, per-Ti transpose, kernel_size-dependent packing, depth tiling 포함."""
+        # self.in_depth, self.Ti, self.To 등 직접 접근
+        ...
 ```
 
-### 10.3 Composite의 top-level kernel_spec.yaml 필요 여부
+### 10.3 Composite의 top-level kernel_spec.yaml → optional 확정
 
-현재 NPU composite는 spec 파일 없이 sub-kernel spec 합성으로 동작.
-v2에서도 composite는 spec 파일 **optional** — 있으면 memory_regions/clock/reset 오버라이드 가능.
+NPU composite는 spec 파일 없이 sub-kernel spec 합성으로 동작.
+composite spec은 있으면 memory_regions/clock/reset 오버라이드 가능.
+
+### 10.4 logical_data vs data → data를 primary로 유지
+
+설계 시 `logical_data`를 별도 필드로 계획했으나, 구현에서는:
+- `tensor.data` = 사용자가 설정하는 logical 데이터 (generate_inputs에서)
+- Stage 3에서 `_apply_layout()`이 `layout_{name}()` 호출 → physical bytes 생성
+- CompositeKernel.forward() pool seeding에서도 `tensor.data` + `layout_{name}()` 자동 적용
+
+---
+
+## 11. 구현 상세 — 설계 대비 실제 차이
+
+### 11.1 Auto-layout 호출 시점
+
+**설계**: Stage 3 pre-step에서 `tensor.data = layout(tensor.logical_data)` 변환
+**구현**: `RuntimeEngine._apply_layout(view, exposed, tensor.data)` — Stage 3 직전에 호출
+- `engine.py:1080-1098`: `_apply_layout()` — sub-kernel의 `layout_{name}()` 메서드 호출
+- `engine.py:1101-1119`: `_apply_unlayout()` — output tensor의 `unlayout_{name}()` 메서드 호출
+- `composite.py:313-330`: CompositeKernel.forward() pool seeding에서도 auto-layout 적용
+
+### 11.2 Auto-golden verify 구현 위치
+
+`vten/runtime/context.py`:
+- `_compute_auto_golden(op_handle)` — 핵심 로직
+- `_find_kernel_for_tensor(tensor_name)` — 커널 탐색
+- `_run_forward(kernel_inst)` — Composite vs Simple 분기
+- `_golden_cache` — `id(kernel_inst)` → forward() 결과 캐시
+- `VerificationTask.golden` — `None` 허용 (auto-golden 트리거)
+
+### 11.3 Auto-chain generate_inputs 구현
+
+`vten/kernel/composite.py`:
+- `_generate_inputs_for(target_kernel, seed)` (lines 410-553)
+- reverse-BFS로 upstream 의존성만 수집 (target 제외 → 사이클 회피)
+- `_same_kernel_class()`: 클래스 이름 + 소스 파일 경로로 동일성 판단
+- `_discover_composite()`: sibling 디렉토리 자동 스캔
+
+`vten/kernel/base.py`:
+- `generate_inputs()` fallback: `_lookup_composite()` → `_discover_composite()` → `_generate_inputs_for()`
+
+### 11.4 Vectorized behavioral model
+
+NPU 커널의 forward()/serialize/deserialize 성능 최적화:
+
+| 커널 | 메서드 | 최적화 | 성능 |
+|------|--------|--------|------|
+| mac_atu | `_serialize_psum()` | 36 vectorized numpy ops (21-bit packing) | 84M → 36 ops |
+| psum_buffer | `_deserialize_psum()` | vectorized 21-bit unpacking | 3.5M → 36 ops |
+| weight_loader | `_ti_parallel_stream_k3()` | broadcast + even/odd split | 80M → broadcast |
+| mac_psum | weight packing in `generate_inputs()` | numpy pad + broadcast | 4.2M → broadcast |
+
+핵심 패턴: Python-level 루프를 numpy array 연산으로 대체.
+bit packing/unpacking은 K*K=9 반복 × 4 byte 접근 = 36 vectorized ops로 고정.
+
+### 11.5 CompositeKernel forward() multi-round evaluation
+
+`composite.py:287-408`:
+1. **Pool seeding**: exposed input tensors → kwargs 또는 instance data, auto-layout 적용
+2. **Multi-round loop** (MAX_ROUNDS=20):
+   - topo order로 sub-kernel 순회
+   - 가용한 입력으로 forward() 호출
+   - 출력을 connection을 통해 downstream으로 전파
+   - cycle 처리: partial input guard (`if "x" in inputs`)
+3. **결과 수집**: exposed output tensors만 반환
+
+fmapIO cycle 처리:
+```
+Round 1: fmap.forward(ifm_mem=...) → ifm_out, coo_out
+Round 2: mac.forward(ifmap=ifm_out, weight=wgt_out) → partial_sum
+Round 3: psum.forward(psum_in=partial_sum) → psum_out
+Round 4: act.forward(psum_in=psum_out, bias_in=bias_out) → quant_out
+Round 5: fmap.forward(ofm_in=quant_out) → ofm_mem  ← 2nd call
+```
