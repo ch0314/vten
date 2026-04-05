@@ -471,7 +471,7 @@ class IRLowering:
         iface_name = op.register_interface
         iface_id = self._get_iface_id(iface_name)
         _reg_spec, abs_offset, mask, expected = self._resolve_poll_params(
-            iface_name, op.register_field_name
+            iface_name, op.register_field_name, op.poll_expected,
         )
         cmd = Command(
             op=OpCode.POLL_REG,
@@ -842,7 +842,8 @@ class IRLowering:
         )
 
     def _resolve_poll_params(
-        self, iface_name: str, field_name: str
+        self, iface_name: str, field_name: str,
+        poll_expected: int | None = None,
     ) -> tuple[object, int, int, int]:
         """Resolve poll_register mask/expected from field bit range."""
         reg_spec, abs_offset = self._resolve_register_by_field_name(
@@ -851,7 +852,10 @@ class IRLowering:
         bit_range_str = reg_spec.fields[field_name]
         hi, lo = parse_bit_range(bit_range_str)
         mask = ((1 << (hi - lo + 1)) - 1) << lo
-        expected = mask
+        if poll_expected is not None:
+            expected = poll_expected << lo
+        else:
+            expected = mask  # default: all 1s
         return reg_spec, abs_offset, mask, expected
 
     @staticmethod

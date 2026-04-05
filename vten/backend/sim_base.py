@@ -12,12 +12,14 @@ from __future__ import annotations
 import abc
 import ctypes
 import ctypes.util
+import json
 import logging
 import os
 import struct
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from vten.backend.base import Backend, BackendResult, CmdStats, raise_backend_error
@@ -404,6 +406,21 @@ class SimBackend(Backend):
     # Progress polling interval (seconds)
     _PROGRESS_POLL_INTERVAL = 2.0
 
+    # Stall detection: if no activity change for this many consecutive polls → WARNING
+    _STALL_WARN_POLLS = 5  # 5 * 2s = 10s of no activity
+
+    # Default bytes-per-beat for expected beat count estimation
+    _DEFAULT_BYTES_PER_BEAT = 32  # 256-bit bus
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        """Format elapsed time: seconds for <60s, m:ss for >=60s."""
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        mins = int(seconds) // 60
+        secs = int(seconds) % 60
+        return f"{mins}m{secs:02d}s"
+
     def _wait_completion(self) -> BackendResult:
         """Wait for backend completion with progress monitoring.
 
@@ -435,10 +452,15 @@ class SimBackend(Backend):
         while True:  # GUI restart loop (single iteration in normal mode)
             logger.log(5, "[handshake 8] waiting for backend completion (timeout=%ds)",
                          effective_timeout)
-            deadline = time.monotonic() + effective_timeout
+            start_time = time.monotonic()
+            deadline = start_time + effective_timeout
             last_progress_str = ""
             poll_count = 0
             process_exited = False
+
+            # Heartbeat state: track per-command deltas across polls
+            prev_snapshot: dict[int, SimBackend._CmdSnapshot] | None = None
+            stall_count = 0  # consecutive polls with no activity change
 
             try:
                 while True:
@@ -453,11 +475,50 @@ class SimBackend(Backend):
                     else:
                         # Timeout on this poll — read progress from SHM
                         poll_count += 1
-                        progress_str = self._format_progress()
-                        if progress_str and progress_str != last_progress_str:
-                            elapsed = time.monotonic() - (deadline - effective_timeout)
-                            logger.info("  [%.1fs] %s", elapsed, progress_str)
+                        elapsed = time.monotonic() - start_time
+                        elapsed_str = self._format_elapsed(elapsed)
+
+                        stats, cmd_meta = self._read_progress_data()
+                        if not stats:
+                            if self._process is not None and self._process.poll() is not None:
+                                process_exited = True
+                                break
+                            continue
+
+                        # Build current snapshot
+                        cur_snapshot = self._build_snapshot(stats)
+
+                        # Format progress line
+                        progress_str = self._format_progress(stats, cmd_meta)
+
+                        if progress_str != last_progress_str:
+                            # Progress changed (committed count changed) — always log
+                            logger.info("  [%s] %s", elapsed_str, progress_str)
                             last_progress_str = progress_str
+                            stall_count = 0
+                        elif prev_snapshot is not None:
+                            # Progress line same — emit heartbeat with deltas
+                            heartbeat = self._format_heartbeat(
+                                cur_snapshot, prev_snapshot, cmd_meta,
+                            )
+                            if heartbeat:
+                                logger.info("  [%s] %s", elapsed_str, heartbeat)
+                                stall_count = 0
+                            else:
+                                stall_count += 1
+
+                        # Stall detection
+                        if stall_count >= self._STALL_WARN_POLLS:
+                            self._emit_stall_warning(
+                                stats, cmd_meta, elapsed_str,
+                            )
+                            stall_count = 0  # reset to avoid spam
+
+                        prev_snapshot = cur_snapshot
+
+                        # JSON timeline (debug-level for log file)
+                        self._emit_timeline(stats, cmd_meta, elapsed)
+
                         # Check if simulator process died
                         if self._process is not None and self._process.poll() is not None:
                             process_exited = True
@@ -486,11 +547,10 @@ class SimBackend(Backend):
                              error_code, error_cmd_id, error_msg)
 
                 if gui_mode and process_alive:
-                    # GUI: log error, reset SHM for restart, keep session alive
+                    # GUI: log error, keep session alive but do NOT signal
+                    # CMD_READY — wait for user to restart or close xsim.
                     gui_last_error = (error_code, error_cmd_id, error_msg)
                     logger.info("[gui] error logged — restart xsim or close to finish")
-                    self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_CMD_READY)
-                    self._sem_h2b.post()
                     continue  # Wait for restart or process exit
 
                 # Normal mode or process exited: raise
@@ -543,15 +603,17 @@ class SimBackend(Backend):
             buffer_reader = self._make_buffer_reader()
 
             if gui_mode and process_alive:
-                # GUI: save result, reset SHM for restart, keep session alive
+                # GUI: save result, keep session alive but do NOT signal
+                # CMD_READY — that would make the SV controller immediately
+                # re-execute the same batch.  Just wait for the user to
+                # either close xsim (process exit) or restart the sim
+                # (which triggers vten_shm_init → sem_b2h with IDLE).
                 gui_last_result = BackendResult(
                     status=backend_status,
                     stats=stats,
                     _shm_reader=buffer_reader,
                 )
                 logger.info("[gui] simulation done — restart xsim or close to finish")
-                self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_CMD_READY)
-                self._sem_h2b.post()
                 continue
 
             # Normal mode or process exited: return result
@@ -575,7 +637,7 @@ class SimBackend(Backend):
     # ── Progress monitoring ──
 
     def _read_command_metadata(self) -> list[dict]:
-        """Read opcode and interface_id for each command from SHM Command Region."""
+        """Read opcode, interface_id, and size for each command from SHM Command Region."""
         if self._shm is None:
             return []
         buf = self._shm.buf
@@ -589,6 +651,8 @@ class SimBackend(Backend):
                 break
             opcode = struct.unpack_from("<H", buf, base + 0x00)[0]
             iface_id = struct.unpack_from("<H", buf, base + 0x04)[0]
+            protocol = struct.unpack_from("<B", buf, base + 0x06)[0]
+            size = struct.unpack_from("<I", buf, base + 0x0C)[0]
             reg_offset = struct.unpack_from("<I", buf, base + 0x18)[0]
             reg_mask = struct.unpack_from("<I", buf, base + 0x20)[0]
             reg_expected = struct.unpack_from("<I", buf, base + 0x24)[0]
@@ -597,6 +661,8 @@ class SimBackend(Backend):
                 "opcode": opcode,
                 "opcode_name": _OPCODE_NAMES.get(opcode, f"?{opcode}"),
                 "interface_id": iface_id,
+                "protocol": protocol,
+                "size": size,
                 "reg_offset": reg_offset,
                 "reg_mask": reg_mask,
                 "reg_expected": reg_expected,
@@ -645,40 +711,219 @@ class SimBackend(Backend):
             "commands": commands,
         }
 
-    def _format_progress(self) -> str:
-        """Format a one-line progress string from current SHM stats."""
-        if self._shm is None:
-            return ""
+    # ── Heartbeat / progress infrastructure ──
+
+    @dataclass
+    class _CmdSnapshot:
+        """Per-command snapshot for delta computation between polls."""
+        cmd_id: int
+        status: int
+        total_beats: int
+        active_cycles: int
+        stall_cycles: int
+        last_active_cycle: int
+
+    def _read_progress_data(self) -> tuple[list[CmdStats], list[dict]]:
+        """Read both stats and command metadata in one call."""
         try:
             stats = self._read_stats_from_shm()
+            cmd_meta = self._read_command_metadata()
         except Exception:
-            return ""
+            return [], []
+        return stats, cmd_meta
 
+    def _build_snapshot(
+        self, stats: list[CmdStats],
+    ) -> dict[int, _CmdSnapshot]:
+        """Build a {cmd_id: snapshot} dict from current stats."""
+        snap: dict[int, SimBackend._CmdSnapshot] = {}
+        for s in stats:
+            snap[s.cmd_id] = self._CmdSnapshot(
+                cmd_id=s.cmd_id,
+                status=s.status,
+                total_beats=s.total_beats,
+                active_cycles=s.active_cycles,
+                stall_cycles=s.stall_cycles,
+                last_active_cycle=s.last_active_cycle,
+            )
+        return snap
+
+    def _format_progress(
+        self, stats: list[CmdStats], cmd_meta: list[dict],
+    ) -> str:
+        """Format a one-line progress string from current SHM stats."""
         if not stats:
             return ""
 
         total = len(stats)
         committed = sum(1 for s in stats if s.status >= 3)  # COMMITTED or ERROR
-        issued = sum(1 for s in stats if s.status == 1)  # ISSUED (in-flight)
-        pending = sum(1 for s in stats if s.status == 0)  # PENDING
+        issued = sum(1 for s in stats if s.status == 1)     # ISSUED (in-flight)
+        pending = sum(1 for s in stats if s.status == 0)    # PENDING
 
         if committed == total:
             return f"{committed}/{total} commands done"
 
-        # Find the stuck command (ISSUED with highest stall)
-        stuck_info = ""
+        # Find the first ISSUED command for summary
+        cmd_info = ""
         if issued > 0:
-            cmd_meta = self._read_command_metadata()
             for s in stats:
-                if s.status == 1:  # ISSUED
+                if s.status == 1:
                     meta = cmd_meta[s.cmd_id] if s.cmd_id < len(cmd_meta) else {}
                     op_name = meta.get("opcode_name", "?")
-                    stuck_info = f", {op_name} cmd#{s.cmd_id}"
-                    if s.stall_cycles > 100:
-                        stuck_info += f" stalled {s.stall_cycles} cyc"
+                    cmd_size = meta.get("size", 0)
+                    cmd_info = f", {op_name} cmd#{s.cmd_id}"
+
+                    # Beat progress for data commands
+                    if op_name in ("PUSH", "PULL", "LOAD", "STORE") and cmd_size > 0:
+                        expected = max(1, cmd_size // self._DEFAULT_BYTES_PER_BEAT)
+                        pct = min(100, s.total_beats * 100 // expected)
+                        cmd_info += f" {pct}% ({s.total_beats}/{expected} beats)"
+                    elif s.stall_cycles > 100:
+                        cmd_info += f" stalled {s.stall_cycles} cyc"
+
+                    # Simulation cycle
+                    if s.last_active_cycle > 0:
+                        cmd_info += f" @cycle {s.last_active_cycle}"
                     break
 
-        return f"{committed}/{total} commands done ({issued} active, {pending} waiting{stuck_info})"
+        return (f"{committed}/{total} commands done "
+                f"({issued} active, {pending} waiting{cmd_info})")
+
+    def _format_heartbeat(
+        self,
+        cur: dict[int, _CmdSnapshot],
+        prev: dict[int, _CmdSnapshot],
+        cmd_meta: list[dict],
+    ) -> str:
+        """Format heartbeat line showing per-BFM activity deltas.
+
+        Returns empty string if there is no meaningful activity to report.
+        """
+        parts: list[str] = []
+        any_activity = False
+
+        for cmd_id, cs in cur.items():
+            if cs.status != 1:  # Only ISSUED commands
+                continue
+            ps = prev.get(cmd_id)
+            if ps is None or ps.status != 1:
+                continue  # Newly issued — skip delta for first poll
+
+            meta = cmd_meta[cmd_id] if cmd_id < len(cmd_meta) else {}
+            op_name = meta.get("opcode_name", "?")
+            cmd_size = meta.get("size", 0)
+
+            d_beats = cs.total_beats - ps.total_beats
+            d_active = cs.active_cycles - ps.active_cycles
+            d_stall = cs.stall_cycles - ps.stall_cycles
+
+            if d_beats > 0 or d_active > 0 or d_stall > 0:
+                any_activity = True
+
+            # Build per-command heartbeat fragment
+            frag = f"{op_name} cmd#{cmd_id}"
+            if op_name in ("PUSH", "PULL", "LOAD", "STORE") and cmd_size > 0:
+                expected = max(1, cmd_size // self._DEFAULT_BYTES_PER_BEAT)
+                pct = min(100, cs.total_beats * 100 // expected)
+                frag += f" {pct}%"
+                if d_beats > 0:
+                    throughput_bytes = d_beats * self._DEFAULT_BYTES_PER_BEAT
+                    throughput_str = self._format_size(throughput_bytes)
+                    frag += f" (+{d_beats} beats, ~{throughput_str}/poll)"
+                elif d_stall > 0:
+                    frag += f" (stalling, +{d_stall} stall cyc)"
+                else:
+                    frag += " (no change)"
+            elif op_name == "POLL_REG":
+                frag += f" polling (+{d_stall} stall cyc)"
+            else:
+                if d_active > 0:
+                    frag += f" (+{d_active} active cyc)"
+                elif d_stall > 0:
+                    frag += f" (+{d_stall} stall cyc)"
+
+            if cs.last_active_cycle > 0:
+                frag += f" @cycle {cs.last_active_cycle}"
+
+            parts.append(frag)
+
+        if not parts:
+            return ""
+        if not any_activity:
+            return ""  # All deltas zero — let stall detection handle it
+
+        return "heartbeat: " + "; ".join(parts)
+
+    def _emit_stall_warning(
+        self,
+        stats: list[CmdStats],
+        cmd_meta: list[dict],
+        elapsed_str: str,
+    ) -> None:
+        """Emit WARNING for commands with no activity for multiple polls."""
+        stall_secs = self._STALL_WARN_POLLS * self._PROGRESS_POLL_INTERVAL
+
+        for s in stats:
+            if s.status != 1:  # Only ISSUED
+                continue
+            meta = cmd_meta[s.cmd_id] if s.cmd_id < len(cmd_meta) else {}
+            op_name = meta.get("opcode_name", "?")
+
+            detail = f"{op_name} cmd#{s.cmd_id}: no activity for {stall_secs:.0f}s"
+            if s.last_active_cycle > 0:
+                detail += f" (last active @cycle {s.last_active_cycle})"
+            if s.stall_cycles > 0:
+                detail += f", {s.stall_cycles} stall cycles"
+
+            # Extra context for POLL_REG
+            if op_name == "POLL_REG":
+                detail += (f", polling addr=0x{meta.get('reg_offset', 0):04x}"
+                           f" mask=0x{meta.get('reg_mask', 0):08x}"
+                           f" expected=0x{meta.get('reg_expected', 0):08x}")
+
+            logger.warning("  [%s] STALL %s", elapsed_str, detail)
+
+    def _emit_timeline(
+        self, stats: list[CmdStats], cmd_meta: list[dict], elapsed: float,
+    ) -> None:
+        """Emit JSON timeline entry at DEBUG level (captured by --log-file)."""
+        # Only emit if a file handler is likely attached (avoid overhead)
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        total = len(stats)
+        committed = sum(1 for s in stats if s.status >= 3)
+        issued_cmds = []
+        for s in stats:
+            if s.status == 1:
+                meta = cmd_meta[s.cmd_id] if s.cmd_id < len(cmd_meta) else {}
+                issued_cmds.append({
+                    "id": s.cmd_id,
+                    "op": meta.get("opcode_name", "?"),
+                    "iface": meta.get("interface_id", -1),
+                    "beats": s.total_beats,
+                    "active": s.active_cycles,
+                    "stall": s.stall_cycles,
+                    "last_cycle": s.last_active_cycle,
+                })
+
+        entry = {
+            "t": round(elapsed, 2),
+            "done": committed,
+            "total": total,
+            "issued": issued_cmds,
+        }
+        logger.debug("timeline: %s", json.dumps(entry, separators=(",", ":")))
+
+    @staticmethod
+    def _format_size(nbytes: int) -> str:
+        """Format byte count as human-readable size."""
+        if nbytes < 1024:
+            return f"{nbytes}B"
+        elif nbytes < 1024 * 1024:
+            return f"{nbytes / 1024:.1f}KB"
+        else:
+            return f"{nbytes / (1024 * 1024):.1f}MB"
 
     def _format_timeout_report(self, diag: dict, elapsed: float) -> str:
         """Format a structured timeout diagnostic report."""

@@ -366,6 +366,7 @@ class XrtGenerator:
             "kernel_name": kernel_name,
             "interfaces": interfaces,
             "args": args,
+            "ctrl_protocol": ctrl_protocol,
         })
         path = out / "kernel.xml"
         path.write_text(content)

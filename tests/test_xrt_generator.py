@@ -210,9 +210,9 @@ class TestTemplateRendering:
         content = generated["kernel.xml"].read_text()
         assert 'vlnv="user.org:kernel:test_kern:1.0"' in content
 
-    def test_kernel_xml_has_ip_c_language(self, generated):
+    def test_kernel_xml_has_ip_language_for_user_managed(self, generated):
         content = generated["kernel.xml"].read_text()
-        assert 'language="ip_c"' in content
+        assert 'language="ip"' in content
 
     def test_kernel_xml_has_interrupt(self, generated):
         content = generated["kernel.xml"].read_text()

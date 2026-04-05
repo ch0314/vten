@@ -552,6 +552,18 @@ def _make_composite_kernel():
                 target_cls.__name__, cls.__name__, n_copied,
             )
 
+        def get_tensor(self, name: str) -> Tensor:
+            """Get a tensor by name, resolving auto-exposed sub-kernel tensors."""
+            # Check auto_exposed: (sub_name, tensor_name) → exposed_name
+            cls = self.__class__
+            for (sub_name, tensor_name), exposed_name in cls._auto_exposed.items():
+                if name == tensor_name or name == exposed_name:
+                    sub = self._get_sub_kernel_instance(sub_name)
+                    if sub is not None:
+                        return sub.get_tensor(tensor_name)
+            # Fall through to base class
+            return super().get_tensor(name)
+
         def _get_sub_kernel_instance(self, sub_name: str) -> Kernel | None:
             """Get the actual kernel instance for a sub-kernel."""
             # After KernelInstance initialization, sub-kernel instances are stored

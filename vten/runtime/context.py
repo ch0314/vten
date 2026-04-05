@@ -188,11 +188,14 @@ class ExecutionContext:
             dep=dep,
         )
 
-    def poll_register(self, register, field_name: str, dep=None) -> OperationHandle:
+    def poll_register(
+        self, register, field_name: str, *, expected: int | None = None, dep=None,
+    ) -> OperationHandle:
         return self._record(
             OpKind.POLL_REGISTER,
             register_interface=register.interface_name,
             register_field_name=field_name,
+            poll_expected=expected,
             dep=dep,
         )
 

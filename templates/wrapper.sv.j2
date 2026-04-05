@@ -247,9 +247,10 @@ module {{ kernel_name }} #(
 );
 
 {% for iface in ctrl_interfaces %}
-    // ── Register wires: {{ iface.name }} ──
+{% set dw = iface.data_width or 32 %}
+    // ── Register wires: {{ iface.name }} ({{ dw }}-bit) ──
 {% for reg in iface.registers %}
-    logic [{{ reg.width - 1 }}:0] reg_{{ reg.name }};
+    logic [{{ dw - 1 }}:0] reg_{{ reg.name }};
 {% endfor %}
 {% endfor %}
 

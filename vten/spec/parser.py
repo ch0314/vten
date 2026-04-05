@@ -197,7 +197,7 @@ def _parse_interface(
         if protocol == Protocol.AXI4:
             addr_width = 64
         elif protocol == Protocol.AXI4L:
-            addr_width = 32
+            addr_width = 12  # 4KB range — standard for Xilinx AXI-Lite IP
 
     # tensor / tensors handling
     tensor = spec.get("tensor")

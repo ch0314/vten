@@ -28,6 +28,7 @@ class Operation:
     register_interface: str | None = None
     register_fields: dict | None = None
     register_field_name: str | None = None  # For poll_register
+    poll_expected: int | None = None  # Override expected value (None = all 1s)
     dep: list[OperationHandle] = field(default_factory=list)
     commit_dep: list[OperationHandle] = field(default_factory=list)
     probe: bool = False

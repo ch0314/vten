@@ -482,7 +482,7 @@ class TestAXI4LiteInterface:
             assert reg.auto_bind.param is not None
 
     def test_lite_default_addr_width(self, tmp_path):
-        """AXI4-Lite addr_width 기본값 32."""
+        """AXI4-Lite addr_width 기본값 12 (4KB range)."""
         data = {
             "kernel": "k",
             "rtl_top": "r.sv",
@@ -497,7 +497,7 @@ class TestAXI4LiteInterface:
             },
         }
         spec = parse_kernel_spec(str(_write_spec(tmp_path, data)))
-        assert spec.get_interface("ctrl").addr_width == 32
+        assert spec.get_interface("ctrl").addr_width == 12
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -129,6 +129,23 @@ PYBIND11_MODULE(vten_xrt, m) {
             return py::bytes(buf.data(), size);
         }, py::arg("size"), py::arg("skip"),
             "Read bytes from buffer at specified offset")
+        // map: establish host memory mapping (matches C++ bo.map<T*>())
+        // Returns bytes from the mapped host buffer.
+        .def("map_read", [](xrt::bo& bo, size_t size) -> py::bytes {
+            auto ptr = bo.map<char*>();
+            if (!ptr) {
+                throw std::runtime_error("bo.map() returned null");
+            }
+            return py::bytes(ptr, size);
+        }, py::arg("size"),
+            "Map host buffer and read bytes from it")
+        // map_init: establish mapping, useful as side-effect for hw_emu
+        .def("map_init", [](xrt::bo& bo) {
+            auto ptr = bo.map<char*>();
+            if (!ptr) {
+                throw std::runtime_error("bo.map() returned null");
+            }
+        }, "Establish host memory mapping (hw_emu compatibility)")
         .def("__bool__", [](const xrt::bo& bo) {
             return static_cast<bool>(bo);
         });

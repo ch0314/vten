@@ -235,10 +235,20 @@ class CommandInterpreter:
                 self._device, size,
                 self._xrt.bo.flags.normal, mem_bank,
             )
-            # For input tensors, write data into BO
+            # Establish host memory mapping (hw_emu compatibility).
+            # Original C++ host code always calls bo.map<T*>() before
+            # any read/write/sync — this may be required for hw_emu's
+            # IPC memory model to properly track the buffer.
+            if hasattr(bo, "map_init"):
+                bo.map_init()
+            # For input tensors, write data into BO.
+            # For output tensors (PULL), zero-init like original host code
+            # (memset(0) ensures hw_emu device memory is properly initialized).
             data = tensor_data.get(buffer_id, b"")
             if data:
                 bo.write(data)
+            else:
+                bo.write(b"\x00" * size)
             # Sync TO_DEVICE to assign device address and transfer data
             bo.sync(self._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             self._buffers[buffer_id] = bo
@@ -246,7 +256,7 @@ class CommandInterpreter:
             op_name = buf_ops.get(buffer_id, "?")
             if hasattr(op_name, "name"):
                 op_name = op_name.name
-            hex_head = " ".join(f"{b:02X}" for b in data[:32]) if data else "-"
+            hex_head = " ".join(f"{b:02X}" for b in data[:32]) if data else "zeroed"
             logger.info(
                 "  pre-allocated BO: buffer_id=%d size=%d bank=%d "
                 "addr=0x%X (%s, data=%d bytes) first32=[%s]",
@@ -338,20 +348,25 @@ class CommandInterpreter:
         """
         bo = self._buffers.get(cmd.buffer_id)
         if bo is None:
+            size = cmd.size or 4096
             mem_bank = self._mem_bank_map.get(cmd.buffer_id, 0)
             bo = self._xrt.bo(
-                self._device, cmd.size or 4096,
+                self._device, size,
                 self._xrt.bo.flags.normal, mem_bank,
             )
+            if hasattr(bo, "map_init"):
+                bo.map_init()
+            # Zero-init output BO (matches original host code memset pattern)
+            bo.write(b"\x00" * size)
+            bo.sync(self._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             self._buffers[cmd.buffer_id] = bo
 
     def _exec_store(self, cmd: Command) -> None:
         """STORE: Sync BO from device, then read data back to host.
 
         In XRT, STORE must happen after the DUT finishes computation.
-        If STORE appears before POLL_REG in the command list (because
-        recv_tensor is called before poll_register for xsim BFM compat),
-        defer execution until after POLL_REG completes.
+        STORE is always deferred and flushed at the end of execute(),
+        after all commands (including all POLL_REGs) complete.
         """
         self._deferred_stores.append(cmd)
 
@@ -366,7 +381,12 @@ class CommandInterpreter:
                 )
             bo.sync(self._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
             size = cmd.size if cmd.size > 0 else bo.size()
-            data = bo.read(size)
+            # Prefer map_read (reads directly from mapped host pointer,
+            # matching original C++ host code pattern) over bo.read().
+            if hasattr(bo, "map_read"):
+                data = bo.map_read(size)
+            else:
+                data = bo.read(size)
             self._output_buffers[cmd.buffer_id] = bytes(data)
             hex_head = " ".join(f"{b:02X}" for b in data[:32])
             logger.info(
@@ -413,6 +433,10 @@ class CommandInterpreter:
                     "None" if bo is None else "no .address()",
                     cmd.reg_value,
                 )
+        logger.info(
+            "    WRITE_REG: iface=%d offset=0x%X value=0x%X (%d)",
+            cmd.interface_id, cmd.reg_offset, cmd.reg_value, cmd.reg_value,
+        )
         ip.write_register(cmd.reg_offset, cmd.reg_value)
 
     def _exec_read_reg(self, cmd: Command) -> None:
@@ -435,9 +459,6 @@ class CommandInterpreter:
                     cmd.reg_offset, poll_count, elapsed_ms / 1000,
                 )
                 cmd.reg_value = val
-                # Flush STORE commands deferred from before this POLL
-                if self._deferred_stores:
-                    self._flush_deferred_stores()
                 return
             elapsed_ms = (time.monotonic() - start) * 1000
             if poll_count % 1000 == 0:

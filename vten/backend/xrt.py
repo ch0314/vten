@@ -42,7 +42,7 @@ class XrtBackend(Backend):
         self._instance_name = xrt_cfg.get("instance_name", "")
         target = xrt_cfg.get("target", "hw")
         # hw_emu needs much longer poll timeout (simulation is slow)
-        default_timeout = 600000 if target == "hw_emu" else 30000
+        default_timeout = 3600000 if target == "hw_emu" else 30000
         self._poll_timeout_ms = xrt_cfg.get("poll_timeout_ms", default_timeout)
         self._config = project_config
 
@@ -209,6 +209,15 @@ class XrtBackend(Backend):
                     k: dict(v) for k, v in self._per_cu_group_ids.items()
                 })
 
+        # Fallback: parse xclbin CONNECTIVITY for arg→mem mapping when
+        # xrt.kernel group_id() fails (e.g. user_managed / AP_CTRL_NONE).
+        if not self._per_cu_group_ids and hasattr(self._xclbin, "get_kernels"):
+            self._per_cu_group_ids = self._parse_xclbin_connectivity()
+            if self._per_cu_group_ids:
+                logger.info("per-CU group_ids (from xclbin connectivity): %s", {
+                    k: dict(v) for k, v in self._per_cu_group_ids.items()
+                })
+
         # Backward compat: default group_ids from first/default kernel
         if self._kernel_name:
             if self._instance_name:
@@ -219,6 +228,62 @@ class XrtBackend(Backend):
                 self._kernel_name, {}
             )
             self._default_ip = self._get_or_create_ip(ip_name)
+
+    def _parse_xclbin_connectivity(self) -> dict[str, dict[int, int]]:
+        """Parse xclbin CONNECTIVITY + IP_LAYOUT to get arg→mem_index mapping.
+
+        Fallback for user_managed kernels where xrt.kernel.group_id() fails.
+        Returns: {kernel_name: {arg_index: mem_data_index}}.
+        """
+        import json
+        import subprocess
+        import tempfile
+
+        xclbin_path = self._xclbin_path
+        result: dict[str, dict[int, int]] = {}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                ip_file = Path(tmpdir) / "ip.json"
+                conn_file = Path(tmpdir) / "conn.json"
+
+                subprocess.run(
+                    ["xclbinutil",
+                     "--dump-section", f"IP_LAYOUT:JSON:{ip_file}",
+                     "--dump-section", f"CONNECTIVITY:JSON:{conn_file}",
+                     "--input", str(xclbin_path),
+                     "--force"],
+                    capture_output=True, check=True,
+                )
+
+                with open(ip_file) as f:
+                    ip_data = json.load(f)
+                with open(conn_file) as f:
+                    conn_data = json.load(f)
+
+            # Build IP index → kernel_name mapping
+            ip_names: dict[int, str] = {}
+            for i, ip in enumerate(ip_data["ip_layout"]["m_ip_data"]):
+                # m_name format: "kernel_name:instance_name"
+                name = ip["m_name"]
+                kern = name.split(":")[0] if ":" in name else name
+                ip_names[i] = kern
+
+            # Build kernel_name → {arg_index: mem_data_index}
+            for conn in conn_data["connectivity"]["m_connection"]:
+                ip_idx = int(conn["m_ip_layout_index"])
+                arg_idx = int(conn["arg_index"])
+                mem_idx = int(conn["mem_data_index"])
+                kern = ip_names.get(ip_idx)
+                if kern:
+                    if kern not in result:
+                        result[kern] = {}
+                    result[kern][arg_idx] = mem_idx
+
+        except Exception as e:
+            logger.warning("Failed to parse xclbin connectivity: %s", e)
+
+        return result
 
     def _get_or_create_ip(self, ip_name: str) -> Any:
         """Get or lazily create an xrt.ip by name."""
@@ -562,7 +627,8 @@ class XrtBackend(Backend):
         self._device = None
         self._xclbin = None
         self._uuid = None
-        self._cleanup_emu_run_dir()
+        # Skip cleanup to inspect hw_emu simulation logs
+        # self._cleanup_emu_run_dir()
 
     def _cleanup_emu_run_dir(self) -> None:
         """Remove hw_emu .run/<PID> directory if it exists.
