@@ -2,6 +2,9 @@
 
 Provides setup_logging() for CLI entry and module-level logger convention.
 All vten modules use: logger = logging.getLogger(__name__)
+
+Shared formatting helpers (format_elapsed, format_size) are used by both
+sim and XRT backends for consistent output.
 """
 
 from __future__ import annotations
@@ -9,6 +12,38 @@ from __future__ import annotations
 import logging
 import os
 import sys
+
+
+# ── Shared formatting helpers ──
+
+
+def format_elapsed(seconds: float) -> str:
+    """Format elapsed time: seconds for <60s, m:ss for >=60s."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    mins = int(seconds) // 60
+    secs = int(seconds) % 60
+    return f"{mins}m{secs:02d}s"
+
+
+def format_size(nbytes: int) -> str:
+    """Format byte count as human-readable size."""
+    if nbytes < 1024:
+        return f"{nbytes}B"
+    elif nbytes < 1024 * 1024:
+        return f"{nbytes / 1024:.1f}KB"
+    else:
+        return f"{nbytes / (1024 * 1024):.1f}MB"
+
+
+# ── Execution phase constants (shared between sim and XRT backends) ──
+
+PHASE_CONFIGURE = "configure"
+PHASE_SEND = "send"
+PHASE_TRIGGER = "trigger"
+PHASE_POLL = "poll"
+PHASE_RECV = "recv"
+PHASE_OTHER = "other"
 
 
 # ── Short component names for console output ──
@@ -28,7 +63,7 @@ _COMPONENT_MAP: dict[str, str] = {
     "vten.build.xsim_build": "build.xsim",
     "vten.build.xrt_build": "build.xrt",
     "vten.build.verilator_build": "build.veri",
-    "vten.functional": "functional",
+    "vten.inference": "inference",
     "vten.runtime.interpreter": "interp",
 }
 

@@ -181,6 +181,22 @@ class Backend(abc.ABC):
         """Send shutdown signal (optional)."""
         pass
 
+    def get_buffer_object(self, buffer_id: int) -> object | None:
+        """Return device buffer object for buffer_id, or None.
+
+        Used by inference API to bind output BOs to Tensor objects.
+        Default returns None (SIM backends don't expose device buffers).
+        """
+        return None
+
+    def inject_prebound(self, buffer_id: int, bo: object) -> None:
+        """Inject a pre-existing device buffer for reuse.
+
+        Used by inference API for upload() — BO already on device,
+        skip LOAD+PUSH. No-op by default (SIM backends).
+        """
+        pass
+
     @property
     def compile_target(self) -> str:
         """Compile target for RuntimeEngine.compile().

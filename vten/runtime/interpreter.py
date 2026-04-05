@@ -11,18 +11,82 @@ Spec reference: 08_backend_abstraction.md §4.3
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any
 
 from vten.errors import BackendError, PollTimeoutError
+from vten.log import (
+    PHASE_CONFIGURE,
+    PHASE_OTHER,
+    PHASE_POLL,
+    PHASE_RECV,
+    PHASE_SEND,
+    PHASE_TRIGGER,
+    format_elapsed,
+    format_size,
+)
 from vten.runtime.binder import parse_bit_range
-from vten.spec.models import OpCode, Protocol
+from vten.spec.models import OpCode
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from vten.runtime.ir import Command
+
+
+def _classify_phases(commands: list[Command]) -> list[str]:
+    """Assign a phase label to each command.
+
+    Phase order: configure → send → trigger → poll → recv.
+    WRITE_REGs before any LOAD/PUSH are 'configure'.
+    WRITE_REGs after LOAD/PUSH are 'trigger' (vsync).
+    """
+    phases: list[str] = []
+    seen_data_op = False
+    for cmd in commands:
+        if cmd.op == OpCode.WRITE_REG:
+            phases.append(PHASE_TRIGGER if seen_data_op else PHASE_CONFIGURE)
+        elif cmd.op in (OpCode.LOAD, OpCode.PUSH):
+            seen_data_op = True
+            phases.append(PHASE_SEND)
+        elif cmd.op in (OpCode.PULL, OpCode.STORE):
+            phases.append(PHASE_RECV)
+        elif cmd.op == OpCode.POLL_REG:
+            phases.append(PHASE_POLL)
+        else:
+            phases.append(PHASE_OTHER)
+    return phases
+
+
+def _phase_summary(phase: str, commands: list[Command], phases: list[str]) -> str:
+    """Build a one-line summary for a phase header."""
+    cmds = [c for c, p in zip(commands, phases) if p == phase]
+    n = len(cmds)
+    if phase == PHASE_CONFIGURE:
+        return f"{n} WRITE_REG"
+    elif phase == PHASE_SEND:
+        n_load = sum(1 for c in cmds if c.op == OpCode.LOAD)
+        n_push = sum(1 for c in cmds if c.op == OpCode.PUSH)
+        total_bytes = sum(c.size for c in cmds if c.op == OpCode.LOAD and c.size)
+        return f"{n_load} LOAD + {n_push} PUSH, {format_size(total_bytes)}"
+    elif phase == PHASE_TRIGGER:
+        return f"{n} WRITE_REG vsync"
+    elif phase == PHASE_POLL:
+        return f"{n} POLL_REG"
+    elif phase == PHASE_RECV:
+        n_pull = sum(1 for c in cmds if c.op == OpCode.PULL)
+        total_bytes = sum(c.size for c in cmds if c.op == OpCode.PULL and c.size)
+        return f"{n_pull} tensor, {format_size(total_bytes)}"
+    return f"{n} commands"
+
+
+# ── Heartbeat / stall thresholds ──
+
+_QUIET_PERIOD = 4.0        # seconds before heartbeat kicks in per phase
+_POLL_REPORT_INTERVAL = 2.0  # seconds between POLL progress reports
+_STALL_THRESHOLD = 10.0    # seconds of no change → WARNING
 
 
 class CommandInterpreter:
@@ -53,19 +117,6 @@ class CommandInterpreter:
             dict[tuple[int, int], tuple[int, str | None]] | None
         ) = None,
     ) -> None:
-        """Initialize interpreter with XRT resources.
-
-        Args:
-            device: pyxrt.device instance.
-            kernel: Default pyxrt.ip (or pyxrt.kernel) instance.
-            xrt_module: The pyxrt module (for bo/sync constants).
-            arg_map: buffer_id → kernel arg_index mapping.
-            poll_timeout_ms: Timeout for POLL_REG operations.
-            ip_map: interface_id → pyxrt.ip mapping for multi-IP.
-            mem_bank_map: buffer_id → memory bank index mapping.
-            addr_bindings: (interface_id, reg_offset) → (buffer_id, bits)
-                mapping for auto_bind address substitution.
-        """
         self._device = device
         self._kernel = kernel
         self._xrt = xrt_module
@@ -104,67 +155,122 @@ class CommandInterpreter:
         """Output buffers populated by STORE commands."""
         return dict(self._output_buffers)
 
+    # ── Main execution loop ──
+
     def execute(
         self,
         commands: list[Command],
         tensor_data: dict[int, bytes],
     ) -> None:
-        """Execute IR commands sequentially.
+        """Execute IR commands sequentially with phase-based logging.
 
-        Args:
-            commands: Ordered list of IR Commands from Stage 6.
-            tensor_data: buffer_id → serialized tensor bytes.
+        INFO level: phase headers + summaries (clean, concise).
+        DEBUG level: individual command execution trace.
         """
         self._output_buffers.clear()
         self._completed.clear()
 
-        # Pre-allocate all BOs referenced by auto_bind address registers.
-        # WRITE_REG (configure) runs before LOAD/PUSH (send) and PULL (recv),
-        # so BOs must exist before any command executes.
+        # Pre-allocate BOs for auto_bind address resolution
         self._preallocate_bound_bos(commands, tensor_data)
 
-        # Collect (iface_id, reg_offset) pairs covered by WRITE_REG commands.
-        # These are already handled by _exec_write_reg with auto_bind substitution.
+        # Collect WRITE_REG coverage for addr_bindings
         covered_regs: set[tuple[int, int]] = set()
         for cmd in commands:
             if cmd.op == OpCode.WRITE_REG:
                 covered_regs.add((cmd.interface_id, cmd.reg_offset))
 
+        # Classify commands into phases
+        phases = _classify_phases(commands)
+
+        # Pre-compute per-phase byte totals for progress tracking
+        phase_total_bytes: dict[str, int] = {}
+        for cmd, ph in zip(commands, phases):
+            if cmd.op == OpCode.LOAD and cmd.size:
+                phase_total_bytes[ph] = phase_total_bytes.get(ph, 0) + cmd.size
+            elif cmd.op == OpCode.PULL and cmd.size:
+                phase_total_bytes[ph] = phase_total_bytes.get(ph, 0) + cmd.size
+
+        emit_timeline = logger.isEnabledFor(logging.DEBUG)
+
         t0 = time.monotonic()
         addr_written = False
+        current_phase: str | None = None
+        phase_start = t0
+        phase_bytes_done = 0
+        phase_cmds_done = 0
         for i, cmd in enumerate(commands):
-            # Write uncovered auto_bind address registers after the last
-            # configure WRITE_REG but before data transfer / VSYNC.
+            # Write uncovered auto_bind address registers at configure→send transition
             if not addr_written and cmd.op != OpCode.WRITE_REG:
                 self._write_addr_bindings(covered_regs)
                 addr_written = True
-            logger.info(
-                "  [%d/%d] cmd_id=%d %s buf=%s iface=%s",
-                i + 1, len(commands), cmd.cmd_id,
-                cmd.op.name if hasattr(cmd.op, "name") else cmd.op,
-                getattr(cmd, "buffer_id", "-"),
+
+            # Phase transition
+            cmd_phase = phases[i]
+            if cmd_phase != current_phase:
+                # Log previous phase completion
+                if current_phase is not None:
+                    phase_elapsed = time.monotonic() - phase_start
+                    self._log_phase_done(
+                        current_phase, phase_elapsed,
+                        phase_bytes_done, phase_total_bytes.get(current_phase, 0),
+                        phase_cmds_done, emit_timeline, t0,
+                    )
+                # Start new phase
+                current_phase = cmd_phase
+                phase_start = time.monotonic()
+                phase_bytes_done = 0
+                phase_cmds_done = 0
+                summary = _phase_summary(cmd_phase, commands, phases)
+                logger.info("── %s (%s) ──", cmd_phase, summary)
+
+            # Individual command trace (DEBUG only)
+            op_name = cmd.op.name if hasattr(cmd.op, "name") else str(cmd.op)
+            logger.debug(
+                "  [%d/%d] %s iface=%s buf=%s",
+                i + 1, len(commands), op_name,
                 getattr(cmd, "interface_id", "-"),
+                getattr(cmd, "buffer_id", "-"),
             )
+
             self._wait_deps(cmd)
             self._dispatch(cmd, tensor_data)
-            elapsed = time.monotonic() - t0
-            logger.info("    done (%.1fs elapsed)", elapsed)
             self._completed.add(cmd.cmd_id)
+            phase_cmds_done += 1
 
-        # Flush any remaining deferred stores (safety net)
+            # Track bytes for progress
+            if cmd.op == OpCode.LOAD and cmd.size:
+                phase_bytes_done += cmd.size
+            elif cmd.op == OpCode.PULL and cmd.size:
+                phase_bytes_done += cmd.size
+
+            # JSON timeline entry
+            if emit_timeline:
+                self._emit_timeline(cmd, cmd_phase, time.monotonic() - t0)
+
+        # Log final phase completion
+        if current_phase is not None:
+            phase_elapsed = time.monotonic() - phase_start
+            self._log_phase_done(
+                current_phase, phase_elapsed,
+                phase_bytes_done, phase_total_bytes.get(current_phase, 0),
+                phase_cmds_done, emit_timeline, t0,
+            )
+
+        # Flush deferred stores — always after all commands complete
         if self._deferred_stores:
+            logger.info("── recv (flush) ──")
             self._flush_deferred_stores()
+
+        total_elapsed = time.monotonic() - t0
+        logger.info("execution complete: %s, %d commands",
+                     format_elapsed(total_elapsed), len(commands))
+
+    # ── addr_bindings ──
 
     def _write_addr_bindings(
         self, covered_regs: set[tuple[int, int]] | None = None,
     ) -> None:
-        """Write uncovered auto_bind address registers to their IPs.
-
-        Only writes registers NOT already handled by WRITE_REG commands.
-        This ensures per-port address registers (e.g., per-bank weight
-        addresses 1-31) are written without double-writing the ones
-        that the configure step handles via auto_bind substitution.
-        """
+        """Write uncovered auto_bind address registers to their IPs."""
         covered = covered_regs or set()
         written = 0
         skipped = 0
@@ -188,28 +294,67 @@ class CommandInterpreter:
             ip.write_register(reg_offset, addr)
             written += 1
         if self._addr_bindings:
-            logger.info(
+            logger.debug(
                 "  addr_bindings: wrote %d, skipped %d (covered by WRITE_REG)",
                 written, skipped,
             )
+
+    # ── Phase progress & timeline helpers ──
+
+    def _log_phase_done(
+        self,
+        phase: str,
+        elapsed: float,
+        bytes_done: int,
+        bytes_total: int,
+        cmds_done: int,
+        emit_timeline: bool,
+        t0: float,
+    ) -> None:
+        """Log phase completion with optional byte progress."""
+        if elapsed >= _QUIET_PERIOD:
+            if bytes_total > 0:
+                pct = bytes_done * 100 // bytes_total
+                logger.info(
+                    "  done %s (%d%%, %s)",
+                    format_elapsed(elapsed), pct, format_size(bytes_done),
+                )
+            else:
+                logger.info("  done %s", format_elapsed(elapsed))
+        # JSON timeline phase summary
+        if emit_timeline:
+            entry = {
+                "t": round(time.monotonic() - t0, 3),
+                "phase_done": phase,
+                "duration_ms": round(elapsed * 1000),
+                "cmds": cmds_done,
+            }
+            if bytes_total > 0:
+                entry["bytes"] = bytes_done
+            logger.debug("timeline: %s", json.dumps(entry, separators=(",", ":")))
+
+    def _emit_timeline(self, cmd, phase: str, elapsed: float) -> None:
+        """Emit per-command JSON timeline entry at DEBUG level."""
+        entry = {
+            "t": round(elapsed, 3),
+            "phase": phase,
+            "cmd": cmd.cmd_id,
+            "op": cmd.op.name if hasattr(cmd.op, "name") else str(cmd.op),
+        }
+        if hasattr(cmd, "buffer_id") and cmd.buffer_id is not None:
+            entry["buf"] = cmd.buffer_id
+        if hasattr(cmd, "size") and cmd.size:
+            entry["size"] = cmd.size
+        logger.debug("timeline: %s", json.dumps(entry, separators=(",", ":")))
+
+    # ── BO pre-allocation ──
 
     def _preallocate_bound_bos(
         self,
         commands: list[Command],
         tensor_data: dict[int, bytes],
     ) -> None:
-        """Pre-allocate BOs for all auto_bind-referenced tensors.
-
-        In XRT, address registers (auto_bind) must contain the BO device
-        address. WRITE_REG (configure) runs before LOAD/PUSH (send) and
-        PULL (recv), so the BOs don't exist yet. Pre-allocate them here
-        so auto_bind substitution resolves to real device addresses.
-
-        For input BOs (LOAD), also writes tensor data and syncs TO_DEVICE.
-        For output BOs (PULL), allocates empty and syncs TO_DEVICE to
-        force hw_emu address assignment.
-        """
-        # Collect buffer_ids referenced by addr_bindings
+        """Pre-allocate BOs for all auto_bind-referenced tensors."""
         bound_buffer_ids: set[int] = set()
         for binding in self._addr_bindings.values():
             bound_buffer_ids.add(binding[0])
@@ -217,7 +362,6 @@ class CommandInterpreter:
         if not bound_buffer_ids:
             return
 
-        # Collect size info from commands
         buf_sizes: dict[int, int] = {}
         buf_ops: dict[int, OpCode] = {}
         for cmd in commands:
@@ -235,21 +379,13 @@ class CommandInterpreter:
                 self._device, size,
                 self._xrt.bo.flags.normal, mem_bank,
             )
-            # Establish host memory mapping (hw_emu compatibility).
-            # Original C++ host code always calls bo.map<T*>() before
-            # any read/write/sync — this may be required for hw_emu's
-            # IPC memory model to properly track the buffer.
             if hasattr(bo, "map_init"):
                 bo.map_init()
-            # For input tensors, write data into BO.
-            # For output tensors (PULL), zero-init like original host code
-            # (memset(0) ensures hw_emu device memory is properly initialized).
             data = tensor_data.get(buffer_id, b"")
             if data:
                 bo.write(data)
             else:
                 bo.write(b"\x00" * size)
-            # Sync TO_DEVICE to assign device address and transfer data
             bo.sync(self._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             self._buffers[buffer_id] = bo
             addr = bo.address() if hasattr(bo, "address") else 0
@@ -257,12 +393,12 @@ class CommandInterpreter:
             if hasattr(op_name, "name"):
                 op_name = op_name.name
             hex_head = " ".join(f"{b:02X}" for b in data[:32]) if data else "zeroed"
-            logger.info(
-                "  pre-allocated BO: buffer_id=%d size=%d bank=%d "
-                "addr=0x%X (%s, data=%d bytes) first32=[%s]",
-                buffer_id, size, mem_bank, addr, op_name, len(data),
-                hex_head,
+            logger.debug(
+                "  pre-alloc BO: buf=%d size=%d bank=%d addr=0x%X (%s) [%s]",
+                buffer_id, size, mem_bank, addr, op_name, hex_head,
             )
+
+    # ── Dependency check ──
 
     def _wait_deps(self, cmd: Command) -> None:
         """Verify all dependencies are satisfied (host-side)."""
@@ -272,6 +408,8 @@ class CommandInterpreter:
                     f"Dependency cmd_id={dep_id} not completed "
                     f"before cmd_id={cmd.cmd_id}"
                 )
+
+    # ── Command dispatch ──
 
     def _dispatch(self, cmd: Command, tensor_data: dict[int, bytes]) -> None:
         """Dispatch command to appropriate handler."""
@@ -295,24 +433,21 @@ class CommandInterpreter:
         else:
             handler(cmd)
 
-    def _exec_load(self, cmd: Command, tensor_data: dict[int, bytes]) -> None:
-        """LOAD: Host → Device Buffer. Create BO and write tensor data.
+    # ── Command handlers ──
 
-        If the BO was pre-allocated (for auto_bind address resolution),
-        reuses it instead of creating a new one on potentially wrong bank.
-        Inference: if BO exists and no data → skip (prebound device buffer).
-        """
+    def _exec_load(self, cmd: Command, tensor_data: dict[int, bytes]) -> None:
+        """LOAD: Host → Device Buffer."""
         data = tensor_data.get(cmd.buffer_id, b"")
         if not data:
             if cmd.buffer_id in self._buffers:
-                return  # BO already on device (prebound) → skip
+                return
             raise BackendError(
                 f"LOAD cmd_id={cmd.cmd_id}: no tensor data for "
                 f"buffer_id={cmd.buffer_id}"
             )
         bo = self._buffers.get(cmd.buffer_id)
         if bo is not None and hasattr(bo, "size") and bo.size() >= len(data):
-            bo.write(data)  # Reuse existing BO
+            bo.write(data)
         else:
             mem_bank = self._mem_bank_map.get(cmd.buffer_id, 0)
             bo = self._xrt.bo(
@@ -323,7 +458,7 @@ class CommandInterpreter:
             self._buffers[cmd.buffer_id] = bo
 
     def _exec_push(self, cmd: Command) -> None:
-        """PUSH: Sync BO to device. Skip if prebound (already synced)."""
+        """PUSH: Sync BO to device."""
         bo = self._buffers.get(cmd.buffer_id)
         if bo is None:
             raise BackendError(
@@ -331,7 +466,7 @@ class CommandInterpreter:
                 f"not loaded"
             )
         if cmd.buffer_id in self._prebound:
-            return  # Already synced to device
+            return
         bo.sync(self._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
         arg_index = self._arg_map.get(cmd.buffer_id)
@@ -340,12 +475,7 @@ class CommandInterpreter:
             ip.set_arg(arg_index, bo)
 
     def _exec_pull(self, cmd: Command) -> None:
-        """PULL: Prepare output BO for device-to-host transfer.
-
-        Unlike SIM where PULL activates a BFM slave entry, XRT PULL
-        only allocates the output buffer. The actual sync FROM device
-        is deferred to STORE, after the kernel writes data.
-        """
+        """PULL: Allocate output BO (actual sync deferred to STORE)."""
         bo = self._buffers.get(cmd.buffer_id)
         if bo is None:
             size = cmd.size or 4096
@@ -356,22 +486,16 @@ class CommandInterpreter:
             )
             if hasattr(bo, "map_init"):
                 bo.map_init()
-            # Zero-init output BO (matches original host code memset pattern)
             bo.write(b"\x00" * size)
             bo.sync(self._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             self._buffers[cmd.buffer_id] = bo
 
     def _exec_store(self, cmd: Command) -> None:
-        """STORE: Sync BO from device, then read data back to host.
-
-        In XRT, STORE must happen after the DUT finishes computation.
-        STORE is always deferred and flushed at the end of execute(),
-        after all commands (including all POLL_REGs) complete.
-        """
+        """STORE: Deferred until all commands complete."""
         self._deferred_stores.append(cmd)
 
     def _flush_deferred_stores(self) -> None:
-        """Execute all deferred STORE commands (after POLL_REG)."""
+        """Execute all deferred STORE commands."""
         for cmd in self._deferred_stores:
             bo = self._buffers.get(cmd.buffer_id)
             if bo is None:
@@ -381,8 +505,6 @@ class CommandInterpreter:
                 )
             bo.sync(self._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
             size = cmd.size if cmd.size > 0 else bo.size()
-            # Prefer map_read (reads directly from mapped host pointer,
-            # matching original C++ host code pattern) over bo.read().
             if hasattr(bo, "map_read"):
                 data = bo.map_read(size)
             else:
@@ -390,22 +512,17 @@ class CommandInterpreter:
             self._output_buffers[cmd.buffer_id] = bytes(data)
             hex_head = " ".join(f"{b:02X}" for b in data[:32])
             logger.info(
-                "    deferred STORE: buf=%d size=%d first32=[%s]",
-                cmd.buffer_id, size, hex_head,
+                "  buf=%d %s: [%s]",
+                cmd.buffer_id, format_size(size), hex_head,
             )
         self._deferred_stores.clear()
 
     def _exec_write_reg(self, cmd: Command) -> None:
-        """WRITE_REG: Write to IP control register.
-
-        If this register has an auto_bind address binding, substitutes
-        the SHM offset with the actual BO device address + byte offset.
-        """
+        """WRITE_REG: Write to IP control register."""
         ip = self._get_ip(cmd.interface_id)
         key = (cmd.interface_id, cmd.reg_offset)
         if key in self._addr_bindings:
             binding = self._addr_bindings[key]
-            # Support both (buffer_id, bits) and (buffer_id, bits, offset)
             if len(binding) == 3:
                 buffer_id, bits_spec, byte_offset = binding
             else:
@@ -417,25 +534,20 @@ class CommandInterpreter:
                 if bits_spec:
                     hi, lo = parse_bit_range(bits_spec)
                     addr = (addr >> lo) & ((1 << (hi - lo + 1)) - 1)
-                logger.info(
-                    "    auto_bind: iface=%d reg=0x%X → buf=%d "
-                    "bo_addr=0x%X offset=%d bits=%s → val=0x%X",
-                    cmd.interface_id, cmd.reg_offset, buffer_id,
-                    bo.address(), byte_offset, bits_spec, addr,
+                logger.debug(
+                    "  auto_bind: iface=%d reg=0x%X → buf=%d addr=0x%X",
+                    cmd.interface_id, cmd.reg_offset, buffer_id, addr,
                 )
                 ip.write_register(cmd.reg_offset, addr)
                 return
             else:
                 logger.warning(
-                    "    auto_bind MISS: iface=%d reg=0x%X buf=%d "
-                    "bo=%s → fallback val=0x%X",
-                    cmd.interface_id, cmd.reg_offset, buffer_id,
-                    "None" if bo is None else "no .address()",
-                    cmd.reg_value,
+                    "  auto_bind MISS: iface=%d reg=0x%X buf=%d → fallback val=0x%X",
+                    cmd.interface_id, cmd.reg_offset, buffer_id, cmd.reg_value,
                 )
-        logger.info(
-            "    WRITE_REG: iface=%d offset=0x%X value=0x%X (%d)",
-            cmd.interface_id, cmd.reg_offset, cmd.reg_value, cmd.reg_value,
+        logger.debug(
+            "  WRITE_REG iface=%d reg=0x%X val=0x%X",
+            cmd.interface_id, cmd.reg_offset, cmd.reg_value,
         )
         ip.write_register(cmd.reg_offset, cmd.reg_value)
 
@@ -445,27 +557,57 @@ class CommandInterpreter:
         cmd.reg_value = ip.read_register(cmd.reg_offset)
 
     def _exec_poll_reg(self, cmd: Command) -> None:
-        """POLL_REG: Poll register until (value & mask) == expected."""
+        """POLL_REG: Poll register with progress reporting and stall detection.
+
+        Reports progress every 2s (only after quiet period).
+        Emits WARNING after 10s of no value change.
+        """
         ip = self._get_ip(cmd.interface_id)
         start = time.monotonic()
         poll_count = 0
+        last_report_time = start
+        last_val: int | None = None
+        last_change_time = start
+
         while True:
             val = ip.read_register(cmd.reg_offset)
             poll_count += 1
+            now = time.monotonic()
+            elapsed = now - start
+
             if (val & cmd.reg_mask) == cmd.reg_expected:
-                elapsed_ms = (time.monotonic() - start) * 1000
                 logger.info(
-                    "    POLL_REG done: 0x%X=%d polls, %.1fs",
-                    cmd.reg_offset, poll_count, elapsed_ms / 1000,
+                    "  POLL (==0x%X): %d polls, %s",
+                    cmd.reg_expected, poll_count, format_elapsed(elapsed),
                 )
                 cmd.reg_value = val
                 return
-            elapsed_ms = (time.monotonic() - start) * 1000
-            if poll_count % 1000 == 0:
+
+            # Track value changes for stall detection
+            if last_val is None or val != last_val:
+                last_val = val
+                last_change_time = now
+
+            # Progress reports (only after quiet period)
+            if elapsed >= _QUIET_PERIOD and (now - last_report_time) >= _POLL_REPORT_INTERVAL:
                 logger.info(
-                    "    POLL_REG 0x%X: %d polls, %.1fs, val=0x%X",
-                    cmd.reg_offset, poll_count, elapsed_ms / 1000, val,
+                    "  [%s] POLL 0x%X: val=0x%X (%d polls)",
+                    format_elapsed(elapsed), cmd.reg_offset, val, poll_count,
                 )
+                last_report_time = now
+
+            # Stall detection
+            no_change = now - last_change_time
+            if no_change >= _STALL_THRESHOLD:
+                logger.warning(
+                    "  [%s] STALL POLL_REG: no change %.0fs "
+                    "(addr=0x%X mask=0x%X expected=0x%X val=0x%X)",
+                    format_elapsed(elapsed), no_change,
+                    cmd.reg_offset, cmd.reg_mask, cmd.reg_expected, val,
+                )
+                last_change_time = now  # reset to avoid spam
+
+            elapsed_ms = elapsed * 1000
             if elapsed_ms > self._poll_timeout_ms:
                 raise PollTimeoutError(
                     f"POLL_REG timeout at offset 0x{cmd.reg_offset:X} "
@@ -482,6 +624,8 @@ class CommandInterpreter:
     def _exec_compare(self, cmd: Command) -> None:
         """COMPARE: Host-side buffer comparison."""
         pass
+
+    # ── Cleanup ──
 
     def cleanup(self) -> None:
         """Release XRT buffer objects."""

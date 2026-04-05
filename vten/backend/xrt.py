@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from vten.backend.base import Backend, BackendResult
 from vten.errors import BackendError
+from vten.log import format_size
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +179,7 @@ class XrtBackend(Backend):
                     cu_name = cu.get_name()
                     self._xclbin_cu_names[kern.get_name()] = cu_name
             if self._xclbin_cu_names:
-                log.info("xclbin CUs: %s", list(self._xclbin_cu_names.values()))
+                log.debug("xclbin CUs: %s", list(self._xclbin_cu_names.values()))
 
         # Cache group_ids for ALL CUs (composite multi-kernel support).
         # group_id() can only be queried via xrt.kernel, which has exclusive
@@ -200,12 +201,12 @@ class XrtBackend(Backend):
                     self._per_cu_group_ids[kern_name] = gids
                     del tmp_kernel
                 except Exception as e:
-                    logger.warning(
-                        "Failed to query group_ids for CU '%s': %s",
+                    logger.debug(
+                        "group_id query failed for CU '%s': %s",
                         cu_name, e,
                     )
             if self._per_cu_group_ids:
-                logger.info("per-CU group_ids: %s", {
+                logger.debug("per-CU group_ids: %s", {
                     k: dict(v) for k, v in self._per_cu_group_ids.items()
                 })
 
@@ -214,7 +215,7 @@ class XrtBackend(Backend):
         if not self._per_cu_group_ids and hasattr(self._xclbin, "get_kernels"):
             self._per_cu_group_ids = self._parse_xclbin_connectivity()
             if self._per_cu_group_ids:
-                logger.info("per-CU group_ids (from xclbin connectivity): %s", {
+                logger.debug("per-CU group_ids (from xclbin connectivity): %s", {
                     k: dict(v) for k, v in self._per_cu_group_ids.items()
                 })
 
@@ -228,6 +229,15 @@ class XrtBackend(Backend):
                 self._kernel_name, {}
             )
             self._default_ip = self._get_or_create_ip(ip_name)
+
+        # INFO-level setup summary
+        cu_list = list(self._xclbin_cu_names.values()) or [self._kernel_name or "?"]
+        logger.info(
+            "XRT: device=%d, xclbin=%s, CUs=%s",
+            self._device_index,
+            Path(self._xclbin_path).name,
+            cu_list,
+        )
 
     def _parse_xclbin_connectivity(self) -> dict[str, dict[int, int]]:
         """Parse xclbin CONNECTIVITY + IP_LAYOUT to get arg→mem_index mapping.
@@ -356,7 +366,7 @@ class XrtBackend(Backend):
                 ip_map[iface_id] = self._default_ip
 
         if sub_to_ip:
-            log.info("composite IP routing: %s", sub_to_ip)
+            log.debug("composite IP routing: %s", sub_to_ip)
 
         return ip_map
 
@@ -599,17 +609,32 @@ class XrtBackend(Backend):
                 interpreter._buffers[buffer_id] = bo
                 interpreter._prebound.add(buffer_id)
 
-        logger.info("mem_bank_map: %s", mem_bank_map)
-        logger.info("addr_bindings: %s", addr_bindings)
-        logger.info("executing %d commands (%d tensors, %.1f KB total)",
-                    len(compiled.commands), len(compiled.tensor_data),
-                    sum(len(v) for v in compiled.tensor_data.values()) / 1024)
+        logger.debug("mem_bank_map: %s", mem_bank_map)
+        logger.debug("addr_bindings: %s", addr_bindings)
+        total_data = sum(len(v) for v in compiled.tensor_data.values())
+        logger.info(
+            "executing %d commands (%d tensors, %s)",
+            len(compiled.commands), len(compiled.tensor_data),
+            format_size(total_data),
+        )
         interpreter.execute(compiled.commands, compiled.tensor_data)
 
         return BackendResult(
             status=0,
             output_buffers=interpreter.output_buffers,
         )
+
+    def get_buffer_object(self, buffer_id: int) -> object | None:
+        """Return XRT BO for buffer_id from interpreter's buffer pool."""
+        if self._interpreter is not None:
+            return self._interpreter._buffers.get(buffer_id)
+        return None
+
+    def inject_prebound(self, buffer_id: int, bo: object) -> None:
+        """Inject a pre-existing BO into interpreter's buffer pool."""
+        if self._interpreter is not None:
+            self._interpreter._buffers[buffer_id] = bo
+            self._interpreter._prebound.add(buffer_id)
 
     @property
     def compile_target(self) -> str:

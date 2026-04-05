@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vten.errors import VerificationError
 from vten.kernel.tensor import Tensor
 from vten.runtime.context import ExecutionContext
 from vten.spec.models import Direction
@@ -22,11 +23,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from vten.backend.base import Backend
     from vten.kernel.base import Kernel
-
-
-class VerificationError(Exception):
-    """Raised when HW output doesn't match behavioral model golden."""
-    pass
 
 
 class InferenceSession:
@@ -311,16 +307,19 @@ class InferenceSession:
 
             hw_logical = out_tensor.cpu()
 
-            if not torch.equal(hw_logical, golden_logical):
+            if not ExecutionContext._compare(hw_logical, golden_logical):
+                max_diff = ExecutionContext._max_diff(hw_logical, golden_logical)
                 n_diff = int((hw_logical != golden_logical).sum().item())
                 n_total = hw_logical.numel()
-                max_diff = int((hw_logical.int() - golden_logical.int()).abs().max().item())
                 raise VerificationError(
                     f"Tensor '{name}' verify FAIL: "
                     f"{n_diff}/{n_total} elements differ, "
                     f"max_diff={max_diff}, "
                     f"hw_shape={tuple(hw_logical.shape)}, "
-                    f"golden_shape={tuple(golden_logical.shape)}"
+                    f"golden_shape={tuple(golden_logical.shape)}",
+                    tensor=name,
+                    shape=tuple(hw_logical.shape),
+                    max_diff=max_diff,
                 )
             logger.info("verify: %s PASS shape=%s", name, tuple(hw_logical.shape))
 
@@ -362,13 +361,16 @@ class InferenceSession:
 
             hw_logical = out_tensor.cpu()
 
-            if not torch.equal(hw_logical, golden_logical):
+            if not ExecutionContext._compare(hw_logical, golden_logical):
+                max_diff = ExecutionContext._max_diff(hw_logical, golden_logical)
                 n_diff = int((hw_logical != golden_logical).sum().item())
                 n_total = hw_logical.numel()
-                max_diff = int((hw_logical.int() - golden_logical.int()).abs().max().item())
                 raise VerificationError(
                     f"Tensor '{name}' verify FAIL: "
-                    f"{n_diff}/{n_total} elements differ, max_diff={max_diff}"
+                    f"{n_diff}/{n_total} elements differ, max_diff={max_diff}",
+                    tensor=name,
+                    shape=tuple(hw_logical.shape),
+                    max_diff=max_diff,
                 )
             logger.info("verify: %s PASS shape=%s", name, tuple(hw_logical.shape))
             out_tensor._golden_data = golden_logical
@@ -388,8 +390,7 @@ class InferenceSession:
         if compiled is None:
             return {}
 
-        is_hw = getattr(self._backend, "compile_target", "sim") == "hw"
-        interpreter = getattr(self._backend, "_interpreter", None)
+        is_hw = self._backend.compile_target == "hw"
         view = compiled.flattened_view
         outputs: dict[str, Tensor] = {}
 
@@ -408,11 +409,11 @@ class InferenceSession:
             t._resolved_shape = origin._resolved_shape
             t._element_count = origin._element_count
 
-            if is_hw and interpreter is not None:
-                # HW: bind BO from interpreter → Tensor(on_device=True)
+            if is_hw:
+                # HW: bind BO from backend → Tensor(on_device=True)
                 buffer_id = compiled.buffer_ids.get(name)
                 if buffer_id is not None:
-                    bo = interpreter._buffers.get(buffer_id)
+                    bo = self._backend.get_buffer_object(buffer_id)
                     if bo is not None:
                         deserialize_fn = self._make_deserialize_fn(
                             view, exposed,
@@ -485,13 +486,23 @@ class InferenceSession:
         merged = {**self._base_params, **(params or {})}
         spec = merged.pop("_spec", None)
 
+        # For CompositeKernel, find the sub-kernel that owns tensor_name
+        # and instantiate only that sub-kernel (avoids serializing unrelated tensors).
+        from vten.kernel.composite import CompositeKernel
+        upload_cls = kernel_class
+        if isinstance(kernel_class, type) and issubclass(kernel_class, CompositeKernel):
+            for (sub_name, t_name), exposed_name in kernel_class._auto_exposed.items():
+                if t_name == tensor_name or exposed_name == tensor_name:
+                    upload_cls = kernel_class._sub_kernel_refs[sub_name]
+                    break
+
         # Create a temporary context to instantiate kernel for layout/packing info
         ctx = ExecutionContext(
             backend=self._backend,
             project_params=merged,
             mode="inference",
         )
-        ki = ctx.instantiate(kernel_class, spec=spec, **merged)
+        ki = ctx.instantiate(upload_cls, spec=spec, **merged)
         tensor = ki.get_tensor(tensor_name)
 
         # Assign data and let the normal compile pipeline handle layout+serialize
@@ -521,13 +532,12 @@ class InferenceSession:
         # Store logical data for golden chain (verify mode)
         t._golden_data = data
 
-        is_hw = getattr(self._backend, "compile_target", "sim") == "hw"
-        interpreter = getattr(self._backend, "_interpreter", None)
+        is_hw = self._backend.compile_target == "hw"
 
-        if is_hw and interpreter is not None and exposed is not None:
+        if is_hw and exposed is not None:
             buffer_id = compiled.buffer_ids.get(tensor_name)
             if buffer_id is not None:
-                bo = interpreter._buffers.get(buffer_id)
+                bo = self._backend.get_buffer_object(buffer_id)
                 if bo is not None:
                     t._bind_bo(bo, exposed._serialized_size)
         else:

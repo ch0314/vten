@@ -311,6 +311,8 @@ class RuntimeEngine:
             v: k for k, v in lowering._iface_id_map.items()
         }
 
+        self._log_ir_summary(commands)
+        self._log_dataflow_summary(view)
         if logger.isEnabledFor(logging.DEBUG):
             self._log_ir_commands(commands, iface_id_to_name, buffer_ids)
 
@@ -450,6 +452,66 @@ class RuntimeEngine:
             )
 
         logger.debug("\n".join(lines))
+
+    @staticmethod
+    def _log_ir_summary(commands: list) -> None:
+        """Log a concise IR summary at INFO level."""
+        from vten.log import format_size
+        n_cfg = sum(1 for c in commands if c.op == OpCode.WRITE_REG)
+        n_load = sum(1 for c in commands if c.op == OpCode.LOAD)
+        n_push = sum(1 for c in commands if c.op == OpCode.PUSH)
+        n_pull = sum(1 for c in commands if c.op == OpCode.PULL)
+        n_store = sum(1 for c in commands if c.op == OpCode.STORE)
+        n_poll = sum(1 for c in commands if c.op == OpCode.POLL_REG)
+        xfer_bytes = sum(c.size for c in commands if c.op == OpCode.LOAD and c.size)
+        recv_bytes = sum(c.size for c in commands if c.op == OpCode.PULL and c.size)
+        parts = []
+        if n_cfg:
+            parts.append(f"{n_cfg} reg")
+        if n_load + n_push:
+            parts.append(f"{n_load}+{n_push} xfer {format_size(xfer_bytes)}")
+        if n_poll:
+            parts.append(f"{n_poll} poll")
+        if n_pull + n_store:
+            parts.append(f"{n_pull}+{n_store} recv {format_size(recv_bytes)}")
+        logger.info("compiled: %d cmds (%s)", len(commands), ", ".join(parts))
+
+    @staticmethod
+    def _log_dataflow_summary(view: FlattenedKernelView) -> None:
+        """Log inter-kernel dataflow for composite kernels at INFO level."""
+        if not view.connections:
+            return  # Unit kernel — no dataflow to report
+
+        from vten.log import format_size
+        from vten.spec.models import Direction
+
+        lines = ["dataflow:"]
+
+        # Internal connections (sub → sub)
+        for conn in view.connections:
+            src = f"{conn.source_sub}.{conn.source_name}"
+            dst = f"{conn.dest_sub}.{conn.dest_name}"
+            lines.append(f"  {src} → {dst}")
+
+        # Exposed tensors (host ↔ device)
+        host_to_dev = []
+        dev_to_host = []
+        for name, exp in view.exposed_tensors.items():
+            size_str = ""
+            if exp._serialized_size:
+                size_str = f" {format_size(exp._serialized_size)}"
+            label = f"{name}{size_str}"
+            if exp.direction == Direction.HOST_TO_DEV:
+                host_to_dev.append(label)
+            elif exp.direction == Direction.DEV_TO_HOST:
+                dev_to_host.append(label)
+
+        if host_to_dev:
+            lines.append(f"  host → device: {', '.join(host_to_dev)}")
+        if dev_to_host:
+            lines.append(f"  device → host: {', '.join(dev_to_host)}")
+
+        logger.info("\n".join(lines))
 
     def _get_primary_kernel(self) -> KernelInstance:
         if not self._kernels:

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from vten.backend.base import Backend, BackendResult, CmdStats, raise_backend_error
+from vten.log import format_elapsed, format_size
 from vten.errors import BackendError
 from vten.errors import TimeoutError as VTenTimeoutError
 
@@ -406,20 +407,14 @@ class SimBackend(Backend):
     # Progress polling interval (seconds)
     _PROGRESS_POLL_INTERVAL = 2.0
 
+    # Quiet period: suppress progress/heartbeat for fast executions (seconds)
+    _QUIET_PERIOD = 4.0
+
     # Stall detection: if no activity change for this many consecutive polls → WARNING
     _STALL_WARN_POLLS = 5  # 5 * 2s = 10s of no activity
 
     # Default bytes-per-beat for expected beat count estimation
     _DEFAULT_BYTES_PER_BEAT = 32  # 256-bit bus
-
-    @staticmethod
-    def _format_elapsed(seconds: float) -> str:
-        """Format elapsed time: seconds for <60s, m:ss for >=60s."""
-        if seconds < 60:
-            return f"{seconds:.1f}s"
-        mins = int(seconds) // 60
-        secs = int(seconds) % 60
-        return f"{mins}m{secs:02d}s"
 
     def _wait_completion(self) -> BackendResult:
         """Wait for backend completion with progress monitoring.
@@ -476,7 +471,7 @@ class SimBackend(Backend):
                         # Timeout on this poll — read progress from SHM
                         poll_count += 1
                         elapsed = time.monotonic() - start_time
-                        elapsed_str = self._format_elapsed(elapsed)
+                        elapsed_str = format_elapsed(elapsed)
 
                         stats, cmd_meta = self._read_progress_data()
                         if not stats:
@@ -491,28 +486,31 @@ class SimBackend(Backend):
                         # Format progress line
                         progress_str = self._format_progress(stats, cmd_meta)
 
+                        # Quiet period: suppress progress/heartbeat for fast runs
+                        in_quiet = elapsed < self._QUIET_PERIOD
+
                         if progress_str != last_progress_str:
-                            # Progress changed (committed count changed) — always log
-                            logger.info("  [%s] %s", elapsed_str, progress_str)
                             last_progress_str = progress_str
                             stall_count = 0
+                            if not in_quiet:
+                                logger.info("  [%s] %s", elapsed_str, progress_str)
                         elif prev_snapshot is not None:
-                            # Progress line same — emit heartbeat with deltas
                             heartbeat = self._format_heartbeat(
                                 cur_snapshot, prev_snapshot, cmd_meta,
                             )
                             if heartbeat:
-                                logger.info("  [%s] %s", elapsed_str, heartbeat)
                                 stall_count = 0
+                                if not in_quiet:
+                                    logger.info("  [%s] %s", elapsed_str, heartbeat)
                             else:
                                 stall_count += 1
 
-                        # Stall detection
+                        # Stall detection (always active, even during quiet)
                         if stall_count >= self._STALL_WARN_POLLS:
                             self._emit_stall_warning(
                                 stats, cmd_meta, elapsed_str,
                             )
-                            stall_count = 0  # reset to avoid spam
+                            stall_count = 0
 
                         prev_snapshot = cur_snapshot
 
@@ -828,7 +826,7 @@ class SimBackend(Backend):
                 frag += f" {pct}%"
                 if d_beats > 0:
                     throughput_bytes = d_beats * self._DEFAULT_BYTES_PER_BEAT
-                    throughput_str = self._format_size(throughput_bytes)
+                    throughput_str = format_size(throughput_bytes)
                     frag += f" (+{d_beats} beats, ~{throughput_str}/poll)"
                 elif d_stall > 0:
                     frag += f" (stalling, +{d_stall} stall cyc)"
@@ -914,16 +912,6 @@ class SimBackend(Backend):
             "issued": issued_cmds,
         }
         logger.debug("timeline: %s", json.dumps(entry, separators=(",", ":")))
-
-    @staticmethod
-    def _format_size(nbytes: int) -> str:
-        """Format byte count as human-readable size."""
-        if nbytes < 1024:
-            return f"{nbytes}B"
-        elif nbytes < 1024 * 1024:
-            return f"{nbytes / 1024:.1f}KB"
-        else:
-            return f"{nbytes / (1024 * 1024):.1f}MB"
 
     def _format_timeout_report(self, diag: dict, elapsed: float) -> str:
         """Format a structured timeout diagnostic report."""

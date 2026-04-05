@@ -119,37 +119,39 @@ class MockHwBackend(Backend):
     def __init__(self):
         self.calls: list[str] = []
         self._persistent = False
-        self._interpreter = None
+        self._buffers: dict[int, MockBO] = {}
         self.last_compiled = None
 
     @property
     def compile_target(self) -> str:
         return "hw"
 
+    def get_buffer_object(self, buffer_id: int) -> object | None:
+        return self._buffers.get(buffer_id)
+
+    def inject_prebound(self, buffer_id: int, bo: object) -> None:
+        self._buffers[buffer_id] = bo
+
     def execute(self, compiled) -> BackendResult:
         self.calls.append("execute")
         self.last_compiled = compiled
 
-        # Create mock interpreter with mock BOs for output tensors
-        if self._interpreter is None:
-            self._interpreter = MockInterpreter()
-
         # For each buffer, create a mock BO (simulates XRT BO allocation)
         for name, exposed in compiled.flattened_view.exposed_tensors.items():
             bid = compiled.buffer_ids.get(name)
-            if bid is not None and bid not in self._interpreter._buffers:
+            if bid is not None and bid not in self._buffers:
                 size = exposed._serialized_size or 32
-                self._interpreter._buffers[bid] = MockBO(size)
+                self._buffers[bid] = MockBO(size)
 
         # Inject prebound buffers
         for bid, bo in compiled.prebound_buffers.items():
-            self._interpreter._buffers[bid] = bo
+            self._buffers[bid] = bo
 
         return BackendResult(status=0)
 
     def cleanup(self) -> None:
         self.calls.append("cleanup")
-        self._interpreter = None
+        self._buffers.clear()
 
 
 class MockBO:
@@ -179,15 +181,6 @@ class MockBO:
 
     def address(self) -> int:
         return 0x10000 + id(self) % 0x10000
-
-
-class MockInterpreter:
-    """Mock CommandInterpreter with buffer tracking."""
-
-    def __init__(self):
-        self._buffers: dict[int, MockBO] = {}
-        self._prebound: set[int] = set()
-        self._output_buffers: dict[int, bytes] = {}
 
 
 # ═══════════════════════════════════════════════════════════════════
