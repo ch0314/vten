@@ -76,7 +76,7 @@ class ExecutionResult:
     total_cycles: int = 0
     per_command_stats: list = field(default_factory=list)
     error: object = None
-    output_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    output_tensors: dict = field(default_factory=dict)  # dict[str, Tensor]
     verification_count: int = 0
     verification_results: list = field(default_factory=list)  # list[VerificationResult]
 
@@ -259,11 +259,8 @@ class ExecutionContext:
                 Returns list[OperationHandle] when chunks is specified.
                 TODO: axis= parameter for arbitrary axis split.
 
-        In inference mode: emits PULL only (no STORE) — data stays on device.
+        In inference mode: identical to verification mode — PULL+STORE generated.
         """
-        if self._mode == "inference":
-            return self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep,
-                                _pull_only=True)
         if chunks is None:
             return self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep)
 
@@ -444,40 +441,104 @@ class ExecutionContext:
 
     def _read_output_tensors(
         self, compiled: object, backend_result: object,
-    ) -> dict[str, torch.Tensor]:
-        """Deserialize DEV_TO_HOST tensors from backend SHM data."""
+    ) -> dict[str, Tensor]:
+        """Deserialize DEV_TO_HOST tensors from backend result.
+
+        Returns Tensor objects with:
+          - .data = deserialized + unlayouted torch.Tensor
+          - BO binding for HW backends (supports .cpu() from device)
+          - Metadata (shape, dtype, etc.) from origin tensor
+        """
+        from vten.kernel.tensor import Tensor as TensorCls
+        from vten.runtime.engine import RuntimeEngine
         from vten.runtime.serializer import StreamSerializer
 
-        output_tensors: dict[str, torch.Tensor] = {}
-        for name, exposed in compiled.flattened_view.exposed_tensors.items():
+        view = compiled.flattened_view
+        is_hw = (self._backend is not None
+                 and self._backend.compile_target == "hw")
+
+        output_tensors: dict[str, TensorCls] = {}
+        for name, exposed in view.exposed_tensors.items():
             if exposed.direction != Direction.DEV_TO_HOST:
                 continue
-            raw_bytes = self._read_tensor_bytes(
-                name, exposed, compiled, backend_result,
-            )
-            if not raw_bytes:
-                continue
+
+            origin = exposed.origin_tensor
             try:
-                iface = compiled.flattened_view.top_spec.get_interface(
-                    exposed.top_interface
-                )
+                iface = view.top_spec.get_interface(exposed.top_interface)
             except KeyError:
                 continue
             if iface.packing is None:
                 continue
-            serializer = StreamSerializer(iface.packing)
-            hw_tensor = serializer.deserialize(
-                raw_bytes,
-                exposed.origin_tensor._element_count,
-                exposed.origin_tensor._resolved_shape,
-                dtype=exposed.origin_tensor.dtype,
+
+            # Create Tensor wrapper
+            t = TensorCls(
+                shape=origin._resolved_shape or origin.shape,
+                dtype=origin.dtype,
+                interface=origin.interface,
+                direction=Direction.DEV_TO_HOST,
             )
-            # Auto-unlayout: convert physical → logical if unlayout exists
-            from vten.runtime.engine import RuntimeEngine
-            output_tensors[name] = RuntimeEngine._apply_unlayout(
-                compiled.flattened_view, exposed, hw_tensor,
+            t.name = name
+            t._resolved_shape = origin._resolved_shape
+            t._element_count = origin._element_count
+
+            # Deserialize from backend result
+            raw_bytes = self._read_tensor_bytes(
+                name, exposed, compiled, backend_result,
             )
+            if raw_bytes:
+                serializer = StreamSerializer(iface.packing)
+                hw_tensor = serializer.deserialize(
+                    raw_bytes,
+                    origin._element_count,
+                    origin._resolved_shape,
+                    dtype=origin.dtype,
+                )
+                t.data = RuntimeEngine._apply_unlayout(view, exposed, hw_tensor)
+
+            # HW backend: bind BO for device-resident access
+            if is_hw:
+                buffer_id = compiled.buffer_ids.get(name)
+                if buffer_id is not None:
+                    bo = self._backend.get_buffer_object(buffer_id)
+                    if bo is not None:
+                        deserialize_fn = self._make_deserialize_fn(view, exposed)
+                        bo_size = (bo.size() if hasattr(bo, "size")
+                                   else getattr(exposed, "_serialized_size", 0))
+                        t._bind_bo(bo, bo_size, deserialize_fn)
+
+            output_tensors[name] = t
         return output_tensors
+
+    @staticmethod
+    def _make_deserialize_fn(view: object, exposed: object):
+        """Create a bytes → torch.Tensor deserialize+unlayout closure.
+
+        Used by Tensor._bind_bo() for .cpu() deserialization.
+        """
+        from vten.runtime.engine import RuntimeEngine
+        from vten.runtime.serializer import StreamSerializer
+
+        try:
+            iface = view.top_spec.get_interface(exposed.top_interface)
+        except (KeyError, AttributeError):
+            return None
+        if iface.packing is None:
+            return None
+
+        packing = iface.packing
+        origin = exposed.origin_tensor
+        element_count = origin._element_count
+        shape = origin._resolved_shape
+        dtype = origin.dtype
+
+        def _deserialize(raw: bytes) -> torch.Tensor:
+            serializer = StreamSerializer(packing)
+            hw_tensor = serializer.deserialize(
+                raw, element_count, shape, dtype=dtype,
+            )
+            return RuntimeEngine._apply_unlayout(view, exposed, hw_tensor)
+
+        return _deserialize
 
     @staticmethod
     def _read_tensor_bytes(
@@ -602,26 +663,9 @@ class ExecutionContext:
         CompositeKernel: forward() with no args (auto-chain with layout).
         Simple Kernel: collect H2D tensor data, apply layout, forward(**inputs).
         """
-        from vten.kernel.composite import CompositeKernel
+        from vten.runtime.golden import run_forward
 
-        if isinstance(kernel_inst, CompositeKernel):
-            return kernel_inst.forward()
-
-        # Simple kernel: collect H2D inputs with layout
-        inputs: dict[str, torch.Tensor] = {}
-        for tensor in kernel_inst.tensors():
-            if tensor.data is None:
-                continue
-            direction = getattr(tensor, "direction", None)
-            if direction is None or direction.value == "host_to_dev":
-                # Apply layout if available
-                layout_fn = getattr(kernel_inst, f"layout_{tensor.name}", None)
-                if layout_fn is not None and callable(layout_fn):
-                    inputs[tensor.name] = layout_fn(tensor.data)
-                else:
-                    inputs[tensor.name] = tensor.data
-
-        return kernel_inst.forward(**inputs)
+        return run_forward(kernel_inst)
 
     def _compute_auto_golden(self, op_handle) -> torch.Tensor:
         """Compute golden tensor automatically from kernel's forward().
@@ -786,38 +830,7 @@ class ExecutionContext:
         # Flatten to match golden (which is flattened in _compute_auto_golden)
         hw_output = hw_output.flatten()
 
-        if not self._compare(hw_output, golden):
-            # Build dtype-aware message with first differing elements
-            max_diff = self._max_diff(hw_output, golden)
-            dtype_str = str(golden.dtype).replace("torch.", "")
-            diff_mask = hw_output != golden
-            diff_indices = diff_mask.nonzero(as_tuple=False)
-            n_diff = diff_indices.shape[0]
-            detail_parts = []
-            _show = min(n_diff, 4)
-            for i in range(_show):
-                idx = tuple(diff_indices[i].tolist())
-                idx_str = f"[{','.join(str(x) for x in idx)}]"
-                detail_parts.append(
-                    f"  {idx_str}: expected={golden[idx].item()}, "
-                    f"actual={hw_output[idx].item()}"
-                )
-            if n_diff > _show:
-                detail_parts.append(f"  ... and {n_diff - _show} more elements differ")
-            detail = "\n".join(detail_parts)
-            msg = (
-                f"Verification failed for tensor '{tensor_name}': "
-                f"shape={shape}, dtype={dtype_str}, max_diff={max_diff}, "
-                f"{n_diff}/{hw_output.numel()} elements differ"
-            )
-            if detail:
-                msg += f"\n{detail}"
-            raise VerificationError(
-                msg,
-                tensor=tensor_name,
-                shape=shape,
-                max_diff=max_diff,
-            )
+        self._check_match(tensor_name, hw_output, golden, shape=shape)
 
     @staticmethod
     def _chunk_element_info(
@@ -889,6 +902,58 @@ class ExecutionContext:
         a, b = hw_output.flatten().float(), golden.flatten().float()
         n = min(a.numel(), b.numel())
         return (a[:n] - b[:n]).abs().max().item()
+
+    @staticmethod
+    def _check_match(
+        tensor_name: str,
+        hw_output: torch.Tensor,
+        golden: torch.Tensor,
+        *,
+        shape: tuple | None = None,
+    ) -> None:
+        """Compare HW output against golden, raise VerificationError on mismatch.
+
+        Shared by both TestScenario (deferred verification) and InferenceSession
+        (golden verification) paths.
+        """
+        if ExecutionContext._compare(hw_output, golden):
+            return
+
+        max_diff = ExecutionContext._max_diff(hw_output, golden)
+        dtype_str = str(golden.dtype).replace("torch.", "")
+        diff_mask = hw_output != golden
+        diff_indices = diff_mask.nonzero(as_tuple=False)
+        n_diff = diff_indices.shape[0]
+
+        # Show first few differing elements
+        detail_parts: list[str] = []
+        _show = min(n_diff, 4)
+        for i in range(_show):
+            idx = tuple(diff_indices[i].tolist())
+            idx_str = f"[{','.join(str(x) for x in idx)}]"
+            detail_parts.append(
+                f"  {idx_str}: expected={golden[idx].item()}, "
+                f"actual={hw_output[idx].item()}"
+            )
+        if n_diff > _show:
+            detail_parts.append(f"  ... and {n_diff - _show} more elements differ")
+
+        effective_shape = shape or tuple(hw_output.shape)
+        msg = (
+            f"Verification failed for tensor '{tensor_name}': "
+            f"shape={effective_shape}, dtype={dtype_str}, max_diff={max_diff}, "
+            f"{n_diff}/{hw_output.numel()} elements differ"
+        )
+        detail = "\n".join(detail_parts)
+        if detail:
+            msg += f"\n{detail}"
+
+        raise VerificationError(
+            msg,
+            tensor=tensor_name,
+            shape=effective_shape,
+            max_diff=max_diff,
+        )
 
     # ── Execution ──
 
@@ -1014,7 +1079,15 @@ class ExecutionContext:
                 status = "ERROR"
 
             # Read output tensors from backend
-            output_tensors = self._read_output_tensors(compiled, backend_result)
+            try:
+                output_tensors = self._read_output_tensors(compiled, backend_result)
+            except (RuntimeError, ValueError) as e:
+                # Inference HW mode may have size mismatches when tensor
+                # _element_count doesn't match STORE data size. Fall back to
+                # empty dict — inference.py's _wrap_outputs handles HW outputs
+                # via get_buffer_object() or output_buffers directly.
+                logger.debug("_read_output_tensors skipped: %s", e)
+                output_tensors = {}
 
             # Run deferred verifications before returning
             verification_count = 0

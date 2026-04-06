@@ -354,3 +354,102 @@ class TestShallowCopy:
         assert inst1._resolved_shape == (32,)
         assert inst2._resolved_shape == (128,)
         assert inst1.data.shape != inst2.data.shape
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §7  Verification state — golden, verified, max_diff, verify()
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestTensorVerification:
+
+    def _make_tensor(self, shape=(4,), dtype=torch.int8) -> Tensor:
+        t = Tensor(shape=shape, dtype=dtype, interface="ddr")
+        t.name = "ofm"
+        t._resolve_shape(_FakeResolver({}))
+        return t
+
+    def test_golden_field_default_none(self):
+        t = self._make_tensor()
+        assert t.golden is None
+        assert t.verified is False
+        assert t.max_diff == 0.0
+
+    def test_golden_field_set_get(self):
+        t = self._make_tensor()
+        golden = torch.tensor([1, 2, 3, 4], dtype=torch.int8)
+        t.golden = golden
+        assert torch.equal(t.golden, golden)
+
+    def test_golden_data_alias_read(self):
+        """_golden_data property delegates to .golden (backward compat)."""
+        t = self._make_tensor()
+        golden = torch.tensor([10, 20, 30, 40], dtype=torch.int8)
+        t.golden = golden
+        assert torch.equal(t._golden_data, golden)
+
+    def test_golden_data_alias_write(self):
+        """_golden_data setter updates .golden."""
+        t = self._make_tensor()
+        golden = torch.tensor([10, 20, 30, 40], dtype=torch.int8)
+        t._golden_data = golden
+        assert torch.equal(t.golden, golden)
+
+    def test_verify_pass(self):
+        """Matching data → verified=True, max_diff=0."""
+        t = self._make_tensor()
+        data = torch.tensor([1, 2, 3, 4], dtype=torch.int8)
+        t.data = data.clone()
+        t.golden = data.clone()
+        t.verify()
+        assert t.verified is True
+        assert t.max_diff == 0.0
+
+    def test_verify_with_explicit_golden(self):
+        """Pass golden to verify() directly."""
+        t = self._make_tensor()
+        data = torch.tensor([1, 2, 3, 4], dtype=torch.int8)
+        t.data = data.clone()
+        t.verify(golden=data.clone())
+        assert t.verified is True
+        assert torch.equal(t.golden, data)
+
+    def test_verify_fail_raises(self):
+        """Mismatching data raises VerificationError."""
+        from vten.errors import VerificationError
+
+        t = self._make_tensor()
+        t.data = torch.tensor([1, 2, 3, 4], dtype=torch.int8)
+        t.golden = torch.tensor([1, 2, 3, 99], dtype=torch.int8)
+        with pytest.raises(VerificationError, match="ofm"):
+            t.verify()
+        # max_diff should still be set even though verify raised
+        assert t.max_diff == pytest.approx(95.0)
+        assert t.verified is True
+
+    def test_verify_no_golden_raises(self):
+        """No golden → VerificationError."""
+        from vten.errors import VerificationError
+
+        t = self._make_tensor()
+        t.data = torch.tensor([1, 2, 3, 4], dtype=torch.int8)
+        with pytest.raises(VerificationError, match="no golden"):
+            t.verify()
+
+    def test_verify_no_data_raises(self):
+        """No data and no BO → VerificationError."""
+        from vten.errors import VerificationError
+
+        t = self._make_tensor()
+        t.golden = torch.tensor([1, 2, 3, 4], dtype=torch.int8)
+        with pytest.raises(VerificationError, match="no data"):
+            t.verify()
+
+    def test_verify_float_tolerance(self):
+        """Float tensors use tolerance-based comparison."""
+        t = self._make_tensor(shape=(4,), dtype=torch.float32)
+        t.data = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        t.golden = torch.tensor([1.0, 2.0, 3.0, 4.0 + 1e-8])
+        t.verify()
+        assert t.verified is True
+        assert t.max_diff < 1e-6

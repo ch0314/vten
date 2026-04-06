@@ -18,6 +18,7 @@ from vten.backend.base import Backend, BackendResult
 from vten.inference import InferenceModule, InferenceSession
 from vten.kernel.base import Kernel
 from vten.kernel.tensor import Tensor
+from vten.spec.models import OpKind
 from vten.runtime.context import ExecutionContext, ExecutionResult
 from vten.spec.models import (
     Direction,
@@ -314,21 +315,21 @@ class TestInferenceMode:
         h = ctx.send_tensor(ki.get_tensor("data_in"))
         assert h.op._skip_data is False
 
-    def test_recv_tensor_pull_only_in_inference(self):
-        """recv_tensor() in inference mode sets _pull_only flag."""
+    def test_recv_tensor_recorded_in_inference(self):
+        """recv_tensor() in inference mode records RECV_TENSOR (same as verification)."""
         ctx = ExecutionContext(project_params={"N": 32}, mode="inference")
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
 
         h = ctx.recv_tensor(ki.get_tensor("data_out"))
-        assert h.op._pull_only is True
+        assert h.op.kind == OpKind.RECV_TENSOR
 
-    def test_recv_tensor_normal_in_verification(self):
-        """recv_tensor() in verification mode has _pull_only=False."""
+    def test_recv_tensor_recorded_in_verification(self):
+        """recv_tensor() in verification mode records RECV_TENSOR."""
         ctx = ExecutionContext(project_params={"N": 32})
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
 
         h = ctx.recv_tensor(ki.get_tensor("data_out"))
-        assert h.op._pull_only is False
+        assert h.op.kind == OpKind.RECV_TENSOR
 
     def test_prebound_injected_into_compiled(self):
         """Bound BOs are injected into CompiledResult.prebound_buffers."""

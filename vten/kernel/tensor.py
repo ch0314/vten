@@ -48,8 +48,10 @@ class Tensor:
         self._bo_size: int = 0                        # serialized byte count
         self._deserialize_fn: Callable[[bytes], torch.Tensor] | None = None
 
-        # Golden data for verified inference chain (logical format)
-        self._golden_data: torch.Tensor | None = None
+        # Verification state
+        self.golden: torch.Tensor | None = None   # behavioral model golden (logical)
+        self.verified: bool = False                # has verify() been called?
+        self.max_diff: float = 0.0                 # max abs diff from golden
 
     @property
     def resolved_shape(self) -> tuple[int, ...]:
@@ -113,6 +115,48 @@ class Tensor:
             raise RuntimeError("shape not resolved")
         return self._element_count
 
+    # ── Golden data backward compat ──
+
+    @property
+    def _golden_data(self) -> torch.Tensor | None:
+        """Backward-compat alias for .golden."""
+        return self.golden
+
+    @_golden_data.setter
+    def _golden_data(self, value: torch.Tensor | None) -> None:
+        self.golden = value
+
+    # ── Verification ──
+
+    def verify(self, golden: torch.Tensor | None = None) -> None:
+        """Compare HW output against golden. Sets .verified and .max_diff.
+
+        Raises VerificationError on mismatch.
+        """
+        from vten.errors import VerificationError
+
+        if golden is not None:
+            self.golden = golden
+        if self.golden is None:
+            raise VerificationError(
+                f"no golden for tensor '{self.name}'", tensor=self.name
+            )
+        hw = self.cpu() if self.on_device else self.data
+        if hw is None:
+            raise VerificationError(
+                f"no data for tensor '{self.name}'", tensor=self.name
+            )
+
+        hw_flat = hw.flatten().float()
+        golden_flat = self.golden.flatten().float()
+        self.max_diff = (hw_flat - golden_flat).abs().max().item()
+        self.verified = True
+
+        # Delegate to shared comparison logic
+        from vten.runtime.context import ExecutionContext
+
+        ExecutionContext._check_match(self.name, hw, self.golden)
+
     # ── Device state (inference) ──
 
     @property
@@ -123,12 +167,14 @@ class Tensor:
     def cpu(self) -> torch.Tensor:
         """Transfer data from device to host and return torch.Tensor.
 
-        If data is already on host, returns it directly.
-        Applies unlayout (deserialize_fn) automatically if set.
+        If deserialized data is already cached on host (from STORE readback),
+        returns it directly — avoids re-reading from BO which can return stale
+        data in hw_emu. Falls back to BO sync+read if no cached data.
         """
+        # Prefer pre-deserialized data (set by _wrap_outputs from STORE readback)
+        if self.data is not None:
+            return self.data
         if self._bo is None:
-            if self.data is not None:
-                return self.data
             raise RuntimeError("no data on host or device")
         # Sync FROM_DEVICE — import xrt constants lazily
         self._bo.sync(2)  # XCL_BO_SYNC_BO_FROM_DEVICE = 2

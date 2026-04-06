@@ -41,7 +41,6 @@ class Operation:
     config_group: int = 0  # multi-config group index (set by config_boundary)
     # Inference mode hints (used by IR lowering)
     _skip_data: bool = False  # send_tensor: BO already on device, skip LOAD+PUSH data
-    _pull_only: bool = False  # recv_tensor: PULL only, no STORE (data stays on device)
 
 
 @dataclass

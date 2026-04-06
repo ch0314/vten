@@ -13,10 +13,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vten.errors import VerificationError
 from vten.kernel.tensor import Tensor
 from vten.runtime.context import ExecutionContext
-from vten.spec.models import Direction
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +78,12 @@ class InferenceSession:
                 base_params = merged
         self._backend = backend
         self._base_params = base_params or {}
+        self._run_count = 0  # tracks run() calls for logging
+        # Auto-configure vten logging if no handlers set (library user mode)
+        vten_root = logging.getLogger("vten")
+        if not vten_root.handlers:
+            from vten.log import setup_logging
+            setup_logging()
         # Enable persistent mode for BO pool reuse
         if hasattr(backend, "_persistent"):
             backend._persistent = True
@@ -173,9 +177,30 @@ class InferenceSession:
         Raises:
             VerificationError: If verify=True and HW output doesn't match golden.
         """
+        import time as _time
+        from vten.log import format_elapsed
+
         inputs = inputs or {}
         merged = {**self._base_params, **params}
         spec = merged.pop("_spec", None)
+
+        self._run_count += 1
+        run_t0 = _time.monotonic()
+
+        # Layer banner — show run number and key params for context
+        label = params.get("name", "") or kernel_class.__name__
+        n_device = sum(
+            1 for d in inputs.values()
+            if isinstance(d, Tensor) and d.on_device
+        )
+        n_host = len(inputs) - n_device
+        input_desc = f"{n_host} host"
+        if n_device:
+            input_desc += f", {n_device} device"
+        logger.info(
+            "──── run #%d: %s (%s) ────",
+            self._run_count, label, input_desc,
+        )
 
         ctx = ExecutionContext(
             backend=self._backend,
@@ -190,9 +215,17 @@ class InferenceSession:
             if isinstance(data, Tensor) and data.on_device:
                 # Device tensor → bind BO, skip LOAD+PUSH
                 ctx.bind_device_buffer(tensor, data._bo)
-                # Assign zero data so forward() (called inside verify()) won't crash
-                shape = tensor._resolved_shape or tensor.shape
-                tensor.data = torch.zeros(shape, dtype=tensor.dtype)
+                # Set host-side data so kernel's forward() works during
+                # ki.run() (kernels call ctx.verify(h, self.forward()["out"])).
+                # Prefer golden (verified chain) > data (STORE readback) > zeros.
+                # Stage 3 serializes this but interpreter skips bo.write()
+                # for prebound buffers, so it's harmless.
+                chain_data = data.golden if data.golden is not None else data.data
+                if chain_data is not None:
+                    tensor.data = chain_data
+                else:
+                    shape = tensor._resolved_shape or tensor.shape
+                    tensor.data = torch.zeros(shape, dtype=tensor.dtype)
             else:
                 # Host tensor → assign data for normal LOAD+PUSH
                 if isinstance(data, Tensor):
@@ -206,264 +239,94 @@ class InferenceSession:
         # Compile + execute
         result = ctx.run()
 
-        # Wrap outputs
-        outputs = self._wrap_outputs(result, ctx, ki)
+        # Output Tensor objects (with BO binding for HW backends)
+        outputs = {name: t for name, t in result.output_tensors.items()}
 
         # Verify against behavioral model golden
         if verify:
-            self._verify_golden(kernel_class, merged, inputs, outputs)
+            # Create fresh kernel instance for golden (avoid stale compile state)
+            golden_ctx = ExecutionContext(project_params=merged)
+            golden_ki = golden_ctx.instantiate(kernel_class, spec=spec, **merged)
+            golden_kernel = golden_ki.kernel_class_instance
+            self._verify_outputs(golden_kernel, inputs, outputs,
+                                 compiled=ctx._last_compiled)
+
+        run_elapsed = _time.monotonic() - run_t0
+        logger.info(
+            "──── run #%d done: %s (%s) ────",
+            self._run_count, label, format_elapsed(run_elapsed),
+        )
 
         return outputs
 
-    def _verify_golden(
+    def _verify_outputs(
         self,
-        kernel_class: type[Kernel],
-        params: dict,
+        kernel_inst: object,
         inputs: dict[str, torch.Tensor | Tensor],
         outputs: dict[str, Tensor],
+        compiled: object | None = None,
     ) -> None:
-        """Compute golden via behavioral model and compare with HW outputs.
+        """Verify HW outputs against golden using shared golden computation.
 
-        Uses the same CompositeKernel.forward() chain as vten run:
-          1. Create fresh kernel instance with resolved params
-          2. Set golden input data on sub-kernel tensors (logical format)
-          3. forward() applies layout → multi-round dataflow → physical output
-          4. unlayout → logical output
-          5. Compare with HW output (.cpu())
-          6. Store golden on output Tensor._golden_data for chain
+        Uses runtime.golden.compute_golden_outputs() — same logic as
+        vten run's verification path, ensuring identical golden results.
+
+        For CompositeKernel: sets golden input data on sub-kernel tensors
+        before calling forward() (needed for multi-layer chain).
         """
         from vten.kernel.composite import CompositeKernel
+        from vten.runtime.golden import compute_golden_outputs
 
-        # Create a fresh kernel instance for golden computation (no backend)
-        golden_ctx = ExecutionContext(project_params=params)
-        golden_ki = golden_ctx.instantiate(kernel_class, **params)
-        golden_kernel = golden_ki.kernel_class_instance
-
-        if isinstance(golden_kernel, CompositeKernel):
-            self._verify_composite(golden_kernel, inputs, outputs)
-        else:
-            self._verify_simple(golden_kernel, inputs, outputs)
-
-    def _verify_composite(
-        self,
-        golden_kernel: Any,
-        inputs: dict[str, torch.Tensor | Tensor],
-        outputs: dict[str, Tensor],
-    ) -> None:
-        """Golden verification for CompositeKernel."""
-        cls = type(golden_kernel)
-
-        # Build reverse mapping: exposed_name → (sub_name, tensor_name)
-        reverse: dict[str, tuple[str, str]] = {}
-        for (sub_name, tensor_name), exposed_name in cls._auto_exposed.items():
-            reverse[exposed_name] = (sub_name, tensor_name)
-            if tensor_name not in reverse:
-                reverse[tensor_name] = (sub_name, tensor_name)
-
-        # Set golden input data on sub-kernel tensors (logical format).
-        # CompositeKernel.forward() reads tensor.data and applies layout_*().
-        for input_name, data in inputs.items():
-            if input_name not in reverse:
-                continue
-            sub_name, tensor_name = reverse[input_name]
-            sub = golden_kernel._get_sub_kernel_instance(sub_name)
-            if sub is None:
-                continue
-            t = sub.get_tensor(tensor_name)
-
-            # Resolve golden data: _golden_data → .data → raw torch.Tensor
-            if isinstance(data, Tensor):
-                golden_data = data._golden_data if data._golden_data is not None else data.data
-            elif isinstance(data, torch.Tensor):
-                golden_data = data
-            else:
-                continue
-
-            if golden_data is not None:
-                t.data = golden_data
-
-        # Run behavioral model (same chain as vten run golden)
-        golden_result = golden_kernel.forward()
-
-        # Compare each output
-        for name, out_tensor in outputs.items():
-            if name not in golden_result:
-                continue
-
-            golden_phys = golden_result[name].flatten()
-
-            # Apply unlayout if available on the owning sub-kernel
-            golden_logical: torch.Tensor
-            if name in reverse:
-                sub_name, tensor_name = reverse[name]
-                sub = golden_kernel._get_sub_kernel_instance(sub_name)
-                unlayout_fn = getattr(sub, f"unlayout_{tensor_name}", None) if sub else None
-                if unlayout_fn is not None:
-                    golden_logical = unlayout_fn(golden_phys)
-                else:
-                    golden_logical = golden_phys
-            else:
-                golden_logical = golden_phys
-
-            hw_logical = out_tensor.cpu()
-
-            if not ExecutionContext._compare(hw_logical, golden_logical):
-                max_diff = ExecutionContext._max_diff(hw_logical, golden_logical)
-                n_diff = int((hw_logical != golden_logical).sum().item())
-                n_total = hw_logical.numel()
-                raise VerificationError(
-                    f"Tensor '{name}' verify FAIL: "
-                    f"{n_diff}/{n_total} elements differ, "
-                    f"max_diff={max_diff}, "
-                    f"hw_shape={tuple(hw_logical.shape)}, "
-                    f"golden_shape={tuple(golden_logical.shape)}",
-                    tensor=name,
-                    shape=tuple(hw_logical.shape),
-                    max_diff=max_diff,
-                )
-            logger.info("verify: %s PASS shape=%s", name, tuple(hw_logical.shape))
-
-            # Store golden for multi-layer chain
-            out_tensor._golden_data = golden_logical
-
-    def _verify_simple(
-        self,
-        golden_kernel: Any,
-        inputs: dict[str, torch.Tensor | Tensor],
-        outputs: dict[str, Tensor],
-    ) -> None:
-        """Golden verification for simple (non-composite) kernel."""
-        # Collect H2D inputs with layout applied
-        fwd_inputs: dict[str, torch.Tensor] = {}
-        for t in golden_kernel.tensors():
-            if t.data is None:
-                continue
-            direction = getattr(t, "direction", None)
-            if direction is None or direction.value == "host_to_dev":
-                layout_fn = getattr(golden_kernel, f"layout_{t.name}", None)
-                if layout_fn is not None and callable(layout_fn):
-                    fwd_inputs[t.name] = layout_fn(t.data)
-                else:
-                    fwd_inputs[t.name] = t.data
-
-        golden_result = golden_kernel.forward(**fwd_inputs)
-
-        for name, out_tensor in outputs.items():
-            if name not in golden_result:
-                continue
-
-            golden_phys = golden_result[name].flatten()
-            unlayout_fn = getattr(golden_kernel, f"unlayout_{name}", None)
-            if unlayout_fn is not None:
-                golden_logical = unlayout_fn(golden_phys)
-            else:
-                golden_logical = golden_phys
-
-            hw_logical = out_tensor.cpu()
-
-            if not ExecutionContext._compare(hw_logical, golden_logical):
-                max_diff = ExecutionContext._max_diff(hw_logical, golden_logical)
-                n_diff = int((hw_logical != golden_logical).sum().item())
-                n_total = hw_logical.numel()
-                raise VerificationError(
-                    f"Tensor '{name}' verify FAIL: "
-                    f"{n_diff}/{n_total} elements differ, max_diff={max_diff}",
-                    tensor=name,
-                    shape=tuple(hw_logical.shape),
-                    max_diff=max_diff,
-                )
-            logger.info("verify: %s PASS shape=%s", name, tuple(hw_logical.shape))
-            out_tensor._golden_data = golden_logical
-
-    def _wrap_outputs(
-        self,
-        result: Any,
-        ctx: ExecutionContext,
-        ki: Any,
-    ) -> dict[str, Tensor]:
-        """Wrap kernel outputs as Tensor objects.
-
-        HW backend: Tensor(on_device=True) with BO bound.
-        SIM backend: Tensor with .data = deserialized torch.Tensor.
-        """
-        compiled = ctx._last_compiled
         if compiled is None:
-            return {}
+            return
 
-        is_hw = self._backend.compile_target == "hw"
         view = compiled.flattened_view
-        outputs: dict[str, Tensor] = {}
 
-        for name, exposed in view.exposed_tensors.items():
-            if exposed.direction != Direction.DEV_TO_HOST:
+        # For CompositeKernel: propagate input golden data to sub-kernel tensors
+        if isinstance(kernel_inst, CompositeKernel):
+            cls = type(kernel_inst)
+            reverse: dict[str, tuple[str, str]] = {}
+            for (sub_name, tensor_name), exposed_name in cls._auto_exposed.items():
+                reverse[exposed_name] = (sub_name, tensor_name)
+                if tensor_name not in reverse:
+                    reverse[tensor_name] = (sub_name, tensor_name)
+
+            for input_name, data in inputs.items():
+                if input_name not in reverse:
+                    continue
+                sub_name, tensor_name = reverse[input_name]
+                sub = kernel_inst._get_sub_kernel_instance(sub_name)
+                if sub is None:
+                    continue
+                t = sub.get_tensor(tensor_name)
+                if isinstance(data, Tensor):
+                    golden_data = data.golden if data.golden is not None else data.data
+                elif isinstance(data, torch.Tensor):
+                    golden_data = data
+                else:
+                    continue
+                if golden_data is not None:
+                    t.data = golden_data
+        else:
+            # Simple kernel: set input data for forward()
+            for t in kernel_inst.tensors():
+                if t.name in inputs:
+                    data = inputs[t.name]
+                    if isinstance(data, Tensor):
+                        t.data = data.golden if data.golden is not None else data.data
+                    elif isinstance(data, torch.Tensor):
+                        t.data = data
+
+        golden_map = compute_golden_outputs(kernel_inst, view)
+
+        for name, out_tensor in outputs.items():
+            golden = golden_map.get(name)
+            if golden is None:
                 continue
-
-            origin = exposed.origin_tensor
-            t = Tensor(
-                shape=origin._resolved_shape or origin.shape,
-                dtype=origin.dtype,
-                interface=origin.interface,
-                direction=Direction.DEV_TO_HOST,
-            )
-            t.name = name
-            t._resolved_shape = origin._resolved_shape
-            t._element_count = origin._element_count
-
-            if is_hw:
-                # HW: bind BO from backend → Tensor(on_device=True)
-                buffer_id = compiled.buffer_ids.get(name)
-                if buffer_id is not None:
-                    bo = self._backend.get_buffer_object(buffer_id)
-                    if bo is not None:
-                        deserialize_fn = self._make_deserialize_fn(
-                            view, exposed,
-                        )
-                        t._bind_bo(bo, exposed._serialized_size, deserialize_fn)
-                        outputs[name] = t
-                        continue
-
-            # SIM or fallback: output is already deserialized by ctx.run()
-            if name in result.output_tensors:
-                t.data = result.output_tensors[name]
-
-            outputs[name] = t
-
-        return outputs
-
-    def _make_deserialize_fn(
-        self,
-        view: Any,
-        exposed: Any,
-    ) -> Any:
-        """Create a bytes → torch.Tensor deserialize function for .cpu().
-
-        Includes packing deserialization and unlayout if applicable.
-        """
-        from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.serializer import StreamSerializer
-
-        try:
-            iface = view.top_spec.get_interface(exposed.top_interface)
-        except (KeyError, AttributeError):
-            return None
-
-        if iface.packing is None:
-            return None
-
-        packing = iface.packing
-        origin = exposed.origin_tensor
-        element_count = origin._element_count
-        shape = origin._resolved_shape
-        dtype = origin.dtype
-
-        def _deserialize(raw: bytes) -> torch.Tensor:
-            serializer = StreamSerializer(packing)
-            hw_tensor = serializer.deserialize(
-                raw, element_count, shape, dtype=dtype,
-            )
-            return RuntimeEngine._apply_unlayout(view, exposed, hw_tensor)
-
-        return _deserialize
+            hw_logical = out_tensor.cpu()
+            ExecutionContext._check_match(name, hw_logical, golden)
+            logger.info("verify: %s PASS shape=%s", name, tuple(hw_logical.shape))
+            out_tensor.golden = golden
 
     def upload(
         self,
@@ -483,8 +346,15 @@ class InferenceSession:
         Returns:
             Tensor(on_device=True) with BO bound.
         """
+        from vten.log import format_size
+
         merged = {**self._base_params, **(params or {})}
         spec = merged.pop("_spec", None)
+
+        logger.info(
+            "upload: %s (%s, %s)",
+            tensor_name, list(data.shape), format_size(data.numel() * data.element_size()),
+        )
 
         # For CompositeKernel, find the sub-kernel that owns tensor_name
         # and instantiate only that sub-kernel (avoids serializing unrelated tensors).
@@ -539,7 +409,8 @@ class InferenceSession:
             if buffer_id is not None:
                 bo = self._backend.get_buffer_object(buffer_id)
                 if bo is not None:
-                    t._bind_bo(bo, exposed._serialized_size)
+                    bo_size = bo.size() if hasattr(bo, "size") else exposed._serialized_size
+                    t._bind_bo(bo, bo_size)
         else:
             # SIM: store host data
             t.data = data
@@ -568,12 +439,20 @@ class InferenceSession:
         Returns:
             Output dict from the last layer.
         """
+        import time as _time
+        from vten.log import format_elapsed
+
         chain = chain or {"ofm_mem": "ifm_mem"}
         per_layer_inputs = per_layer_inputs or [{} for _ in layers]
+
+        n = len(layers)
+        logger.info("════ pipeline: %d layers (%s) ════", n, kernel_class.__name__)
+        pipe_t0 = _time.monotonic()
 
         current = dict(inputs)
         result: dict[str, Tensor] | None = None
         for i, layer_params in enumerate(layers):
+            layer_params = {**layer_params, "name": layer_params.get("name", f"layer {i}/{n}")}
             merged_inputs = {**current, **per_layer_inputs[i]}
             result = self.run(
                 kernel_class, inputs=merged_inputs, verify=verify, **layer_params,
@@ -587,6 +466,11 @@ class InferenceSession:
 
         if result is None:
             raise ValueError("layers list is empty")
+
+        pipe_elapsed = _time.monotonic() - pipe_t0
+        logger.info(
+            "════ pipeline done: %d layers, %s ════", n, format_elapsed(pipe_elapsed),
+        )
         return result
 
     def cleanup(self) -> None:
