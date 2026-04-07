@@ -618,16 +618,14 @@ class TestXsimBackendHandshake:
 
 
 class TestXsimBackendMultiBatch:
-    """Multiple submit/wait cycles on same backend instance."""
+    """Multiple execute() cycles on same backend instance."""
 
-    def test_backend_supports_multiple_submits(self):
-        """Backend can handle sequential submit/wait pairs."""
+    def test_backend_supports_execute(self):
+        """Backend has callable execute() method."""
         from vten.backend.xsim import XsimBackend
 
         backend = XsimBackend(project_config=_xsim_config())
-        # Verify submit can be called (actual execution requires xsim)
-        assert callable(backend.submit)
-        assert callable(backend.wait)
+        assert callable(backend.execute)
 
     def test_session_id_increments(self):
         """Each session gets a unique ID (monotonic or random)."""

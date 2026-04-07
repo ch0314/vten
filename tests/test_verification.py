@@ -412,10 +412,10 @@ class TestVerificationEager:
 
 
 class TestXsimWaitReturnsReader:
-    """XsimBackend.wait() returns BackendResult with functional _shm_reader."""
+    """SimBackend._wait_completion() returns BackendResult with functional _shm_reader."""
 
     def test_wait_result_has_shm_reader(self):
-        """After wait(), BackendResult._shm_reader is set."""
+        """After _wait_completion(), BackendResult._shm_reader is set."""
         from unittest.mock import MagicMock
 
         from vten.backend.xsim import XsimBackend
@@ -439,7 +439,7 @@ class TestXsimWaitReturnsReader:
         mock_sem.timedwait.return_value = True
         backend._sem_b2h = mock_sem
 
-        result = backend.wait()
+        result = backend._wait_completion()
         assert result._shm_reader is not None
         assert result.read_buffer(0) == data
 
@@ -450,7 +450,7 @@ class TestXsimWaitReturnsReader:
         backend = XsimBackend(project_config={
             "backend": {"xsim": {"vivado_path": ""}},
         })
-        result = backend.wait()
+        result = backend._wait_completion()
         assert result.read_buffer(0) == b""
 
 

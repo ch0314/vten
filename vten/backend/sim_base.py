@@ -204,15 +204,7 @@ class SimBackend(Backend):
             self._shutdown_sim()
             self._release_posix_resources()
 
-    # ── Optional fine-grained control ──
-
-    def submit(self, compiled: CompiledResult) -> None:
-        """Async submit: write SHM, launch sim, signal ready."""
-        self._submit_shm(compiled.shm_image, compiled.bfm_configs)
-
-    def wait(self) -> BackendResult:
-        """Wait for completion and return result."""
-        return self._wait_completion()
+    # ── Optional lifecycle control ──
 
     def shutdown(self) -> None:
         """Send SHUTDOWN signal to backend, wait for process exit."""

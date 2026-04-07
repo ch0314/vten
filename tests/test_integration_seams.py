@@ -181,7 +181,7 @@ class TestCompiledResultToSVGenerator:
 
 
 class TestCompiledResultToBackend:
-    """CompiledResult.shm_image + bfm_configs → Backend.submit()."""
+    """CompiledResult.shm_image + bfm_configs → Backend.execute()."""
 
     def test_compiled_shm_image_is_bytes(self):
         """shm_image from compile is bytes (submit expects bytes)."""

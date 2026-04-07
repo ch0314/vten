@@ -250,33 +250,6 @@ class TestBackendABC:
             assert isinstance(b, Backend)
         assert b.cleaned
 
-    def test_submit_raises_not_implemented(self):
-        from vten.backend.base import Backend
-
-        class StubBackend(Backend):
-            def execute(self, compiled):
-                pass
-
-            def cleanup(self):
-                pass
-
-        b = StubBackend()
-        with pytest.raises(NotImplementedError):
-            b.submit(None)
-
-    def test_wait_raises_not_implemented(self):
-        from vten.backend.base import Backend
-
-        class StubBackend(Backend):
-            def execute(self, compiled):
-                pass
-
-            def cleanup(self):
-                pass
-
-        b = StubBackend()
-        with pytest.raises(NotImplementedError):
-            b.wait()
 
 
 # ═══════════════════════════════════════════════════════════════════

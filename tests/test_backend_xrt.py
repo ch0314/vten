@@ -247,7 +247,7 @@ class TestInterpreterMultiIP:
 
     def _make_interpreter(self, ip_map=None, addr_bindings=None,
                           mem_bank_map=None):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
         device = MagicMock()
         default_ip = MagicMock()
         xrt_mod = MagicMock()
@@ -331,7 +331,7 @@ class TestInterpreterAddrTranslation:
     """CommandInterpreter substitutes BO address for auto_bind registers."""
 
     def _make_interpreter(self, addr_bindings):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
         device = MagicMock()
         default_ip = MagicMock()
         xrt_mod = MagicMock()
@@ -432,7 +432,7 @@ class TestInterpreterMemBank:
     """CommandInterpreter uses mem_bank_map for BO allocation."""
 
     def test_load_uses_mem_bank_map(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
         from vten.runtime.ir import Command
         from vten.spec.models import OpCode
 
@@ -457,7 +457,7 @@ class TestInterpreterMemBank:
         )
 
     def test_load_defaults_to_bank_0(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
         from vten.runtime.ir import Command
         from vten.spec.models import OpCode
 

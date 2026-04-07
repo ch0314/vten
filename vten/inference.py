@@ -308,7 +308,8 @@ class InferenceSession:
             if golden is None:
                 continue
             hw_logical = out_tensor.cpu()
-            ExecutionContext._check_match(name, hw_logical, golden)
+            from vten.runtime.verifier import check_match
+            check_match(name, hw_logical, golden)
             logger.info("verify: %s PASS shape=%s", name, tuple(hw_logical.shape))
             out_tensor.golden = golden
 

@@ -321,38 +321,12 @@ class ExecutionContext:
         self._internal_probe_golden[(sub_kernel_name, tensor_name)] = golden
 
     def _collect_probe_golden_tensors(self) -> dict[str, torch.Tensor]:
-        """Collect golden tensors for probe-enabled PULL operations.
-
-        Handles two patterns:
-        1. ctx.verify(h_pull, golden)  — verify directly on probe PULL op
-        2. ctx.verify(h_store, golden) — verify on STORE for the same tensor
-
-        In both cases, the golden tensor is matched by tensor name to the
-        probe-enabled PULL operation.
-
-        Returns:
-            tensor_name → golden torch.Tensor (serialization done by engine).
-        """
-        # Step 1: find tensor names with probe-enabled operations
-        probe_tensor_names: set[str] = set()
-        for op in self._pending_ops:
-            if op.probe and op.tensor is not None:
-                probe_tensor_names.add(op.tensor.name)
-
-        # Step 2: match verifications to probe tensors by name
-        probe_golden: dict[str, torch.Tensor] = {}
-        for task in self._verifications:
-            op = task.op_handle.op
-            if op.tensor is None:
-                continue
-            tensor_name = op.tensor.name
-            if tensor_name in probe_tensor_names and tensor_name not in probe_golden:
-                golden = task.golden
-                if golden is None:
-                    # Auto-golden for probe: compute eagerly
-                    golden = self._compute_auto_golden(task.op_handle)
-                probe_golden[tensor_name] = golden
-        return probe_golden
+        from vten.runtime.probe_manager import collect_probe_golden_tensors
+        return collect_probe_golden_tensors(
+            self._pending_ops,
+            self._verifications,
+            self._compute_auto_golden,
+        )
 
     # ── Declarative Probes ──
 
@@ -361,51 +335,19 @@ class ExecutionContext:
         self._declarative_probes = list(probes)
 
     def _apply_declarative_probes(self) -> None:
-        """Post-hoc annotation: mark ops as probes based on declarative specs.
-
-        For output probes (simple name like "data_out"): set probe=True on
-        matching PULL/RECV operations.
-        For internal probes (dotted name like "scale.data_out"): store in
-        _internal_probe_requests for golden extraction.
-        """
+        from vten.runtime.probe_manager import apply_declarative_probes
         if not self._declarative_probes:
             return
-        for probe_spec in self._declarative_probes:
-            if "." in probe_spec:
-                # Internal probe: "sub_kernel.tensor_name"
-                sub, tensor = probe_spec.rsplit(".", 1)
-                self._internal_probe_requests.append((sub, tensor))
-            else:
-                # Output probe: find matching PULL/RECV op
-                for op in self._pending_ops:
-                    if (
-                        op.kind in (OpKind.PULL_TENSOR, OpKind.RECV_TENSOR)
-                        and op.tensor is not None
-                        and op.tensor.name == probe_spec
-                    ):
-                        op.probe = True
+        reqs = apply_declarative_probes(self._declarative_probes, self._pending_ops)
+        self._internal_probe_requests.extend(reqs)
 
     def _resolve_internal_probe_golden(self) -> None:
-        """Auto-extract internal probe golden from CompositeKernel forward results.
-
-        v2: Uses _sub_kernel_refs and forward() chain instead of golden_provides/pool.
-        After forward() has run during ki.run(ctx), we can extract intermediate
-        values from the forward chain pool stored on the composite instance.
-        """
-        if not self._internal_probe_requests:
-            return
-        for ki in self._kernels.values():
-            inst = ki.kernel_class_instance
-            pool = getattr(inst, "_golden_pool", None)
-            if pool is None:
-                continue
-            for sub_name, tensor_name in self._internal_probe_requests:
-                if (sub_name, tensor_name) in self._internal_probe_golden:
-                    continue
-                # v2: pool keys are (sub_name, tensor_name) tuples
-                key = (sub_name, tensor_name)
-                if key in pool:
-                    self._internal_probe_golden[key] = pool[key]
+        from vten.runtime.probe_manager import resolve_internal_probe_golden
+        resolve_internal_probe_golden(
+            self._internal_probe_requests,
+            self._kernels,
+            self._internal_probe_golden,
+        )
 
     def _compute_shm_flags(self) -> int:
         """Compute SHM control header flags from backend config."""
@@ -441,201 +383,34 @@ class ExecutionContext:
 
     def _read_output_tensors(
         self, compiled: object, backend_result: object,
-    ) -> dict[str, Tensor]:
-        """Deserialize DEV_TO_HOST tensors from backend result.
-
-        Returns Tensor objects with:
-          - .data = deserialized + unlayouted torch.Tensor
-          - BO binding for HW backends (supports .cpu() from device)
-          - Metadata (shape, dtype, etc.) from origin tensor
-        """
-        from vten.kernel.tensor import Tensor as TensorCls
-        from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.serializer import StreamSerializer
-
-        view = compiled.flattened_view
+    ) -> dict:
+        from vten.runtime.output_reader import read_output_tensors
         is_hw = (self._backend is not None
                  and self._backend.compile_target == "hw")
-
-        output_tensors: dict[str, TensorCls] = {}
-        for name, exposed in view.exposed_tensors.items():
-            if exposed.direction != Direction.DEV_TO_HOST:
-                continue
-
-            origin = exposed.origin_tensor
-            try:
-                iface = view.top_spec.get_interface(exposed.top_interface)
-            except KeyError:
-                continue
-            if iface.packing is None:
-                continue
-
-            # Create Tensor wrapper
-            t = TensorCls(
-                shape=origin._resolved_shape or origin.shape,
-                dtype=origin.dtype,
-                interface=origin.interface,
-                direction=Direction.DEV_TO_HOST,
-            )
-            t.name = name
-            t._resolved_shape = origin._resolved_shape
-            t._element_count = origin._element_count
-
-            # Deserialize from backend result
-            raw_bytes = self._read_tensor_bytes(
-                name, exposed, compiled, backend_result,
-            )
-            if raw_bytes:
-                serializer = StreamSerializer(iface.packing)
-                hw_tensor = serializer.deserialize(
-                    raw_bytes,
-                    origin._element_count,
-                    origin._resolved_shape,
-                    dtype=origin.dtype,
-                )
-                t.data = RuntimeEngine._apply_unlayout(view, exposed, hw_tensor)
-
-            # HW backend: bind BO for device-resident access
-            if is_hw:
-                buffer_id = compiled.buffer_ids.get(name)
-                if buffer_id is not None:
-                    bo = self._backend.get_buffer_object(buffer_id)
-                    if bo is not None:
-                        deserialize_fn = self._make_deserialize_fn(view, exposed)
-                        bo_size = (bo.size() if hasattr(bo, "size")
-                                   else getattr(exposed, "_serialized_size", 0))
-                        t._bind_bo(bo, bo_size, deserialize_fn)
-
-            output_tensors[name] = t
-        return output_tensors
+        get_bo = (
+            self._backend.get_buffer_object
+            if is_hw and self._backend is not None else None
+        )
+        return read_output_tensors(
+            compiled, backend_result,
+            is_hw=is_hw,
+            get_buffer_object=get_bo,
+        )
 
     @staticmethod
     def _make_deserialize_fn(view: object, exposed: object):
-        """Create a bytes → torch.Tensor deserialize+unlayout closure.
-
-        Used by Tensor._bind_bo() for .cpu() deserialization.
-        """
-        from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.serializer import StreamSerializer
-
-        try:
-            iface = view.top_spec.get_interface(exposed.top_interface)
-        except (KeyError, AttributeError):
-            return None
-        if iface.packing is None:
-            return None
-
-        packing = iface.packing
-        origin = exposed.origin_tensor
-        element_count = origin._element_count
-        shape = origin._resolved_shape
-        dtype = origin.dtype
-
-        def _deserialize(raw: bytes) -> torch.Tensor:
-            serializer = StreamSerializer(packing)
-            hw_tensor = serializer.deserialize(
-                raw, element_count, shape, dtype=dtype,
-            )
-            return RuntimeEngine._apply_unlayout(view, exposed, hw_tensor)
-
-        return _deserialize
+        from vten.runtime.output_reader import make_deserialize_fn
+        return make_deserialize_fn(view, exposed)
 
     @staticmethod
-    def _read_tensor_bytes(
-        name: str, exposed, compiled, backend_result,
-        buffer_prefix: str = "",
-    ) -> bytes:
-        """Read raw bytes for a tensor, reassembling array/chunk buffers.
-
-        Args:
-            buffer_prefix: Key prefix for multi-config (e.g. "cfg1:").
-        """
-        prefixed = f"{buffer_prefix}{name}"
-        # Detect chunked buffers: look for chunk_0 key pattern
-        chunk_0_key = f"{prefixed}:chunk_0"
-        is_chunked = any(
-            k.startswith(chunk_0_key) for k in compiled.buffer_ids
-        )
-
-        if is_chunked:
-            return ExecutionContext._read_all_chunk_bytes(
-                name, exposed, compiled, backend_result,
-                buffer_prefix=buffer_prefix,
-            )
-
-        if exposed._port_buffers:
-            parts = {}
-            for port_name in exposed._port_buffers:
-                key = f"{prefixed}:{port_name}"
-                bid = compiled.buffer_ids.get(key)
-                if bid is None:
-                    continue
-                data = backend_result.read_buffer(bid)
-                if data:
-                    parts[port_name] = data
-            if exposed._port_mode == "channel_interleave" and parts:
-                from vten.runtime.serializer import MultiPortSerializer
-                return MultiPortSerializer.reassemble(
-                    parts, exposed._interleave_unit
-                )
-            return b"".join(parts.values())
-        buffer_id = compiled.buffer_ids[prefixed]
-        return backend_result.read_buffer(buffer_id)
+    def _read_tensor_bytes(name, exposed, compiled, backend_result, buffer_prefix=""):
+        from vten.runtime.output_reader import read_tensor_bytes
+        return read_tensor_bytes(name, exposed, compiled, backend_result, buffer_prefix)
 
     @staticmethod
-    def _read_all_chunk_bytes(
-        name: str, exposed, compiled, backend_result,
-        buffer_prefix: str = "",
-    ) -> bytes:
-        """Read and concatenate all chunk buffers for a chunked tensor."""
-        prefixed = f"{buffer_prefix}{name}"
-        parts: list[bytes] = []
-        ci = 0
-        while True:
-            if exposed._port_buffers:
-                # Chunked + array: read per-chunk-per-element
-                chunk_parts: list[bytes] = []
-                for fname in exposed._port_buffers:
-                    key = f"{prefixed}:chunk_{ci}:{fname}"
-                    bid = compiled.buffer_ids.get(key)
-                    if bid is None:
-                        return b"".join(parts)
-                    data = backend_result.read_buffer(bid)
-                    if data:
-                        chunk_parts.append(data)
-                parts.extend(chunk_parts)
-            else:
-                key = f"{prefixed}:chunk_{ci}"
-                bid = compiled.buffer_ids.get(key)
-                if bid is None:
-                    break
-                data = backend_result.read_buffer(bid)
-                if data:
-                    parts.append(data)
-            ci += 1
-        return b"".join(parts)
-
-    @staticmethod
-    def _read_chunk_bytes(
-        name: str, exposed, compiled, backend_result,
-        chunk_index: int, buffer_prefix: str = "",
-    ) -> bytes:
-        """Read raw bytes for a single chunk of a chunked tensor."""
-        prefixed = f"{buffer_prefix}{name}"
-        if exposed._port_buffers:
-            parts: list[bytes] = []
-            for fname in exposed._port_buffers:
-                key = f"{prefixed}:chunk_{chunk_index}:{fname}"
-                bid = compiled.buffer_ids.get(key)
-                if bid is None:
-                    continue
-                data = backend_result.read_buffer(bid)
-                if data:
-                    parts.append(data)
-            return b"".join(parts)
-        key = f"{prefixed}:chunk_{chunk_index}"
-        bid = compiled.buffer_ids[key]
-        return backend_result.read_buffer(bid)
+    def _read_chunk_bytes(name, exposed, compiled, backend_result, chunk_index, buffer_prefix=""):
+        from vten.runtime.output_reader import read_chunk_bytes
+        return read_chunk_bytes(name, exposed, compiled, backend_result, chunk_index, buffer_prefix)
 
     # ── Auto-golden ──
 
@@ -833,17 +608,9 @@ class ExecutionContext:
         self._check_match(tensor_name, hw_output, golden, shape=shape)
 
     @staticmethod
-    def _chunk_element_info(
-        exposed, chunk_index: int, chunk_total: int,
-        chunks_spec: int | list[int] | None,
-    ) -> tuple[int, tuple[int, ...]]:
-        """Compute element count and shape for a single chunk."""
-        total_elems = exposed.origin_tensor._element_count
-        if isinstance(chunks_spec, list):
-            chunk_elems = chunks_spec[chunk_index]
-        else:
-            chunk_elems = total_elems // chunk_total
-        return chunk_elems, (chunk_elems,)
+    def _chunk_element_info(exposed, chunk_index, chunk_total, chunks_spec):
+        from vten.runtime.verifier import chunk_element_info
+        return chunk_element_info(exposed, chunk_index, chunk_total, chunks_spec)
 
     def _run_deferred_verifications(self) -> tuple[int, list]:
         """Execute all deferred VerificationTasks after run().
@@ -888,72 +655,19 @@ class ExecutionContext:
         return count, results
 
     @staticmethod
-    def _compare(hw_output: torch.Tensor, golden: torch.Tensor) -> bool:
-        """Element-wise comparison with tolerance."""
-        if hw_output.shape != golden.shape:
-            return False
-        if golden.is_floating_point():
-            return torch.allclose(hw_output.float(), golden.float(), atol=1e-6, rtol=1e-5)
-        return torch.equal(hw_output, golden)
+    def _compare(hw_output, golden):
+        from vten.runtime.verifier import compare
+        return compare(hw_output, golden)
 
     @staticmethod
-    def _max_diff(hw_output: torch.Tensor, golden: torch.Tensor) -> float:
-        """Maximum element-wise absolute difference."""
-        a, b = hw_output.flatten().float(), golden.flatten().float()
-        n = min(a.numel(), b.numel())
-        return (a[:n] - b[:n]).abs().max().item()
+    def _max_diff(hw_output, golden):
+        from vten.runtime.verifier import max_diff
+        return max_diff(hw_output, golden)
 
     @staticmethod
-    def _check_match(
-        tensor_name: str,
-        hw_output: torch.Tensor,
-        golden: torch.Tensor,
-        *,
-        shape: tuple | None = None,
-    ) -> None:
-        """Compare HW output against golden, raise VerificationError on mismatch.
-
-        Shared by both TestScenario (deferred verification) and InferenceSession
-        (golden verification) paths.
-        """
-        if ExecutionContext._compare(hw_output, golden):
-            return
-
-        max_diff = ExecutionContext._max_diff(hw_output, golden)
-        dtype_str = str(golden.dtype).replace("torch.", "")
-        diff_mask = hw_output != golden
-        diff_indices = diff_mask.nonzero(as_tuple=False)
-        n_diff = diff_indices.shape[0]
-
-        # Show first few differing elements
-        detail_parts: list[str] = []
-        _show = min(n_diff, 4)
-        for i in range(_show):
-            idx = tuple(diff_indices[i].tolist())
-            idx_str = f"[{','.join(str(x) for x in idx)}]"
-            detail_parts.append(
-                f"  {idx_str}: expected={golden[idx].item()}, "
-                f"actual={hw_output[idx].item()}"
-            )
-        if n_diff > _show:
-            detail_parts.append(f"  ... and {n_diff - _show} more elements differ")
-
-        effective_shape = shape or tuple(hw_output.shape)
-        msg = (
-            f"Verification failed for tensor '{tensor_name}': "
-            f"shape={effective_shape}, dtype={dtype_str}, max_diff={max_diff}, "
-            f"{n_diff}/{hw_output.numel()} elements differ"
-        )
-        detail = "\n".join(detail_parts)
-        if detail:
-            msg += f"\n{detail}"
-
-        raise VerificationError(
-            msg,
-            tensor=tensor_name,
-            shape=effective_shape,
-            max_diff=max_diff,
-        )
+    def _check_match(tensor_name, hw_output, golden, *, shape=None):
+        from vten.runtime.verifier import check_match
+        return check_match(tensor_name, hw_output, golden, shape=shape)
 
     # ── Execution ──
 

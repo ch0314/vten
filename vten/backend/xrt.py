@@ -145,8 +145,8 @@ class XrtBackend(Backend):
         ini_content = (
             "[Emulation]\n"
             "print_infos_in_console=false\n"
-            "info_suppress=true\n"
-            "[Debug]\n"
+            "debug_mode=off\n"
+            "[Runtime]\n"
             "verbosity=0\n"
         )
         try:
@@ -619,7 +619,7 @@ class XrtBackend(Backend):
         if self._device is None:
             self._init_device()
 
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         ip_map = self._build_ip_map(compiled)
         mem_bank_map = self._build_mem_bank_map(compiled)

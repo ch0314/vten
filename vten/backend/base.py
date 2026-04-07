@@ -142,8 +142,9 @@ class Backend(abc.ABC):
     """Abstract backend interface.
 
     All backends must implement execute() and cleanup().
-    SIM backends may additionally override submit()/wait()/shutdown()
-    for fine-grained lifecycle control.
+    SIM backends may additionally override shutdown() for process signalling.
+    Multi-batch backends implement the session protocol
+    (open_session/submit_batch/wait_batch/close_session).
     """
 
     @abc.abstractmethod
@@ -167,15 +168,7 @@ class Backend(abc.ABC):
     def __exit__(self, *exc) -> None:
         self.cleanup()
 
-    # ── Optional fine-grained control (SimBackend overrides) ──
-
-    def submit(self, compiled: CompiledResult) -> None:
-        """Async submit (optional). First half of execute()."""
-        raise NotImplementedError("Use execute() for synchronous operation")
-
-    def wait(self) -> BackendResult:
-        """Wait for result (optional). Second half of execute()."""
-        raise NotImplementedError("Use execute() for synchronous operation")
+    # ── Optional lifecycle control ──
 
     def shutdown(self) -> None:
         """Send shutdown signal (optional)."""

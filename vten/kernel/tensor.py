@@ -152,10 +152,9 @@ class Tensor:
         self.max_diff = (hw_flat - golden_flat).abs().max().item()
         self.verified = True
 
-        # Delegate to shared comparison logic
-        from vten.runtime.context import ExecutionContext
+        from vten.runtime.verifier import check_match
 
-        ExecutionContext._check_match(self.name, hw, self.golden)
+        check_match(self.name, hw, self.golden)
 
     # ── Device state (inference) ──
 

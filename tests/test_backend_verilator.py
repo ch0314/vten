@@ -87,10 +87,9 @@ class TestVerilatorBackendInit:
         from vten.backend.verilator import VerilatorBackend
         assert VerilatorBackend.execute is SimBackend.execute
 
-    def test_inherits_submit_wait(self):
+    def test_inherits_shutdown(self):
         from vten.backend.verilator import VerilatorBackend
-        assert VerilatorBackend.submit is SimBackend.submit
-        assert VerilatorBackend.wait is SimBackend.wait
+        assert VerilatorBackend.shutdown is SimBackend.shutdown
 
     def test_session_id_none_initially(self):
         from vten.backend.verilator import VerilatorBackend

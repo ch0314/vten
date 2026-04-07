@@ -85,7 +85,7 @@ class TestCommandInterpreterDispatch:
     """CommandInterpreter dispatches OpCodes to handlers."""
 
     def test_load_creates_buffer(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         interp = CommandInterpreter(
             device=MagicMock(), kernel=_mock_kernel(),
@@ -98,7 +98,7 @@ class TestCommandInterpreterDispatch:
 
     def test_load_missing_data_raises(self):
         from vten.errors import BackendError
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         interp = CommandInterpreter(
             device=MagicMock(), kernel=_mock_kernel(),
@@ -109,7 +109,7 @@ class TestCommandInterpreterDispatch:
             interp.execute([cmd], {})
 
     def test_store_populates_output_buffers(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         interp = CommandInterpreter(
             device=MagicMock(), kernel=_mock_kernel(),
@@ -123,7 +123,7 @@ class TestCommandInterpreterDispatch:
 
     def test_store_missing_buffer_raises(self):
         from vten.errors import BackendError
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         interp = CommandInterpreter(
             device=MagicMock(), kernel=_mock_kernel(),
@@ -134,7 +134,7 @@ class TestCommandInterpreterDispatch:
             interp.execute([cmd], {})
 
     def test_write_reg_calls_kernel(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         kernel = _mock_kernel()
         interp = CommandInterpreter(
@@ -146,7 +146,7 @@ class TestCommandInterpreterDispatch:
         kernel.write_register.assert_called_once_with(0x10, 0xFF)
 
     def test_read_reg_calls_kernel(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         kernel = _mock_kernel()
         kernel.read_register.return_value = 42
@@ -160,7 +160,7 @@ class TestCommandInterpreterDispatch:
         assert cmd.reg_value == 42
 
     def test_poll_reg_succeeds_immediately(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         kernel = _mock_kernel()
         kernel.read_register.return_value = 0x01
@@ -175,7 +175,7 @@ class TestCommandInterpreterDispatch:
 
     def test_poll_reg_timeout_raises(self):
         from vten.errors import PollTimeoutError
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         kernel = _mock_kernel()
         kernel.read_register.return_value = 0x00  # never matches
@@ -190,7 +190,7 @@ class TestCommandInterpreterDispatch:
             interp.execute([cmd], {})
 
     def test_barrier_is_noop(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         interp = CommandInterpreter(
             device=MagicMock(), kernel=_mock_kernel(),
@@ -201,7 +201,7 @@ class TestCommandInterpreterDispatch:
         assert 0 in interp._completed
 
     def test_push_syncs_and_sets_arg(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         kernel = _mock_kernel()
         interp = CommandInterpreter(
@@ -216,7 +216,7 @@ class TestCommandInterpreterDispatch:
 
     def test_push_missing_buffer_raises(self):
         from vten.errors import BackendError
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         interp = CommandInterpreter(
             device=MagicMock(), kernel=_mock_kernel(),
@@ -237,7 +237,7 @@ class TestCommandInterpreterDeps:
 
     def test_unsatisfied_dep_raises(self):
         from vten.errors import BackendError
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         interp = CommandInterpreter(
             device=MagicMock(), kernel=_mock_kernel(),
@@ -248,7 +248,7 @@ class TestCommandInterpreterDeps:
             interp.execute([cmd], {})
 
     def test_sequential_deps_work(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         interp = CommandInterpreter(
             device=MagicMock(), kernel=_mock_kernel(),
@@ -263,7 +263,7 @@ class TestCommandInterpreterDeps:
         assert interp._completed == {0, 1, 2}
 
     def test_cleanup_clears_state(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         interp = CommandInterpreter(
             device=MagicMock(), kernel=_mock_kernel(),
@@ -286,7 +286,7 @@ class TestCommandInterpreterPipeline:
     """Full LOAD → PUSH → PULL → STORE pipeline."""
 
     def test_full_data_path(self):
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         kernel = _mock_kernel()
         interp = CommandInterpreter(
@@ -310,7 +310,7 @@ class TestCommandInterpreterPipeline:
 
     def test_unknown_opcode_raises(self):
         from vten.errors import BackendError
-        from vten.runtime.interpreter import CommandInterpreter
+        from vten.backend.xrt_interpreter import CommandInterpreter
 
         interp = CommandInterpreter(
             device=MagicMock(), kernel=_mock_kernel(),
