@@ -88,9 +88,14 @@ def compute_golden_outputs(
         golden_phys = fwd_result[name].flatten()
 
         # Format conversion: packing round-trip for dtype alignment
+        # The round-trip simulates HW precision loss (element_width truncation).
+        # Deserialize with the *physical* dtype (forward output dtype, typically
+        # uint8) to avoid sign-extension of unsigned values 128-255, then cast
+        # to the logical target dtype.
         origin = exposed.origin_tensor
         target_dtype = origin.dtype
         if golden_phys.dtype != target_dtype:
+            phys_dtype = golden_phys.dtype  # preserve physical dtype for round-trip
             try:
                 iface = view.top_spec.get_interface(exposed.top_interface)
                 if iface.packing is not None:
@@ -99,12 +104,12 @@ def compute_golden_outputs(
                     golden_phys = serializer.deserialize(
                         raw, origin._element_count,
                         origin._resolved_shape,
-                        dtype=target_dtype,
+                        dtype=phys_dtype,
                     ).flatten()
             except (KeyError, AttributeError):
                 pass
 
-            # Fallback: simple dtype cast
+            # Cast to logical dtype after unsigned round-trip
             if golden_phys.dtype != target_dtype:
                 golden_phys = golden_phys.to(target_dtype)
 
