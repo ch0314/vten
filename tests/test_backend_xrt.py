@@ -61,7 +61,7 @@ class TestXrtBackendInit:
         config = _xrt_config()
         del config["backend"]["xrt"]["poll_timeout_ms"]
         backend = XrtBackend(project_config=config)
-        assert backend._poll_timeout_ms == 30000
+        assert backend._poll_timeout_ms == 30000000
 
     def test_cleanup_idempotent(self):
         from vten.backend.xrt import XrtBackend

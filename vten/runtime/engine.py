@@ -222,6 +222,7 @@ class CompiledResult:
     views: list[FlattenedKernelView] | None = None  # multi-config: all views
     probe_buffer_map: dict[int, int] = field(default_factory=dict)  # probe_index → golden_buffer_id
     prebound_buffers: dict[int, object] = field(default_factory=dict)  # buffer_id → xrt.bo (inference)
+    mode: str = "verification"  # "verification" or "inference"
 
 
 # ── RuntimeEngine ──
@@ -236,11 +237,13 @@ class RuntimeEngine:
         ops: list[Operation],
         project_params: dict,
         alias_registry: AliasRegistry | None = None,
+        quiet: bool = False,
     ) -> None:
         self._kernels = kernels
         self._ops = ops
         self._project_params = project_params
         self._alias_registry = alias_registry
+        self._quiet = quiet
 
     # ── Internal: Stages 0–6 (IR generation, no SHM packing) ──
 
@@ -311,8 +314,8 @@ class RuntimeEngine:
             v: k for k, v in lowering._iface_id_map.items()
         }
 
-        self._log_ir_summary(commands)
-        self._log_dataflow_summary(view)
+        self._log_ir_summary(commands, quiet=self._quiet)
+        self._log_dataflow_summary(view, quiet=self._quiet)
         if logger.isEnabledFor(logging.DEBUG):
             self._log_ir_commands(commands, iface_id_to_name, buffer_ids)
 
@@ -404,6 +407,7 @@ class RuntimeEngine:
             iface_id_to_name=iface_id_to_name,
             shm_layout=self._last_shm_layout,
             probe_buffer_map=probe_buffer_map,
+            mode="inference" if self._quiet else "verification",
         )
 
     @staticmethod
@@ -454,9 +458,10 @@ class RuntimeEngine:
         logger.debug("\n".join(lines))
 
     @staticmethod
-    def _log_ir_summary(commands: list) -> None:
-        """Log a concise IR summary at INFO level."""
+    def _log_ir_summary(commands: list, quiet: bool = False) -> None:
+        """Log a concise IR summary. DEBUG when quiet (inference mode)."""
         from vten.log import format_size
+        _log = logger.debug if quiet else logger.info
         n_cfg = sum(1 for c in commands if c.op == OpCode.WRITE_REG)
         n_load = sum(1 for c in commands if c.op == OpCode.LOAD)
         n_push = sum(1 for c in commands if c.op == OpCode.PUSH)
@@ -474,17 +479,18 @@ class RuntimeEngine:
             parts.append(f"{n_poll} poll")
         if n_pull + n_store:
             parts.append(f"{n_pull}+{n_store} recv {format_size(recv_bytes)}")
-        logger.info("compiled: %d cmds (%s)", len(commands), ", ".join(parts))
+        _log("compiled: %d cmds (%s)", len(commands), ", ".join(parts))
 
     @staticmethod
-    def _log_dataflow_summary(view: FlattenedKernelView) -> None:
-        """Log inter-kernel dataflow for composite kernels at INFO level."""
+    def _log_dataflow_summary(view: FlattenedKernelView, quiet: bool = False) -> None:
+        """Log inter-kernel dataflow. DEBUG when quiet (inference mode)."""
         if not view.connections:
             return  # Unit kernel — no dataflow to report
 
         from vten.log import format_size
         from vten.spec.models import Direction
 
+        _log = logger.debug if quiet else logger.info
         lines = ["dataflow:"]
 
         # Internal connections (sub → sub)
@@ -511,7 +517,7 @@ class RuntimeEngine:
         if dev_to_host:
             lines.append(f"  device → host: {', '.join(dev_to_host)}")
 
-        logger.info("\n".join(lines))
+        _log("\n".join(lines))
 
     def _get_primary_kernel(self) -> KernelInstance:
         if not self._kernels:

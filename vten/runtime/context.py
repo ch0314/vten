@@ -291,7 +291,7 @@ class ExecutionContext:
         After run(): eager — immediately compares HW output vs golden.
 
         If golden is None, auto-golden is computed from the kernel's forward().
-        In inference mode: no-op (skip all verification).
+        In inference mode: no-op (verification is handled by _verify_outputs).
         """
         if self._mode == "inference":
             return
@@ -985,6 +985,7 @@ class ExecutionContext:
                 ops=ops,
                 project_params=params,
                 alias_registry=self._alias_registry,
+                quiet=(self._mode == "inference"),
             ))
 
         return RuntimeEngine.compile_multi(engines, target=target)
@@ -1009,6 +1010,7 @@ class ExecutionContext:
                 ops=self._pending_ops,
                 project_params=self._project_params,
                 alias_registry=self._alias_registry,
+                quiet=(self._mode == "inference"),
             )
             probe_golden_tensors = self._collect_probe_golden_tensors()
             shm_flags = self._compute_shm_flags()
@@ -1032,6 +1034,7 @@ class ExecutionContext:
                 bid = compiled.buffer_ids.get(tensor_name)
                 if bid is not None:
                     compiled.prebound_buffers[bid] = bo
+                    logger.debug("prebound %s → bid=%d", tensor_name, bid)
 
         if self._backend is not None:
             # Session mode: use open_session/submit_batch/wait_batch

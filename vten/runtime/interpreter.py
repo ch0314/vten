@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vten.errors import BackendError, PollTimeoutError
@@ -34,6 +35,27 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from vten.runtime.ir import Command
+
+
+@dataclass
+class PhaseResult:
+    """Summary of one execution phase (configure/send/trigger/poll/recv)."""
+
+    phase: str
+    elapsed: float  # seconds
+    n_cmds: int
+    n_bytes: int = 0
+    n_tensors: int = 0
+    n_polls: int = 0
+
+
+@dataclass
+class ExecutionSummary:
+    """Structured summary of a CommandInterpreter.execute() run."""
+
+    total_elapsed: float
+    total_commands: int
+    phases: list[PhaseResult] = field(default_factory=list)
 
 
 def _classify_phases(commands: list[Command]) -> list[str]:
@@ -116,6 +138,7 @@ class CommandInterpreter:
         addr_bindings: (
             dict[tuple[int, int], tuple[int, str | None]] | None
         ) = None,
+        quiet: bool = False,
     ) -> None:
         self._device = device
         self._kernel = kernel
@@ -125,11 +148,14 @@ class CommandInterpreter:
         self._ip_map = ip_map or {}
         self._mem_bank_map = mem_bank_map or {}
         self._addr_bindings = addr_bindings or {}
+        self._quiet = quiet
         self._buffers: dict[int, Any] = {}  # buffer_id → XRT BO
         self._output_buffers: dict[int, bytes] = {}
         self._completed: set[int] = set()  # completed cmd_ids
         self._prebound: set[int] = set()  # buffer_ids with pre-synced BOs
         self._deferred_stores: list[Command] = []  # STORE cmds deferred past POLL
+        self._summary: ExecutionSummary | None = None
+        self._last_poll_count: int = 0
 
     def update_maps(
         self,
@@ -164,11 +190,16 @@ class CommandInterpreter:
     ) -> None:
         """Execute IR commands sequentially with phase-based logging.
 
-        INFO level: phase headers + summaries (clean, concise).
-        DEBUG level: individual command execution trace.
+        When quiet=False (CLI path): INFO-level phase headers + summaries.
+        When quiet=True (inference path): all demoted to DEBUG; caller reads
+        self._summary for its own concise output.
+        DEBUG level: individual command execution trace (always).
         """
+        _log = logger.debug if self._quiet else logger.info
+
         self._output_buffers.clear()
         self._completed.clear()
+        self._last_poll_count = 0
 
         # Pre-allocate BOs for auto_bind address resolution
         self._preallocate_bound_bos(commands, tensor_data)
@@ -182,13 +213,16 @@ class CommandInterpreter:
         # Classify commands into phases
         phases = _classify_phases(commands)
 
-        # Pre-compute per-phase byte totals for progress tracking
+        # Pre-compute per-phase byte/tensor totals
         phase_total_bytes: dict[str, int] = {}
+        phase_tensor_count: dict[str, int] = {}
         for cmd, ph in zip(commands, phases):
             if cmd.op == OpCode.LOAD and cmd.size:
                 phase_total_bytes[ph] = phase_total_bytes.get(ph, 0) + cmd.size
+                phase_tensor_count[ph] = phase_tensor_count.get(ph, 0) + 1
             elif cmd.op == OpCode.PULL and cmd.size:
                 phase_total_bytes[ph] = phase_total_bytes.get(ph, 0) + cmd.size
+                phase_tensor_count[ph] = phase_tensor_count.get(ph, 0) + 1
 
         emit_timeline = logger.isEnabledFor(logging.DEBUG)
 
@@ -198,6 +232,7 @@ class CommandInterpreter:
         phase_start = t0
         phase_bytes_done = 0
         phase_cmds_done = 0
+        phase_results: list[PhaseResult] = []
         for i, cmd in enumerate(commands):
             # Write uncovered auto_bind address registers at configure→send transition
             if not addr_written and cmd.op != OpCode.WRITE_REG:
@@ -207,9 +242,17 @@ class CommandInterpreter:
             # Phase transition
             cmd_phase = phases[i]
             if cmd_phase != current_phase:
-                # Log previous phase completion
+                # Collect + log previous phase completion
                 if current_phase is not None:
                     phase_elapsed = time.monotonic() - phase_start
+                    phase_results.append(PhaseResult(
+                        phase=current_phase,
+                        elapsed=phase_elapsed,
+                        n_cmds=phase_cmds_done,
+                        n_bytes=phase_bytes_done,
+                        n_tensors=phase_tensor_count.get(current_phase, 0),
+                        n_polls=self._last_poll_count if current_phase == PHASE_POLL else 0,
+                    ))
                     self._log_phase_done(
                         current_phase, phase_elapsed,
                         phase_bytes_done, phase_total_bytes.get(current_phase, 0),
@@ -221,7 +264,7 @@ class CommandInterpreter:
                 phase_bytes_done = 0
                 phase_cmds_done = 0
                 summary = _phase_summary(cmd_phase, commands, phases)
-                logger.info("── %s (%s) ──", cmd_phase, summary)
+                _log("── %s (%s) ──", cmd_phase, summary)
 
             # Individual command trace (DEBUG only)
             op_name = cmd.op.name if hasattr(cmd.op, "name") else str(cmd.op)
@@ -247,9 +290,17 @@ class CommandInterpreter:
             if emit_timeline:
                 self._emit_timeline(cmd, cmd_phase, time.monotonic() - t0)
 
-        # Log final phase completion
+        # Collect + log final phase completion
         if current_phase is not None:
             phase_elapsed = time.monotonic() - phase_start
+            phase_results.append(PhaseResult(
+                phase=current_phase,
+                elapsed=phase_elapsed,
+                n_cmds=phase_cmds_done,
+                n_bytes=phase_bytes_done,
+                n_tensors=phase_tensor_count.get(current_phase, 0),
+                n_polls=self._last_poll_count if current_phase == PHASE_POLL else 0,
+            ))
             self._log_phase_done(
                 current_phase, phase_elapsed,
                 phase_bytes_done, phase_total_bytes.get(current_phase, 0),
@@ -258,12 +309,18 @@ class CommandInterpreter:
 
         # Flush deferred stores — always after all commands complete
         if self._deferred_stores:
-            logger.info("── recv (flush) ──")
+            _log("── recv (flush) ──")
             self._flush_deferred_stores()
 
         total_elapsed = time.monotonic() - t0
-        logger.info("execution complete: %s, %d commands",
-                     format_elapsed(total_elapsed), len(commands))
+        _log("execution complete: %s, %d commands",
+             format_elapsed(total_elapsed), len(commands))
+
+        self._summary = ExecutionSummary(
+            total_elapsed=total_elapsed,
+            total_commands=len(commands),
+            phases=phase_results,
+        )
 
     # ── addr_bindings ──
 
@@ -312,15 +369,16 @@ class CommandInterpreter:
         t0: float,
     ) -> None:
         """Log phase completion with optional byte progress."""
+        _log = logger.debug if self._quiet else logger.info
         if elapsed >= _QUIET_PERIOD:
             if bytes_total > 0:
                 pct = bytes_done * 100 // bytes_total
-                logger.info(
+                _log(
                     "  done %s (%d%%, %s)",
                     format_elapsed(elapsed), pct, format_size(bytes_done),
                 )
             else:
-                logger.info("  done %s", format_elapsed(elapsed))
+                _log("  done %s", format_elapsed(elapsed))
         # JSON timeline phase summary
         if emit_timeline:
             entry = {
@@ -371,9 +429,10 @@ class CommandInterpreter:
                     buf_ops[cmd.buffer_id] = cmd.op
 
         for buffer_id in sorted(bound_buffer_ids):
-            if buffer_id in self._buffers:
-                continue
             size = buf_sizes.get(buffer_id, 4096)
+            existing = self._buffers.get(buffer_id)
+            if existing is not None and existing.size() >= size:
+                continue
             mem_bank = self._mem_bank_map.get(buffer_id, 0)
             bo = self._xrt.bo(
                 self._device, size,
@@ -437,6 +496,10 @@ class CommandInterpreter:
 
     def _exec_load(self, cmd: Command, tensor_data: dict[int, bytes]) -> None:
         """LOAD: Host → Device Buffer."""
+        # Skip: prebound BO already has correct data on device
+        if cmd.buffer_id in self._prebound:
+            logger.debug("LOAD skip prebound buf=%d", cmd.buffer_id)
+            return
         data = tensor_data.get(cmd.buffer_id, b"")
         if not data:
             if cmd.buffer_id in self._buffers:
@@ -476,9 +539,12 @@ class CommandInterpreter:
 
     def _exec_pull(self, cmd: Command) -> None:
         """PULL: Allocate output BO (actual sync deferred to STORE)."""
+        size = cmd.size or 4096
         bo = self._buffers.get(cmd.buffer_id)
+        # Reallocate if existing BO is too small (layer size changed)
+        if bo is not None and bo.size() < size:
+            bo = None
         if bo is None:
-            size = cmd.size or 4096
             mem_bank = self._mem_bank_map.get(cmd.buffer_id, 0)
             bo = self._xrt.bo(
                 self._device, size,
@@ -511,7 +577,8 @@ class CommandInterpreter:
                 data = bo.read(size)
             self._output_buffers[cmd.buffer_id] = bytes(data)
             hex_head = " ".join(f"{b:02X}" for b in data[:32])
-            logger.info(
+            _log = logger.debug if self._quiet else logger.info
+            _log(
                 "  buf=%d %s: [%s]",
                 cmd.buffer_id, format_size(size), hex_head,
             )
@@ -561,7 +628,9 @@ class CommandInterpreter:
 
         Reports progress every 2s (only after quiet period).
         Emits WARNING after 10s of no value change.
+        STALL warnings are always WARNING (never quiet-suppressed).
         """
+        _log = logger.debug if self._quiet else logger.info
         ip = self._get_ip(cmd.interface_id)
         start = time.monotonic()
         poll_count = 0
@@ -576,10 +645,11 @@ class CommandInterpreter:
             elapsed = now - start
 
             if (val & cmd.reg_mask) == cmd.reg_expected:
-                logger.info(
+                _log(
                     "  POLL (==0x%X): %d polls, %s",
                     cmd.reg_expected, poll_count, format_elapsed(elapsed),
                 )
+                self._last_poll_count = poll_count
                 cmd.reg_value = val
                 return
 
@@ -590,13 +660,13 @@ class CommandInterpreter:
 
             # Progress reports (only after quiet period)
             if elapsed >= _QUIET_PERIOD and (now - last_report_time) >= _POLL_REPORT_INTERVAL:
-                logger.info(
+                _log(
                     "  [%s] POLL 0x%X: val=0x%X (%d polls)",
                     format_elapsed(elapsed), cmd.reg_offset, val, poll_count,
                 )
                 last_report_time = now
 
-            # Stall detection
+            # Stall detection — always WARNING, never suppressed
             no_change = now - last_change_time
             if no_change >= _STALL_THRESHOLD:
                 logger.warning(

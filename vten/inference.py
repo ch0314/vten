@@ -9,9 +9,12 @@ Spec reference: 11_inference_api.md
 from __future__ import annotations
 
 import logging
+import time as _time
 from typing import TYPE_CHECKING, Any
 
 import torch
+
+from vten.log import format_elapsed, format_size
 
 from vten.kernel.tensor import Tensor
 from vten.runtime.context import ExecutionContext
@@ -56,6 +59,7 @@ class InferenceSession:
         kernel: str | None = None,
         target: str = "hw",
         project_dir: str = ".",
+        log_level: str | None = None,
     ) -> None:
         """Create an inference session.
 
@@ -65,6 +69,8 @@ class InferenceSession:
             kernel: Kernel name for xclbin auto-discovery (e.g. "npu_pipeline").
             target: "hw" or "hw_emu" (used with string backend).
             project_dir: Project root containing vten.toml (default: ".").
+            log_level: Log level (e.g. "DEBUG", "INFO"). If None, auto-configures
+                to INFO when no vten handlers exist.
         """
         if isinstance(backend, str):
             backend, project_config = self._create_backend(
@@ -81,9 +87,9 @@ class InferenceSession:
         self._run_count = 0  # tracks run() calls for logging
         # Auto-configure vten logging if no handlers set (library user mode)
         vten_root = logging.getLogger("vten")
-        if not vten_root.handlers:
+        if log_level or not vten_root.handlers:
             from vten.log import setup_logging
-            setup_logging()
+            setup_logging(level=log_level or "INFO")
         # Enable persistent mode for BO pool reuse
         if hasattr(backend, "_persistent"):
             backend._persistent = True
@@ -177,9 +183,6 @@ class InferenceSession:
         Raises:
             VerificationError: If verify=True and HW output doesn't match golden.
         """
-        import time as _time
-        from vten.log import format_elapsed
-
         inputs = inputs or {}
         merged = {**self._base_params, **params}
         spec = merged.pop("_spec", None)
@@ -214,12 +217,14 @@ class InferenceSession:
             tensor = ki.get_tensor(name)
             if isinstance(data, Tensor) and data.on_device:
                 # Device tensor → bind BO, skip LOAD+PUSH
-                ctx.bind_device_buffer(tensor, data._bo)
-                # Set host-side data so kernel's forward() works during
-                # ki.run() (kernels call ctx.verify(h, self.forward()["out"])).
+                # When verify=True, skip prebound and serialize fresh
+                # (eliminates upload/main-run BO discrepancy)
+                if not verify:
+                    ctx.bind_device_buffer(tensor, data._bo)
+                # Set host-side data for two purposes:
+                # 1. Stage 3 serialization (verify mode re-serializes fresh)
+                # 2. Golden computation in _verify_outputs() (forward() reads tensor data)
                 # Prefer golden (verified chain) > data (STORE readback) > zeros.
-                # Stage 3 serializes this but interpreter skips bo.write()
-                # for prebound buffers, so it's harmless.
                 chain_data = data.golden if data.golden is not None else data.data
                 if chain_data is not None:
                     tensor.data = chain_data
@@ -239,25 +244,37 @@ class InferenceSession:
         # Compile + execute
         result = ctx.run()
 
+        # Log execution summary (phase-by-phase)
+        self._log_execution_summary()
+
         # Output Tensor objects (with BO binding for HW backends)
         outputs = {name: t for name, t in result.output_tensors.items()}
 
         # Verify against behavioral model golden
         if verify:
-            # Create fresh kernel instance for golden (avoid stale compile state)
-            golden_ctx = ExecutionContext(project_params=merged)
-            golden_ki = golden_ctx.instantiate(kernel_class, spec=spec, **merged)
-            golden_kernel = golden_ki.kernel_class_instance
-            self._verify_outputs(golden_kernel, inputs, outputs,
+            self._verify_outputs(ki.kernel_class_instance, inputs, outputs,
                                  compiled=ctx._last_compiled)
 
         run_elapsed = _time.monotonic() - run_t0
-        logger.info(
-            "──── run #%d done: %s (%s) ────",
-            self._run_count, label, format_elapsed(run_elapsed),
-        )
+        logger.info("  total: %s", format_elapsed(run_elapsed))
 
         return outputs
+
+    def _log_execution_summary(self) -> None:
+        """Log execution phase summary from backend's interpreter."""
+        summary = getattr(self._backend, "get_execution_summary", lambda: None)()
+        if summary is None:
+            return
+        for p in summary.phases:
+            if p.phase == "configure":
+                logger.info("  configure: %d regs (%s)", p.n_cmds, format_elapsed(p.elapsed))
+            elif p.phase == "send":
+                logger.info("  send: %d tensors (%s)", p.n_tensors, format_size(p.n_bytes))
+            elif p.phase == "poll":
+                logger.info("  poll: %s, %d polls", format_elapsed(p.elapsed), p.n_polls)
+            elif p.phase == "recv":
+                logger.info("  recv: %d tensors (%s)", p.n_tensors, format_size(p.n_bytes))
+            # trigger: skip (vsync detail unnecessary)
 
     def _verify_outputs(
         self,
@@ -268,13 +285,13 @@ class InferenceSession:
     ) -> None:
         """Verify HW outputs against golden using shared golden computation.
 
-        Uses runtime.golden.compute_golden_outputs() — same logic as
-        vten run's verification path, ensuring identical golden results.
+        Uses runtime.golden.compute_golden_outputs() — identical logic to
+        CLI's _compute_auto_golden + _apply_unlayout path.
 
-        For CompositeKernel: sets golden input data on sub-kernel tensors
-        before calling forward() (needed for multi-layer chain).
+        Sub-kernel tensor data is already set from input binding in run().
+        For device-resident inputs (chained outputs), the golden/data from
+        the previous layer was set on the sub-kernel tensor during binding.
         """
-        from vten.kernel.composite import CompositeKernel
         from vten.runtime.golden import compute_golden_outputs
 
         if compiled is None:
@@ -282,41 +299,8 @@ class InferenceSession:
 
         view = compiled.flattened_view
 
-        # For CompositeKernel: propagate input golden data to sub-kernel tensors
-        if isinstance(kernel_inst, CompositeKernel):
-            cls = type(kernel_inst)
-            reverse: dict[str, tuple[str, str]] = {}
-            for (sub_name, tensor_name), exposed_name in cls._auto_exposed.items():
-                reverse[exposed_name] = (sub_name, tensor_name)
-                if tensor_name not in reverse:
-                    reverse[tensor_name] = (sub_name, tensor_name)
-
-            for input_name, data in inputs.items():
-                if input_name not in reverse:
-                    continue
-                sub_name, tensor_name = reverse[input_name]
-                sub = kernel_inst._get_sub_kernel_instance(sub_name)
-                if sub is None:
-                    continue
-                t = sub.get_tensor(tensor_name)
-                if isinstance(data, Tensor):
-                    golden_data = data.golden if data.golden is not None else data.data
-                elif isinstance(data, torch.Tensor):
-                    golden_data = data
-                else:
-                    continue
-                if golden_data is not None:
-                    t.data = golden_data
-        else:
-            # Simple kernel: set input data for forward()
-            for t in kernel_inst.tensors():
-                if t.name in inputs:
-                    data = inputs[t.name]
-                    if isinstance(data, Tensor):
-                        t.data = data.golden if data.golden is not None else data.data
-                    elif isinstance(data, torch.Tensor):
-                        t.data = data
-
+        # compute_golden_outputs uses the same forward() + format conversion
+        # + unlayout pipeline as CLI verification
         golden_map = compute_golden_outputs(kernel_inst, view)
 
         for name, out_tensor in outputs.items():
@@ -346,8 +330,6 @@ class InferenceSession:
         Returns:
             Tensor(on_device=True) with BO bound.
         """
-        from vten.log import format_size
-
         merged = {**self._base_params, **(params or {})}
         spec = merged.pop("_spec", None)
 
@@ -439,9 +421,6 @@ class InferenceSession:
         Returns:
             Output dict from the last layer.
         """
-        import time as _time
-        from vten.log import format_elapsed
-
         chain = chain or {"ofm_mem": "ifm_mem"}
         per_layer_inputs = per_layer_inputs or [{} for _ in layers]
 

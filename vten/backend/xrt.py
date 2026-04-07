@@ -43,7 +43,7 @@ class XrtBackend(Backend):
         self._instance_name = xrt_cfg.get("instance_name", "")
         target = xrt_cfg.get("target", "hw")
         # hw_emu needs much longer poll timeout (simulation is slow)
-        default_timeout = 3600000 if target == "hw_emu" else 30000
+        default_timeout = 36000000000 if target == "hw_emu" else 30000000
         self._poll_timeout_ms = xrt_cfg.get("poll_timeout_ms", default_timeout)
         self._config = project_config
 
@@ -61,6 +61,7 @@ class XrtBackend(Backend):
         self._ips: dict[str, Any] = {}  # ip_name → xrt.ip
         self._interpreter: Any = None
         self._emu_run_dir: Path | None = None  # hw_emu .run/<PID> to clean up
+        self._xrt_ini_created: bool = False  # whether we auto-created xrt.ini
 
     def _discover_xclbin(self) -> str:
         """Auto-discover xclbin from kernel build directory.
@@ -113,10 +114,47 @@ class XrtBackend(Backend):
             if not cwd_emconfig.exists() and xclbin_emconfig.exists():
                 shutil.copy2(xclbin_emconfig, cwd_emconfig)
 
+            # Suppress Vitis-EM "Data transfer" and periodic info dumps
+            # that pollute the console by mixing with vten's own logging.
+            # xrt.ini controls this; create one if user hasn't provided their own.
+            self._setup_xrt_ini()
+
             # Track hw_emu .run/<PID> directory for cleanup.
             # XRT creates this next to sys.executable during emulation.
             exe_dir = Path(sys.executable).resolve().parent
             self._emu_run_dir = exe_dir / ".run" / str(os.getpid())
+
+    def _setup_xrt_ini(self) -> None:
+        """Create xrt.ini to suppress verbose hw_emu console output.
+
+        Only writes if no xrt.ini exists in CWD. User-provided xrt.ini
+        is never overwritten.
+
+        Settings:
+          [Emulation]
+          print_infos_in_console=false  — suppresses periodic Data Transfer dumps
+          info_suppress=true            — suppresses INFO::[ Vitis-EM ] lines
+        """
+        import os
+
+        ini_path = Path.cwd() / "xrt.ini"
+        if ini_path.exists():
+            # User has their own xrt.ini — don't touch it
+            return
+
+        ini_content = (
+            "[Emulation]\n"
+            "print_infos_in_console=false\n"
+            "info_suppress=true\n"
+            "[Debug]\n"
+            "verbosity=0\n"
+        )
+        try:
+            ini_path.write_text(ini_content)
+            self._xrt_ini_created = True
+            logger.debug("created xrt.ini to suppress hw_emu console output")
+        except OSError as e:
+            logger.debug("failed to create xrt.ini: %s", e)
 
     def _init_device(self) -> None:
         """Initialize FPGA device and load xclbin.
@@ -587,9 +625,11 @@ class XrtBackend(Backend):
         mem_bank_map = self._build_mem_bank_map(compiled)
         addr_bindings = self._build_addr_bindings(compiled)
 
+        quiet = compiled.mode == "inference"
         if self._persistent and self._interpreter is not None:
             interpreter = self._interpreter
             interpreter.update_maps(ip_map, mem_bank_map, addr_bindings)
+            interpreter._quiet = quiet
         else:
             interpreter = CommandInterpreter(
                 device=self._device,
@@ -600,6 +640,7 @@ class XrtBackend(Backend):
                 ip_map=ip_map,
                 mem_bank_map=mem_bank_map,
                 addr_bindings=addr_bindings,
+                quiet=quiet,
             )
             self._interpreter = interpreter
 
@@ -608,11 +649,17 @@ class XrtBackend(Backend):
             for buffer_id, bo in compiled.prebound_buffers.items():
                 interpreter._buffers[buffer_id] = bo
                 interpreter._prebound.add(buffer_id)
+            logger.debug(
+                "prebound injected: %s (prebound_set=%s)",
+                list(compiled.prebound_buffers.keys()),
+                interpreter._prebound,
+            )
 
         logger.debug("mem_bank_map: %s", mem_bank_map)
         logger.debug("addr_bindings: %s", addr_bindings)
         total_data = sum(len(v) for v in compiled.tensor_data.values())
-        logger.info(
+        _log = logger.debug if quiet else logger.info
+        _log(
             "executing %d commands (%d tensors, %s)",
             len(compiled.commands), len(compiled.tensor_data),
             format_size(total_data),
@@ -623,6 +670,12 @@ class XrtBackend(Backend):
             status=0,
             output_buffers=interpreter.output_buffers,
         )
+
+    def get_execution_summary(self) -> object | None:
+        """Return the last ExecutionSummary from the interpreter, or None."""
+        if self._interpreter is not None:
+            return self._interpreter._summary
+        return None
 
     def get_buffer_object(self, buffer_id: int) -> object | None:
         """Return XRT BO for buffer_id from interpreter's buffer pool."""
@@ -652,28 +705,62 @@ class XrtBackend(Backend):
         self._device = None
         self._xclbin = None
         self._uuid = None
-        # Skip cleanup to inspect hw_emu simulation logs
-        # self._cleanup_emu_run_dir()
+        # Clean up auto-created xrt.ini
+        if self._xrt_ini_created:
+            try:
+                (Path.cwd() / "xrt.ini").unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._xrt_ini_created = False
+        self._cleanup_emu_run_dir()
 
     def _cleanup_emu_run_dir(self) -> None:
-        """Remove hw_emu .run/<PID> directory if it exists.
+        """Remove hw_emu .run/<PID> directories.
 
         XRT hw_emu creates <sys.executable>/../.run/<PID>/ containing
         unzipped xclbin, BO state files, etc. These are not cleaned up
         automatically and can accumulate to many GB over time.
+
+        Cleans up both the current PID's directory and any orphaned
+        directories from previous runs whose PIDs are no longer alive.
         """
         if self._emu_run_dir is None:
             return
 
         run_dir = self._emu_run_dir
         self._emu_run_dir = None
-
-        if not run_dir.is_dir():
-            return
+        run_parent = run_dir.parent  # .run/
 
         import shutil
-        try:
-            shutil.rmtree(run_dir)
-            logger.info("cleaned up hw_emu artifacts: %s", run_dir)
-        except OSError as e:
-            logger.warning("failed to clean up %s: %s", run_dir, e)
+
+        # Clean current PID's directory
+        if run_dir.is_dir():
+            try:
+                shutil.rmtree(run_dir)
+                logger.debug("cleaned up hw_emu artifacts: %s", run_dir)
+            except OSError as e:
+                logger.warning("failed to clean up %s: %s", run_dir, e)
+
+        # Clean orphaned .run/<PID> directories from crashed previous runs
+        if run_parent.is_dir():
+            import os
+            import signal
+
+            for entry in run_parent.iterdir():
+                if not entry.is_dir() or not entry.name.isdigit():
+                    continue
+                pid = int(entry.name)
+                # Check if PID is still alive
+                try:
+                    os.kill(pid, signal.SIG_DFL)
+                    # PID alive — skip
+                except ProcessLookupError:
+                    # PID dead — orphaned, safe to remove
+                    try:
+                        shutil.rmtree(entry)
+                        logger.debug("cleaned up orphaned hw_emu dir: %s", entry)
+                    except OSError:
+                        pass
+                except PermissionError:
+                    # Not our process — skip
+                    pass
