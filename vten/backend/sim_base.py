@@ -191,18 +191,31 @@ class SimBackend(Backend):
         self._session_id: str | None = None
         self._sem_h2b: _PosixSemaphore | None = None
         self._sem_b2h: _PosixSemaphore | None = None
+        self._session_active: bool = False
+        self._batch_count: int = 0
+        self._last_backend_result: BackendResult | None = None
 
     # ── Backend ABC: execute() ──
 
     def execute(self, compiled: CompiledResult) -> BackendResult:
-        """Full lifecycle: submit SHM → start sim → wait → result."""
-        try:
-            self._probe_buffer_map = getattr(compiled, "probe_buffer_map", {})
+        """Execute compiled result. Session is managed automatically.
+
+        First call: creates SHM, starts simulator, submits first batch.
+        Subsequent calls: updates SHM in-place, submits new batch.
+        Simulator stays alive until cleanup() is called.
+        """
+        self._probe_buffer_map = getattr(compiled, "probe_buffer_map", {})
+        self._batch_count += 1
+        if not self._session_active:
+            logger.debug("──── batch #%d (new session) ────", self._batch_count)
             self._submit_shm(compiled.shm_image, compiled.bfm_configs)
-            return self._wait_completion()
-        finally:
-            self._shutdown_sim()
-            self._release_posix_resources()
+            self._session_active = True
+        else:
+            logger.debug("──── batch #%d (session reuse) ────", self._batch_count)
+            self._submit_batch_internal(compiled)
+        result = self._wait_completion()
+        self._last_backend_result = result
+        return result
 
     # ── Optional lifecycle control ──
 
@@ -239,7 +252,10 @@ class SimBackend(Backend):
         self._session_id = None
 
     def cleanup(self) -> None:
-        """Release all POSIX resources. Idempotent and exception-safe."""
+        """Close active session (if any) and release resources. Idempotent."""
+        if self._session_active:
+            self._shutdown_sim()
+            self._session_active = False
         self._release_posix_resources()
 
         # Terminate process if still alive
@@ -397,13 +413,13 @@ class SimBackend(Backend):
         logger.log(5, "[handshake 4] CMD_READY signaled")
 
     # Progress polling interval (seconds)
-    _PROGRESS_POLL_INTERVAL = 2.0
+    _PROGRESS_POLL_INTERVAL = 5.0
 
     # Quiet period: suppress progress/heartbeat for fast executions (seconds)
     _QUIET_PERIOD = 4.0
 
     # Stall detection: if no activity change for this many consecutive polls → WARNING
-    _STALL_WARN_POLLS = 5  # 5 * 2s = 10s of no activity
+    _STALL_WARN_POLLS = 5  # 5 * 10s = 50s of no activity
 
     # Default bytes-per-beat for expected beat count estimation
     _DEFAULT_BYTES_PER_BEAT = 32  # 256-bit bus
@@ -1113,20 +1129,10 @@ class SimBackend(Backend):
     def supports_session(self) -> bool:
         return True
 
-    def open_session(self, compiled: CompiledResult) -> None:
-        """Open persistent session: create SHM, start sim, submit first batch."""
-        self._probe_buffer_map = getattr(compiled, "probe_buffer_map", {})
-        self._submit_shm(compiled.shm_image, compiled.bfm_configs)
-        self._session_active = True
-
-    def submit_batch(self, compiled: CompiledResult) -> None:
-        """Submit a new batch within an open session.
-
-        Updates Command/Stats/BufferDescriptor/Data regions in-place
-        from the new compiled result, then signals CMD_READY.
-        """
+    def _submit_batch_internal(self, compiled: CompiledResult) -> None:
+        """Update SHM in-place for a subsequent batch within an active session."""
         if self._shm is None:
-            raise BackendError("no active session (call open_session first)")
+            raise BackendError("no active session")
 
         layout = compiled.shm_layout
         if layout is None:
@@ -1136,32 +1142,34 @@ class SimBackend(Backend):
         buf = self._shm.buf
 
         if layout.total_size > len(buf):
-            # Dynamic resize: ftruncate POSIX SHM, then re-mmap on Python side.
-            # The C bridge will detect the size change via fstat in vten_shm_remap().
             self._resize_shm(layout.total_size)
-            buf = self._shm.buf  # refreshed after resize
+            buf = self._shm.buf
 
-        # Overwrite entire SHM image (simpler and correct for resized case too)
         buf[:len(shm_image)] = shm_image
 
-        # Reset statuses
         self._write_shm_u32(self.BACKEND_STATUS_OFFSET, BACKEND_STATUS_IDLE)
         self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_CMD_READY)
         self._sem_h2b.post()
         logger.log(5, "[session] batch submitted (cmds=%d, bufs=%d)",
                      layout.num_commands, layout.num_buffers)
 
+    # ── Session protocol (legacy, delegates to execute/cleanup) ──
+
+    def open_session(self, compiled: CompiledResult) -> None:
+        """Open persistent session. Prefer execute() for auto-management."""
+        self.execute(compiled)
+
+    def submit_batch(self, compiled: CompiledResult) -> None:
+        """Submit batch in open session. Prefer execute() for auto-management."""
+        self.execute(compiled)
+
     def wait_batch(self) -> BackendResult:
-        """Wait for current batch to complete. Sim stays alive."""
-        return self._wait_completion()
+        """No-op — execute() already waits for completion."""
+        return self._last_backend_result
 
     def close_session(self) -> None:
-        """Close session: SHUTDOWN → process exit → cleanup. Idempotent."""
-        if not getattr(self, "_session_active", False):
-            return
-        self._session_active = False
-        self._shutdown_sim()
-        self._release_posix_resources()
+        """Close session. Prefer cleanup() for full resource release."""
+        self.cleanup()
 
     def _read_stats_from_shm(self) -> list[CmdStats]:
         """Parse per-command stats from SHM Stats Region."""

@@ -104,9 +104,7 @@ class ExecutionContext:
         # Declarative probe support
         self._declarative_probes: list[str] = []
         self._internal_probe_requests: list[tuple[str, str]] = []
-        # Session state (multi-batch)
-        self._session_open: bool = False
-        self._batch_count: int = 0
+        # (Session state removed — backend manages its own session lifecycle)
 
     def instantiate(self, kernel_class: type, spec=None, **params) -> KernelInstance:
         """Create and initialize a kernel instance with eager resolution."""
@@ -498,33 +496,7 @@ class ExecutionContext:
                     logger.debug("prebound %s → bid=%d", tensor_name, bid)
 
         if self._backend is not None:
-            # Session mode: use open_session/submit_batch/wait_batch
-            if (
-                hasattr(self._backend, "supports_session")
-                and self._backend.supports_session
-                and self._session_open
-            ):
-                self._batch_count += 1
-                logger.debug("──── batch #%d submit (session reuse) ────",
-                             self._batch_count)
-                self._backend.submit_batch(compiled)
-                backend_result = self._backend.wait_batch()
-            elif (
-                hasattr(self._backend, "supports_session")
-                and self._backend.supports_session
-                and not self._session_open
-            ):
-                self._batch_count += 1
-                logger.debug("──── batch #%d submit (new session) ────",
-                             self._batch_count)
-                self._backend.open_session(compiled)
-                backend_result = self._backend.wait_batch()
-                self._session_open = True
-            else:
-                self._batch_count += 1
-                logger.debug("──── batch #%d submit (one-shot) ────",
-                             self._batch_count)
-                backend_result = self._backend.execute(compiled)
+            backend_result = self._backend.execute(compiled)
             self._last_backend_result = backend_result
 
             # Build BatchResult from backend stats
@@ -576,11 +548,8 @@ class ExecutionContext:
     # ── Session lifecycle ──
 
     def close(self) -> None:
-        """Close the backend session if one is open. Idempotent."""
-        if self._session_open and self._backend is not None:
-            if hasattr(self._backend, "close_session"):
-                self._backend.close_session()
-            self._session_open = False
+        """No-op. Backend lifecycle is managed by the caller via cleanup()."""
+        pass
 
     def __enter__(self) -> ExecutionContext:
         return self

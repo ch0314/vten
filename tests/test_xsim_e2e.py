@@ -207,27 +207,17 @@ class TestMultiBatchSessionE2E:
         prev_cwd = os.getcwd()
         os.chdir(str(project))
         try:
-            session_open = False
-            for i in range(3):
-                ctx = ExecutionContext(backend=backend, project_params={"N": 1024})
-                ctx._session_open = session_open
-                ki = ctx.instantiate(KernelClass, spec=spec, N=1024)
-                ki.generate_inputs(seed=42 + i)
-                h_push = ctx.push_tensor(ki.data_in)
-                ctx.pull_tensor(ki.data_out, dep=h_push)
-                result = ctx.run(verify=True)
-                session_open = ctx._session_open
-                assert result.status == "DONE"
-
-            # Close session
-            assert session_open is True
-            backend.close_session()
+            with backend:
+                for i in range(3):
+                    ctx = ExecutionContext(backend=backend, project_params={"N": 1024})
+                    ki = ctx.instantiate(KernelClass, spec=spec, N=1024)
+                    ki.generate_inputs(seed=42 + i)
+                    h_push = ctx.push_tensor(ki.data_in)
+                    ctx.pull_tensor(ki.data_out, dep=h_push)
+                    result = ctx.run(verify=True)
+                    assert result.status == "DONE"
         finally:
             os.chdir(prev_cwd)
-            try:
-                backend.cleanup()
-            except Exception:
-                pass
 
     @pytest.mark.xsim
     def test_session_growing_tensor_sizes(self):
@@ -244,25 +234,17 @@ class TestMultiBatchSessionE2E:
         prev_cwd = os.getcwd()
         os.chdir(str(project))
         try:
-            session_open = False
-            for N in [256, 1024, 4096]:
-                ctx = ExecutionContext(backend=backend, project_params={"N": N})
-                ctx._session_open = session_open
-                ki = ctx.instantiate(KernelClass, spec=spec, N=N)
-                ki.generate_inputs(seed=N)
-                h_push = ctx.push_tensor(ki.data_in)
-                ctx.pull_tensor(ki.data_out, dep=h_push)
-                result = ctx.run(verify=True)
-                session_open = ctx._session_open
-                assert result.status == "DONE", f"Failed at N={N}"
-
-            backend.close_session()
+            with backend:
+                for N in [256, 1024, 4096]:
+                    ctx = ExecutionContext(backend=backend, project_params={"N": N})
+                    ki = ctx.instantiate(KernelClass, spec=spec, N=N)
+                    ki.generate_inputs(seed=N)
+                    h_push = ctx.push_tensor(ki.data_in)
+                    ctx.pull_tensor(ki.data_out, dep=h_push)
+                    result = ctx.run(verify=True)
+                    assert result.status == "DONE", f"Failed at N={N}"
         finally:
             os.chdir(prev_cwd)
-            try:
-                backend.cleanup()
-            except Exception:
-                pass
 
 
 

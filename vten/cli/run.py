@@ -15,7 +15,7 @@ from pathlib import Path
 from vten.backend.registry import get_backend, resolve_backend_name
 from vten.cli.config import load_project_config
 from vten.errors import BackendError, ProbeMismatchError, VTenError, VerificationError
-from vten.spec.models import DEFAULT_DATA_WIDTH
+
 
 logger = logging.getLogger(__name__)
 
@@ -232,80 +232,6 @@ def merge_configs(base: dict, override: dict | None) -> dict:
         return dict(base)
     return {**base, **override}
 
-
-def _build_shm_image(kernel_dir: Path) -> bytes | None:
-    """Try to load pre-built SHM image from kernel build/shm/."""
-    shm_path = kernel_dir / "build" / "shm" / "kernel_task.bin"
-    if shm_path.exists():
-        return shm_path.read_bytes()
-    return None
-
-
-def _build_bfm_configs(kernel_dir: Path) -> list:
-    """Try to derive BFM configs from kernel_spec.yaml or synthesized spec."""
-    from vten.runtime.ir import BFMConfig
-    from vten.spec.parser import parse_kernel_spec
-
-    spec_path = kernel_dir / "kernel_spec.yaml"
-    spec = None
-
-    if spec_path.exists():
-        try:
-            spec = parse_kernel_spec(spec_path)
-        except Exception:
-            pass
-    else:
-        # Composite kernel: synthesize spec
-        from vten.build.composite import (
-            is_composite_kernel,
-            load_composite_class,
-            synthesize_spec,
-        )
-        if is_composite_kernel(kernel_dir):
-            try:
-                project = kernel_dir.parent.parent
-                composite_cls = load_composite_class(kernel_dir)
-                spec = synthesize_spec(
-                    composite_cls, project, kernel_dir.name
-                )
-            except Exception:
-                pass
-
-    if spec is None:
-        return []
-
-    configs = []
-    for name, iface in spec.interfaces.items():
-        configs.append(BFMConfig(
-            interface_name=name,
-            protocol=iface.protocol,
-            data_width=iface.data_width or DEFAULT_DATA_WIDTH,
-            addr_width=iface.addr_width or 64,
-            role="slave",
-        ))
-    return configs
-
-
-def _compile_from_context(ctx) -> tuple[bytes | None, list]:
-    """If ctx has pending ops, compile them into SHM image and BFM configs.
-
-    Returns (shm_image, bfm_configs) or (None, []) if no ops recorded.
-    """
-    if not ctx._pending_ops:
-        return None, []
-
-    from vten.runtime.engine import RuntimeEngine
-
-    engine = RuntimeEngine(
-        kernels=ctx._kernels,
-        ops=ctx._pending_ops,
-        project_params=ctx._project_params,
-        alias_registry=ctx._alias_registry,
-    )
-    compiled = engine.compile()
-    ctx._last_compiled = compiled
-    ctx._pending_ops = []
-    return compiled.shm_image, compiled.bfm_configs
 
 
 def _enrich_stats(
@@ -530,150 +456,100 @@ def _run_single_test(
                 kernel_name, test_name, backend_name, len(run_cfgs))
 
     last_error: Exception | None = None
-    session_open = False  # Track session state across configs
-    batch_count = 0      # Track batch number across configs
-    try:
-        for cfg_idx, cfg in enumerate(run_cfgs):
-            logger.debug("config %d/%d: %s", cfg_idx + 1, len(run_cfgs), cfg)
-            try:
-                # Create ExecutionContext with backend so ctx.run() drives
-                # the full lifecycle: compile → execute → verify
-                from vten.runtime.context import ExecutionContext
-
-                # Include build_params so resolver Tier 2 can access them
-                if "build_params" not in cfg and "build_params" in config:
-                    cfg["build_params"] = config["build_params"]
-
-                # Propagate project-level paths into per-config params
-                for _pk in ("_project_dir", "_kernel_build_dir"):
-                    if _pk in config and _pk not in cfg:
-                        cfg[_pk] = config[_pk]
-
-                ctx = ExecutionContext(
-                    backend=backend_inst,
-                    project_params=cfg,
-                )
-                # Share session state across configs for multi-batch mode
-                ctx._session_open = session_open
-                ctx._batch_count = batch_count
-                scenario.run(ctx, cfg)
-
-                if ctx._pending_ops:
-                    # Scenario recorded DSL ops — ctx.run() handles everything
-                    batch_result = ctx.run(verify=verify)
-                    session_open = ctx._session_open
-                    batch_count = ctx._batch_count
-                    configs_passed += 1
-
-                    if batch_result.per_command_stats:
-                        max_cycle = max(
-                            (s.commit_cycle for s in batch_result.per_command_stats
-                             if s.commit_cycle),
-                            default=0,
-                        )
-                        total_cycles = max(total_cycles, max_cycle)
-                        all_cmd_stats.extend(
-                            _enrich_stats(
-                                batch_result.per_command_stats,
-                                ctx._last_compiled,
-                            )
-                        )
-
-                    logger.info("  config %d/%d: PASS (%d cycles, %d verifications)",
-                               cfg_idx + 1, len(run_cfgs),
-                               batch_result.total_cycles,
-                               batch_result.verification_count)
-
-                    # Count verifications that passed (no VerificationError raised)
-                    verification_count += batch_result.verification_count
-                    verification_passed += batch_result.verification_count
-                    for vr in batch_result.verification_results:
-                        all_verification_results.append({
-                            "tensor": vr.tensor_name,
-                            "passed": vr.passed,
-                            "max_diff": vr.max_diff,
-                        })
-                else:
-                    # No DSL ops — fall back to pre-built SHM image
-                    from vten.runtime.engine import CompiledResult
-                    shm_image = _build_shm_image(kernel_dir)
-                    bfm_configs = _build_bfm_configs(kernel_dir)
-                    compiled = CompiledResult(
-                        commands=[],
-                        shm_image=shm_image or b"",
-                        bfm_configs=bfm_configs,
-                        buffer_ids={},
-                        flattened_view=None,
-                    )
-                    result = backend_inst.execute(compiled)
-                    configs_passed += 1
-                    if result.stats:
-                        max_cycle = max(
-                            (s.commit_cycle for s in result.stats
-                             if s.commit_cycle),
-                            default=0,
-                        )
-                        total_cycles = max(total_cycles, max_cycle)
-                        all_cmd_stats.extend(
-                            _enrich_stats(result.stats, None)
-                        )
-            except VerificationError as ve:
-                status = "FAIL"
-                last_error = ve
-                logger.warning("verification failed (config %d/%d): %s",
-                               cfg_idx + 1, len(run_cfgs), ve)
-                # Collect verification results from the error context
-                vr_list = ve.context.get("verification_results", [])
-                verification_count += len(vr_list) if vr_list else 1
-                for vr in vr_list:
-                    all_verification_results.append({
-                        "tensor": vr.tensor_name,
-                        "passed": vr.passed,
-                        "max_diff": vr.max_diff,
-                    })
-                    if vr.passed:
-                        verification_passed += 1
-                if not vr_list:
-                    all_verification_results.append({
-                        "tensor": ve.tensor,
-                        "passed": False,
-                        "max_diff": ve.max_diff,
-                    })
-            except ProbeMismatchError as pme:
-                status = "FAIL"
-                last_error = pme
-                _report_probe_mismatch(pme, results_dir, ctx, cfg_idx, len(run_cfgs))
-            except BackendError as be:
-                status = "FAIL"
-                last_error = be
-                logger.error("backend error (config %d/%d): %s",
-                             cfg_idx + 1, len(run_cfgs), be)
-            except Exception as exc:
-                status = "FAIL"
-                last_error = exc
-                logger.error("test execution failed (config %d/%d): %s",
-                             cfg_idx + 1, len(run_cfgs), exc)
-                logger.debug("traceback:", exc_info=True)
-
-        if configs_passed < len(run_cfgs):
-            status = "FAIL"
-    finally:
-        # Close session if one was opened (multi-batch mode)
-        if session_open:
-            try:
-                backend_inst.close_session()
-            except Exception:
-                pass
-        else:
-            try:
-                backend_inst.shutdown()
-            except Exception:
-                pass
-        # Always cleanup (releases XRT resources, removes hw_emu .run/<PID>)
+    for cfg_idx, cfg in enumerate(run_cfgs):
+        logger.debug("config %d/%d: %s", cfg_idx + 1, len(run_cfgs), cfg)
         try:
-            backend_inst.cleanup()
-        except Exception:
-            pass
+            from vten.runtime.context import ExecutionContext
+
+            # Include build_params so resolver Tier 2 can access them
+            if "build_params" not in cfg and "build_params" in config:
+                cfg["build_params"] = config["build_params"]
+
+            # Propagate project-level paths into per-config params
+            for _pk in ("_project_dir", "_kernel_build_dir"):
+                if _pk in config and _pk not in cfg:
+                    cfg[_pk] = config[_pk]
+
+            ctx = ExecutionContext(
+                backend=backend_inst,
+                project_params=cfg,
+            )
+            scenario.run(ctx, cfg)
+
+            if not ctx._pending_ops:
+                # Scenario recorded no ops — count as pass, skip execution
+                configs_passed += 1
+                continue
+
+            batch_result = ctx.run(verify=verify)
+            configs_passed += 1
+
+            if batch_result.per_command_stats:
+                max_cycle = max(
+                    (s.commit_cycle for s in batch_result.per_command_stats
+                     if s.commit_cycle),
+                    default=0,
+                )
+                total_cycles = max(total_cycles, max_cycle)
+                all_cmd_stats.extend(
+                    _enrich_stats(
+                        batch_result.per_command_stats,
+                        ctx._last_compiled,
+                    )
+                )
+
+            logger.info("  config %d/%d: PASS (%d cycles, %d verifications)",
+                       cfg_idx + 1, len(run_cfgs),
+                       batch_result.total_cycles,
+                       batch_result.verification_count)
+
+            verification_count += batch_result.verification_count
+            verification_passed += batch_result.verification_count
+            for vr in batch_result.verification_results:
+                all_verification_results.append({
+                    "tensor": vr.tensor_name,
+                    "passed": vr.passed,
+                    "max_diff": vr.max_diff,
+                })
+        except VerificationError as ve:
+            status = "FAIL"
+            last_error = ve
+            logger.warning("verification failed (config %d/%d): %s",
+                           cfg_idx + 1, len(run_cfgs), ve)
+            vr_list = ve.context.get("verification_results", [])
+            verification_count += len(vr_list) if vr_list else 1
+            for vr in vr_list:
+                all_verification_results.append({
+                    "tensor": vr.tensor_name,
+                    "passed": vr.passed,
+                    "max_diff": vr.max_diff,
+                })
+                if vr.passed:
+                    verification_passed += 1
+            if not vr_list:
+                all_verification_results.append({
+                    "tensor": ve.tensor,
+                    "passed": False,
+                    "max_diff": ve.max_diff,
+                })
+        except ProbeMismatchError as pme:
+            status = "FAIL"
+            last_error = pme
+            _report_probe_mismatch(pme, results_dir, ctx, cfg_idx, len(run_cfgs))
+        except BackendError as be:
+            status = "FAIL"
+            last_error = be
+            logger.error("backend error (config %d/%d): %s",
+                         cfg_idx + 1, len(run_cfgs), be)
+        except Exception as exc:
+            status = "FAIL"
+            last_error = exc
+            logger.error("test execution failed (config %d/%d): %s",
+                         cfg_idx + 1, len(run_cfgs), exc)
+            logger.debug("traceback:", exc_info=True)
+
+    if configs_passed < len(run_cfgs):
+        status = "FAIL"
 
     logger.info("result: %s (%d/%d configs passed)", status, configs_passed, len(run_cfgs))
 
@@ -801,22 +677,23 @@ def run_test(
     else:
         os.chdir(str(project))
     try:
-        for test_idx, (scenario_name, scenario) in enumerate(scenarios, 1):
-            logger.info("")
-            logger.info("════ test %d/%d: %s/%s ════",
-                        test_idx, len(scenarios), kernel_name, scenario_name)
-            _run_single_test(
-                project=project,
-                config=config,
-                kernel_name=kernel_name,
-                test_name=scenario_name,
-                scenario=scenario,
-                kernel_dir=kernel_dir,
-                backend_name=backend_name,
-                backend_inst=backend_inst,
-                config_overrides=config_overrides,
-                gui=gui,
-                verify=verify,
-            )
+        with backend_inst:
+            for test_idx, (scenario_name, scenario) in enumerate(scenarios, 1):
+                logger.info("")
+                logger.info("════ test %d/%d: %s/%s ════",
+                            test_idx, len(scenarios), kernel_name, scenario_name)
+                _run_single_test(
+                    project=project,
+                    config=config,
+                    kernel_name=kernel_name,
+                    test_name=scenario_name,
+                    scenario=scenario,
+                    kernel_dir=kernel_dir,
+                    backend_name=backend_name,
+                    backend_inst=backend_inst,
+                    config_overrides=config_overrides,
+                    gui=gui,
+                    verify=verify,
+                )
     finally:
         os.chdir(prev_cwd)

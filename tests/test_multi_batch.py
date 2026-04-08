@@ -1,9 +1,10 @@
-"""Tests for multi-batch session lifecycle.
+"""Tests for multi-batch execution lifecycle.
 
 Verifies:
-1. Backend session protocol (open/submit/wait/close)
-2. ExecutionContext session-aware run()
-3. Backward compatibility (execute() still works)
+1. Backend auto-manages session (first execute opens, subsequent reuse)
+2. ExecutionContext delegates to backend.execute() uniformly
+3. Backend cleanup closes active session
+4. Backward compatibility (legacy backends without session support)
 """
 
 from __future__ import annotations
@@ -61,49 +62,38 @@ def _stream_spec() -> KernelSpec:
     )
 
 
-# ── Mock session backend ──
+# ── Mock backend with session auto-management (mirrors SimBackend) ──
 
 
 class MockSessionBackend(Backend):
-    """Mock backend that supports session protocol."""
+    """Mock backend that auto-manages session in execute()."""
 
     def __init__(self):
         self.calls: list[str] = []
-        self._session_open = False
-
-    @property
-    def supports_session(self) -> bool:
-        return True
+        self._session_active = False
 
     @property
     def compile_target(self) -> str:
         return "sim"
 
     def execute(self, compiled) -> BackendResult:
-        self.calls.append("execute")
+        if not self._session_active:
+            self.calls.append("session_start")
+            self._session_active = True
+        else:
+            self.calls.append("batch_submit")
+        self.calls.append("wait")
         return BackendResult(status=0)
-
-    def open_session(self, compiled) -> None:
-        self.calls.append("open_session")
-        self._session_open = True
-
-    def submit_batch(self, compiled) -> None:
-        self.calls.append("submit_batch")
-
-    def wait_batch(self) -> BackendResult:
-        self.calls.append("wait_batch")
-        return BackendResult(status=0)
-
-    def close_session(self) -> None:
-        self.calls.append("close_session")
-        self._session_open = False
 
     def cleanup(self) -> None:
+        if self._session_active:
+            self.calls.append("session_close")
+            self._session_active = False
         self.calls.append("cleanup")
 
 
 class MockLegacyBackend(Backend):
-    """Mock backend that does NOT support sessions."""
+    """Mock backend that does NOT support sessions (one-shot execute)."""
 
     def __init__(self):
         self.calls: list[str] = []
@@ -118,6 +108,19 @@ class MockLegacyBackend(Backend):
 
     def cleanup(self) -> None:
         self.calls.append("cleanup")
+
+
+# ── Helpers ──
+
+
+def _make_ctx_and_run(backend):
+    """Create ExecutionContext, record ops, call run()."""
+    ctx = ExecutionContext(backend=backend, project_params={"N": 32})
+    ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
+    ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
+    ctx.push_tensor(ki.get_tensor("data_in"))
+    ctx.pull_tensor(ki.get_tensor("data_out"))
+    return ctx, ctx.run()
 
 
 # ── Session lifecycle tests ──
@@ -125,80 +128,69 @@ class MockLegacyBackend(Backend):
 
 class TestSessionLifecycle:
 
-    def test_first_run_opens_session(self):
-        """First ctx.run() calls open_session + wait_batch."""
+    def test_first_execute_starts_session(self):
+        """First ctx.run() → backend.execute() starts session."""
         backend = MockSessionBackend()
-        ctx = ExecutionContext(backend=backend, project_params={"N": 32})
-        ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
-        ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx.push_tensor(ki.get_tensor("data_in"))
-        ctx.pull_tensor(ki.get_tensor("data_out"))
+        _make_ctx_and_run(backend)
 
-        ctx.run()
+        assert "session_start" in backend.calls
+        assert "wait" in backend.calls
+        assert backend._session_active is True
 
-        assert "open_session" in backend.calls
-        assert "wait_batch" in backend.calls
-        assert "execute" not in backend.calls
-        assert ctx._session_open is True
-
-    def test_second_run_submits_batch(self):
-        """Second ctx.run() calls submit_batch + wait_batch (not open_session)."""
+    def test_second_execute_reuses_session(self):
+        """Second ctx.run() on same backend reuses session."""
         backend = MockSessionBackend()
 
-        # First run
-        ctx1 = ExecutionContext(backend=backend, project_params={"N": 32})
-        ki1 = ctx1.instantiate(StreamKernel, spec=_stream_spec(), N=32)
-        ki1.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx1.push_tensor(ki1.get_tensor("data_in"))
-        ctx1.pull_tensor(ki1.get_tensor("data_out"))
-        ctx1.run()
+        _make_ctx_and_run(backend)
+        _make_ctx_and_run(backend)
 
-        # Second run (new context, but session state transferred)
-        ctx2 = ExecutionContext(backend=backend, project_params={"N": 32})
-        ctx2._session_open = ctx1._session_open  # Transfer state
-        ki2 = ctx2.instantiate(StreamKernel, spec=_stream_spec(), N=32)
-        ki2.get_tensor("data_in").data = torch.ones(32, dtype=torch.int8)
-        ctx2.push_tensor(ki2.get_tensor("data_in"))
-        ctx2.pull_tensor(ki2.get_tensor("data_out"))
-        ctx2.run()
+        assert backend.calls.count("session_start") == 1
+        assert backend.calls.count("batch_submit") == 1
+        assert backend.calls.count("wait") == 2
 
-        assert backend.calls.count("open_session") == 1
-        assert backend.calls.count("submit_batch") == 1
-        assert backend.calls.count("wait_batch") == 2
-        assert "execute" not in backend.calls
-
-    def test_close_session(self):
-        """close() calls backend.close_session()."""
+    def test_cleanup_closes_session(self):
+        """cleanup() closes active session."""
         backend = MockSessionBackend()
-        ctx = ExecutionContext(backend=backend, project_params={"N": 32})
-        ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
-        ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx.push_tensor(ki.get_tensor("data_in"))
-        ctx.pull_tensor(ki.get_tensor("data_out"))
-        ctx.run()
-        ctx.close()
+        _make_ctx_and_run(backend)
+        backend.cleanup()
 
-        assert "close_session" in backend.calls
-        assert ctx._session_open is False
+        assert "session_close" in backend.calls
+        assert backend._session_active is False
 
-    def test_close_idempotent(self):
-        """Calling close() multiple times is safe."""
+    def test_cleanup_idempotent(self):
+        """Calling cleanup() multiple times is safe."""
         backend = MockSessionBackend()
-        ctx = ExecutionContext(backend=backend, project_params={"N": 32})
-        ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
-        ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx.push_tensor(ki.get_tensor("data_in"))
-        ctx.pull_tensor(ki.get_tensor("data_out"))
-        ctx.run()
+        _make_ctx_and_run(backend)
 
-        ctx.close()
-        ctx.close()
+        backend.cleanup()
+        backend.cleanup()
+        backend.cleanup()
+
+        assert backend.calls.count("session_close") == 1
+        assert backend.calls.count("cleanup") == 3
+
+    def test_backend_context_manager(self):
+        """with backend: pattern calls cleanup on exit."""
+        backend = MockSessionBackend()
+        with backend:
+            _make_ctx_and_run(backend)
+
+        assert "session_close" in backend.calls
+        assert "cleanup" in backend.calls
+
+    def test_ctx_close_is_noop(self):
+        """ExecutionContext.close() is no-op (backend manages lifecycle)."""
+        backend = MockSessionBackend()
+        ctx, _ = _make_ctx_and_run(backend)
         ctx.close()
 
-        assert backend.calls.count("close_session") == 1
+        # close() should not trigger session_close
+        assert "session_close" not in backend.calls
+        # session still active
+        assert backend._session_active is True
 
-    def test_context_manager(self):
-        """ExecutionContext works as context manager."""
+    def test_ctx_context_manager_is_noop(self):
+        """with ctx: pattern is no-op for backend lifecycle."""
         backend = MockSessionBackend()
         with ExecutionContext(backend=backend, project_params={"N": 32}) as ctx:
             ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
@@ -207,7 +199,9 @@ class TestSessionLifecycle:
             ctx.pull_tensor(ki.get_tensor("data_out"))
             ctx.run()
 
-        assert "close_session" in backend.calls
+        # Backend session still active (caller must cleanup)
+        assert "session_close" not in backend.calls
+        assert backend._session_active is True
 
 
 # ── Backward compatibility tests ──
@@ -216,17 +210,11 @@ class TestSessionLifecycle:
 class TestBackwardCompat:
 
     def test_legacy_backend_uses_execute(self):
-        """Backend without supports_session uses execute()."""
+        """Backend without session support uses execute()."""
         backend = MockLegacyBackend()
-        ctx = ExecutionContext(backend=backend, project_params={"N": 32})
-        ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
-        ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx.push_tensor(ki.get_tensor("data_in"))
-        ctx.pull_tensor(ki.get_tensor("data_out"))
-        ctx.run()
+        _make_ctx_and_run(backend)
 
         assert "execute" in backend.calls
-        assert "open_session" not in backend.calls
 
     def test_no_backend_returns_done(self):
         """No backend → compile-only, returns DONE."""
@@ -237,5 +225,3 @@ class TestBackwardCompat:
         ctx.pull_tensor(ki.get_tensor("data_out"))
         result = ctx.run()
         assert result.status == "DONE"
-
-

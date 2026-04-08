@@ -159,7 +159,7 @@ class Backend(abc.ABC):
 
     @abc.abstractmethod
     def cleanup(self) -> None:
-        """Release resources. Idempotent."""
+        """Close active session (if any) and release resources. Idempotent."""
         ...
 
     def __enter__(self) -> Backend:
