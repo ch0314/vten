@@ -68,7 +68,7 @@ class FmapIOKernel(Kernel):
 
 **규칙:**
 - `layout_{tensor_name}(self, logical) → physical` 메서드가 있으면 framework가 Stage 3에서 자동 호출
-- `unlayout_{tensor_name}(self, physical) → logical` 메서드가 있으면 verify 시 자동 호출
+- `unlayout_{tensor_name}(self, physical) → logical` 메서드가 있으면 auto-verify 시 자동 호출
 - 없으면 identity (logical == physical) — passthrough 커널 등
 - `self.*`로 모든 param 접근 가능 — 별도 `params: dict` 불필요
 - 재사용 가능한 변환 로직은 유틸리티 함수로 분리하고 메서드에서 호출
@@ -687,48 +687,40 @@ run()은 **항상 사용자 작성**. HW 실행 프로토콜은 자동화 불가
 ```python
 def run(self, ctx):
     h_cfg = ctx.configure(self)
-    ctx.send_tensor(self.wl.wgt_mem, dep=h_cfg)
-    ctx.send_tensor(self.fmap.ifm_mem, dep=h_cfg)
-    ctx.send_tensor(self.bias.bias_mem, dep=h_cfg)
-    h_ofm = ctx.recv_tensor(self.fmap.ofm_mem, dep=h_cfg)
+    ctx.push_tensor(self.wl.wgt_mem, dep=h_cfg)
+    ctx.push_tensor(self.fmap.ifm_mem, dep=h_cfg)
+    ctx.push_tensor(self.bias.bias_mem, dep=h_cfg)
+    h_ofm = ctx.pull_tensor(self.fmap.ofm_mem, dep=h_cfg)
     for ctrl in [self.psum_ctrl, self.act_ctrl, self.bias_ctrl,
                   self.wl_ctrl, self.fmap_ctrl]:
         ctx.write_register(ctrl, {"vsync": 1}, dep=h_cfg)
-    ctx.verify(h_ofm)  # golden 자동 계산 (§6)
 ```
 
 ---
 
 ## 6. Verification 자동화
 
-### 6.1 ctx.verify() — golden 생략 가능
+### 6.1 ctx.run(verify=True) — auto-golden 검증
 
 ```python
-# BEFORE
+# BEFORE (deprecated — ctx.verify() 삭제됨)
 golden = self.forward()
 ctx.verify(h_ofm, golden)
 
-# AFTER — golden 생략 시 framework가 자동 계산
-ctx.verify(h_ofm)
-
-# 기존 2-arg도 유지 (backward compat)
-ctx.verify(h_ofm, explicit_golden)
+# AFTER — run(verify=True)로 자동 검증
+ctx.run(verify=True)  # framework가 forward()를 호출하여 golden 자동 계산
 ```
 
-### 6.2 Framework verify 동작 (구현)
+### 6.2 Framework auto-verify 동작 (구현)
 
-`vten/runtime/context.py`의 `_compute_auto_golden()`:
+`vten/runtime/context.py`의 `_run_auto_verification()`:
 
 ```python
-def verify(self, op_handle, golden=None):
-    if self._last_compiled is not None:
-        # eager: 즉시 검증
-        if golden is None:
-            golden = self._compute_auto_golden(op_handle)
-        self._verify_immediate(op_handle, golden)
-    else:
-        # deferred: run() 후 일괄 검증
-        self._verifications.append(VerificationTask(op_handle, golden))
+def run(self, verify: bool = False):
+    # ... compile + execute ...
+    if verify:
+        self._run_auto_verification(compiled, result)
+    # auto-golden은 _compute_auto_golden()으로 각 D2H 텐서에 대해 계산
 ```
 
 ### 6.3 Auto-golden 계산 파이프라인
@@ -762,11 +754,10 @@ forward() 출력 dtype과 tensor dtype이 다를 때 자동 변환:
 
 ### 6.5 chunk 지원
 
-`recv_tensor(tensor, chunks=N)`으로 분할된 출력도 auto-golden 지원:
+`pull_tensor(tensor, chunks=N)`으로 분할된 출력도 auto-golden 지원:
 ```python
-psum_handles = ctx.recv_tensor(self.partial_sum, chunks=self.in_depth)
-for h in psum_handles:
-    ctx.verify(h)  # 각 chunk에 대해 golden 자동 슬라이싱
+psum_handles = ctx.pull_tensor(self.partial_sum, chunks=self.in_depth)
+# run(verify=True)가 각 chunk에 대해 golden 자동 슬라이싱
 ```
 
 golden 전체를 계산한 뒤, `chunk_index`와 `chunk_total`로 구간 슬라이싱.
@@ -788,7 +779,7 @@ golden 전체를 계산한 뒤, `chunk_index`와 `chunk_total`로 구간 슬라�
 physical = self.layout_wgt_mem(self.wgt_mem.data)
 ctx.verify(h_out, self.forward(wgt_mem=physical)["wgt_out"])
 # AFTER:
-ctx.verify(h_out)
+ctx.run(verify=True)  # auto-golden 자동 계산
 
 # ── mac_atu: 수동 einsum + per-depth 슬라이싱 → auto-golden + chunk ──
 # BEFORE (12줄):
@@ -800,9 +791,8 @@ for d in range(self.in_depth):
             golden_slices.append(mac_result[u, x, d].flatten())
     golden_d = torch.cat(golden_slices).to(torch.int32)
     ctx.verify(psum_handles[d], golden_d)
-# AFTER (2줄):
-for h in psum_handles:
-    ctx.verify(h)
+# AFTER (1줄):
+ctx.run(verify=True)  # chunk별 golden 자동 슬라이싱
 
 # ── fmapIO: 수동 layout + 2개 verify → auto-golden ──
 # BEFORE:
@@ -811,14 +801,13 @@ golden = self.forward(ifm_mem=physical)
 ctx.verify(h_ifm, golden["ifm_out"])
 ctx.verify(h_coo, golden["coo_out"])
 # AFTER:
-ctx.verify(h_ifm)
-ctx.verify(h_coo)
+ctx.run(verify=True)  # 모든 D2H 텐서 자동 검증
 
 # ── composite (mac_psum, npu_pipeline) ──
 # BEFORE:
 ctx.verify(h_out, self.forward()["psum_out"])
 # AFTER:
-ctx.verify(h_out)
+ctx.run(verify=True)
 ```
 
 ---
@@ -955,12 +944,11 @@ class ActQuantKernel(Kernel):
         return {"quant_out": (clipped & 0xFF).flatten().to(torch.uint8)}
 
     def run(self, ctx):
-        h_bias = ctx.send_tensor(self.bias_in)
-        h_out = ctx.recv_tensor(self.quant_out, dep=h_bias)
+        h_bias = ctx.push_tensor(self.bias_in)
+        h_out = ctx.pull_tensor(self.quant_out, dep=h_bias)
         h_cfg = ctx.configure(self, dep=h_bias)
         ctx.write_register(self.ctrl, {"vsync": 1}, dep=h_cfg)
-        ctx.send_tensor(self.psum_in, dep=h_cfg)
-        ctx.verify(h_out)  # golden 자동
+        ctx.push_tensor(self.psum_in, dep=h_cfg)
 ```
 
 ### 8.2 NpuPipelineKernel (composite)
@@ -1020,14 +1008,13 @@ class NpuPipelineKernel(CompositeKernel):
 
     def run(self, ctx):
         h_cfg = ctx.configure(self)
-        ctx.send_tensor(self.wl.wgt_mem, dep=h_cfg)
-        ctx.send_tensor(self.fmap.ifm_mem, dep=h_cfg)
-        ctx.send_tensor(self.bias.bias_mem, dep=h_cfg)
-        h_ofm = ctx.recv_tensor(self.fmap.ofm_mem, dep=h_cfg)
+        ctx.push_tensor(self.wl.wgt_mem, dep=h_cfg)
+        ctx.push_tensor(self.fmap.ifm_mem, dep=h_cfg)
+        ctx.push_tensor(self.bias.bias_mem, dep=h_cfg)
+        h_ofm = ctx.pull_tensor(self.fmap.ofm_mem, dep=h_cfg)
         for ctrl in [self.psum_ctrl, self.act_ctrl, self.bias_ctrl,
                       self.wl_ctrl, self.fmap_ctrl]:
             ctx.write_register(ctrl, {"vsync": 1}, dep=h_cfg)
-        ctx.verify(h_ofm)
 ```
 
 ### 8.3 Test (변경 거의 없음)
@@ -1068,7 +1055,7 @@ class TestForwardK3(TestScenario):
 - `vten/kernel/base.py` — forward(**inputs) → dict 시그니처
 - `vten/kernel/composite.py` — auto forward chain (multi-round dataflow)
 - `vten/runtime/engine.py` — auto-pack Stage 3 pre-step (`_apply_layout`), `_apply_unlayout`
-- `vten/runtime/context.py` — verify(golden=None) auto-golden 계산
+- `vten/runtime/context.py` — run(verify=True) auto-golden 계산
 
 ### Phase C: Parameter & Register 통합 — ✅ 완료
 
@@ -1141,14 +1128,14 @@ composite spec은 있으면 memory_regions/clock/reset 오버라이드 가능.
 - `engine.py:1101-1119`: `_apply_unlayout()` — output tensor의 `unlayout_{name}()` 메서드 호출
 - `composite.py:313-330`: CompositeKernel.forward() pool seeding에서도 auto-layout 적용
 
-### 11.2 Auto-golden verify 구현 위치
+### 11.2 Auto-golden verification 구현 위치
 
 `vten/runtime/context.py`:
-- `_compute_auto_golden(op_handle)` — 핵심 로직
+- `_run_auto_verification(compiled, result)` — run(verify=True) 시 호출
+- `_compute_auto_golden(tensor_name, compiled)` — 핵심 로직
 - `_find_kernel_for_tensor(tensor_name)` — 커널 탐색
 - `_run_forward(kernel_inst)` — Composite vs Simple 분기
 - `_golden_cache` — `id(kernel_inst)` → forward() 결과 캐시
-- `VerificationTask.golden` — `None` 허용 (auto-golden 트리거)
 
 ### 11.3 Auto-chain generate_inputs 구현
 

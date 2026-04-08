@@ -102,15 +102,14 @@ class TestVtenTypesSvh:
             "OP_READ_REG": 6,
             "OP_POLL_REG": 7,
             "OP_BARRIER": 8,
-            "OP_COMPARE": 9,
         }
         for name, val in expected.items():
             assert opcodes.get(name) == val, f"{name}: expected {val}, got {opcodes.get(name)}"
 
     def test_opcode_count(self):
-        """Exactly 9 opcodes."""
+        """Exactly 8 opcodes."""
         opcodes = _extract_enum_values(self.text, "opcode_t")
-        assert len(opcodes) == 9
+        assert len(opcodes) == 8
 
     # ── Protocol enum (§1.1) ──
 

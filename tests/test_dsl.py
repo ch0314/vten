@@ -5,11 +5,11 @@ Spec reference: 01_kernel_and_dsl.md §3 (DSL Operations)
 NPU 3D patterns: npu_3d_analysis.md §14 (test_dsl.py)
 
 NPU 3D execution sequence:
-  Host workflow: LOAD(ifm) → LOAD(wgt) → LOAD(bias)
+  Host workflow: PUSH(ifm) → PUSH(wgt) → PUSH(bias)
                  → CONFIGURE → WRITE_REG(vsync) × 3
-                 → POLL_REG(layer_done) → STORE(ofm)
+                 → POLL_REG(layer_done) → PULL(ofm)
   VSYNC order: bias_loader → weight_loader → fmapIO
-  Dependencies: configure dep on 3 loads, fmapIO vsync dep on bias/wgt vsync
+  Dependencies: configure dep on 3 pushes, fmapIO vsync dep on bias/wgt vsync
 """
 
 from __future__ import annotations
@@ -83,8 +83,6 @@ class WeightLoaderStub(Kernel):
 class TestOpKind:
 
     def test_all_values(self):
-        assert OpKind.LOAD_TENSOR.value == "load_tensor"
-        assert OpKind.STORE_TENSOR.value == "store_tensor"
         assert OpKind.PUSH_TENSOR.value == "push_tensor"
         assert OpKind.PULL_TENSOR.value == "pull_tensor"
         assert OpKind.WRITE_REGISTER.value == "write_register"
@@ -92,11 +90,10 @@ class TestOpKind:
         assert OpKind.POLL_REGISTER.value == "poll_register"
         assert OpKind.CONFIGURE.value == "configure"
         assert OpKind.BARRIER.value == "barrier"
-        assert OpKind.SEND_TENSOR.value == "send_tensor"
-        assert OpKind.RECV_TENSOR.value == "recv_tensor"
+        assert len(OpKind) == 7
 
     def test_from_string(self):
-        assert OpKind("load_tensor") == OpKind.LOAD_TENSOR
+        assert OpKind("push_tensor") == OpKind.PUSH_TENSOR
         assert OpKind("barrier") == OpKind.BARRIER
 
 
@@ -107,23 +104,23 @@ class TestOpKind:
 
 class TestOperation:
 
-    def test_load_ifm_tensor(self):
-        """NPU 3D: LOAD IFM tensor (host → DDR)."""
+    def test_push_ifm_tensor(self):
+        """NPU 3D: PUSH IFM tensor (host → DUT)."""
         ifm = Tensor(
             shape=("${IN_CH}", "${IN_DEPTH}", "${IN_HEIGHT}", "${IN_WIDTH}"),
             dtype=torch.int8, interface="ddr",
         )
-        op = Operation(kind=OpKind.LOAD_TENSOR, tensor=ifm)
-        assert op.kind == OpKind.LOAD_TENSOR
+        op = Operation(kind=OpKind.PUSH_TENSOR, tensor=ifm)
+        assert op.kind == OpKind.PUSH_TENSOR
         assert op.tensor is ifm
         assert op.kernel is None
         assert op.dep == []
         assert op.commit_dep == []
 
-    def test_load_bias_int32(self):
-        """NPU 3D: LOAD bias int32 tensor."""
+    def test_push_bias_int32(self):
+        """NPU 3D: PUSH bias int32 tensor."""
         bias = Tensor(shape=("${OUT_CH}",), dtype=torch.int32, interface="ddr")
-        op = Operation(kind=OpKind.LOAD_TENSOR, tensor=bias)
+        op = Operation(kind=OpKind.PUSH_TENSOR, tensor=bias)
         assert op.tensor.dtype == torch.int32
 
     def test_defaults(self):
@@ -135,8 +132,6 @@ class TestOperation:
         assert op.register_field_name is None
         assert op.probe is False
         assert op.sync is False
-        assert op.golden is None
-        assert op.verify is False
 
     def test_write_register_vsync(self):
         """NPU 3D: WRITE_REG vsync trigger = 1."""
@@ -166,12 +161,12 @@ class TestOperation:
         assert op.kernel is k
 
     def test_op_with_deps(self):
-        """NPU 3D: push_tensor depends on load completion."""
-        load = Operation(kind=OpKind.LOAD_TENSOR)
-        h_load = OperationHandle(op=load)
-        push = Operation(kind=OpKind.PUSH_TENSOR, dep=[h_load])
-        assert len(push.dep) == 1
-        assert push.dep[0] is h_load
+        """NPU 3D: pull_tensor depends on push completion."""
+        push = Operation(kind=OpKind.PUSH_TENSOR)
+        h_push = OperationHandle(op=push)
+        pull = Operation(kind=OpKind.PULL_TENSOR, dep=[h_push])
+        assert len(pull.dep) == 1
+        assert pull.dep[0] is h_push
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -182,7 +177,7 @@ class TestOperation:
 class TestOperationHandle:
 
     def test_wraps_operation(self):
-        op = Operation(kind=OpKind.LOAD_TENSOR)
+        op = Operation(kind=OpKind.PUSH_TENSOR)
         handle = OperationHandle(op=op)
         assert handle.op is op
 
@@ -215,24 +210,24 @@ class TestOperationHandle:
 class TestNPU3DWorkflow:
     """NPU 3D host execution sequence as DSL operations."""
 
-    def test_load_three_tensors(self):
-        """Phase 1: LOAD ifm, weight, bias (host → device memory)."""
-        load_ifm = Operation(kind=OpKind.LOAD_TENSOR)
-        load_wgt = Operation(kind=OpKind.LOAD_TENSOR)
-        load_bias = Operation(kind=OpKind.LOAD_TENSOR)
-        h_ifm = OperationHandle(op=load_ifm)
-        h_wgt = OperationHandle(op=load_wgt)
-        h_bias = OperationHandle(op=load_bias)
+    def test_push_three_tensors(self):
+        """Phase 1: PUSH ifm, weight, bias (host → DUT)."""
+        push_ifm = Operation(kind=OpKind.PUSH_TENSOR)
+        push_wgt = Operation(kind=OpKind.PUSH_TENSOR)
+        push_bias = Operation(kind=OpKind.PUSH_TENSOR)
+        h_ifm = OperationHandle(op=push_ifm)
+        h_wgt = OperationHandle(op=push_wgt)
+        h_bias = OperationHandle(op=push_bias)
         assert all(
-            op.kind == OpKind.LOAD_TENSOR
+            op.kind == OpKind.PUSH_TENSOR
             for op in [h_ifm.op, h_wgt.op, h_bias.op]
         )
 
-    def test_configure_depends_on_loads(self):
-        """Phase 2: CONFIGURE depends on all 3 LOADs."""
-        h_ifm = OperationHandle(op=Operation(kind=OpKind.LOAD_TENSOR))
-        h_wgt = OperationHandle(op=Operation(kind=OpKind.LOAD_TENSOR))
-        h_bias = OperationHandle(op=Operation(kind=OpKind.LOAD_TENSOR))
+    def test_configure_depends_on_pushes(self):
+        """Phase 2: CONFIGURE depends on all 3 PUSHes."""
+        h_ifm = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
+        h_wgt = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
+        h_bias = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
 
         k = FmapIOStub()
         configure = Operation(
@@ -292,39 +287,36 @@ class TestNPU3DWorkflow:
         assert poll.register_interface == "ctrl_fmapio"
         assert len(poll.dep) == 1
 
-    def test_store_ofm_with_verify(self):
-        """Phase 5: STORE OFM + verify against golden."""
-        golden = torch.randn(32, 16, 16, 16)
+    def test_pull_ofm(self):
+        """Phase 5: PULL OFM from DUT."""
         ofm = Tensor(
             shape=("${OUT_CH}", "${OUT_DEPTH}", "${OUT_HEIGHT}", "${OUT_WIDTH}"),
             dtype=torch.int8, interface="ddr",
         )
-        h_pull = OperationHandle(op=Operation(kind=OpKind.PULL_TENSOR))
+        h_push = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
 
-        store = Operation(
-            kind=OpKind.STORE_TENSOR,
+        pull = Operation(
+            kind=OpKind.PULL_TENSOR,
             tensor=ofm,
-            dep=[h_pull],
-            verify=True,
-            golden=golden,
+            dep=[h_push],
         )
-        assert store.verify is True
-        assert store.golden.shape == (32, 16, 16, 16)
+        assert pull.kind == OpKind.PULL_TENSOR
+        assert pull.tensor is ofm
 
     def test_full_npu3d_chain(self):
-        """Full NPU 3D workflow: load×3 → configure → vsync×3 → poll → store.
+        """Full NPU 3D workflow: push×3 → configure → vsync×3 → poll → pull.
 
         Mirrors host code sequence from npu_3d_analysis.md §7.1.
         """
-        # Phase 1: Load tensors
-        h_load_ifm = OperationHandle(op=Operation(kind=OpKind.LOAD_TENSOR))
-        h_load_wgt = OperationHandle(op=Operation(kind=OpKind.LOAD_TENSOR))
-        h_load_bias = OperationHandle(op=Operation(kind=OpKind.LOAD_TENSOR))
+        # Phase 1: Push tensors
+        h_push_ifm = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
+        h_push_wgt = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
+        h_push_bias = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
 
         # Phase 2: Configure (auto_bind all registers)
         configure = Operation(
             kind=OpKind.CONFIGURE,
-            dep=[h_load_ifm, h_load_wgt, h_load_bias],
+            dep=[h_push_ifm, h_push_wgt, h_push_bias],
         )
         h_configure = OperationHandle(op=configure)
 
@@ -348,15 +340,9 @@ class TestNPU3DWorkflow:
             dep=[h_vsync_bias, h_vsync_wgt],
         ))
 
-        # Phase 3.5: Push/Pull tensors (memory-mapped pattern)
-        h_push_ifm = OperationHandle(op=Operation(
-            kind=OpKind.PUSH_TENSOR, dep=[h_vsync_fmap],
-        ))
-        h_push_wgt = OperationHandle(op=Operation(
-            kind=OpKind.PUSH_TENSOR, dep=[h_vsync_fmap],
-        ))
+        # Phase 3.5: Pull output tensors
         h_pull_ofm = OperationHandle(op=Operation(
-            kind=OpKind.PULL_TENSOR, dep=[h_push_ifm, h_push_wgt],
+            kind=OpKind.PULL_TENSOR, dep=[h_vsync_fmap],
         ))
 
         # Phase 4: Poll layer_done
@@ -370,18 +356,12 @@ class TestNPU3DWorkflow:
         # Commit dependency: pull commit waits for poll
         h_pull_ofm.add_commit_dependency(h_poll)
 
-        # Phase 5: Store OFM
-        store = Operation(
-            kind=OpKind.STORE_TENSOR,
-            dep=[h_pull_ofm],
-        )
-
         # Verify chain structure
-        assert len(configure.dep) == 3  # 3 loads
+        assert len(configure.dep) == 3  # 3 pushes
         assert len(h_vsync_fmap.op.dep) == 2  # bias + wgt vsyncs
-        assert len(h_pull_ofm.op.dep) == 2  # push_ifm + push_wgt
+        assert len(h_pull_ofm.op.dep) == 1  # vsync_fmap
         assert len(h_pull_ofm.op.commit_dep) == 1  # poll
-        assert store.dep[0].op.kind == OpKind.PULL_TENSOR
+        assert h_pull_ofm.op.kind == OpKind.PULL_TENSOR
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -424,37 +404,20 @@ class TestMemoryMappedPattern:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §6  Stream shorthand ops — send_tensor, recv_tensor
-# ═══════════════════════════════════════════════════════════════════
-
-
-class TestShorthandOps:
-    """send_tensor = load + push, recv_tensor = pull + store."""
-
-    def test_send_tensor_kind(self):
-        op = Operation(kind=OpKind.SEND_TENSOR)
-        assert op.kind == OpKind.SEND_TENSOR
-
-    def test_recv_tensor_kind(self):
-        op = Operation(kind=OpKind.RECV_TENSOR)
-        assert op.kind == OpKind.RECV_TENSOR
-
-
-# ═══════════════════════════════════════════════════════════════════
-# §7  Dependency patterns — NPU 3D specifics
+# §6  Dependency patterns — NPU 3D specifics
 # ═══════════════════════════════════════════════════════════════════
 
 
 class TestDependencyPatterns:
     """NPU 3D dependency chain patterns."""
 
-    def test_fan_in_three_loads(self):
-        """3 LOAD ops (ifm, weight, bias) fan into configure."""
-        loads = [
-            OperationHandle(op=Operation(kind=OpKind.LOAD_TENSOR))
+    def test_fan_in_three_pushes(self):
+        """3 PUSH ops (ifm, weight, bias) fan into configure."""
+        pushes = [
+            OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
             for _ in range(3)
         ]
-        configure = Operation(kind=OpKind.CONFIGURE, dep=loads)
+        configure = Operation(kind=OpKind.CONFIGURE, dep=pushes)
         assert len(configure.dep) == 3
 
     def test_fan_in_two_vsyncs(self):
@@ -492,20 +455,9 @@ class TestDependencyPatterns:
         h_barrier = OperationHandle(op=barrier)
         assert barrier.kind == OpKind.BARRIER
         assert barrier.dep == []
-        # Next layer's load depends on barrier
-        next_load = Operation(kind=OpKind.LOAD_TENSOR, dep=[h_barrier])
-        assert next_load.dep[0].op.kind == OpKind.BARRIER
-
-    def test_verify_with_golden(self):
-        """NPU 3D OFM verify: golden = conv3d output."""
-        golden = torch.randn(32, 16, 16, 16)  # OFM shape
-        pull = Operation(
-            kind=OpKind.PULL_TENSOR,
-            verify=True,
-            golden=golden,
-        )
-        assert pull.verify is True
-        assert torch.equal(pull.golden, golden)
+        # Next layer's push depends on barrier
+        next_push = Operation(kind=OpKind.PUSH_TENSOR, dep=[h_barrier])
+        assert next_push.dep[0].op.kind == OpKind.BARRIER
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -526,7 +478,7 @@ class TestOpCode:
         assert OpCode.READ_REG.value == 6
         assert OpCode.POLL_REG.value == 7
         assert OpCode.BARRIER.value == 8
-        assert OpCode.COMPARE.value == 9
+        assert len(OpCode) == 8
 
 
 # ═══════════════════════════════════════════════════════════════════

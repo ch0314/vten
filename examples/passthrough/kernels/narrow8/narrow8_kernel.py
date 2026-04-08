@@ -28,7 +28,5 @@ class Narrow8Kernel(Kernel):
         return {"data_out": self.data_in.data.clone()}
 
     def run(self, ctx) -> None:
-        h_load = ctx.load_tensor(self.data_in)
-        h_push = ctx.push_tensor(self.data_in, dep=h_load)
-        h_pull = ctx.pull_tensor(self.data_out, dep=h_load)
-        ctx.verify(h_pull, self.forward()["data_out"])
+        h_push = ctx.push_tensor(self.data_in)
+        h_pull = ctx.pull_tensor(self.data_out, dep=h_push)

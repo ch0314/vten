@@ -52,7 +52,7 @@ class TestApplyOutputProbe:
         ctx = ExecutionContext()
         tensor = MagicMock()
         tensor.name = "data_out"
-        op = Operation(kind=OpKind.RECV_TENSOR, tensor=tensor)
+        op = Operation(kind=OpKind.PULL_TENSOR, tensor=tensor)
         ctx._pending_ops.append(op)
         ctx._register_declarative_probes(["data_out"])
         ctx._apply_declarative_probes()

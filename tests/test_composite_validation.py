@@ -364,9 +364,8 @@ class TestCompilePipeline:
             from vten.spec.models import OpKind
 
             ops = [
-                Operation(kind=OpKind.LOAD_TENSOR, tensor=k.data_in),
-                Operation(kind=OpKind.SEND_TENSOR, tensor=k.data_in),
-                Operation(kind=OpKind.RECV_TENSOR, tensor=k.data_out),
+                Operation(kind=OpKind.PUSH_TENSOR, tensor=k.data_in),
+                Operation(kind=OpKind.PULL_TENSOR, tensor=k.data_out),
             ]
             engine = RuntimeEngine(
                 kernels=ctx._kernels, ops=ops,

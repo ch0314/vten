@@ -26,8 +26,7 @@ typedef enum logic [3:0] {
     OP_WRITE_REG = 4'd5,
     OP_READ_REG  = 4'd6,
     OP_POLL_REG  = 4'd7,
-    OP_BARRIER   = 4'd8,
-    OP_COMPARE   = 4'd9
+    OP_BARRIER   = 4'd8
 } opcode_t;
 
 // ============================================================================

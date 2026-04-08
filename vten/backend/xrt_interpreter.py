@@ -123,7 +123,6 @@ class CommandInterpreter:
       READ_REG  → ip.read_register(offset)
       POLL_REG  → polling loop on read_register
       BARRIER   → host-side fence (all pending ops complete)
-      COMPARE   → host-side buffer comparison
     """
 
     def __init__(
@@ -481,7 +480,6 @@ class CommandInterpreter:
             OpCode.READ_REG: self._exec_read_reg,
             OpCode.POLL_REG: self._exec_poll_reg,
             OpCode.BARRIER: self._exec_barrier,
-            OpCode.COMPARE: self._exec_compare,
         }.get(cmd.op)
 
         if handler is None:
@@ -689,10 +687,6 @@ class CommandInterpreter:
 
     def _exec_barrier(self, cmd: Command) -> None:
         """BARRIER: Host-side fence — all prior commands already complete."""
-        pass
-
-    def _exec_compare(self, cmd: Command) -> None:
-        """COMPARE: Host-side buffer comparison."""
         pass
 
     # ── Cleanup ──

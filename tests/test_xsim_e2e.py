@@ -101,14 +101,12 @@ class TestMultiConfigE2E:
             for i in range(3):
                 ki = ctx.instantiate(KernelClass, spec=spec, N=1024)
                 ki.generate_inputs(seed=42 + i)
-                h_load = ctx.load_tensor(ki.data_in)
-                ctx.push_tensor(ki.data_in, dep=h_load)
-                h_pull = ctx.pull_tensor(ki.data_out, dep=h_load)
+                h_push = ctx.push_tensor(ki.data_in)
+                ctx.pull_tensor(ki.data_out, dep=h_push)
                 goldens.append(ki.forward()["data_out"])
-                ctx.verify(h_pull, goldens[-1])
                 ctx.config_boundary()
 
-            result = ctx.run()
+            result = ctx.run(verify=True)
             assert result.status == "DONE"
         finally:
             os.chdir(prev_cwd)
@@ -130,13 +128,11 @@ class TestMultiConfigE2E:
                 ctx._project_params = {"N": n_val}
                 ki = ctx.instantiate(KernelClass, spec=spec, N=n_val)
                 ki.generate_inputs(seed=42)
-                h_load = ctx.load_tensor(ki.data_in)
-                ctx.push_tensor(ki.data_in, dep=h_load)
-                h_pull = ctx.pull_tensor(ki.data_out, dep=h_load)
-                ctx.verify(h_pull, ki.forward()["data_out"])
+                h_push = ctx.push_tensor(ki.data_in)
+                ctx.pull_tensor(ki.data_out, dep=h_push)
                 ctx.config_boundary()
 
-            result = ctx.run()
+            result = ctx.run(verify=True)
             assert result.status == "DONE"
         finally:
             os.chdir(prev_cwd)
@@ -170,12 +166,11 @@ class TestMultiConfigE2E:
                 )
                 ki.generate_inputs(seed=42)
 
-                h_load = ctx.load_tensor(ki.data_in)
+                h_push = ctx.push_tensor(ki.data_in)
 
                 # ctx.configure auto-writes runtime_params with register mappings
-                h_cfg = ctx.configure(ki, dep=h_load)
+                h_cfg = ctx.configure(ki, dep=h_push)
 
-                h_push = ctx.push_tensor(ki.data_in, dep=h_cfg)
                 h_pull = ctx.pull_tensor(ki.data_out, dep=h_cfg)
 
                 h_start_s = ctx.write_register(
@@ -190,10 +185,9 @@ class TestMultiConfigE2E:
                 h_pull.add_commit_dependency(h_poll_s)
                 h_pull.add_commit_dependency(h_poll_o)
 
-                ctx.verify(h_pull, ki.forward()["data_out"])
                 ctx.config_boundary()
 
-            result = ctx.run()
+            result = ctx.run(verify=True)
             assert result.status == "DONE"
         finally:
             os.chdir(prev_cwd)
@@ -219,11 +213,9 @@ class TestMultiBatchSessionE2E:
                 ctx._session_open = session_open
                 ki = ctx.instantiate(KernelClass, spec=spec, N=1024)
                 ki.generate_inputs(seed=42 + i)
-                h_load = ctx.load_tensor(ki.data_in)
-                ctx.push_tensor(ki.data_in, dep=h_load)
-                h_pull = ctx.pull_tensor(ki.data_out, dep=h_load)
-                ctx.verify(h_pull, ki.forward()["data_out"])
-                result = ctx.run()
+                h_push = ctx.push_tensor(ki.data_in)
+                ctx.pull_tensor(ki.data_out, dep=h_push)
+                result = ctx.run(verify=True)
                 session_open = ctx._session_open
                 assert result.status == "DONE"
 
@@ -258,11 +250,9 @@ class TestMultiBatchSessionE2E:
                 ctx._session_open = session_open
                 ki = ctx.instantiate(KernelClass, spec=spec, N=N)
                 ki.generate_inputs(seed=N)
-                h_load = ctx.load_tensor(ki.data_in)
-                ctx.push_tensor(ki.data_in, dep=h_load)
-                h_pull = ctx.pull_tensor(ki.data_out, dep=h_load)
-                ctx.verify(h_pull, ki.forward()["data_out"])
-                result = ctx.run()
+                h_push = ctx.push_tensor(ki.data_in)
+                ctx.pull_tensor(ki.data_out, dep=h_push)
+                result = ctx.run(verify=True)
                 session_open = ctx._session_open
                 assert result.status == "DONE", f"Failed at N={N}"
 
@@ -299,14 +289,12 @@ class TestEdgeCases:
             ctx = ExecutionContext(backend=backend, project_params={"N": 1024})
             ki = ctx.instantiate(KernelClass, spec=spec, N=1024)
             ki.generate_inputs(seed=42)
-            h_load = ctx.load_tensor(ki.data_in)
-            ctx.push_tensor(ki.data_in, dep=h_load)
-            h_pull = ctx.pull_tensor(ki.data_out, dep=h_load)
-            # forward() returns correct data, but RTL XORs with 0x01
-            ctx.verify(h_pull, ki.forward()["data_out"])
+            h_push = ctx.push_tensor(ki.data_in)
+            ctx.pull_tensor(ki.data_out, dep=h_push)
 
             with pytest.raises(VerificationError):
-                ctx.run()
+                # forward() returns correct data, but RTL XORs with 0x01
+                ctx.run(verify=True)
         finally:
             os.chdir(prev_cwd)
             try:
@@ -333,16 +321,14 @@ class TestEdgeCases:
             ctx = ExecutionContext(backend=backend, project_params={"N": 1024})
             ki = ctx.instantiate(KernelClass, spec=spec, N=1024)
             ki.generate_inputs(seed=42)
-            h_load = ctx.load_tensor(ki.data_in)
-            ctx.push_tensor(ki.data_in, dep=h_load)
-            # probe=True triggers COMPARE command in BFM
-            h_pull = ctx.pull_tensor(ki.data_out, dep=h_load, probe=True)
-            ctx.verify(h_pull, ki.forward()["data_out"])
+            h_push = ctx.push_tensor(ki.data_in)
+            # probe=True triggers golden comparison in BFM
+            ctx.pull_tensor(ki.data_out, dep=h_push, probe=True)
 
             with pytest.raises(Exception):
                 # Either VerificationError from host or BackendError
                 # from PROBE_MISMATCH — both indicate failure detection
-                ctx.run()
+                ctx.run(verify=True)
         finally:
             os.chdir(prev_cwd)
             try:

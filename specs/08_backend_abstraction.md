@@ -148,7 +148,7 @@ vten/
 | `READ_REG` | BFM이 AXI-Lite 읽기 | `ip.read_register(offset)` |
 | `POLL_REG` | BFM 폴링 루프 | `while (ip.read_register() & mask) != expected` |
 | `BARRIER` | 스케줄러 글로벌 펜스 | Host-side fence (이전 DMA 완료 대기) |
-| `COMPARE` | SHM 내 버퍼 비교 | Host 메모리에서 직접 비교 |
+| ~~`COMPARE`~~ | ~~삭제됨~~ | 검증은 `ctx.run(verify=True)`로 Host-side에서 수행 |
 
 ### 4.2 파이프라인 분기점
 
@@ -513,17 +513,15 @@ def _exec_store(self, cmd: Command):
     self._output_buffers[cmd.buffer_id] = bytes(data)
 ```
 
-#### BARRIER / COMPARE
+#### BARRIER
 
 ```python
 def _exec_barrier(self, cmd: Command):
     # Host-side fence: 순차 실행이므로 이전 커맨드가 이미 완료됨
     pass
-
-def _exec_compare(self, cmd: Command):
-    # Host-side 버퍼 비교 (현재 미구현, 추후 확장)
-    pass
 ```
+
+> **Note:** COMPARE OpCode는 삭제되었다. 검증은 `ctx.run(verify=True)`로 Host-side에서 auto-golden과 비교하여 수행한다.
 
 ### 6.4 XrtBackend 클래스
 
@@ -1303,5 +1301,5 @@ $ vten report
 ```
 
 사용자 코드(Kernel 클래스, DSL 시나리오)는 **백엔드에 관계없이 동일**하다.
-`generate_inputs()`, `forward()`, `send_tensor()`, `recv_tensor()` 등
+`generate_inputs()`, `forward()`, `push_tensor()`, `pull_tensor()` 등
 모든 DSL 호출이 SIM과 HW에서 동일하게 동작한다.

@@ -369,7 +369,6 @@ OP_WRITE_REG = 5
 OP_READ_REG = 6
 OP_POLL_REG = 7
 OP_BARRIER = 8
-OP_COMPARE = 9
 
 # ── Protocol constants ──
 PROTO_AXI4S = 1

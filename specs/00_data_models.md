@@ -72,24 +72,19 @@ class OpCode(Enum):
     READ_REG  = 6    # AXI-Lite로 레지스터 읽기 (결과 reg_value에 기록)
     POLL_REG  = 7    # (value & mask) == expected 될 때까지 반복 읽기
     BARRIER   = 8    # 전역 동기화 펜스 — 이전 모든 커맨드 commit 후 다음 issue
-    COMPARE   = 9    # 버퍼와 golden_buffer의 비트별 비교 (probe 모드)
 ```
 
 ### 1.5 OpKind (Record Phase)
 
 ```python
 class OpKind(Enum):
-    LOAD_TENSOR     = "load_tensor"
-    STORE_TENSOR    = "store_tensor"
-    PUSH_TENSOR     = "push_tensor"
-    PULL_TENSOR     = "pull_tensor"
+    PUSH_TENSOR     = "push_tensor"     # LOAD + PUSH 생성 (alias target이면 PUSH만)
+    PULL_TENSOR     = "pull_tensor"     # PULL + STORE 생성 (alias source이면 PULL만)
     WRITE_REGISTER  = "write_register"
     READ_REGISTER   = "read_register"
     POLL_REGISTER   = "poll_register"
     CONFIGURE       = "configure"
     BARRIER         = "barrier"
-    SEND_TENSOR     = "send_tensor"     # = load + push (자동)
-    RECV_TENSOR     = "recv_tensor"     # = pull + store (자동)
 ```
 
 ### 1.6 MappingType (CompositeKernel 인터페이스 매핑)
@@ -124,7 +119,7 @@ vTen 실행 모델의 4단계 용어 계층. 모든 스펙 문서가 이 정의�
 | Term | Scope | Definition |
 |------|-------|------------|
 | **Command** | Lowest | 하나의 IR 명령. 64바이트 SHM 슬롯 1개를 차지한다. BFM dispatch 또는 내부 스케줄러 액션과 1:1 대응. 예: PUSH 1개, WRITE_REG 1개. |
-| **Operation** | DSL | DSL 메서드 호출 1회. IR lowering 시 여러 Command로 확장될 수 있다. 예: `send_tensor()` → LOAD + PUSH (2 commands). `configure()` → N × WRITE_REG. |
+| **Operation** | DSL | DSL 메서드 호출 1회. IR lowering 시 여러 Command로 확장될 수 있다. 예: `push_tensor()` → LOAD + PUSH (2 commands). `configure()` → N × WRITE_REG. |
 | **Invocation** | Execution cycle | 하나의 가속기 실행 사이클: configure → 입력 전달 → 연산 → 출력 수집. 특정 파라미터 세트로 DUT를 한 번 "사용"하는 것에 해당. 하나의 Invocation은 보통 5–15개 Operation으로 구성. |
 | **Batch** | Host↔Backend | 하나의 SHM 제출 단위: 두 `ctx.run()` 호출 사이의 모든 Command (또는 시작부터 첫 `ctx.run()`까지). Batch 당 정확히 하나의 Host↔Backend 세마포어 핸드셰이크. 하나의 Batch에 하나 이상의 Invocation을 포함할 수 있다. §11.4, §11.5에서는 **Kernel Task**를 동의어로 사용 (후방호환). |
 
@@ -133,15 +128,15 @@ vTen 실행 모델의 4단계 용어 계층. 모든 스펙 문서가 이 정의�
 ```
 Batch (1 Host↔Backend handshake)
 ├── Invocation 0 (accelerator run with config A)
-│   ├── Operation: send_tensor(ifm)        → Commands: LOAD, PUSH
-│   ├── Operation: send_tensor(weight)     → Commands: LOAD, PUSH
+│   ├── Operation: push_tensor(ifm)        → Commands: LOAD, PUSH
+│   ├── Operation: push_tensor(weight)     → Commands: LOAD, PUSH
 │   ├── Operation: configure(kernel)       → Commands: WRITE_REG ×N
 │   ├── Operation: write_register(start=1) → Command:  WRITE_REG
-│   ├── Operation: recv_tensor(ofm)        → Command:  PULL  (aliased: STORE skipped)
+│   ├── Operation: pull_tensor(ofm)        → Command:  PULL  (aliased: STORE skipped)
 │   └── Operation: poll_register(done)     → Command:  POLL_REG
 ├── Invocation 1 (accelerator run with config B)
-│   ├── Operation: send_tensor(ifm)        → Command:  PUSH  (aliased: LOAD skipped)
-│   ├── Operation: send_tensor(weight)     → Commands: LOAD, PUSH
+│   ├── Operation: push_tensor(ifm)        → Command:  PUSH  (aliased: LOAD skipped)
+│   ├── Operation: push_tensor(weight)     → Commands: LOAD, PUSH
 │   │   ...
 │   └── Operation: poll_register(done)     → Command:  POLL_REG
 └── ...more Invocations...
@@ -1349,8 +1344,6 @@ class Operation:
     commit_dep: list['OperationHandle'] = field(default_factory=list)
     probe: bool = False
     sync: bool = False
-    golden: torch.Tensor | None = None       # verify()에서 설정
-    verify: bool = False
     config_group: int = 0                    # multi-config 그룹 인덱스 (config_boundary()로 증가)
 
 
@@ -1377,7 +1370,7 @@ class Command:
     """Execution IR의 단일 커맨드.
     """
     op: OpCode               # LOAD | PUSH | PULL | STORE | WRITE_REG |
-                             # READ_REG | POLL_REG | BARRIER | COMPARE
+                             # READ_REG | POLL_REG | BARRIER
     cmd_id: int                  # 0부터 시작하는 고유 ID
     interface_id: int = 0        # Binding Table 인덱스
     buffer_id: int = 0           # SHM 데이터 버퍼 인덱스
@@ -1413,19 +1406,16 @@ class Command:
 
 | Operation Kind | 확장 결과 | cmd_id 할당 |
 |---|---|---|
-| LOAD_TENSOR | 1× LOAD | 1 |
-| STORE_TENSOR | 1× STORE | 1 |
-| PUSH_TENSOR | 1× PUSH per port (분할 시 N개) | 1 또는 N |
-| PULL_TENSOR | 1× PULL per port | 1 또는 N |
+| PUSH_TENSOR | LOAD + PUSH (alias target이면 PUSH만) | 1-2 (분할 시 N+1) |
+| PULL_TENSOR | PULL + STORE (alias source이면 PULL만) | 1-2 (분할 시 N+1) |
 | WRITE_REGISTER | 1× WRITE_REG per field | 1+ |
 | READ_REGISTER | 1× READ_REG | 1 |
 | POLL_REGISTER | 1× POLL_REG | 1 |
 | CONFIGURE | N× WRITE_REG (모든 auto_bind) | N |
 | BARRIER | 1× BARRIER | 1 |
-| SEND_TENSOR | LOAD + PUSH (MM) 또는 PUSH만 (Stream) | 1-2 |
-| RECV_TENSOR | PULL + STORE (MM) 또는 PULL만 (Stream) | 1-2 |
 
 > ※ CONFIGURE는 `OpKind`로만 존재하며, IR lowering 시 개별 WRITE_REG Command로 확장된다.
+> ※ `push_tensor`는 기존 `send_tensor` (= load + push)를 흡수했다. `pull_tensor`는 기존 `recv_tensor` (= pull + store)를 흡수했다.
 
 ---
 
@@ -2003,7 +1993,7 @@ class TestScenario:
                 k.generate_inputs(seed=42)
                 push1 = ctx.push_tensor(k.data_in)
                 pull1 = ctx.pull_tensor(k.data_out, dep=push1)
-                ctx.verify(pull1, k.forward())
+                ctx.run(verify=True)  # golden 자동 계산 (forward() 호출)
     """
     
     kernel: str = ""               # 대상 커널 이름 (kernel_spec.yaml의 kernel 필드와 매칭)

@@ -131,8 +131,8 @@ class TestSessionLifecycle:
         ctx = ExecutionContext(backend=backend, project_params={"N": 32})
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
         ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx.send_tensor(ki.get_tensor("data_in"))
-        ctx.recv_tensor(ki.get_tensor("data_out"))
+        ctx.push_tensor(ki.get_tensor("data_in"))
+        ctx.pull_tensor(ki.get_tensor("data_out"))
 
         ctx.run()
 
@@ -149,8 +149,8 @@ class TestSessionLifecycle:
         ctx1 = ExecutionContext(backend=backend, project_params={"N": 32})
         ki1 = ctx1.instantiate(StreamKernel, spec=_stream_spec(), N=32)
         ki1.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx1.send_tensor(ki1.get_tensor("data_in"))
-        ctx1.recv_tensor(ki1.get_tensor("data_out"))
+        ctx1.push_tensor(ki1.get_tensor("data_in"))
+        ctx1.pull_tensor(ki1.get_tensor("data_out"))
         ctx1.run()
 
         # Second run (new context, but session state transferred)
@@ -158,8 +158,8 @@ class TestSessionLifecycle:
         ctx2._session_open = ctx1._session_open  # Transfer state
         ki2 = ctx2.instantiate(StreamKernel, spec=_stream_spec(), N=32)
         ki2.get_tensor("data_in").data = torch.ones(32, dtype=torch.int8)
-        ctx2.send_tensor(ki2.get_tensor("data_in"))
-        ctx2.recv_tensor(ki2.get_tensor("data_out"))
+        ctx2.push_tensor(ki2.get_tensor("data_in"))
+        ctx2.pull_tensor(ki2.get_tensor("data_out"))
         ctx2.run()
 
         assert backend.calls.count("open_session") == 1
@@ -173,8 +173,8 @@ class TestSessionLifecycle:
         ctx = ExecutionContext(backend=backend, project_params={"N": 32})
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
         ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx.send_tensor(ki.get_tensor("data_in"))
-        ctx.recv_tensor(ki.get_tensor("data_out"))
+        ctx.push_tensor(ki.get_tensor("data_in"))
+        ctx.pull_tensor(ki.get_tensor("data_out"))
         ctx.run()
         ctx.close()
 
@@ -187,8 +187,8 @@ class TestSessionLifecycle:
         ctx = ExecutionContext(backend=backend, project_params={"N": 32})
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
         ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx.send_tensor(ki.get_tensor("data_in"))
-        ctx.recv_tensor(ki.get_tensor("data_out"))
+        ctx.push_tensor(ki.get_tensor("data_in"))
+        ctx.pull_tensor(ki.get_tensor("data_out"))
         ctx.run()
 
         ctx.close()
@@ -203,8 +203,8 @@ class TestSessionLifecycle:
         with ExecutionContext(backend=backend, project_params={"N": 32}) as ctx:
             ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
             ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-            ctx.send_tensor(ki.get_tensor("data_in"))
-            ctx.recv_tensor(ki.get_tensor("data_out"))
+            ctx.push_tensor(ki.get_tensor("data_in"))
+            ctx.pull_tensor(ki.get_tensor("data_out"))
             ctx.run()
 
         assert "close_session" in backend.calls
@@ -221,8 +221,8 @@ class TestBackwardCompat:
         ctx = ExecutionContext(backend=backend, project_params={"N": 32})
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
         ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx.send_tensor(ki.get_tensor("data_in"))
-        ctx.recv_tensor(ki.get_tensor("data_out"))
+        ctx.push_tensor(ki.get_tensor("data_in"))
+        ctx.pull_tensor(ki.get_tensor("data_out"))
         ctx.run()
 
         assert "execute" in backend.calls
@@ -233,8 +233,8 @@ class TestBackwardCompat:
         ctx = ExecutionContext(project_params={"N": 32})
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
         ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx.send_tensor(ki.get_tensor("data_in"))
-        ctx.recv_tensor(ki.get_tensor("data_out"))
+        ctx.push_tensor(ki.get_tensor("data_in"))
+        ctx.pull_tensor(ki.get_tensor("data_out"))
         result = ctx.run()
         assert result.status == "DONE"
 

@@ -44,10 +44,9 @@ class TestScaleAddProbe(TestScenario):
         k = ctx.instantiate(ScaleAddKernel, N=N)
         k.generate_inputs(seed=42)
 
-        h_load = ctx.load_tensor(k.data_in)
-        h_cfg = ctx.configure(k, dep=h_load)
+        h_push = ctx.push_tensor(k.data_in)
+        h_cfg = ctx.configure(k, dep=h_push)
 
-        h_push = ctx.push_tensor(k.data_in, dep=h_cfg)
         h_pull = ctx.pull_tensor(k.data_out, dep=h_cfg, probe=True)
 
         h_start_s = ctx.write_register(k.scale_ctrl, {"start": 1}, dep=h_cfg)
@@ -57,5 +56,3 @@ class TestScaleAddProbe(TestScenario):
         h_poll_o = ctx.poll_register(k.offset_ctrl, "done", dep=h_start_o)
         h_pull.add_commit_dependency(h_poll_s)
         h_pull.add_commit_dependency(h_poll_o)
-
-        ctx.verify(h_pull, k.forward()["data_out"])

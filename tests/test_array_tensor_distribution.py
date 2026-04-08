@@ -3,7 +3,7 @@
 Validates:
 - Tensor data block-split across array elements (Stage 3)
 - Per-element buffer_id allocation (Stage 6)
-- Per-element PUSH/PULL/SEND/RECV command generation (Stage 6)
+- Per-element PUSH/PULL command generation (Stage 6)
 - SHM packing with per-element buffers (Stage 7)
 """
 
@@ -409,18 +409,18 @@ class TestArrayPushPullCommands:
         total = sum(c.size for c in push_cmds)
         assert total == exp._serialized_size
 
-    def test_push_first_cmd_gets_deps(self):
-        """First element PUSH gets upstream deps, rest get empty."""
+    def test_push_each_cmd_depends_on_its_load(self):
+        """Each PUSH depends on its corresponding LOAD."""
         view, lowering, inst, exp = self._setup_with_data([4])
         ops = [
             Operation(kind=OpKind.PUSH_TENSOR, tensor=exp.origin_tensor),
         ]
         commands, _ = lowering.lower(ops)
+        load_cmds = [c for c in commands if c.op == OpCode.LOAD]
         push_cmds = [c for c in commands if c.op == OpCode.PUSH]
-        # No upstream deps in this case, but structure should be correct
-        # First cmd can have deps, rest must be empty
-        for cmd in push_cmds[1:]:
-            assert cmd.dep == []
+        # Each PUSH should depend on its corresponding LOAD
+        for i, push_cmd in enumerate(push_cmds):
+            assert push_cmd.dep == [load_cmds[i].cmd_id]
 
     def test_pull_generates_n_commands(self):
         """pull_tensor on [3] array → 3 PULL commands."""
@@ -462,15 +462,15 @@ class TestArrayPushPullCommands:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §4 — Send/Recv Tensor with Array (Phase C2)
+# §4 — Push/Pull Tensor with Array (Phase C2)
 # ═══════════════════════════════════════════════════════════════════
 
 
-class TestArraySendRecvCommands:
-    """send_tensor/recv_tensor expand to per-element LOAD+PUSH / PULL+STORE."""
+class TestArrayPushPullExpandedCommands:
+    """push_tensor/pull_tensor expand to per-element LOAD+PUSH / PULL commands."""
 
-    def test_send_tensor_generates_load_push_pairs(self):
-        """send_tensor on [2] array → 2 LOAD + 2 PUSH = 4 commands."""
+    def test_push_tensor_generates_load_push_pairs(self):
+        """push_tensor on [2] array → 2 LOAD + 2 PUSH = 4 commands."""
         spec = _make_array_spec([2])
         view, lowering, inst = _make_array_ir_setup(spec, ArrayKernel)
         exp = view.exposed_tensors["wgt"]
@@ -485,7 +485,7 @@ class TestArraySendRecvCommands:
         lowering = IRLowering(view)
 
         ops = [
-            Operation(kind=OpKind.SEND_TENSOR, tensor=exp.origin_tensor),
+            Operation(kind=OpKind.PUSH_TENSOR, tensor=exp.origin_tensor),
         ]
         commands, _ = lowering.lower(ops)
         load_cmds = [c for c in commands if c.op == OpCode.LOAD]
@@ -496,8 +496,8 @@ class TestArraySendRecvCommands:
         for i, push_cmd in enumerate(push_cmds):
             assert push_cmd.dep == [load_cmds[i].cmd_id]
 
-    def test_recv_tensor_generates_pull_commands(self):
-        """recv_tensor on [2] array for AXI4-Stream → 2 PULL (no STORE)."""
+    def test_pull_tensor_generates_pull_commands(self):
+        """pull_tensor on [2] array for AXI4-Stream → 2 PULL (no STORE)."""
         spec = _make_array_output_spec([2])
         view, lowering, inst = _make_array_ir_setup(
             spec, ArrayOutputKernel, tensor_name="result"
@@ -506,7 +506,7 @@ class TestArraySendRecvCommands:
         assert exp._port_buffers is not None
 
         ops = [
-            Operation(kind=OpKind.RECV_TENSOR, tensor=exp.origin_tensor),
+            Operation(kind=OpKind.PULL_TENSOR, tensor=exp.origin_tensor),
         ]
         commands, _ = lowering.lower(ops)
         pull_cmds = [c for c in commands if c.op == OpCode.PULL]
@@ -574,8 +574,8 @@ class TestArrayFullPipeline:
         # Verify tensor_data has per-element entries
         assert len(result.tensor_data) == 4
 
-    def test_compile_send_tensor_with_array(self):
-        """send_tensor with array: LOAD+PUSH pairs in SHM."""
+    def test_compile_push_tensor_with_array(self):
+        """push_tensor with array: LOAD+PUSH pairs in SHM."""
         from vten.runtime.engine import RuntimeEngine
 
         spec = _make_array_spec([2])
@@ -590,7 +590,7 @@ class TestArrayFullPipeline:
 
         ops = [
             Operation(
-                kind=OpKind.SEND_TENSOR,
+                kind=OpKind.PUSH_TENSOR,
                 tensor=inst.kernel_class_instance.wgt,
             ),
         ]

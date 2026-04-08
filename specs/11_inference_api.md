@@ -76,9 +76,9 @@ y = r2["ofm_mem"].cpu()  # 최종만 host로
 
 | | Verification | Inference |
 |---|---|---|
-| `ctx.verify()` | golden 비교 실행 | **no-op** |
-| `ctx.send_tensor()` (bound) | LOAD+PUSH | **skip** (BO on device) |
-| `ctx.recv_tensor()` | PULL + STORE | **PULL only** (device에 남김) |
+| `ctx.run(verify=True)` | golden 비교 실행 | **no-op** (verify 무시) |
+| `ctx.push_tensor()` (bound) | LOAD+PUSH | **skip** (BO on device) |
+| `ctx.pull_tensor()` | PULL + STORE | **PULL only** (device에 남김) |
 | `ctx.configure()` | WRITE_REG | WRITE_REG (동일) |
 | `ctx.write_register()` | WRITE_REG | WRITE_REG (동일) |
 | output | `result.output_tensors` (torch.Tensor) | `dict[str, Tensor(on_device)]` |
@@ -236,10 +236,9 @@ result = session.run(
    - torch.Tensor → ki.get_tensor(name).logical_data = data (layout 자동)
    - Tensor(on_device) → ctx.bind_device_buffer(tensor, data._bo) (skip 등록)
 5. ki.run(ctx)  ← 기존 DSL sequence 그대로 실행
-   - ctx.send_tensor() → bound면 NoOpHandle, 아니면 LOAD+PUSH op 기록
+   - ctx.push_tensor() → bound면 NoOpHandle, 아니면 LOAD+PUSH op 기록
    - ctx.configure() → WRITE_REG ops 기록
-   - ctx.recv_tensor() → PULL op만 기록 (STORE 안 함)
-   - ctx.verify() → no-op (inference mode)
+   - ctx.pull_tensor() → PULL op만 기록 (STORE 안 함)
 6. result = ctx.run()  → compile (Stages 0-6) + execute (XrtBackend)
 7. output을 Tensor(on_device=True)로 wrap하여 반환
 ```
@@ -475,13 +474,14 @@ ctx = ExecutionContext(
 
 ### 8.2 동작 변경
 
-**verify() — no-op:**
+**run(verify=True) — inference mode에서 no-op:**
 
 ```python
-def verify(self, handle, golden=None, **kwargs):
-    if self._mode == "inference":
-        return  # golden 계산도 스킵
-    # 기존 verification 로직
+def run(self, verify: bool = False):
+    # ... compile + execute ...
+    if verify and self._mode != "inference":
+        self._run_auto_verification(compiled, result)
+    # inference mode에서는 verify=True여도 무시
 ```
 
 **bind_device_buffer() — NEW:**
@@ -489,33 +489,35 @@ def verify(self, handle, golden=None, **kwargs):
 ```python
 def bind_device_buffer(self, tensor: Tensor, bo: Any) -> None:
     """Tensor(on_device)의 BO를 바인딩.
-    이후 send_tensor() 호출 시 자동 skip."""
+    이후 push_tensor() 호출 시 자동 skip."""
     self._bound_bos[tensor.name] = bo
 ```
 
-**send_tensor() — bound면 skip:**
+**push_tensor() — bound면 skip:**
 
 ```python
-def send_tensor(self, tensor, dep=None):
+def push_tensor(self, tensor, dep=None, probe=False):
     if self._mode == "inference" and tensor.name in self._bound_bos:
         return NoOpHandle()  # BO 이미 device에 → 아무것도 안 함
-    # 기존 로직: load + push op 기록
+    # 기존 로직: LOAD + PUSH op 기록
 ```
 
-**recv_tensor() — PULL only:**
+**pull_tensor() — inference mode에서 PULL only:**
 
 ```python
-def recv_tensor(self, tensor, dep=None, chunks=None):
+def pull_tensor(self, tensor, dep=None, probe=False, chunks=None):
     if self._mode == "inference":
-        return self.pull_tensor(tensor, dep=dep)  # PULL만, STORE 안 함
-    # 기존 로직: pull + store op 기록
+        # PULL만, STORE 안 함 (데이터는 device에 남김)
+        return self._record(OpKind.PULL_TENSOR, tensor=tensor, dep=dep,
+                            probe=probe, _skip_store=True)
+    # 기존 로직: PULL + STORE op 기록
 ```
 
 ### 8.3 NoOpHandle
 
 ```python
 class NoOpHandle:
-    """bound된 send_tensor()가 반환하는 placeholder.
+    """bound된 push_tensor()가 반환하는 placeholder.
     dep= 체인에서 무시된다."""
     @property
     def op_index(self) -> int:
@@ -669,7 +671,7 @@ After:
 | `ctx.poll_register()` | XRT inference에 필요 (LAYER_DONE 폴링) |
 | `ctx.read_register()` | 디버깅용 |
 | `ctx.alias()` | 같은 ctx 내 multi-kernel에 여전히 유용 |
-| `ctx.store_tensor()` | recv_tensor 내부 사용 |
+| STORE IR command | pull_tensor 내부에서 자동 생성 |
 
 ---
 

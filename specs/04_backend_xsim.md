@@ -850,7 +850,7 @@ gcc -shared -fPIC -o libvten_shm.so \
 typedef enum logic [3:0] {
     OP_LOAD=4'd1, OP_PUSH=4'd2, OP_PULL=4'd3, OP_STORE=4'd4,
     OP_WRITE_REG=4'd5, OP_READ_REG=4'd6, OP_POLL_REG=4'd7,
-    OP_BARRIER=4'd8, OP_COMPARE=4'd9
+    OP_BARRIER=4'd8
 } opcode_t;
 
 typedef enum logic [1:0] {
@@ -923,8 +923,7 @@ typedef enum logic [3:0] {
     OP_WRITE_REG = 4'd5,
     OP_READ_REG  = 4'd6,
     OP_POLL_REG  = 4'd7,
-    OP_BARRIER   = 4'd8,
-    OP_COMPARE   = 4'd9
+    OP_BARRIER   = 4'd8
 } opcode_t;
 
 // ═══════════════════════════════════════════════════════════════

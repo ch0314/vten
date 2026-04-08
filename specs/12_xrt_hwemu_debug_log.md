@@ -121,14 +121,14 @@ XRT hw_emu 백엔드를 통한 NPU_3D E2E 검증 과정에서 발견된 이슈�
   - STORE 단계에서 `map_read()` 선호 (원본 host code 패턴 매치)
 - **파일**: `vten/runtime/interpreter.py`
 
-### 5.2 `recv_tensor` 실행 순서 → emulator crash
+### 5.2 `pull_tensor` 실행 순서 → emulator crash
 
 - **증상**: hw_emu ~18분 후 xsim crash
   ```
   [libprotobuf ERROR] Can't parse message of type "xclReadAddrKernelCtrl_response"
   ERROR: [HW-EMU 22] xclRegRW - xclRead failed for CU: 0
   ```
-- **원인**: `npu_pipeline_kernel.py`에서 `recv_tensor` (`bo.sync(FROM_DEVICE)`)가
+- **원인**: `npu_pipeline_kernel.py`에서 `pull_tensor` (`bo.sync(FROM_DEVICE)`)가
   `poll_register`보다 먼저 실행. DUT가 DDR[0]에 쓰는 중에 host가 DDR[0] read →
   bus contention → emulator 내부 상태 손상
 - **해결**: dependency chain 수정
@@ -137,7 +137,7 @@ XRT hw_emu 백엔드를 통한 NPU_3D E2E 검증 과정에서 발견된 이슈�
   # After:  cfg → vsync → POLL → POLL → PULL (correct)
   h_started = ctx.poll_register(..., expected=0, dep=h_vsync)
   h_done    = ctx.poll_register(..., dep=h_started)
-  h_ofm     = ctx.recv_tensor(self.ofm_mem, dep=h_done)
+  h_ofm     = ctx.pull_tensor(self.ofm_mem, dep=h_done)
   ```
 - **파일**: `npu_pipeline_kernel.py`
 
@@ -176,7 +176,7 @@ XRT hw_emu 백엔드를 통한 NPU_3D E2E 검증 과정에서 발견된 이슈�
 - 메모리 뱅크 매핑 (group_id fallback): **완료**
 - 레지스터 설정값 (host.cpp 대비): **검증 완료**
 - BO 할당/초기화: **완료**
-- recv_tensor 순서 (PULL after POLL): **완료**
+- pull_tensor 순서 (PULL after POLL): **완료**
 - emulator crash: **해결**
 - 파이프라인 데이터 흐름: **전체 동작 확인** (Vitis-EM 통계로 확인)
 - Deferred STORE timing: **해결** — POLL#2 후 flush

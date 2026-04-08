@@ -38,7 +38,7 @@ def apply_declarative_probes(
         else:
             for op in pending_ops:
                 if (
-                    op.kind in (OpKind.PULL_TENSOR, OpKind.RECV_TENSOR)
+                    op.kind == OpKind.PULL_TENSOR
                     and op.tensor is not None
                     and op.tensor.name == probe_spec
                 ):

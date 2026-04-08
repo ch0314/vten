@@ -44,11 +44,10 @@ class TestDmaPipelineStore(TestScenario):
         k = ctx.instantiate(DmaPipelineKernel, N=N)
         k.generate_inputs(seed=42)
 
-        h_load = ctx.load_tensor(k.data_in)
-        h_push = ctx.push_tensor(k.data_in, dep=h_load)
-        h_pull = ctx.pull_tensor(k.data_out, dep=h_load)
+        h_push = ctx.push_tensor(k.data_in)
+        h_pull = ctx.pull_tensor(k.data_out, dep=h_push)
 
-        h_cfg = ctx.configure(k, dep=h_load)
+        h_cfg = ctx.configure(k, dep=h_push)
 
         h_start_rdma = ctx.write_register(k.rdma_ctrl, {"start": 1}, dep=h_cfg)
         h_start_scale = ctx.write_register(k.scale_ctrl, {"start": 1}, dep=h_cfg)
@@ -64,8 +63,3 @@ class TestDmaPipelineStore(TestScenario):
         h_pull.add_commit_dependency(h_poll_scale)
         h_pull.add_commit_dependency(h_poll_offset)
         h_pull.add_commit_dependency(h_poll_wdma)
-
-        # Store output tensor back to host memory
-        h_store = ctx.store_tensor(k.data_out, dep=h_pull)
-
-        ctx.verify(h_pull, k.forward()["data_out"])

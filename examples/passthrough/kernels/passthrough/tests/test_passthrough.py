@@ -27,9 +27,6 @@ class TestPassthroughProbe(TestScenario):
         k = ctx.instantiate(PassthroughKernel, N=cfg.get("N", 1024))
         k.generate_inputs(seed=42)
 
-        h_load = ctx.load_tensor(k.data_in)
-        h_push = ctx.push_tensor(k.data_in, dep=h_load)
+        h_push = ctx.push_tensor(k.data_in)
         # probe=True: BFM compares each output beat against golden buffer (buf 0)
-        h_pull = ctx.pull_tensor(k.data_out, dep=h_load, probe=True)
-        # Host-side verify confirms data integrity
-        ctx.verify(h_pull, k.forward()["data_out"])
+        h_pull = ctx.pull_tensor(k.data_out, dep=h_push, probe=True)

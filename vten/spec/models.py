@@ -43,15 +43,12 @@ class OpCode(Enum):
     READ_REG = 6
     POLL_REG = 7
     BARRIER = 8
-    COMPARE = 9
 
 
 # ── OpKind (§1.5 — Record Phase Operations) ──
 
 
 class OpKind(Enum):
-    LOAD_TENSOR = "load_tensor"
-    STORE_TENSOR = "store_tensor"
     PUSH_TENSOR = "push_tensor"
     PULL_TENSOR = "pull_tensor"
     WRITE_REGISTER = "write_register"
@@ -59,8 +56,6 @@ class OpKind(Enum):
     POLL_REGISTER = "poll_register"
     CONFIGURE = "configure"
     BARRIER = "barrier"
-    SEND_TENSOR = "send_tensor"
-    RECV_TENSOR = "recv_tensor"
 
 
 # ── MappingType (§1.6) ──

@@ -17,7 +17,7 @@
 
 ## 1. Passthrough E2E (Minimal Pipeline)
 
-최소 파이프라인으로 전체 흐름(DSL → IR → SHM → BFM → DUT → BFM → SHM → verify) 검증.
+최소 파이프라인으로 전체 흐름(DSL → IR → SHM → BFM → DUT → BFM → SHM → verification) 검증.
 
 ### 1.1 DUT
 
@@ -134,7 +134,7 @@ class TestPassthrough(TestScenario):
 
         push1 = ctx.push_tensor(k.data_in)
         pull1 = ctx.pull_tensor(k.data_out, dep=push1)
-        ctx.verify(pull1, k.forward())
+        ctx.run(verify=True)  # golden 자동 계산 (forward() 호출)
 ```
 
 ### 1.6 Build & Run
@@ -174,26 +174,23 @@ Memory-mapped 인터페이스 전체 흐름 검증.
 ### 2.1 Workflow
 
 ```
-1. load_tensor(ifm)        → LOAD cmd, SHM buf 0 populated
-2. load_tensor(weight)     → LOAD cmd, SHM buf 1 populated
-3. configure(kernel)       → N × WRITE_REG cmds (auto_bind)
+1. configure(kernel)       → N × WRITE_REG cmds (auto_bind)
+2. push_tensor(ifm)        → LOAD + PUSH cmds (SHM buf 0 populated, BFM slave, accel reads)
+3. push_tensor(weight)     → LOAD + PUSH cmds (SHM buf 1 populated)
 4. write_register(start=1) → WRITE_REG cmd
-5. push_tensor(ifm)        → PUSH cmd (BFM slave, accel reads)
-6. push_tensor(weight)     → PUSH cmd
-7. pull_tensor(ofm)        → PULL cmd (BFM slave, accel writes)
-8. poll_register(done)     → POLL_REG cmd
-9. store_tensor(ofm)       → STORE cmd
-10. verify(golden)
+5. pull_tensor(ofm)        → PULL + STORE cmds (BFM slave, accel writes)
+6. poll_register(done)     → POLL_REG cmd
+7. run(verify=True)        → golden 자동 검증
 ```
 
 ### 2.2 Key Verification Points
 
-- LOAD 사전 committed → write_register가 dep 충족으로 즉시 dispatch
+- push_tensor 내부의 LOAD 사전 committed → write_register가 dep 충족으로 즉시 dispatch
 - configure() → auto_bind 레지스터에 올바른 주소 기록
 - PUSH BFM이 DUT read 요청에 올바른 데이터 서빙
 - PULL BFM이 DUT write 데이터를 올바르게 SHM에 기록
 - POLL_REG가 done 비트 감지 후 PULL의 commit dependency 해제
-- STORE 후 역직렬화된 output == golden
+- STORE 후 역직렬화된 output == golden (run(verify=True)로 자동 검증)
 
 ---
 
@@ -208,20 +205,16 @@ def run(self, ctx, cfg):
     npu = ctx.instantiate("npu_top", C=64, D=32, H=32, W=32)
     npu.generate_inputs(seed=42)
 
-    l1 = ctx.load_tensor(npu.ifm)           # op 0
-    l2 = ctx.load_tensor(npu.weight)         # op 1
-    ctx.configure(npu)                       # op 2
+    ctx.configure(npu)                       # op 0
+    push1 = ctx.push_tensor(npu.ifm)            # op 1 → LOAD + PUSH
+    push2 = ctx.push_tensor(npu.weight)          # op 2 → LOAD + PUSH
     w0 = ctx.write_register(npu.ctrl,
-             {"start": 1}, dep=[l1, l2])     # op 3
-    push1 = ctx.push_tensor(npu.ifm, dep=w0)    # op 4
-    push2 = ctx.push_tensor(npu.weight, dep=w0)  # op 5
-    pull1 = ctx.pull_tensor(npu.ofm,
-                dep=[push1, push2])          # op 6
+             {"start": 1}, dep=[push1, push2])   # op 3
+    pull1 = ctx.pull_tensor(npu.ofm, dep=w0)     # op 4 → PULL + STORE
     p1 = ctx.poll_register(npu.ctrl,
-             "done", dep=w0)                 # op 7
+             "done", dep=w0)                     # op 5
     pull1.add_commit_dependency(p1)
-    s1 = ctx.store_tensor(npu.ofm, dep=pull1)    # op 8
-    ctx.verify(s1, npu.forward())
+    ctx.run(verify=True)  # golden 자동 계산 (forward() chain)
 ```
 
 ### 3.2 Stage 0 — Flatten
@@ -379,7 +372,7 @@ Phase 4 마일스톤: 가장 단순한 파이프라인으로 전체 흐름을 �
 5. **Build**: `vten build --kernel passthrough` (5-stage 빌드 파이프라인)
 6. **Run**: `vten run --kernel passthrough --test test_passthrough`
 
-이것으로 전체 파이프라인(DSL → IR → SHM → BFM → DUT → BFM → SHM → verify)을 검증한 후 복잡도를 추가한다.
+이것으로 전체 파이프라인(DSL → IR → SHM → BFM → DUT → BFM → SHM → verification)을 검증한 후 복잡도를 추가한다.
 
 ### 4.4 Multi-Kernel E2E Target
 
@@ -407,7 +400,7 @@ Phase 5 마일스톤: 다중 커널 프로젝트에서 공유 빌드 + 커널별
 
 ### Resolved (v0.4.2)
 
-- ~~CONFIGURE OpCode SHM 출현 여부~~: 삭제됨. Runtime이 WRITE_REG로 확장. OpCode re-encoding (BARRIER=8, COMPARE=9).
+- ~~CONFIGURE OpCode SHM 출현 여부~~: 삭제됨. Runtime이 WRITE_REG로 확장. OpCode re-encoding (BARRIER=8). COMPARE도 삭제됨.
 - ~~Backend error code 값 테이블~~: `BackendErrorCode` 클래스 정의 (00_data_models §10.13). 코드 0~9.
 - ~~cmd_bfm_map 생성~~: Codegen이 `iface_to_bfm[]` 룩업 테이블 생성 (06_codegen_and_cli §3.3).
 - ~~Controller↔Scheduler 인터페이스~~: `feed_valid`/`feed_ready`/`feed_done` handshake 통일. S_DISPATCH → S_LOAD_BATCH + S_FEED 분리.

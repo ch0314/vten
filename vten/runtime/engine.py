@@ -69,6 +69,7 @@ class CompiledResult:
     bfm_configs: list[BFMConfig]
     buffer_ids: dict[str, int]
     flattened_view: FlattenedKernelView
+    ops: list[Operation] = field(default_factory=list)  # original DSL operations
     probe_reports: list[ProbePoint] = field(default_factory=list)
     tensor_data: dict[int, bytes] = field(default_factory=dict)
     iface_id_to_name: dict[int, str] = field(default_factory=dict)
@@ -257,6 +258,7 @@ class RuntimeEngine:
             bfm_configs=bfm_configs,
             buffer_ids=buffer_ids,
             flattened_view=view,
+            ops=list(self._ops),
             probe_reports=view.probe_points,
             tensor_data=tensor_data,
             iface_id_to_name=iface_id_to_name,
@@ -871,12 +873,8 @@ class RuntimeEngine:
         """
         from vten.spec.models import OpKind
 
-        h2d_ops = {
-            OpKind.SEND_TENSOR, OpKind.PUSH_TENSOR, OpKind.LOAD_TENSOR,
-        }
-        d2h_ops = {
-            OpKind.RECV_TENSOR, OpKind.PULL_TENSOR, OpKind.STORE_TENSOR,
-        }
+        h2d_ops = {OpKind.PUSH_TENSOR}
+        d2h_ops = {OpKind.PULL_TENSOR}
 
         referenced: set[str] = set()
         for op in self._ops:
@@ -1318,12 +1316,18 @@ class RuntimeEngine:
         logger.debug("compile_multi complete: %d commands, %d buffers, %.1fms",
                      len(all_commands), len(all_buffer_ids), elapsed * 1000)
 
+        # Collect all ops from all engines
+        all_ops = []
+        for eng in engines:
+            all_ops.extend(eng._ops)
+
         return CompiledResult(
             commands=all_commands,
             shm_image=shm_image,
             bfm_configs=all_bfm_configs,
             buffer_ids=all_buffer_ids,
             flattened_view=views[0],  # Primary view for output tensor reading
+            ops=all_ops,
             probe_reports=views[0].probe_points,
             tensor_data=all_tensor_data,
             iface_id_to_name=all_iface_id_to_name,

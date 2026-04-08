@@ -222,7 +222,7 @@ Phase 5: Validation         ← specs: 07
 class OpCode(Enum):      # §1.4 — SHM 인코딩 값
     LOAD=1, PUSH=2, PULL=3, STORE=4,
     WRITE_REG=5, READ_REG=6, POLL_REG=7,
-    BARRIER=8, COMPARE=9
+    BARRIER=8
 
 class Protocol(Enum):    # §1.1
     AXI4S="axi4_stream", AXI4="axi4", AXI4L="axi4_lite"

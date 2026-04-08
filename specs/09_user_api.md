@@ -30,7 +30,7 @@ API       └────────────┬─────────�
                        │
 Level 1   ┌────────────┴─────────────────────┐  세밀한 제어
 DSL       │  h = ctx.push_tensor(k.ifm)       │  의존성/순서 직접 지정
-          │  ctx.verify(h, golden)             │
+          │  ctx.run(verify=True)              │
           └────────────┬─────────────────────┘
                        │
 Level 0   ┌────────────┴─────────────────────┐  항상 필요
@@ -142,37 +142,26 @@ ctx = ExecutionContext(backend=backend, project_params={"N": 1024})
 k = ctx.instantiate(PassthroughKernel, N=1024)
 k.generate_inputs(seed=42)
 
-# L1: Host ↔ SHM
-h_load = ctx.load_tensor(k.data_in)
+# Data: Host ↔ DUT
+h_push = ctx.push_tensor(k.data_in)         # LOAD + PUSH 자동 생성
+h_pull = ctx.pull_tensor(k.data_out, dep=h_push)  # PULL + STORE 자동 생성
 
-# L2: SHM ↔ DUT
-h_push = ctx.push_tensor(k.data_in, dep=h_load)
-h_pull = ctx.pull_tensor(k.data_out, dep=h_push)
-
-# 검증
-ctx.verify(h_pull, k.forward()["data_out"])
-
-result = ctx.run()   # → BatchResult
+# 실행 + 검증
+result = ctx.run(verify=True)   # → BatchResult (golden 자동 계산)
 print(result.status)  # "DONE"
 ```
 
 ### 3.2 DSL Operations
 
-**L1: Host ↔ SHM Memory**
+**Data: Host ↔ DUT**
 
 | 메서드 | 설명 | IR 명령 |
 |--------|------|---------|
-| `ctx.load_tensor(t)` | Host → SHM (H2D 텐서 직렬화/적재) | LOAD |
-| `ctx.store_tensor(t)` | SHM → Host (D2H 텐서 읽기/역직렬화) | STORE |
+| `ctx.push_tensor(t)` | Host → DUT 텐서 전송 (LOAD + PUSH 자동 생성) | LOAD + PUSH |
+| `ctx.pull_tensor(t)` | DUT → Host 텐서 수신 (PULL + STORE 자동 생성) | PULL + STORE |
+| `ctx.pull_tensor(t, chunks=N)` | DUT → Host 텐서를 N 청크로 분할 수신 | N × (PULL + STORE) |
 
-**L2: SHM ↔ Accelerator (BFM)**
-
-| 메서드 | 설명 | IR 명령 |
-|--------|------|---------|
-| `ctx.push_tensor(t)` | SHM → DUT (BFM이 DUT에 데이터 전송) | PUSH |
-| `ctx.pull_tensor(t)` | DUT → SHM (BFM이 DUT에서 데이터 수신) | PULL |
-
-**L3: Control**
+**Control**
 
 | 메서드 | 설명 | IR 명령 |
 |--------|------|---------|
@@ -182,19 +171,11 @@ print(result.status)  # "DONE"
 | `ctx.configure(kernel)` | auto_bind 레지스터 일괄 쓰기 | N × WRITE_REG |
 | `ctx.barrier()` | 전체 동기화 펜스 | BARRIER |
 
-**Shorthands** (L1+L2 결합)
-
-| 메서드 | 확장 | 용도 |
-|--------|------|------|
-| `ctx.send_tensor(t)` | load + push | H2D 텐서 전체 전송 |
-| `ctx.recv_tensor(t)` | pull + store | D2H 텐서 전체 수신 |
-| `ctx.recv_tensor(t, chunks=N)` | N × (pull + store) | D2H 텐서를 N 청크로 분할 수신 |
-
-**검증 & 버퍼 재사용**
+**실행 & 검증 & 버퍼 재사용**
 
 | 메서드 | 설명 |
 |--------|------|
-| `ctx.verify(handle, golden)` | HW 출력 vs golden 비교 |
+| `ctx.run(verify=True)` | 실행 + auto-golden 검증 (forward() 자동 호출) |
 | `ctx.alias(src, dst)` | 버퍼 재사용 (LOAD/STORE 스킵) |
 | `handle.add_commit_dependency(other)` | commit 의존성 추가 |
 | `ctx.set_internal_probe_golden(sub, tensor, golden)` | 내부 probe golden 등록 |
@@ -204,18 +185,15 @@ print(result.status)  # "DONE"
 의존성은 `dep=` 파라미터로 지정한다.
 
 ```python
-l1 = ctx.load_tensor(k.ifm)         # dep 없음 → 즉시 실행 가능
-l2 = ctx.load_tensor(k.weight)      # dep 없음 → l1과 병렬
-
-cfg = ctx.configure(k, dep=[l1, l2]) # l1, l2 완료 후 configure
-push = ctx.push_tensor(k.ifm, dep=cfg)
-pull = ctx.pull_tensor(k.ofm, dep=push)
+cfg = ctx.configure(k)                 # auto_bind 레지스터 설정
+push1 = ctx.push_tensor(k.ifm, dep=cfg)    # LOAD + PUSH, configure 완료 후
+push2 = ctx.push_tensor(k.weight, dep=cfg)  # LOAD + PUSH, configure 완료 후
+pull = ctx.pull_tensor(k.ofm, dep=[push1, push2])  # PULL + STORE
 
 poll = ctx.poll_register(k.ctrl, "done", dep=cfg)
-pull.add_commit_dependency(poll)      # poll 완료 전까지 pull commit 보류
+pull.add_commit_dependency(poll)       # poll 완료 전까지 pull commit 보류
 
-store = ctx.store_tensor(k.ofm, dep=pull)
-ctx.verify(store, k.forward()["ofm"])
+ctx.run(verify=True)  # golden 자동 계산 (forward() 호출)
 ```
 
 ### 3.4 Chunked Receive (`chunks=`)
@@ -224,11 +202,11 @@ DUT가 depth slice 사이에 tready rising edge를 요구하는 경우 등, 전�
 
 ```python
 # chunks=N (int): N등분
-handles = ctx.recv_tensor(k.partial_sum, chunks=in_depth, dep=h_cfg)
+handles = ctx.pull_tensor(k.partial_sum, chunks=in_depth, dep=h_cfg)
 # → list[OperationHandle], 각 chunk별 handle
 
 # chunks=[n0, n1, ...] (list[int]): element count 직접 지정
-handles = ctx.recv_tensor(k.output, chunks=[100, 200, 100], dep=h_cfg)
+handles = ctx.pull_tensor(k.output, chunks=[100, 200, 100], dep=h_cfg)
 ```
 
 **동작 원리:**
@@ -241,9 +219,7 @@ handles = ctx.recv_tensor(k.output, chunks=[100, 200, 100], dep=h_cfg)
 
 **Per-chunk 검증:**
 ```python
-handles = ctx.recv_tensor(k.psum, chunks=4, dep=h_cfg)
-for d in range(4):
-    ctx.verify(handles[d], golden_per_depth[d])
+handles = ctx.pull_tensor(k.psum, chunks=4, dep=h_cfg)
 ```
 
 **반환 타입:**
@@ -302,7 +278,7 @@ class TestScaleAddProbe(TestScenario):
 
 ```python
 h_pull = ctx.pull_tensor(k.data_out, dep=h_push, probe=True)
-ctx.verify(h_pull, k.forward()["data_out"])  # golden이 SHM에도 전달됨
+# golden은 run(verify=True)로 자동 계산되거나 probe의 golden_buf로 전달됨
 ```
 
 **내부 Probe:**
@@ -348,9 +324,9 @@ y = outputs["data_out"]          # D2H 텐서 자동 역직렬화
 ```
 
 **자동 생성되는 DSL:**
-1. `inputs`에 있는 텐서 → `ctx.send_tensor()` (= load + push)
+1. `inputs`에 있는 텐서 → `ctx.push_tensor()` (= LOAD + PUSH)
 2. `configure=True` → `ctx.configure()`
-3. `inputs`에 없는 텐서 → `ctx.recv_tensor()` (= pull + store)
+3. `inputs`에 없는 텐서 → `ctx.pull_tensor()` (= PULL + STORE)
 
 ### 4.2 KernelExecutor — 반복 호출 + 자동 alias
 
@@ -390,8 +366,8 @@ ctx = ExecutionContext(backend=backend, project_params={"N": 1024})
 k = ctx.instantiate(PassthroughKernel, N=1024)
 k.data_in.data = x
 
-h_send = ctx.send_tensor(k.data_in)
-h_recv = ctx.recv_tensor(k.data_out, dep=h_send)
+h_push = ctx.push_tensor(k.data_in)       # LOAD + PUSH
+h_pull = ctx.pull_tensor(k.data_out, dep=h_push)  # PULL + STORE
 
 result = ctx.run()
 y = result.output_tensors["data_out"]
@@ -446,10 +422,9 @@ class TestPassthrough(TestScenario):
         k = ctx.instantiate(PassthroughKernel, N=cfg.get("N", 1024))
         k.generate_inputs(seed=42)
 
-        h_load = ctx.load_tensor(k.data_in)
-        h_push = ctx.push_tensor(k.data_in, dep=h_load)
-        h_pull = ctx.pull_tensor(k.data_out, dep=h_push)
-        ctx.verify(h_pull, k.forward()["data_out"])
+        h_push = ctx.push_tensor(k.data_in)         # LOAD + PUSH
+        h_pull = ctx.pull_tensor(k.data_out, dep=h_push)  # PULL + STORE
+        ctx.run(verify=True)  # golden 자동 계산 (forward() 호출)
 ```
 
 **Functional API 방식** (pytest에서 직접 사용 시):
@@ -669,20 +644,22 @@ class MyKernel(Kernel):
 ctx = ExecutionContext(backend=b, project_params={...})
 k = ctx.instantiate(MyKernel, **params)
 
-# 연산
-h = ctx.load_tensor(t) / ctx.store_tensor(t)       # Host ↔ SHM
-h = ctx.push_tensor(t) / ctx.pull_tensor(t)        # SHM ↔ DUT
-h = ctx.send_tensor(t) / ctx.recv_tensor(t)        # Shorthand (load+push / pull+store)
+# 데이터 전송
+h = ctx.push_tensor(t)                              # Host → DUT (LOAD + PUSH)
+h = ctx.pull_tensor(t)                              # DUT → Host (PULL + STORE)
+h = ctx.pull_tensor(t, chunks=N)                    # N 청크로 분할 수신
+
+# 제어
 h = ctx.write_register(reg, {f: v}) / ctx.read_register(reg, f) / ctx.poll_register(reg, f)
 h = ctx.configure(k) / ctx.barrier()
 
-# 의존성 & 검증
-ctx.verify(h, golden)
+# 의존성 & 버퍼 재사용
 ctx.alias(src, dst)
 h.add_commit_dependency(other_h)
 ctx.set_internal_probe_golden(sub, tensor, golden)  # 내부 probe golden 등록
 
-result = ctx.run()  # → BatchResult
+# 실행 & 검증
+result = ctx.run(verify=True)  # → BatchResult (auto-golden 검증 포함)
 ```
 
 ### Functional API (Level 2)
@@ -706,13 +683,11 @@ ctx = ExecutionContext(backend=b, project_params={"N": 1024})
 for cfg in [{"scale_factor": 1}, {"scale_factor": 2}, {"scale_factor": 3}]:
     ki = ctx.instantiate(MyKernel, **cfg)
     ki.generate_inputs(seed=42)
-    h_load = ctx.load_tensor(ki.data_in)
-    h_push = ctx.push_tensor(ki.data_in, dep=h_load)
-    h_pull = ctx.pull_tensor(ki.data_out, dep=h_push)
-    ctx.verify(h_pull, ki.forward())
+    h_push = ctx.push_tensor(ki.data_in)         # LOAD + PUSH
+    h_pull = ctx.pull_tensor(ki.data_out, dep=h_push)  # PULL + STORE
     ctx.config_boundary()           # BARRIER 삽입 + config_group 증가
 
-result = ctx.run()                  # 1회 xsim 실행으로 3개 config 검증
+result = ctx.run(verify=True)       # 1회 xsim 실행으로 3개 config 검증 (auto-golden)
 ```
 
 ### Multi-Batch Session (Level 2 — KernelExecutor)

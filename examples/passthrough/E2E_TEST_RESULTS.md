@@ -22,7 +22,7 @@
 **Features validated**:
 - AXI4-Stream PUSH/PULL
 - Basic SHM → DPI-C → BFM → DUT pipeline
-- Host-side verification (`ctx.verify`)
+- Host-side verification (`ctx.run(verify=True)`)
 
 ### TestPassthrough
 | Field | Value |
@@ -135,7 +135,7 @@
 - `ctx.write_register()` with manual value (length)
 - `ctx.poll_register()` with dual PULL commit dependency
 - Parametric expressions in tensor shapes (`"${N}//2"`)
-- Dual output verification (`ctx.verify` x2)
+- Dual output verification (`run(verify=True)` with 2 output tensors)
 
 ### TestStreamScatter
 | Field | Value |
@@ -212,7 +212,7 @@
 | probe (mismatch) | | v | | v |
 | generate_controller | | v | v | |
 | Parametric expressions | | | v | |
-| Host-side verify PASS | v | v | v | |
+| Host-side verify PASS (run(verify=True)) | v | v | v | |
 | Host-side verify FAIL | | | | v |
 
 ## Not Yet Tested
@@ -220,6 +220,4 @@
 - CompositeKernel (multi-kernel composition)
 - Multi-batch execution
 - probe with explicit golden_buf_id (CompositeKernel Internal)
-- STORE command
-- COMPARE command
 - Waveform dump (`--waveform`)

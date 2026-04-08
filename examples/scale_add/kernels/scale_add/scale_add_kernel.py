@@ -55,12 +55,11 @@ class ScaleAddKernel(CompositeKernel):
         return {"data_out": x.clamp(-128, 127).to(torch.int8)}
 
     def run(self, ctx) -> None:
-        h_load = ctx.load_tensor(self.data_in)
+        h_push = ctx.push_tensor(self.data_in)
 
         # ctx.configure auto-writes runtime_params with register mappings
-        h_cfg = ctx.configure(self, dep=h_load)
+        h_cfg = ctx.configure(self, dep=h_push)
 
-        h_push = ctx.push_tensor(self.data_in, dep=h_cfg)
         h_pull = ctx.pull_tensor(self.data_out, dep=h_cfg)
 
         # Start both sub-kernels
@@ -72,5 +71,3 @@ class ScaleAddKernel(CompositeKernel):
         h_poll_o = ctx.poll_register(self.offset_ctrl, "done", dep=h_start_o)
         h_pull.add_commit_dependency(h_poll_s)
         h_pull.add_commit_dependency(h_poll_o)
-
-        ctx.verify(h_pull, self.forward()["data_out"])

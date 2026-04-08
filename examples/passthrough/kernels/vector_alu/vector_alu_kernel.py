@@ -53,18 +53,14 @@ class VectorAluKernel(Kernel):
         return {"result": raw.clamp(-128, 127).to(torch.int8)}
 
     def run(self, ctx) -> None:
-        h_load_a = ctx.load_tensor(self.operand_a)
-        h_load_b = ctx.load_tensor(self.operand_b)
+        h_push_a = ctx.push_tensor(self.operand_a)
+        h_push_b = ctx.push_tensor(self.operand_b)
 
-        h_cfg = ctx.configure(self, dep=[h_load_a, h_load_b])
+        h_cfg = ctx.configure(self, dep=[h_push_a, h_push_b])
 
-        h_push_a = ctx.push_tensor(self.operand_a, dep=h_cfg)
-        h_push_b = ctx.push_tensor(self.operand_b, dep=h_cfg)
         h_pull = ctx.pull_tensor(self.result, dep=h_cfg)
 
         h_start = ctx.write_register(self.ctrl, {"start": 1}, dep=h_cfg)
 
         h_poll = ctx.poll_register(self.ctrl, "done", dep=h_start)
         h_pull.add_commit_dependency(h_poll)
-
-        ctx.verify(h_pull, self.forward()["result"])

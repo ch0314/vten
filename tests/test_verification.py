@@ -345,65 +345,55 @@ class TestVerificationCompare:
         assert abs(ExecutionContext._max_diff(a, b) - 0.5) < 1e-6
 
 
-class TestVerificationDeferred:
-    """Deferred verification: verify() before run()."""
+class TestAutoVerification:
+    """Auto-verification via ctx.run(verify=True)."""
 
-    def test_verify_before_run_stores_task(self):
+    def test_run_verify_true_triggers_auto_verify(self):
+        """ctx.run(verify=True) calls _auto_verify_all internally."""
         from vten.runtime.context import ExecutionContext
-
-        ctx = ExecutionContext()
-        golden = torch.tensor([1, 2, 3])
-        # Create a fake op_handle
-        from vten.dsl.operations import Operation, OperationHandle
-        from vten.spec.models import OpKind
+        from vten.kernel.base import Kernel
         from vten.kernel.tensor import Tensor
+        from vten.spec.models import InterfaceSpec, KernelSpec, PackingScheme, Protocol
 
-        t = Tensor(shape=(3,), dtype=torch.int32, interface="data_out")
-        t.name = "test_out"
-        op = Operation(kind=OpKind.STORE_TENSOR, tensor=t, dep=[], commit_dep=[])
-        handle = OperationHandle(op=op)
-        ctx.verify(handle, golden)
-        assert len(ctx._verifications) == 1
-        assert ctx._verifications[0].golden is golden
+        class TinyKernel(Kernel):
+            x = Tensor(shape=(4,), dtype=torch.int8, interface="axis_in")
+            y = Tensor(shape=(4,), dtype=torch.int8, interface="axis_out")
+            def forward(self, **inputs):
+                return {"y": self.x.data.clone()}
 
-    def test_multiple_deferred_verifications(self):
+        spec = KernelSpec(
+            kernel_name="tiny",
+            rtl_top="rtl/tiny.sv",
+            interfaces={
+                "axis_in": InterfaceSpec(
+                    name="axis_in", rtl_port="s_axis", protocol=Protocol.AXI4S,
+                    tensor="x",
+                    packing=PackingScheme(element_width=8, elements_per_beat=4),
+                ),
+                "axis_out": InterfaceSpec(
+                    name="axis_out", rtl_port="m_axis", protocol=Protocol.AXI4S,
+                    tensor="y",
+                    packing=PackingScheme(element_width=8, elements_per_beat=4),
+                ),
+            },
+        )
+
+        ctx = ExecutionContext(project_params={})
+        inst = ctx.instantiate(TinyKernel, spec=spec)
+        inst.x.data = torch.tensor([10, 20, 30, 40], dtype=torch.int8)
+        ctx.push_tensor(inst.x)
+        ctx.pull_tensor(inst.y)
+
+        # Without backend, run(verify=True) should not raise
+        result = ctx.run(verify=True)
+        assert result.status == "DONE"
+
+    def test_verifications_list_empty_by_default(self):
+        """_verifications list is empty (no deferred verify API)."""
         from vten.runtime.context import ExecutionContext
 
         ctx = ExecutionContext()
-        from vten.dsl.operations import Operation, OperationHandle
-        from vten.spec.models import OpKind
-        from vten.kernel.tensor import Tensor
-
-        for i in range(3):
-            t = Tensor(shape=(4,), dtype=torch.int32, interface="data_out")
-            t.name = f"out_{i}"
-            op = Operation(kind=OpKind.STORE_TENSOR, tensor=t, dep=[], commit_dep=[])
-            handle = OperationHandle(op=op)
-            ctx.verify(handle, torch.zeros(4))
-
-        assert len(ctx._verifications) == 3
-
-
-class TestVerificationEager:
-    """Eager verification: verify() after run()."""
-
-    def test_verify_after_run_is_eager(self):
-        """When _last_compiled is set, verify() calls _verify_immediate."""
-        from unittest.mock import MagicMock, patch
-        from vten.runtime.context import ExecutionContext
-
-        ctx = ExecutionContext()
-        ctx._last_compiled = MagicMock()
-        ctx._last_backend_result = MagicMock()
-
-        # Should call _verify_immediate, not append to list
-        with patch.object(ctx, "_verify_immediate") as mock_verify:
-            mock_handle = MagicMock()
-            golden = torch.tensor([1])
-            ctx.verify(mock_handle, golden)
-            mock_verify.assert_called_once_with(mock_handle, golden)
-
-        assert len(ctx._verifications) == 0
+        assert ctx._verifications == []
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -33,8 +33,6 @@ class Operation:
     commit_dep: list[OperationHandle] = field(default_factory=list)
     probe: bool = False
     sync: bool = False
-    golden: torch.Tensor | None = None
-    verify: bool = False
     chunk_index: int | None = None
     chunk_total: int | None = None
     chunks_spec: int | list[int] | None = None  # original chunks arg

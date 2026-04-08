@@ -162,17 +162,17 @@ class TestExecutionContextAPI:
         """DSL operations are recorded as pending."""
         ctx = ExecutionContext(project_params={})
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=8)
-        h1 = ctx.load_tensor(inst.data_in)
-        h2 = ctx.push_tensor(inst.data_in, dep=h1)
+        h1 = ctx.push_tensor(inst.data_in)
+        h2 = ctx.pull_tensor(inst.data_out, dep=h1)
         assert len(ctx._pending_ops) == 2
 
     def test_operation_handles_returned(self):
         """Each DSL call returns an OperationHandle."""
         ctx = ExecutionContext(project_params={})
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=8)
-        h = ctx.load_tensor(inst.data_in)
+        h = ctx.push_tensor(inst.data_in)
         assert isinstance(h, OperationHandle)
-        assert h.op.kind == OpKind.LOAD_TENSOR
+        assert h.op.kind == OpKind.PUSH_TENSOR
 
     def test_barrier(self):
         """barrier() records a BARRIER operation."""
@@ -215,8 +215,8 @@ class TestExecutionContextAPI:
         ctx = ExecutionContext(project_params={})
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=8)
         inst.data_in.fill_random()
-        ctx.send_tensor(inst.data_in)
-        ctx.recv_tensor(inst.data_out)
+        ctx.push_tensor(inst.data_in)
+        ctx.pull_tensor(inst.data_out)
         ctx.run()
         assert len(ctx._pending_ops) == 0
 
@@ -229,14 +229,14 @@ class TestExecutionContextAPI:
 class TestPassthroughE2E:
     """End-to-end: passthrough kernel with AXI4-Stream."""
 
-    def test_send_recv_pipeline(self):
-        """send_tensor + recv_tensor → compile → valid commands + SHM."""
+    def test_push_pull_pipeline(self):
+        """push_tensor + pull_tensor → compile → valid commands + SHM."""
         ctx = ExecutionContext(project_params={})
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=16)
         inst.data_in.fill_random()
 
-        h_send = ctx.send_tensor(inst.data_in)
-        h_recv = ctx.recv_tensor(inst.data_out, dep=h_send)
+        h_push = ctx.push_tensor(inst.data_in)
+        h_pull = ctx.pull_tensor(inst.data_out, dep=h_push)
 
         result = ctx.run()
         assert result.status == "DONE"
@@ -253,8 +253,8 @@ class TestPassthroughE2E:
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=16)
         inst.data_in.fill_random()
 
-        ctx.send_tensor(inst.data_in)
-        ctx.recv_tensor(inst.data_out)
+        ctx.push_tensor(inst.data_in)
+        ctx.pull_tensor(inst.data_out)
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -269,8 +269,8 @@ class TestPassthroughE2E:
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=16)
         inst.data_in.fill_random()
 
-        ctx.send_tensor(inst.data_in)
-        ctx.recv_tensor(inst.data_out)
+        ctx.push_tensor(inst.data_in)
+        ctx.pull_tensor(inst.data_out)
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -283,8 +283,8 @@ class TestPassthroughE2E:
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=16)
         inst.data_in.fill_random()
 
-        ctx.send_tensor(inst.data_in)
-        ctx.recv_tensor(inst.data_out)
+        ctx.push_tensor(inst.data_in)
+        ctx.pull_tensor(inst.data_out)
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -297,8 +297,8 @@ class TestPassthroughE2E:
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=16)
         inst.data_in.fill_random()
 
-        ctx.send_tensor(inst.data_in)
-        ctx.recv_tensor(inst.data_out)
+        ctx.push_tensor(inst.data_in)
+        ctx.pull_tensor(inst.data_out)
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -311,8 +311,8 @@ class TestPassthroughE2E:
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=16)
         inst.data_in.fill_random()
 
-        ctx.send_tensor(inst.data_in)
-        ctx.recv_tensor(inst.data_out)
+        ctx.push_tensor(inst.data_in)
+        ctx.pull_tensor(inst.data_out)
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -326,8 +326,8 @@ class TestPassthroughE2E:
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=16)
         inst.data_in.data = torch.arange(16, dtype=torch.int8)
 
-        ctx.send_tensor(inst.data_in)
-        ctx.recv_tensor(inst.data_out)
+        ctx.push_tensor(inst.data_in)
+        ctx.pull_tensor(inst.data_out)
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -354,13 +354,11 @@ class TestMemKernelE2E:
         inst.ifm.fill_random()
         reg = RegisterHandle(interface_name="ctrl")
 
-        h_load = ctx.load_tensor(inst.ifm)
-        h_push = ctx.push_tensor(inst.ifm, dep=h_load)
+        h_push = ctx.push_tensor(inst.ifm)
         h_conf = ctx.configure(inst, dep=h_push)
         h_vsync = ctx.write_register(reg, {"trigger": 1}, dep=h_conf)
         h_poll = ctx.poll_register(reg, "done", dep=h_vsync)
         h_pull = ctx.pull_tensor(inst.ofm, dep=h_poll)
-        h_store = ctx.store_tensor(inst.ofm, dep=h_pull)
 
         result = ctx.run()
         assert result.status == "DONE"
@@ -382,7 +380,7 @@ class TestMemKernelE2E:
         inst = ctx.instantiate(MemKernel, spec=_mem_spec(), IN_CH=32, OUT_CH=32)
         inst.ifm.fill_random()
 
-        ctx.load_tensor(inst.ifm)
+        ctx.push_tensor(inst.ifm)
         ctx.configure(inst)
         ctx.run()
 
@@ -399,7 +397,7 @@ class TestMemKernelE2E:
         inst = ctx.instantiate(MemKernel, spec=_mem_spec(), IN_CH=32, OUT_CH=32)
         inst.ifm.fill_random()
 
-        ctx.load_tensor(inst.ifm)
+        ctx.push_tensor(inst.ifm)
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -413,8 +411,8 @@ class TestMemKernelE2E:
         inst = ctx.instantiate(MemKernel, spec=_mem_spec(), IN_CH=32, OUT_CH=32)
         inst.ifm.fill_random()
 
-        ctx.load_tensor(inst.ifm)
-        ctx.store_tensor(inst.ofm)
+        ctx.push_tensor(inst.ifm)
+        ctx.pull_tensor(inst.ofm)
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -427,8 +425,8 @@ class TestMemKernelE2E:
         inst = ctx.instantiate(MemKernel, spec=_mem_spec(), IN_CH=32, OUT_CH=32)
         inst.ifm.fill_random()
 
-        ctx.send_tensor(inst.ifm)
-        ctx.recv_tensor(inst.ofm)
+        ctx.push_tensor(inst.ifm)
+        ctx.pull_tensor(inst.ofm)
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -443,18 +441,18 @@ class TestMemKernelE2E:
 class TestDependencyChainE2E:
     """Dependencies correctly flow through the full pipeline."""
 
-    def test_send_then_recv_with_dep(self):
-        """recv depends on send via OperationHandle."""
+    def test_push_then_pull_with_dep(self):
+        """pull depends on push via OperationHandle."""
         ctx = ExecutionContext(project_params={})
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=8)
         inst.data_in.fill_random()
 
-        h = ctx.send_tensor(inst.data_in)
-        ctx.recv_tensor(inst.data_out, dep=h)
+        h = ctx.push_tensor(inst.data_in)
+        ctx.pull_tensor(inst.data_out, dep=h)
         ctx.run()
 
         compiled = ctx._last_compiled
-        # recv's PULL command should depend on send's last command (PUSH)
+        # pull's PULL command should depend on push's last command (PUSH)
         pull_cmd = [c for c in compiled.commands if c.op == OpCode.PULL][0]
         push_cmd = [c for c in compiled.commands if c.op == OpCode.PUSH][0]
         assert push_cmd.cmd_id in pull_cmd.dep
@@ -465,9 +463,9 @@ class TestDependencyChainE2E:
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=8)
         inst.data_in.fill_random()
 
-        ctx.send_tensor(inst.data_in)
+        ctx.push_tensor(inst.data_in)
         ctx.barrier()
-        ctx.recv_tensor(inst.data_out)
+        ctx.pull_tensor(inst.data_out)
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -491,28 +489,28 @@ class TestAliasE2E:
         inst.ifm.fill_random()
 
         ctx.alias(inst.ifm, inst.ofm)
-        ctx.send_tensor(inst.ifm)
-        ctx.recv_tensor(inst.ofm)
+        ctx.push_tensor(inst.ifm)
+        ctx.pull_tensor(inst.ofm)
         ctx.run()
 
         compiled = ctx._last_compiled
         assert compiled.buffer_ids["ifm"] == compiled.buffer_ids["ofm"]
 
-    def test_alias_send_skips_load(self):
-        """send_tensor on alias target skips LOAD."""
+    def test_alias_push_skips_load(self):
+        """push_tensor on alias target skips LOAD."""
         ctx = ExecutionContext(project_params={})
         inst = ctx.instantiate(MemKernel, spec=_mem_spec(), IN_CH=32, OUT_CH=32)
         inst.ifm.fill_random()
 
-        # ofm aliases ifm → sending ofm skips LOAD
+        # ofm aliases ifm → pushing ofm skips LOAD
         ctx.alias(inst.ifm, inst.ofm)
-        ctx.recv_tensor(inst.ifm)
-        ctx.send_tensor(inst.ofm)  # alias target → PUSH only
+        ctx.pull_tensor(inst.ifm)
+        ctx.push_tensor(inst.ofm)  # alias target → PUSH only
         ctx.run()
 
         compiled = ctx._last_compiled
-        # send_tensor(ofm) should produce just PUSH (no LOAD)
-        # Count LOADs — should only be from recv_tensor's expansion (0 for recv which is PULL)
+        # push_tensor(ofm) on alias target should produce just PUSH (no LOAD)
+        # pull_tensor(ifm) produces PULL+STORE for AXI4 memory-mapped
         load_cmds = [c for c in compiled.commands if c.op == OpCode.LOAD]
         # There should be no LOAD commands at all
         assert len(load_cmds) == 0
@@ -540,7 +538,7 @@ class TestPipelineErrors:
         # Set data with wrong element count
         inst.data_in.data = torch.tensor([1, 2, 3], dtype=torch.int8)  # 3 != 16
 
-        ctx.send_tensor(inst.data_in)
+        ctx.push_tensor(inst.data_in)
         with pytest.raises(ShapeMismatchError):
             ctx.run()
 
@@ -558,8 +556,8 @@ class TestSHMImageStructure:
         ctx = ExecutionContext(project_params={})
         inst = ctx.instantiate(PassthroughKernel, spec=_passthrough_spec(), SIZE=16)
         inst.data_in.fill_random()
-        ctx.send_tensor(inst.data_in)
-        ctx.recv_tensor(inst.data_out)
+        ctx.push_tensor(inst.data_in)
+        ctx.pull_tensor(inst.data_out)
         ctx.run()
         return ctx._last_compiled
 

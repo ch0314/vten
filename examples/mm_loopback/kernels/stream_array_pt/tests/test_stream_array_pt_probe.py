@@ -25,11 +25,7 @@ class TestStreamArrayPtProbe(TestScenario):
         k = ctx.instantiate(StreamArrayPtKernel, N=N)
         k.generate_inputs(seed=42)
 
-        h_load = ctx.load_tensor(k.data_in)
-        h_push = ctx.push_tensor(k.data_in, dep=h_load)
+        h_push = ctx.push_tensor(k.data_in)
 
         # probe=True: each array element BFM compares output against golden
-        h_pull = ctx.pull_tensor(k.data_out, dep=h_load, probe=True)
-
-        h_store = ctx.store_tensor(k.data_out, dep=h_pull)
-        ctx.verify(h_store, k.forward()["data_out"])
+        h_pull = ctx.pull_tensor(k.data_out, dep=h_push, probe=True)

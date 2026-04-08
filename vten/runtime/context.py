@@ -51,15 +51,6 @@ class AliasRegistry:
         return self._write_cmds.get(tensor_name)
 
 
-# ── VerificationTask ──
-
-
-@dataclass
-class VerificationTask:
-    op_handle: OperationHandle
-    golden: torch.Tensor | None = None
-
-
 # ── Result types ──
 
 
@@ -99,7 +90,6 @@ class ExecutionContext:
         self._backend = backend
         self._project_params = project_params or {}
         self._mode = mode  # "verification" or "inference"
-        self._verifications: list[VerificationTask] = []
         self._bound_bos: dict[str, object] = {}  # tensor_name → xrt.bo
         self._alias_registry = AliasRegistry()
         self._last_compiled: object | None = None
@@ -113,6 +103,8 @@ class ExecutionContext:
         self._internal_probe_golden: dict[tuple[str, str], torch.Tensor] = {}
         # Auto-golden cache: id(kernel_instance) → forward() result dict
         self._golden_cache: dict[int, dict[str, torch.Tensor]] = {}
+        # Deferred verifications (probe golden collection still reads this)
+        self._verifications: list = []
         # Declarative probe support
         self._declarative_probes: list[str] = []
         self._internal_probe_requests: list[tuple[str, str]] = []
@@ -150,25 +142,52 @@ class ExecutionContext:
         self._kernels[instance.name] = instance
         return instance
 
-    # ── L1: Host ↔ Memory ──
-
-    def load_tensor(self, tensor, dep=None) -> OperationHandle:
-        return self._record(OpKind.LOAD_TENSOR, tensor=tensor, dep=dep)
-
-    def store_tensor(self, tensor, dep=None) -> OperationHandle:
-        return self._record(OpKind.STORE_TENSOR, tensor=tensor, dep=dep)
-
-    # ── L2: Accel ↔ Memory ──
+    # ── Data: Host ↔ DUT ──
 
     def push_tensor(self, tensor, dep=None, probe=False) -> OperationHandle:
+        """Provide tensor data to DUT. Generates LOAD + PUSH IR commands."""
+        if self._mode == "inference" and tensor.name in self._bound_bos:
+            return self._record(OpKind.PUSH_TENSOR, tensor=tensor, dep=dep,
+                                probe=probe, _skip_data=True)
         return self._record(
             OpKind.PUSH_TENSOR, tensor=tensor, dep=dep, probe=probe
         )
 
-    def pull_tensor(self, tensor, dep=None, probe=False) -> OperationHandle:
-        return self._record(
-            OpKind.PULL_TENSOR, tensor=tensor, dep=dep, probe=probe
-        )
+    def pull_tensor(
+        self, tensor, dep=None, probe=False,
+        chunks: int | list[int] | None = None,
+    ) -> OperationHandle | list[OperationHandle]:
+        """Capture tensor data from DUT. Generates PULL + STORE IR commands.
+
+        Args:
+            chunks: Split the receive into multiple PULL command groups.
+                int → N equal-sized chunks along the first axis.
+                list[int] → explicit per-chunk element counts.
+                Returns list[OperationHandle] when chunks is specified.
+        """
+        if chunks is None:
+            return self._record(
+                OpKind.PULL_TENSOR, tensor=tensor, dep=dep, probe=probe
+            )
+
+        if isinstance(chunks, int):
+            chunk_total = chunks
+        else:
+            chunk_total = len(chunks)
+
+        handles: list[OperationHandle] = []
+        for i in range(chunk_total):
+            h = self._record(
+                OpKind.PULL_TENSOR,
+                tensor=tensor,
+                dep=dep,
+                probe=probe,
+                chunk_index=i,
+                chunk_total=chunk_total,
+                chunks_spec=chunks,
+            )
+            handles.append(h)
+        return handles
 
     # ── L3: Control ──
 
@@ -222,8 +241,8 @@ class ExecutionContext:
             ctx = ExecutionContext(backend=backend)
             for cfg in configs:
                 ki = ctx.instantiate(kernel_class, spec=spec, **cfg)
-                ctx.send_tensor(ki.get_tensor("in"))
-                ctx.recv_tensor(ki.get_tensor("out"))
+                ctx.push_tensor(ki.get_tensor("in"))
+                ctx.pull_tensor(ki.get_tensor("out"))
                 ctx.config_boundary()
             result = ctx.run()  # single batch, all configs
         """
@@ -234,75 +253,7 @@ class ExecutionContext:
         # Reset kernels for next group (new instantiate calls go to new group)
         self._kernels = {}
 
-    # ── Shorthands ──
-
-    def send_tensor(self, tensor, dep=None) -> OperationHandle:
-        if self._mode == "inference" and tensor.name in self._bound_bos:
-            # Device BO already present — record no-op placeholder
-            return self._record(OpKind.SEND_TENSOR, tensor=tensor, dep=dep,
-                                _skip_data=True)
-        return self._record(OpKind.SEND_TENSOR, tensor=tensor, dep=dep)
-
-    def recv_tensor(
-        self, tensor, dep=None, chunks: int | list[int] | None = None,
-    ) -> OperationHandle | list[OperationHandle]:
-        """Receive tensor from device.
-
-        Args:
-            chunks: Split the receive into multiple PULL command groups.
-                int → N equal-sized chunks along the first axis.
-                list[int] → explicit per-chunk element counts.
-                Split is along the serialized byte stream (C-contiguous
-                order = axis 0). Each chunk generates separate BFM
-                commands, so tready is naturally deasserted/reasserted
-                between chunks.
-                Returns list[OperationHandle] when chunks is specified.
-                TODO: axis= parameter for arbitrary axis split.
-
-        In inference mode: identical to verification mode — PULL+STORE generated.
-        """
-        if chunks is None:
-            return self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep)
-
-        if isinstance(chunks, int):
-            chunk_total = chunks
-        else:
-            chunk_total = len(chunks)
-
-        handles: list[OperationHandle] = []
-        for i in range(chunk_total):
-            h = self._record(
-                OpKind.RECV_TENSOR,
-                tensor=tensor,
-                dep=dep,
-                chunk_index=i,
-                chunk_total=chunk_total,
-                chunks_spec=chunks,
-            )
-            handles.append(h)
-        return handles
-
-    # ── Verification ──
-
-    def verify(self, op_handle, golden=None) -> None:
-        """Register or execute verification.
-
-        Before run(): deferred — stored as VerificationTask, executed after run().
-        After run(): eager — immediately compares HW output vs golden.
-
-        If golden is None, auto-golden is computed from the kernel's forward().
-        In inference mode: no-op (verification is handled by _verify_outputs).
-        """
-        if self._mode == "inference":
-            return
-        if self._last_compiled is not None:
-            if golden is None:
-                golden = self._compute_auto_golden(op_handle)
-            self._verify_immediate(op_handle, golden)
-        else:
-            self._verifications.append(
-                VerificationTask(op_handle=op_handle, golden=golden)
-            )
+    # ── (send_tensor/recv_tensor/verify removed — use push_tensor/pull_tensor) ──
 
     def set_internal_probe_golden(
         self, sub_kernel_name: str, tensor_name: str, golden: torch.Tensor
@@ -612,25 +563,29 @@ class ExecutionContext:
         from vten.runtime.verifier import chunk_element_info
         return chunk_element_info(exposed, chunk_index, chunk_total, chunks_spec)
 
-    def _run_deferred_verifications(self) -> tuple[int, list]:
-        """Execute all deferred VerificationTasks after run().
+    def _auto_verify_all(self, compiled, backend_result) -> tuple[int, list]:
+        """Auto-verify all DEV_TO_HOST tensors against forward() golden.
 
-        Collects all results before raising on failure.
         Returns (count, list[VerificationResult]).
         """
         from vten.reporting import VerificationResult
+        from vten.spec.models import Direction
 
-        count = len(self._verifications)
+        view = compiled.flattened_view
         results: list[VerificationResult] = []
         first_error: VerificationError | None = None
 
-        for task in self._verifications:
-            tensor_name = task.op_handle.op.tensor.name
+        for tensor_name, exposed in view.exposed_tensors.items():
+            if exposed.direction != Direction.DEV_TO_HOST:
+                continue
+
             try:
-                golden = task.golden
-                if golden is None:
-                    golden = self._compute_auto_golden(task.op_handle)
-                self._verify_immediate(task.op_handle, golden)
+                # Find a matching op to build auto-golden context
+                op_handle = self._find_pull_op_handle(tensor_name)
+                if op_handle is None:
+                    continue
+                golden = self._compute_auto_golden(op_handle)
+                self._verify_immediate(op_handle, golden)
                 results.append(VerificationResult(
                     tensor_name=tensor_name,
                     passed=True,
@@ -645,14 +600,26 @@ class ExecutionContext:
                 if first_error is None:
                     first_error = e
 
-        self._verifications.clear()
+        count = len(results)
 
         if first_error is not None:
-            # Attach all results to the error for reporting
             first_error.context["verification_results"] = results
             raise first_error
 
         return count, results
+
+    def _find_pull_op_handle(self, tensor_name: str):
+        """Find the last PULL_TENSOR OperationHandle for a given tensor name."""
+        # Search in the ops that were compiled (saved before clearing)
+        compiled = self._last_compiled
+        if compiled is None:
+            return None
+        for op in reversed(compiled.ops):
+            if (op.kind == OpKind.PULL_TENSOR
+                    and op.tensor is not None
+                    and op.tensor.name == tensor_name):
+                return OperationHandle(op=op)
+        return None
 
     @staticmethod
     def _compare(hw_output, golden):
@@ -704,8 +671,13 @@ class ExecutionContext:
 
         return RuntimeEngine.compile_multi(engines, target=target)
 
-    def run(self) -> ExecutionResult:
-        """Compile pending ops → submit → wait → return ExecutionResult."""
+    def run(self, *, verify: bool = False) -> ExecutionResult:
+        """Compile pending ops → submit → wait → return ExecutionResult.
+
+        Args:
+            verify: If True, auto-verify all DEV_TO_HOST tensors against
+                golden computed from kernel forward().
+        """
         from vten.runtime.engine import RuntimeEngine
 
         # Apply declarative probes (post-hoc annotation)
@@ -799,30 +771,16 @@ class ExecutionContext:
             try:
                 output_tensors = self._read_output_tensors(compiled, backend_result)
             except (RuntimeError, ValueError) as e:
-                # Inference HW mode may have size mismatches when tensor
-                # _element_count doesn't match STORE data size. Fall back to
-                # empty dict — inference.py's _wrap_outputs handles HW outputs
-                # via get_buffer_object() or output_buffers directly.
                 logger.debug("_read_output_tensors skipped: %s", e)
                 output_tensors = {}
 
-            # Run deferred verifications before returning
+            # Auto-verify all D2H tensors when verify=True
             verification_count = 0
             verification_results: list = []
-            if self._verifications:
-                logger.log(5, "running %d deferred verifications", len(self._verifications))
-                try:
-                    verification_count, verification_results = (
-                        self._run_deferred_verifications()
-                    )
-                except VerificationError as e:
-                    verification_count = len(
-                        e.context.get("verification_results", [])
-                    )
-                    verification_results = e.context.get(
-                        "verification_results", []
-                    )
-                    raise
+            if verify:
+                verification_count, verification_results = (
+                    self._auto_verify_all(compiled, backend_result)
+                )
 
             self._golden_cache.clear()
 
@@ -867,8 +825,6 @@ class ExecutionContext:
             commit_dep=[],
             probe=kwargs.pop("probe", False),
             sync=kwargs.pop("sync", False),
-            golden=None,
-            verify=False,
             config_group=self._current_config_group,
             **kwargs,
         )

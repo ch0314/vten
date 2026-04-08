@@ -258,11 +258,7 @@ class IRLowering:
         kind = op.kind
         dep_ids = self._resolve_deps(op.dep, op_to_cmd_range)
 
-        if kind == OpKind.LOAD_TENSOR:
-            return self._lower_load(op, dep_ids, next_cmd_id)
-        elif kind == OpKind.STORE_TENSOR:
-            return self._lower_store(op, dep_ids, next_cmd_id)
-        elif kind == OpKind.PUSH_TENSOR:
+        if kind == OpKind.PUSH_TENSOR:
             return self._lower_push(op, dep_ids, next_cmd_id)
         elif kind == OpKind.PULL_TENSOR:
             return self._lower_pull(op, dep_ids, next_cmd_id)
@@ -276,91 +272,80 @@ class IRLowering:
             return self._lower_configure(op, dep_ids, next_cmd_id)
         elif kind == OpKind.BARRIER:
             return self._lower_barrier(op, dep_ids, next_cmd_id)
-        elif kind == OpKind.SEND_TENSOR:
-            return self._lower_send_tensor(op, dep_ids, next_cmd_id)
-        elif kind == OpKind.RECV_TENSOR:
-            return self._lower_recv_tensor(op, dep_ids, next_cmd_id)
         else:
             raise CompilationError(f"Unknown OpKind: {kind}")
 
     # ── Individual lowering methods ──
 
-    def _lower_load(
+    def _lower_push(
         self, op: Operation, dep_ids: list[int], next_cmd_id: int
     ) -> tuple[list[Command], int]:
+        """Lower PUSH_TENSOR → LOAD + PUSH (alias/skip-aware)."""
         exposed = self._view.exposed_tensors[op.tensor.name]
+        iface = self._view.top_spec.get_interface(exposed.top_interface)
+        commands: list[Command] = []
 
-        # Skip LOAD for alias targets — buffer already has data from prior batch
         is_alias_target = (
             self._alias_registry
             and self._alias_registry.is_alias_target(exposed.name)
         )
-        if is_alias_target:
-            return [], next_cmd_id
+        skip_load = is_alias_target or getattr(op, "_skip_data", False)
 
-        cmd = Command(
-            op=OpCode.LOAD,
-            cmd_id=next_cmd_id,
-            buffer_id=self._buffer_ids[exposed.name],
-            size=exposed._serialized_size,
-            dep=dep_ids,
-        )
-        return [cmd], next_cmd_id + 1
-
-    def _lower_store(
-        self, op: Operation, dep_ids: list[int], next_cmd_id: int
-    ) -> tuple[list[Command], int]:
-        exposed = self._view.exposed_tensors[op.tensor.name]
-        iface = self._view.top_spec.get_interface(exposed.top_interface)
-
-        # Skip STORE for alias sources (buffer reused by next batch)
-        # and for AXI4-Stream (data read directly from SHM)
-        is_alias_source = (
-            self._alias_registry
-            and self._alias_registry.is_alias_source(exposed.name)
-        )
-        if is_alias_source or iface.protocol == Protocol.AXI4S:
-            return [], next_cmd_id
-
-        cmd = Command(
-            op=OpCode.STORE,
-            cmd_id=next_cmd_id,
-            buffer_id=self._buffer_ids[exposed.name],
-            size=exposed._serialized_size,
-            dep=dep_ids,
-        )
-        return [cmd], next_cmd_id + 1
-
-    def _lower_push(
-        self, op: Operation, dep_ids: list[int], next_cmd_id: int
-    ) -> tuple[list[Command], int]:
-        exposed = self._view.exposed_tensors[op.tensor.name]
-        iface = self._view.top_spec.get_interface(exposed.top_interface)
-
-        # Multi-port (array or split): per-port PUSH commands
+        # Multi-port (array or split): per-port LOAD + PUSH
         if exposed._port_buffers:
-            commands: list[Command] = []
             base_addr = exposed.address or 0
             addr_offset = 0
-            for port_name, port_data in exposed._port_buffers.items():
-                cmd = Command(
+            for i, (port_name, port_data) in enumerate(
+                exposed._port_buffers.items()
+            ):
+                bid = self._buffer_ids[f"{exposed.name}:{port_name}"]
+                if not skip_load:
+                    load_cmd = Command(
+                        op=OpCode.LOAD,
+                        cmd_id=next_cmd_id,
+                        buffer_id=bid,
+                        size=len(port_data),
+                        dep=dep_ids if i == 0 else [],
+                    )
+                    commands.append(load_cmd)
+                    load_id = next_cmd_id
+                    next_cmd_id += 1
+                    push_dep = [load_id]
+                else:
+                    push_dep = dep_ids if i == 0 else []
+                push_cmd = Command(
                     op=OpCode.PUSH,
                     cmd_id=next_cmd_id,
                     interface_id=self._get_iface_id(port_name),
-                    buffer_id=self._buffer_ids[f"{exposed.name}:{port_name}"],
+                    buffer_id=bid,
                     protocol=iface.protocol,
                     phys_addr=base_addr + addr_offset,
                     size=len(port_data),
                     role=_determine_role(iface.protocol, OpCode.PUSH),
                     probe=op.probe,
-                    dep=dep_ids if not commands else [],
+                    dep=push_dep,
                 )
-                commands.append(cmd)
+                commands.append(push_cmd)
                 addr_offset += len(port_data)
                 next_cmd_id += 1
             return commands, next_cmd_id
 
-        cmd = Command(
+        if not skip_load:
+            load_cmd = Command(
+                op=OpCode.LOAD,
+                cmd_id=next_cmd_id,
+                buffer_id=self._buffer_ids[exposed.name],
+                size=exposed._serialized_size,
+                dep=dep_ids,
+            )
+            commands.append(load_cmd)
+            load_id = next_cmd_id
+            next_cmd_id += 1
+            push_dep = [load_id]
+        else:
+            push_dep = list(dep_ids)
+
+        push_cmd = Command(
             op=OpCode.PUSH,
             cmd_id=next_cmd_id,
             interface_id=self._get_iface_id(exposed.top_interface),
@@ -370,42 +355,72 @@ class IRLowering:
             size=exposed._serialized_size,
             role=_determine_role(iface.protocol, OpCode.PUSH),
             probe=op.probe,
-            dep=dep_ids,
+            dep=push_dep,
         )
-        return [cmd], next_cmd_id + 1
+        commands.append(push_cmd)
+        next_cmd_id += 1
+        return commands, next_cmd_id
 
     def _lower_pull(
         self, op: Operation, dep_ids: list[int], next_cmd_id: int
     ) -> tuple[list[Command], int]:
+        """Lower PULL_TENSOR → PULL + STORE (alias/chunk-aware)."""
         exposed = self._view.exposed_tensors[op.tensor.name]
         iface = self._view.top_spec.get_interface(exposed.top_interface)
 
-        # Multi-port (array or split): per-port PULL commands
+        # Chunked: delegate to chunk-aware lowering
+        if op.chunk_total is not None:
+            return self._lower_pull_chunk(
+                op, exposed, iface, dep_ids, next_cmd_id,
+            )
+
+        commands: list[Command] = []
+
+        is_alias_source = (
+            self._alias_registry
+            and self._alias_registry.is_alias_source(exposed.name)
+        )
+
+        # Multi-port (array or split): per-port PULL + STORE
         if exposed._port_buffers:
-            commands: list[Command] = []
             base_addr = exposed.address or 0
             addr_offset = 0
-            for port_name, port_data in exposed._port_buffers.items():
-                cmd = Command(
+            for i, (port_name, port_data) in enumerate(
+                exposed._port_buffers.items()
+            ):
+                bid = self._buffer_ids[f"{exposed.name}:{port_name}"]
+                pull_cmd = Command(
                     op=OpCode.PULL,
                     cmd_id=next_cmd_id,
                     interface_id=self._get_iface_id(port_name),
-                    buffer_id=self._buffer_ids[f"{exposed.name}:{port_name}"],
+                    buffer_id=bid,
                     protocol=iface.protocol,
                     phys_addr=base_addr + addr_offset,
                     size=len(port_data),
                     role=_determine_role(iface.protocol, OpCode.PULL),
                     probe=op.probe,
-                    dep=dep_ids if not commands else [],
+                    dep=dep_ids if i == 0 else [],
                 )
-                commands.append(cmd)
+                commands.append(pull_cmd)
                 addr_offset += len(port_data)
-                if self._alias_registry:
-                    self._alias_registry.record_write_cmd(exposed.name, next_cmd_id)
+                pull_id = next_cmd_id
                 next_cmd_id += 1
+
+                if self._alias_registry:
+                    self._alias_registry.record_write_cmd(exposed.name, pull_id)
+
+                if not is_alias_source and iface.protocol != Protocol.AXI4S:
+                    store_cmd = Command(
+                        op=OpCode.STORE,
+                        cmd_id=next_cmd_id,
+                        buffer_id=bid,
+                        dep=[pull_id],
+                    )
+                    commands.append(store_cmd)
+                    next_cmd_id += 1
             return commands, next_cmd_id
 
-        cmd = Command(
+        pull_cmd = Command(
             op=OpCode.PULL,
             cmd_id=next_cmd_id,
             interface_id=self._get_iface_id(exposed.top_interface),
@@ -417,9 +432,24 @@ class IRLowering:
             probe=op.probe,
             dep=dep_ids,
         )
+        commands.append(pull_cmd)
+        pull_id = next_cmd_id
+        next_cmd_id += 1
+
         if self._alias_registry:
-            self._alias_registry.record_write_cmd(exposed.name, next_cmd_id)
-        return [cmd], next_cmd_id + 1
+            self._alias_registry.record_write_cmd(exposed.name, pull_id)
+
+        if not is_alias_source and iface.protocol != Protocol.AXI4S:
+            store_cmd = Command(
+                op=OpCode.STORE,
+                cmd_id=next_cmd_id,
+                buffer_id=self._buffer_ids[exposed.name],
+                dep=[pull_id],
+            )
+            commands.append(store_cmd)
+            next_cmd_id += 1
+
+        return commands, next_cmd_id
 
     def _lower_write_reg(
         self, op: Operation, dep_ids: list[int], next_cmd_id: int
@@ -510,7 +540,7 @@ class IRLowering:
                     protocol=Protocol.AXI4L,
                     reg_offset=reg_binding.absolute_offset,
                     reg_value=reg_binding.resolved_value,
-                    dep=dep_ids if i == 0 else [],
+                    dep=dep_ids if i == 0 else [next_cmd_id - 1],
                 )
             )
             next_cmd_id += 1
@@ -527,174 +557,7 @@ class IRLowering:
         )
         return [cmd], next_cmd_id + 1
 
-    def _lower_send_tensor(
-        self, op: Operation, dep_ids: list[int], next_cmd_id: int
-    ) -> tuple[list[Command], int]:
-        exposed = self._view.exposed_tensors[op.tensor.name]
-        iface = self._view.top_spec.get_interface(exposed.top_interface)
-        commands: list[Command] = []
-
-        is_alias_target = (
-            self._alias_registry
-            and self._alias_registry.is_alias_target(exposed.name)
-        )
-
-        # Multi-port (array or split): per-port LOAD + PUSH
-        if exposed._port_buffers:
-            base_addr = exposed.address or 0
-            addr_offset = 0
-            for i, (port_name, port_data) in enumerate(
-                exposed._port_buffers.items()
-            ):
-                bid = self._buffer_ids[f"{exposed.name}:{port_name}"]
-                if not is_alias_target:
-                    load_cmd = Command(
-                        op=OpCode.LOAD,
-                        cmd_id=next_cmd_id,
-                        buffer_id=bid,
-                        size=len(port_data),
-                        dep=dep_ids if i == 0 else [],
-                    )
-                    commands.append(load_cmd)
-                    load_id = next_cmd_id
-                    next_cmd_id += 1
-                    push_dep = [load_id]
-                else:
-                    push_dep = dep_ids if i == 0 else []
-                push_cmd = Command(
-                    op=OpCode.PUSH,
-                    cmd_id=next_cmd_id,
-                    interface_id=self._get_iface_id(port_name),
-                    buffer_id=bid,
-                    protocol=iface.protocol,
-                    phys_addr=base_addr + addr_offset,
-                    size=len(port_data),
-                    role=_determine_role(iface.protocol, OpCode.PUSH),
-                    dep=push_dep,
-                )
-                commands.append(push_cmd)
-                addr_offset += len(port_data)
-                next_cmd_id += 1
-            return commands, next_cmd_id
-
-        if not is_alias_target:
-            load_cmd = Command(
-                op=OpCode.LOAD,
-                cmd_id=next_cmd_id,
-                buffer_id=self._buffer_ids[exposed.name],
-                size=exposed._serialized_size,
-                dep=dep_ids,
-            )
-            commands.append(load_cmd)
-            load_id = next_cmd_id
-            next_cmd_id += 1
-            push_dep = [load_id]
-        else:
-            push_dep = list(dep_ids)
-
-        push_cmd = Command(
-            op=OpCode.PUSH,
-            cmd_id=next_cmd_id,
-            interface_id=self._get_iface_id(exposed.top_interface),
-            buffer_id=self._buffer_ids[exposed.name],
-            protocol=iface.protocol,
-            phys_addr=exposed.address or 0,
-            size=exposed._serialized_size,
-            role=_determine_role(iface.protocol, OpCode.PUSH),
-            dep=push_dep,
-        )
-        commands.append(push_cmd)
-        next_cmd_id += 1
-        return commands, next_cmd_id
-
-    def _lower_recv_tensor(
-        self, op: Operation, dep_ids: list[int], next_cmd_id: int
-    ) -> tuple[list[Command], int]:
-        exposed = self._view.exposed_tensors[op.tensor.name]
-        iface = self._view.top_spec.get_interface(exposed.top_interface)
-
-        # Chunked recv: delegate to chunk-aware lowering
-        if op.chunk_total is not None:
-            return self._lower_recv_tensor_chunk(
-                op, exposed, iface, dep_ids, next_cmd_id,
-            )
-
-        commands: list[Command] = []
-
-        is_alias_source = (
-            self._alias_registry
-            and self._alias_registry.is_alias_source(exposed.name)
-        )
-
-        # Multi-port (array or split): per-port PULL + STORE
-        if exposed._port_buffers:
-            base_addr = exposed.address or 0
-            addr_offset = 0
-            for i, (port_name, port_data) in enumerate(
-                exposed._port_buffers.items()
-            ):
-                bid = self._buffer_ids[f"{exposed.name}:{port_name}"]
-                pull_cmd = Command(
-                    op=OpCode.PULL,
-                    cmd_id=next_cmd_id,
-                    interface_id=self._get_iface_id(port_name),
-                    buffer_id=bid,
-                    protocol=iface.protocol,
-                    phys_addr=base_addr + addr_offset,
-                    size=len(port_data),
-                    role=_determine_role(iface.protocol, OpCode.PULL),
-                    dep=dep_ids if i == 0 else [],
-                )
-                commands.append(pull_cmd)
-                addr_offset += len(port_data)
-                pull_id = next_cmd_id
-                next_cmd_id += 1
-
-                if self._alias_registry:
-                    self._alias_registry.record_write_cmd(exposed.name, pull_id)
-
-                if not is_alias_source and iface.protocol != Protocol.AXI4S:
-                    store_cmd = Command(
-                        op=OpCode.STORE,
-                        cmd_id=next_cmd_id,
-                        buffer_id=bid,
-                        dep=[pull_id],
-                    )
-                    commands.append(store_cmd)
-                    next_cmd_id += 1
-            return commands, next_cmd_id
-
-        pull_cmd = Command(
-            op=OpCode.PULL,
-            cmd_id=next_cmd_id,
-            interface_id=self._get_iface_id(exposed.top_interface),
-            buffer_id=self._buffer_ids[exposed.name],
-            protocol=iface.protocol,
-            phys_addr=exposed.address or 0,
-            size=exposed._serialized_size,
-            role=_determine_role(iface.protocol, OpCode.PULL),
-            dep=dep_ids,
-        )
-        commands.append(pull_cmd)
-        pull_id = next_cmd_id
-        next_cmd_id += 1
-
-        if self._alias_registry:
-            self._alias_registry.record_write_cmd(exposed.name, pull_id)
-
-        if not is_alias_source and iface.protocol != Protocol.AXI4S:
-            store_cmd = Command(
-                op=OpCode.STORE,
-                cmd_id=next_cmd_id,
-                buffer_id=self._buffer_ids[exposed.name],
-                dep=[pull_id],
-            )
-            commands.append(store_cmd)
-            next_cmd_id += 1
-
-        return commands, next_cmd_id
-
-    def _lower_recv_tensor_chunk(
+    def _lower_pull_chunk(
         self,
         op: Operation,
         exposed: object,

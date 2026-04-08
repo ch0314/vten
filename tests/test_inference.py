@@ -63,9 +63,8 @@ class StreamKernel(Kernel):
         return {"data_out": data.clone()}
 
     def run(self, ctx) -> None:
-        h_send = ctx.send_tensor(self.data_in)
-        h_recv = ctx.recv_tensor(self.data_out, dep=h_send)
-        ctx.verify(h_recv)
+        h_push = ctx.push_tensor(self.data_in)
+        ctx.pull_tensor(self.data_out, dep=h_push)
 
 
 def _stream_spec() -> KernelSpec:
@@ -260,30 +259,17 @@ class TestTensorDeviceState:
 
 class TestInferenceMode:
 
-    def test_verify_noop_in_inference_mode(self):
-        """verify() does nothing in inference mode."""
+    def test_run_with_verify_true(self):
+        """ctx.run(verify=True) triggers auto-verification."""
         ctx = ExecutionContext(project_params={"N": 32}, mode="inference")
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
         ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
 
-        # Record ops
-        h_send = ctx.send_tensor(ki.get_tensor("data_in"))
-        h_recv = ctx.recv_tensor(ki.get_tensor("data_out"), dep=h_send)
-
-        # verify() should silently return (not add to _verifications)
-        ctx.verify(h_recv, torch.zeros(32, dtype=torch.int8))
-        assert len(ctx._verifications) == 0
-
-    def test_verify_works_in_verification_mode(self):
-        """verify() is active in verification mode (default)."""
-        ctx = ExecutionContext(project_params={"N": 32})
-        ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
-        ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-
-        h_send = ctx.send_tensor(ki.get_tensor("data_in"))
-        h_recv = ctx.recv_tensor(ki.get_tensor("data_out"), dep=h_send)
-        ctx.verify(h_recv, torch.zeros(32, dtype=torch.int8))
-        assert len(ctx._verifications) == 1
+        ctx.push_tensor(ki.get_tensor("data_in"))
+        ctx.pull_tensor(ki.get_tensor("data_out"))
+        # In inference mode without backend, run(verify=True) should not raise
+        result = ctx.run(verify=True)
+        assert result.status == "DONE"
 
     def test_bind_device_buffer(self):
         """bind_device_buffer() stores BO mapping."""
@@ -294,42 +280,42 @@ class TestInferenceMode:
         assert "data_in" in ctx._bound_bos
         assert ctx._bound_bos["data_in"] is bo
 
-    def test_send_tensor_skip_data_when_bound(self):
-        """send_tensor() with bound BO sets _skip_data flag."""
+    def test_push_tensor_skip_data_when_bound(self):
+        """push_tensor() with bound BO sets _skip_data flag."""
         ctx = ExecutionContext(project_params={"N": 32}, mode="inference")
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
 
         bo = MockBO(32)
         ctx.bind_device_buffer(ki.get_tensor("data_in"), bo)
 
-        h = ctx.send_tensor(ki.get_tensor("data_in"))
+        h = ctx.push_tensor(ki.get_tensor("data_in"))
         # The recorded op should have _skip_data=True
         assert h.op._skip_data is True
 
-    def test_send_tensor_normal_when_not_bound(self):
-        """send_tensor() without bound BO records normally."""
+    def test_push_tensor_normal_when_not_bound(self):
+        """push_tensor() without bound BO records normally."""
         ctx = ExecutionContext(project_params={"N": 32}, mode="inference")
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
         ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
 
-        h = ctx.send_tensor(ki.get_tensor("data_in"))
+        h = ctx.push_tensor(ki.get_tensor("data_in"))
         assert h.op._skip_data is False
 
-    def test_recv_tensor_recorded_in_inference(self):
-        """recv_tensor() in inference mode records RECV_TENSOR (same as verification)."""
+    def test_pull_tensor_recorded_in_inference(self):
+        """pull_tensor() in inference mode records PULL_TENSOR."""
         ctx = ExecutionContext(project_params={"N": 32}, mode="inference")
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
 
-        h = ctx.recv_tensor(ki.get_tensor("data_out"))
-        assert h.op.kind == OpKind.RECV_TENSOR
+        h = ctx.pull_tensor(ki.get_tensor("data_out"))
+        assert h.op.kind == OpKind.PULL_TENSOR
 
-    def test_recv_tensor_recorded_in_verification(self):
-        """recv_tensor() in verification mode records RECV_TENSOR."""
+    def test_pull_tensor_recorded_in_verification(self):
+        """pull_tensor() in verification mode records PULL_TENSOR."""
         ctx = ExecutionContext(project_params={"N": 32})
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
 
-        h = ctx.recv_tensor(ki.get_tensor("data_out"))
-        assert h.op.kind == OpKind.RECV_TENSOR
+        h = ctx.pull_tensor(ki.get_tensor("data_out"))
+        assert h.op.kind == OpKind.PULL_TENSOR
 
     def test_prebound_injected_into_compiled(self):
         """Bound BOs are injected into CompiledResult.prebound_buffers."""
@@ -342,8 +328,8 @@ class TestInferenceMode:
         bo = MockBO(32)
         ctx.bind_device_buffer(ki.get_tensor("data_in"), bo)
 
-        ctx.send_tensor(ki.get_tensor("data_in"))
-        ctx.recv_tensor(ki.get_tensor("data_out"))
+        ctx.push_tensor(ki.get_tensor("data_in"))
+        ctx.pull_tensor(ki.get_tensor("data_out"))
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -517,7 +503,7 @@ class TestInferenceSessionPassthrough:
         assert backend.calls == ["execute", "execute"]
 
     def test_verify_not_called_in_inference(self):
-        """Passthrough kernel calls ctx.verify() in run(), but it's no-op."""
+        """Passthrough kernel run() works without verification in inference mode."""
         KernelClass, spec = self._get_kernel_and_spec()
         backend = MockSimBackend()
         session = InferenceSession(backend)

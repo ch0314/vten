@@ -82,8 +82,8 @@ class TestIRLoweringOffsets:
         )
 
         # Record ops
-        ctx.send_tensor(ki.get_tensor("data_in"))
-        ctx.recv_tensor(ki.get_tensor("data_out"))
+        ctx.push_tensor(ki.get_tensor("data_in"))
+        ctx.pull_tensor(ki.get_tensor("data_out"))
 
         engine2 = RuntimeEngine(
             kernels=ctx._kernels,
@@ -109,8 +109,8 @@ class TestIRLoweringOffsets:
         ki = ctx.instantiate(StreamKernel, spec=spec, N=32)
         ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
 
-        ctx.send_tensor(ki.get_tensor("data_in"))
-        ctx.recv_tensor(ki.get_tensor("data_out"))
+        ctx.push_tensor(ki.get_tensor("data_in"))
+        ctx.pull_tensor(ki.get_tensor("data_out"))
 
         from vten.runtime.engine import RuntimeEngine
 
@@ -141,8 +141,8 @@ class TestCompileMulti:
         ki.get_tensor("data_in").data = torch.randint(
             -128, 127, (N,), dtype=torch.int8,
         )
-        ctx.send_tensor(ki.get_tensor("data_in"))
-        ctx.recv_tensor(ki.get_tensor("data_out"))
+        ctx.push_tensor(ki.get_tensor("data_in"))
+        ctx.pull_tensor(ki.get_tensor("data_out"))
 
         from vten.runtime.engine import RuntimeEngine
 
@@ -255,8 +255,8 @@ class TestConfigBoundary:
 
         ki1 = ctx.instantiate(StreamKernel, spec=spec, N=32)
         ki1.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-        ctx.send_tensor(ki1.get_tensor("data_in"))
-        ctx.recv_tensor(ki1.get_tensor("data_out"))
+        ctx.push_tensor(ki1.get_tensor("data_in"))
+        ctx.pull_tensor(ki1.get_tensor("data_out"))
 
         ops_before = len(ctx._pending_ops)
         ctx.config_boundary()
@@ -298,15 +298,15 @@ class TestConfigBoundary:
         # Config 1
         ki1 = ctx.instantiate(StreamKernel, spec=spec, N=32)
         ki1.get_tensor("data_in").data = torch.randint(-128, 127, (32,), dtype=torch.int8)
-        ctx.send_tensor(ki1.get_tensor("data_in"))
-        ctx.recv_tensor(ki1.get_tensor("data_out"))
+        ctx.push_tensor(ki1.get_tensor("data_in"))
+        ctx.pull_tensor(ki1.get_tensor("data_out"))
         ctx.config_boundary()
 
         # Config 2
         ki2 = ctx.instantiate(StreamKernel, spec=spec, N=64)
         ki2.get_tensor("data_in").data = torch.randint(-128, 127, (64,), dtype=torch.int8)
-        ctx.send_tensor(ki2.get_tensor("data_in"))
-        ctx.recv_tensor(ki2.get_tensor("data_out"))
+        ctx.push_tensor(ki2.get_tensor("data_in"))
+        ctx.pull_tensor(ki2.get_tensor("data_out"))
 
         with patch.object(ExecutionContext, "run", capture_run):
             ctx.run()
@@ -343,8 +343,8 @@ class TestConfigBoundary:
         for _ in range(3):
             ki = ctx.instantiate(StreamKernel, spec=spec, N=32)
             ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
-            ctx.send_tensor(ki.get_tensor("data_in"))
-            ctx.recv_tensor(ki.get_tensor("data_out"))
+            ctx.push_tensor(ki.get_tensor("data_in"))
+            ctx.pull_tensor(ki.get_tensor("data_out"))
             ctx.config_boundary()
 
         with patch.object(ExecutionContext, "run", capture_run):

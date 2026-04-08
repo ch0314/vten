@@ -272,31 +272,17 @@ class TestParseBitRange:
 class TestExpansionCounts:
     """Each OpKind expands to the correct number of Commands."""
 
-    def test_load_tensor_expands_to_1(self):
-        """LOAD_TENSOR → 1 LOAD command."""
-        view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
-        op = Operation(kind=OpKind.LOAD_TENSOR, tensor=inst.get_tensor("data_in"))
-        cmds, _ = _lower_ops(view, lowering, [op])
-        assert len(cmds) == 1
-        assert cmds[0].op == OpCode.LOAD
-
-    def test_store_tensor_skipped_for_axi4s(self):
-        """STORE_TENSOR → 0 commands for AXI4-Stream (data read from SHM directly)."""
-        view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
-        op = Operation(kind=OpKind.STORE_TENSOR, tensor=inst.get_tensor("data_out"))
-        cmds, _ = _lower_ops(view, lowering, [op])
-        assert len(cmds) == 0
-
-    def test_push_tensor_single_port(self):
-        """PUSH_TENSOR (no split) → 1 PUSH command."""
+    def test_push_tensor_axi4s_no_alias(self):
+        """PUSH_TENSOR on AXI4-Stream (no alias) → LOAD + PUSH = 2 commands."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
         op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
         cmds, _ = _lower_ops(view, lowering, [op])
-        assert len(cmds) == 1
-        assert cmds[0].op == OpCode.PUSH
+        assert len(cmds) == 2
+        assert cmds[0].op == OpCode.LOAD
+        assert cmds[1].op == OpCode.PUSH
 
-    def test_pull_tensor_single_port(self):
-        """PULL_TENSOR (no split) → 1 PULL command."""
+    def test_pull_tensor_axi4s_no_alias(self):
+        """PULL_TENSOR on AXI4-Stream (no alias) → 1 PULL (no STORE for stream)."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
         op = Operation(kind=OpKind.PULL_TENSOR, tensor=inst.get_tensor("data_out"))
         cmds, _ = _lower_ops(view, lowering, [op])
@@ -312,52 +298,45 @@ class TestExpansionCounts:
         assert cmds[0].op == OpCode.BARRIER
         assert cmds[0].sync is True
 
-    def test_send_tensor_no_alias(self):
-        """SEND_TENSOR (no alias) → 2 commands: LOAD + PUSH."""
-        view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
-        op = Operation(kind=OpKind.SEND_TENSOR, tensor=inst.get_tensor("data_in"))
+    def test_push_tensor_axi4_no_alias(self):
+        """PUSH_TENSOR on AXI4 (no alias) → LOAD + PUSH = 2 commands."""
+        view, lowering, inst = _make_ir_setup(
+            _make_mem_spec(), MemKernel, runtime_params={"IN_CH": 32}
+        )
+        op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("ifm"))
         cmds, _ = _lower_ops(view, lowering, [op])
         assert len(cmds) == 2
         assert cmds[0].op == OpCode.LOAD
         assert cmds[1].op == OpCode.PUSH
 
-    def test_recv_tensor_no_alias_axi4(self):
-        """RECV_TENSOR on AXI4 (no alias) → 2 commands: PULL + STORE."""
+    def test_pull_tensor_no_alias_axi4(self):
+        """PULL_TENSOR on AXI4 (no alias) → PULL + STORE = 2 commands."""
         view, lowering, inst = _make_ir_setup(
             _make_mem_spec(), MemKernel, runtime_params={"IN_CH": 32}
         )
-        op = Operation(kind=OpKind.RECV_TENSOR, tensor=inst.get_tensor("ofm"))
+        op = Operation(kind=OpKind.PULL_TENSOR, tensor=inst.get_tensor("ofm"))
         cmds, _ = _lower_ops(view, lowering, [op])
         assert len(cmds) == 2
         assert cmds[0].op == OpCode.PULL
         assert cmds[1].op == OpCode.STORE
 
-    def test_recv_tensor_no_alias_axi4s(self):
-        """RECV_TENSOR on AXI4-Stream (no alias) → 1 PULL (no STORE for stream)."""
-        view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
-        op = Operation(kind=OpKind.RECV_TENSOR, tensor=inst.get_tensor("data_out"))
-        cmds, _ = _lower_ops(view, lowering, [op])
-        # AXI4-Stream: PULL only, no STORE
-        assert len(cmds) == 1
-        assert cmds[0].op == OpCode.PULL
-
 
 # ═══════════════════════════════════════════════════════════════════
-# §12.8 — chunked recv_tensor lowering
+# §12.8 — chunked pull_tensor lowering
 # ═══════════════════════════════════════════════════════════════════
 
 
-class TestChunkedRecvTensorLowering:
-    """recv_tensor(tensor, chunks=N) generates per-chunk PULL commands."""
+class TestChunkedPullTensorLowering:
+    """pull_tensor(tensor, chunks=N) generates per-chunk PULL commands."""
 
-    def test_chunked_recv_stream_generates_n_pulls(self):
+    def test_chunked_pull_stream_generates_n_pulls(self):
         """chunks=4 on AXI4-Stream → 4 separate PULL commands."""
         view, lowering, inst = _make_ir_setup(
             _make_stream_spec(), PassthroughKernel,
         )
         ops = [
             Operation(
-                kind=OpKind.RECV_TENSOR,
+                kind=OpKind.PULL_TENSOR,
                 tensor=inst.get_tensor("data_out"),
                 chunk_index=i,
                 chunk_total=4,
@@ -373,14 +352,14 @@ class TestChunkedRecvTensorLowering:
         chunk_bids = [c.buffer_id for c in cmds]
         assert len(set(chunk_bids)) == 4
 
-    def test_chunked_recv_mem_generates_pull_store_pairs(self):
+    def test_chunked_pull_mem_generates_pull_store_pairs(self):
         """chunks=2 on AXI4 → 2 × (PULL + STORE) = 4 commands."""
         view, lowering, inst = _make_ir_setup(
             _make_mem_spec(), MemKernel, runtime_params={"IN_CH": 32},
         )
         ops = [
             Operation(
-                kind=OpKind.RECV_TENSOR,
+                kind=OpKind.PULL_TENSOR,
                 tensor=inst.get_tensor("ofm"),
                 chunk_index=i,
                 chunk_total=2,
@@ -397,7 +376,7 @@ class TestChunkedRecvTensorLowering:
         # Different buffer_ids for each chunk
         assert cmds[0].buffer_id != cmds[2].buffer_id
 
-    def test_chunked_recv_sizes_are_equal_split(self):
+    def test_chunked_pull_sizes_are_equal_split(self):
         """Each chunk's PULL size = total_serialized_size / N."""
         view, lowering, inst = _make_ir_setup(
             _make_stream_spec(), PassthroughKernel,
@@ -406,7 +385,7 @@ class TestChunkedRecvTensorLowering:
         total_size = view.exposed_tensors["data_out"]._serialized_size
         ops = [
             Operation(
-                kind=OpKind.RECV_TENSOR,
+                kind=OpKind.PULL_TENSOR,
                 tensor=tensor,
                 chunk_index=i,
                 chunk_total=4,
@@ -419,14 +398,14 @@ class TestChunkedRecvTensorLowering:
         for cmd in cmds:
             assert cmd.size == expected_per_chunk
 
-    def test_chunked_recv_buffer_id_naming(self):
+    def test_chunked_pull_buffer_id_naming(self):
         """Buffer IDs follow {name}:chunk_{i} pattern."""
         view, lowering, inst = _make_ir_setup(
             _make_stream_spec(), PassthroughKernel,
         )
         ops = [
             Operation(
-                kind=OpKind.RECV_TENSOR,
+                kind=OpKind.PULL_TENSOR,
                 tensor=inst.get_tensor("data_out"),
                 chunk_index=i,
                 chunk_total=3,
@@ -440,7 +419,7 @@ class TestChunkedRecvTensorLowering:
         # Logical name maps to chunk_0
         assert buf_ids["data_out"] == buf_ids["data_out:chunk_0"]
 
-    def test_chunked_recv_with_list_chunks_spec(self):
+    def test_chunked_pull_with_list_chunks_spec(self):
         """chunks=[10, 6] gives proportional sizes."""
         view, lowering, inst = _make_ir_setup(
             _make_stream_spec(), PassthroughKernel,
@@ -448,7 +427,7 @@ class TestChunkedRecvTensorLowering:
         total_size = view.exposed_tensors["data_out"]._serialized_size
         ops = [
             Operation(
-                kind=OpKind.RECV_TENSOR,
+                kind=OpKind.PULL_TENSOR,
                 tensor=inst.get_tensor("data_out"),
                 chunk_index=i,
                 chunk_total=2,
@@ -462,17 +441,17 @@ class TestChunkedRecvTensorLowering:
         assert cmds[1].size == total_size * 6 // 16
 
 
-class TestChunkedRecvTensorContext:
-    """ExecutionContext.recv_tensor(chunks=...) API tests."""
+class TestChunkedPullTensorContext:
+    """ExecutionContext.pull_tensor(chunks=...) API tests."""
 
-    def test_recv_tensor_chunks_returns_list(self):
+    def test_pull_tensor_chunks_returns_list(self):
         """chunks=N returns list of N OperationHandles."""
         from vten.runtime.context import ExecutionContext
 
         ctx = ExecutionContext()
         tensor = Tensor(shape=(16,), dtype=torch.int8, interface="axis_out")
         tensor.name = "data_out"
-        handles = ctx.recv_tensor(tensor, chunks=4)
+        handles = ctx.pull_tensor(tensor, chunks=4)
         assert isinstance(handles, list)
         assert len(handles) == 4
         for i, h in enumerate(handles):
@@ -480,25 +459,25 @@ class TestChunkedRecvTensorContext:
             assert h.op.chunk_total == 4
             assert h.op.chunks_spec == 4
 
-    def test_recv_tensor_no_chunks_returns_single_handle(self):
+    def test_pull_tensor_no_chunks_returns_single_handle(self):
         """Without chunks, returns single OperationHandle (backward compat)."""
         from vten.runtime.context import ExecutionContext
 
         ctx = ExecutionContext()
         tensor = Tensor(shape=(16,), dtype=torch.int8, interface="axis_out")
         tensor.name = "data_out"
-        handle = ctx.recv_tensor(tensor)
+        handle = ctx.pull_tensor(tensor)
         assert isinstance(handle, OperationHandle)
         assert handle.op.chunk_index is None
 
-    def test_recv_tensor_list_chunks_returns_list(self):
+    def test_pull_tensor_list_chunks_returns_list(self):
         """chunks=[5, 11] returns list of 2 handles."""
         from vten.runtime.context import ExecutionContext
 
         ctx = ExecutionContext()
         tensor = Tensor(shape=(16,), dtype=torch.int8, interface="axis_out")
         tensor.name = "data_out"
-        handles = ctx.recv_tensor(tensor, chunks=[5, 11])
+        handles = ctx.pull_tensor(tensor, chunks=[5, 11])
         assert len(handles) == 2
         assert handles[0].op.chunks_spec == [5, 11]
 
@@ -727,8 +706,8 @@ class TestConfigureLowering:
         assert len(cmds) == 1
         assert cmds[0].reg_value == 2048
 
-    def test_first_cmd_gets_dep_rest_empty(self):
-        """Only first WRITE_REG in configure() expansion gets dep."""
+    def test_configure_cmds_chain_sequentially(self):
+        """Configure WRITE_REGs chain: first gets parent dep, rest chain to previous."""
         from vten.runtime.binder import resolve_auto_binds
 
         regs = [
@@ -749,11 +728,11 @@ class TestConfigureLowering:
         )
         cmds, _ = _lower_ops(view, lowering, [push_op, configure_op])
 
-        # First configure cmd (index 1) gets dep, second (index 2) gets empty
+        # push_tensor → LOAD(0)+PUSH(1), configure → WRITE_REG(2), WRITE_REG(3)
         configure_cmds = [c for c in cmds if c.reg_offset in (0x010, 0x014)]
         assert len(configure_cmds) == 2
         assert len(configure_cmds[0].dep) > 0
-        assert configure_cmds[1].dep == []
+        assert configure_cmds[1].dep == [configure_cmds[0].cmd_id]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -767,16 +746,16 @@ class TestDependencyResolution:
     def test_dep_references_last_cmd(self):
         """Multi-command expansion: downstream dep → last cmd_id."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
-        # send_tensor → LOAD(id=0), PUSH(id=1)
-        send_op = Operation(kind=OpKind.SEND_TENSOR, tensor=inst.get_tensor("data_in"))
-        send_handle = OperationHandle(op=send_op)
-        # barrier depends on send
+        # push_tensor → LOAD(id=0), PUSH(id=1)
+        push_op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
+        push_handle = OperationHandle(op=push_op)
+        # barrier depends on push
         barrier_op = Operation(
             kind=OpKind.BARRIER,
-            dep=[send_handle],
+            dep=[push_handle],
         )
-        cmds, _ = _lower_ops(view, lowering, [send_op, barrier_op])
-        # send → LOAD(0), PUSH(1); barrier → BARRIER(2) with dep=[1]
+        cmds, _ = _lower_ops(view, lowering, [push_op, barrier_op])
+        # push_tensor → LOAD(0), PUSH(1); barrier → BARRIER(2) with dep=[1]
         barrier_cmd = cmds[2]
         assert barrier_cmd.op == OpCode.BARRIER
         assert 1 in barrier_cmd.dep
@@ -784,25 +763,26 @@ class TestDependencyResolution:
     def test_no_dep_empty_list(self):
         """Operation with dep=None → empty dep list."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
-        op = Operation(kind=OpKind.LOAD_TENSOR, tensor=inst.get_tensor("data_in"))
+        op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
         cmds, _ = _lower_ops(view, lowering, [op])
         assert cmds[0].dep == []
 
     def test_commit_dep_on_last_command(self):
         """commit_dep applied to expansion's last command only."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
-        load_op = Operation(kind=OpKind.LOAD_TENSOR, tensor=inst.get_tensor("data_in"))
-        load_handle = OperationHandle(op=load_op)
-        # send_tensor expands to LOAD+PUSH; commit_dep on the PUSH
-        send_op = Operation(
-            kind=OpKind.SEND_TENSOR,
+        push_op1 = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
+        push_handle1 = OperationHandle(op=push_op1)
+        # second push_tensor also expands to LOAD+PUSH; commit_dep on the PUSH
+        push_op2 = Operation(
+            kind=OpKind.PUSH_TENSOR,
             tensor=inst.get_tensor("data_in"),
-            commit_dep=[load_handle],
+            commit_dep=[push_handle1],
         )
-        cmds, _ = _lower_ops(view, lowering, [load_op, send_op])
-        # send → LOAD(1), PUSH(2); commit_dep on PUSH(2) → [0]
-        push_cmd = [c for c in cmds if c.op == OpCode.PUSH][0]
-        assert 0 in push_cmd.commit_dep
+        cmds, _ = _lower_ops(view, lowering, [push_op1, push_op2])
+        # push1 → LOAD(0), PUSH(1); push2 → LOAD(2), PUSH(3); commit_dep on PUSH(3) → [1]
+        last_push_cmd = cmds[3]
+        assert last_push_cmd.op == OpCode.PUSH
+        assert 1 in last_push_cmd.commit_dep
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -816,11 +796,11 @@ class TestDependencyLimits:
     def test_max_4_issue_deps(self):
         """≤4 issue deps is valid."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
-        # Create 4 independent loads
+        # Create 4 independent push_tensor ops (each → LOAD+PUSH = 2 cmds)
         ops = []
         handles = []
         for i in range(4):
-            op = Operation(kind=OpKind.LOAD_TENSOR, tensor=inst.get_tensor("data_in"))
+            op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
             ops.append(op)
             handles.append(OperationHandle(op=op))
         # 5th op depends on all 4
@@ -836,7 +816,7 @@ class TestDependencyLimits:
         ops = []
         handles = []
         for i in range(5):
-            op = Operation(kind=OpKind.LOAD_TENSOR, tensor=inst.get_tensor("data_in"))
+            op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
             ops.append(op)
             handles.append(OperationHandle(op=op))
         barrier = Operation(kind=OpKind.BARRIER, dep=handles)
@@ -856,7 +836,7 @@ class TestBufferIDAllocation:
     def test_sequential_ids(self):
         """Buffer IDs start at 0, increment sequentially."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
-        op = Operation(kind=OpKind.LOAD_TENSOR, tensor=inst.get_tensor("data_in"))
+        op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
         _, buffer_ids = _lower_ops(view, lowering, [op])
         # Two exposed tensors: data_in and data_out
         assert len(buffer_ids) == 2
@@ -874,7 +854,7 @@ class TestBufferIDAllocation:
         # Re-create lowering with alias registry
         from vten.runtime.ir import IRLowering
         lowering = IRLowering(view, alias_reg)
-        op = Operation(kind=OpKind.LOAD_TENSOR, tensor=inst.get_tensor("data_in"))
+        op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
         _, buffer_ids = _lower_ops(view, lowering, [op])
         assert buffer_ids["data_in"] == buffer_ids["data_out"]
 
@@ -885,19 +865,19 @@ class TestBufferIDAllocation:
 
 
 class TestShorthandExpansion:
-    """send_tensor / recv_tensor alias-aware lowering."""
+    """push_tensor / pull_tensor alias-aware lowering."""
 
-    def test_send_no_alias_load_push(self):
-        """send_tensor (no alias) → LOAD + PUSH."""
+    def test_push_no_alias_load_push(self):
+        """push_tensor (no alias) → LOAD + PUSH."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
-        op = Operation(kind=OpKind.SEND_TENSOR, tensor=inst.get_tensor("data_in"))
+        op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
         cmds, _ = _lower_ops(view, lowering, [op])
         assert len(cmds) == 2
         assert cmds[0].op == OpCode.LOAD
         assert cmds[1].op == OpCode.PUSH
 
-    def test_send_alias_push_only(self):
-        """send_tensor (alias target) → PUSH only, LOAD skipped."""
+    def test_push_alias_push_only(self):
+        """push_tensor (alias target) → PUSH only, LOAD skipped."""
         alias_reg = AliasRegistry()
         view, lowering, inst = _make_ir_setup(
             _make_stream_spec(), PassthroughKernel, alias_registry=alias_reg
@@ -907,24 +887,24 @@ class TestShorthandExpansion:
         from vten.runtime.ir import IRLowering
         lowering = IRLowering(view, alias_reg)
 
-        op = Operation(kind=OpKind.SEND_TENSOR, tensor=inst.get_tensor("data_in"))
+        op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
         cmds, _ = _lower_ops(view, lowering, [op])
         assert len(cmds) == 1
         assert cmds[0].op == OpCode.PUSH
 
-    def test_recv_no_alias_pull_store_axi4(self):
-        """recv_tensor on AXI4 (no alias) → PULL + STORE."""
+    def test_pull_no_alias_pull_store_axi4(self):
+        """pull_tensor on AXI4 (no alias) → PULL + STORE."""
         view, lowering, inst = _make_ir_setup(
             _make_mem_spec(), MemKernel, runtime_params={"IN_CH": 32}
         )
-        op = Operation(kind=OpKind.RECV_TENSOR, tensor=inst.get_tensor("ofm"))
+        op = Operation(kind=OpKind.PULL_TENSOR, tensor=inst.get_tensor("ofm"))
         cmds, _ = _lower_ops(view, lowering, [op])
         assert len(cmds) == 2
         assert cmds[0].op == OpCode.PULL
         assert cmds[1].op == OpCode.STORE
 
-    def test_recv_alias_pull_only(self):
-        """recv_tensor (alias source) → PULL only, STORE skipped."""
+    def test_pull_alias_pull_only(self):
+        """pull_tensor (alias source) → PULL only, STORE skipped."""
         alias_reg = AliasRegistry()
         view, lowering, inst = _make_ir_setup(
             _make_mem_spec(), MemKernel,
@@ -936,7 +916,7 @@ class TestShorthandExpansion:
         from vten.runtime.ir import IRLowering
         lowering = IRLowering(view, alias_reg)
 
-        op = Operation(kind=OpKind.RECV_TENSOR, tensor=inst.get_tensor("ofm"))
+        op = Operation(kind=OpKind.PULL_TENSOR, tensor=inst.get_tensor("ofm"))
         cmds, _ = _lower_ops(view, lowering, [op])
         # AXI4 + alias source → PULL only
         assert len(cmds) == 1
@@ -951,8 +931,8 @@ class TestShorthandExpansion:
 class TestMultiPortPushPull:
     """Split interface generates N commands per port."""
 
-    def test_multi_port_push_generates_n_commands(self):
-        """Split interface with 4 ports → 4 PUSH commands."""
+    def test_multi_port_push_generates_2n_commands(self):
+        """Split interface with 4 ports → 4×(LOAD+PUSH) = 8 commands."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
         # Manually set port_buffers on exposed tensor
         exposed = view.exposed_tensors["data_in"]
@@ -961,34 +941,38 @@ class TestMultiPortPushPull:
         }
         op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
         cmds, _ = _lower_ops(view, lowering, [op])
-        assert len(cmds) == 4
-        assert all(c.op == OpCode.PUSH for c in cmds)
+        assert len(cmds) == 8
+        push_cmds = [c for c in cmds if c.op == OpCode.PUSH]
+        load_cmds = [c for c in cmds if c.op == OpCode.LOAD]
+        assert len(push_cmds) == 4
+        assert len(load_cmds) == 4
 
-    def test_first_port_gets_dep(self):
-        """Only first port command gets dep, rest empty."""
+    def test_first_port_load_gets_dep(self):
+        """Only first port's LOAD command gets dep, rest empty."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
         exposed = view.exposed_tensors["data_in"]
         exposed._port_buffers = {
             f"port_{i}": bytes(32) for i in range(3)
         }
-        # Create a preceding load to generate a dep
-        load_op = Operation(kind=OpKind.LOAD_TENSOR, tensor=inst.get_tensor("data_in"))
-        load_handle = OperationHandle(op=load_op)
+        # Create a preceding barrier to generate a dep
+        barrier_op = Operation(kind=OpKind.BARRIER)
+        barrier_handle = OperationHandle(op=barrier_op)
         push_op = Operation(
             kind=OpKind.PUSH_TENSOR,
             tensor=inst.get_tensor("data_in"),
-            dep=[load_handle],
+            dep=[barrier_handle],
         )
-        cmds, _ = _lower_ops(view, lowering, [load_op, push_op])
-        push_cmds = [c for c in cmds if c.op == OpCode.PUSH]
-        assert len(push_cmds) == 3
-        # First push has dep, rest don't
-        assert len(push_cmds[0].dep) > 0
-        assert push_cmds[1].dep == []
-        assert push_cmds[2].dep == []
+        cmds, _ = _lower_ops(view, lowering, [barrier_op, push_op])
+        # barrier(0), then 3 ports × (LOAD+PUSH) = 6 cmds
+        load_cmds = [c for c in cmds if c.op == OpCode.LOAD]
+        assert len(load_cmds) == 3
+        # First LOAD of multi-port has dep (on barrier), rest don't
+        assert len(load_cmds[0].dep) > 0
+        assert load_cmds[1].dep == []
+        assert load_cmds[2].dep == []
 
     def test_each_port_gets_unique_interface_id(self):
-        """Each port command gets a distinct interface_id."""
+        """Each port's PUSH command gets a distinct interface_id."""
         view, lowering, inst = _make_ir_setup(_make_stream_spec(), PassthroughKernel)
         exposed = view.exposed_tensors["data_in"]
         exposed._port_buffers = {
@@ -997,7 +981,8 @@ class TestMultiPortPushPull:
         }
         op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("data_in"))
         cmds, _ = _lower_ops(view, lowering, [op])
-        iface_ids = [c.interface_id for c in cmds]
+        push_cmds = [c for c in cmds if c.op == OpCode.PUSH]
+        iface_ids = [c.interface_id for c in push_cmds]
         assert len(set(iface_ids)) == 2  # each port gets unique ID
 
 
@@ -1010,7 +995,7 @@ class TestNPU3DFullIR:
     """End-to-end IR lowering for NPU 3D single invocation."""
 
     def test_expected_command_sequence(self):
-        """NPU 3D simplified: load → configure → write_reg → poll → store."""
+        """NPU 3D simplified: push → configure → write_reg → poll → pull."""
         from vten.runtime.binder import resolve_auto_binds
 
         view, lowering, inst = _make_ir_setup(
@@ -1019,7 +1004,7 @@ class TestNPU3DFullIR:
         view._register_bindings = resolve_auto_binds(view)
 
         ops = [
-            Operation(kind=OpKind.LOAD_TENSOR, tensor=inst.get_tensor("ifm")),
+            Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("ifm")),
             Operation(kind=OpKind.CONFIGURE, kernel=None),
             Operation(
                 kind=OpKind.WRITE_REGISTER,
@@ -1031,14 +1016,16 @@ class TestNPU3DFullIR:
                 register_interface="ctrl",
                 register_field_name="done",
             ),
-            Operation(kind=OpKind.STORE_TENSOR, tensor=inst.get_tensor("ofm")),
+            Operation(kind=OpKind.PULL_TENSOR, tensor=inst.get_tensor("ofm")),
         ]
         cmds, buffer_ids = _lower_ops(view, lowering, ops)
 
         opcodes = [c.op for c in cmds]
         assert OpCode.LOAD in opcodes
+        assert OpCode.PUSH in opcodes
         assert OpCode.WRITE_REG in opcodes
         assert OpCode.POLL_REG in opcodes
+        assert OpCode.PULL in opcodes
         assert OpCode.STORE in opcodes
 
     def test_cmd_ids_are_sequential(self):
@@ -1047,10 +1034,8 @@ class TestNPU3DFullIR:
             _make_mem_spec(), MemKernel, runtime_params={"IN_CH": 32}
         )
         ops = [
-            Operation(kind=OpKind.LOAD_TENSOR, tensor=inst.get_tensor("ifm")),
             Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("ifm")),
             Operation(kind=OpKind.PULL_TENSOR, tensor=inst.get_tensor("ofm")),
-            Operation(kind=OpKind.STORE_TENSOR, tensor=inst.get_tensor("ofm")),
         ]
         cmds, _ = _lower_ops(view, lowering, ops)
         cmd_ids = [c.cmd_id for c in cmds]
@@ -1166,7 +1151,6 @@ class TestCommandFields:
     def test_command_import(self):
         from vten.spec.models import OpCode
         assert OpCode.LOAD.value == 1
-        assert OpCode.COMPARE.value == 9
 
     def test_opcode_values(self):
         """OpCode enum values match SHM encoding."""
@@ -1178,7 +1162,6 @@ class TestCommandFields:
         assert OpCode.READ_REG.value == 6
         assert OpCode.POLL_REG.value == 7
         assert OpCode.BARRIER.value == 8
-        assert OpCode.COMPARE.value == 9
 
     def test_command_dataclass_fields(self):
         """Command dataclass has all fields from spec §9."""

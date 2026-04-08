@@ -222,23 +222,32 @@ class KernelInstance:
         )
 ```
 
-    # ── L1: Host ↔ Memory ──
-
-    def load_tensor(self, tensor, dep=None) -> OperationHandle:
-        return self._record(OpKind.LOAD_TENSOR, tensor=tensor, dep=dep)
-
-    def store_tensor(self, tensor, dep=None) -> OperationHandle:
-        return self._record(OpKind.STORE_TENSOR, tensor=tensor, dep=dep)
-
-    # ── L2: Accel ↔ Memory ──
+    # ── Data: Host ↔ DUT ──
 
     def push_tensor(self, tensor, dep=None, probe=False) -> OperationHandle:
+        """Host → DUT 텐서 전송. 내부적으로 LOAD + PUSH IR 생성.
+        alias target이면 PUSH만 생성 (LOAD skip)."""
         return self._record(OpKind.PUSH_TENSOR, tensor=tensor,
                             dep=dep, probe=probe)
 
-    def pull_tensor(self, tensor, dep=None, probe=False) -> OperationHandle:
-        return self._record(OpKind.PULL_TENSOR, tensor=tensor,
-                            dep=dep, probe=probe)
+    def pull_tensor(self, tensor, dep=None, probe=False,
+                    chunks: int | list[int] | None = None,
+                    ) -> OperationHandle | list[OperationHandle]:
+        """DUT → Host 텐서 수신. 내부적으로 PULL + STORE IR 생성.
+        alias source이면 PULL만 생성 (STORE skip).
+
+        Args:
+            chunks: 전송을 N개 청크로 분할. BFM이 청크 사이에 tready deassert.
+                int → N등분, list[int] → explicit per-chunk element counts.
+                Returns list[OperationHandle] when chunks is specified.
+        """
+        if chunks is None:
+            return self._record(OpKind.PULL_TENSOR, tensor=tensor,
+                                dep=dep, probe=probe)
+        # Creates N separate PULL_TENSOR ops, each with chunk_index/chunk_total
+        return [self._record(OpKind.PULL_TENSOR, tensor=tensor, dep=dep,
+                             chunk_index=i, chunk_total=N, chunks_spec=chunks)
+                for i in range(N := len(chunks) if isinstance(chunks, list) else chunks)]
 
     # ── L3: Control ──
 
@@ -301,31 +310,6 @@ class KernelInstance:
     def barrier(self) -> OperationHandle:
         return self._record(OpKind.BARRIER)
 
-    # ── Shorthands ──
-
-    def send_tensor(self, tensor, dep=None) -> OperationHandle:
-        return self._record(OpKind.SEND_TENSOR, tensor=tensor, dep=dep)
-
-    def recv_tensor(self, tensor, dep=None,
-                    chunks: int | list[int] | None = None,
-                    ) -> OperationHandle | list[OperationHandle]:
-        """chunks: 전송을 N개 청크로 분할. BFM이 청크 사이에 tready deassert.
-        int → N등분, list[int] → explicit per-chunk element counts.
-        Returns list[OperationHandle] when chunks is specified."""
-        if chunks is None:
-            return self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep)
-        # Creates N separate RECV_TENSOR ops, each with chunk_index/chunk_total
-        return [self._record(OpKind.RECV_TENSOR, tensor=tensor, dep=dep,
-                             chunk_index=i, chunk_total=N, chunks_spec=chunks)
-                for i in range(N := len(chunks) if isinstance(chunks, list) else chunks)]
-
-    # ── Verification ──
-
-    def verify(self, op_handle, golden):
-        """golden: Tensor (직접 비교) 또는 dict (forward() 반환값, 자동 추출)."""
-        self._verifications.append(VerificationTask(
-            op_handle=op_handle, golden=golden))
-
     # ── Buffer Aliasing ──
 
     def alias(self, src: TensorRef, dst: TensorRef) -> None:
@@ -335,8 +319,13 @@ class KernelInstance:
 
     # ── Execution ──
 
-    def run(self) -> 'BatchResult':
+    def run(self, verify: bool = False) -> 'BatchResult':
         """Pending Operations를 하나의 Batch로 컴파일 → 제출 → 완료 대기.
+
+        Args:
+            verify: True이면 실행 후 auto-golden 검증 수행.
+                forward()를 호출하여 golden을 자동 계산하고,
+                DEV_TO_HOST 텐서의 HW 출력과 비교한다.
 
         여러 번 호출 가능. 각 호출은 직전 run() 이후 기록된 Operation만
         컴파일한다. BatchResult를 반환한다 (00_data_models.md §13).
@@ -352,13 +341,14 @@ class KernelInstance:
             6. host_status = CMD_READY; sem_post(h2b).
             7. sem_timedwait(b2h, timeout) — Backend 완료 대기.
             8. Stats Region 읽기 → BatchResult 구성.
-            9. 내부 상태 초기화:
+            9. verify=True이면 auto-golden 검증 실행.
+            10. 내부 상태 초기화:
                - pending_ops = []
                - cmd_id 카운터 0으로 리셋
                - Command Region, Stats Region은 stale (다음 run()이 덮어씀)
                - Data Region은 보존 (cross-Batch alias 지원)
                - Alias registry 보존 (cross-Batch alias 유효)
-            10. BatchResult 반환.
+            11. BatchResult 반환.
 
         후방호환:
             Single-Invocation 테스트에서 run()을 1회 호출하면
@@ -380,38 +370,11 @@ class KernelInstance:
         self._last_backend_result = backend_result
         self._pending_ops = []
 
-        # Deferred verification: run() 전에 등록된 verify() 실행
-        self._run_deferred_verifications(compiled, backend_result)
-
         return BatchResult(
             status="DONE",
             total_cycles=backend_result.stats_total_cycles(),
             per_command_stats=backend_result.stats,
         )
-
-    # ── Verification ──
-
-    def verify(self, op_handle, golden):
-        """검증 수행.
-
-        ctx.run() 이전에 호출: deferred VerificationTask로 기록.
-            → run() 종료 시 자동 실행 (후방호환).
-        ctx.run() 이후에 호출: 즉시(eager) 검증 수행.
-            → SHM에서 버퍼 데이터를 읽어 golden과 비교.
-            → VerificationError 시 즉시 raise.
-
-        golden 인자:
-            - Tensor: 직접 비교 대상 (후방호환).
-            - dict: forward() 반환값 dict. 프레임워크가 op_handle에 대응하는
-              텐서 이름을 key로 사용하여 올바른 golden 텐서를 자동 추출.
-        """
-        if self._last_compiled is not None:
-            # Eager mode: run() 이후 호출
-            self._verify_immediate(op_handle, golden)
-        else:
-            # Deferred mode: run() 이전 호출 (후방호환)
-            self._verifications.append(VerificationTask(
-                op_handle=op_handle, golden=golden))
 
     # ── Internal ──
 
@@ -423,7 +386,6 @@ class KernelInstance:
             commit_dep=[],
             probe=kwargs.pop('probe', False),
             sync=kwargs.pop('sync', False),
-            golden=None, verify=False,
             **kwargs,
         )
         self._pending_ops.append(op)
@@ -434,33 +396,33 @@ class KernelInstance:
         if isinstance(dep, OperationHandle): return [dep]
         return list(dep)
 
-    def _verify_immediate(self, op_handle, golden):
-        """Eager verification: run() 이후 호출 시 즉시 비교."""
-        tensor_name = op_handle.op.tensor.name
-        buffer_id = self._last_compiled.buffer_ids[tensor_name]
-        raw_bytes = self._last_backend_result.read_buffer(buffer_id)
+    def _run_auto_verification(self, compiled, result):
+        """Auto-golden verification: run(verify=True) 시 호출.
+        
+        DEV_TO_HOST 텐서를 대상으로 forward()로 golden을 자동 계산하고,
+        HW 출력과 비교한다.
+        """
+        for tensor_name, exposed in compiled.flattened_view.exposed_tensors.items():
+            if exposed.origin_tensor.direction != Direction.DEV_TO_HOST:
+                continue
+            golden = self._compute_auto_golden(tensor_name, compiled)
+            buffer_id = compiled.buffer_ids[tensor_name]
+            raw_bytes = result.read_buffer(buffer_id)
 
-        exposed = self._last_compiled.flattened_view.exposed_tensors[tensor_name]
-        iface = self._last_compiled.flattened_view.top_spec.get_interface(
-            exposed.top_interface)
-        deserializer = StreamSerializer(iface.packing)
-        hw_output = deserializer.deserialize(
-            raw_bytes,
-            exposed.origin_tensor._element_count,
-            exposed.origin_tensor._resolved_shape,
-        )
-        if not self._compare(hw_output, golden, exposed):
-            raise VerificationError(
-                tensor=tensor_name,
-                shape=exposed.origin_tensor._resolved_shape,
-                max_diff=self._max_diff(hw_output, golden),
+            iface = compiled.flattened_view.top_spec.get_interface(
+                exposed.top_interface)
+            deserializer = StreamSerializer(iface.packing)
+            hw_output = deserializer.deserialize(
+                raw_bytes,
+                exposed.origin_tensor._element_count,
+                exposed.origin_tensor._resolved_shape,
             )
-
-    def _run_deferred_verifications(self, compiled, result):
-        """Deferred verification: run() 전에 등록된 verify() 일괄 실행."""
-        for task in self._verifications:
-            self._verify_immediate(task.op_handle, task.golden)
-        self._verifications.clear()
+            if not self._compare(hw_output, golden, exposed):
+                raise VerificationError(
+                    tensor=tensor_name,
+                    shape=exposed.origin_tensor._resolved_shape,
+                    max_diff=self._max_diff(hw_output, golden),
+                )
 ```
 
 ---
@@ -536,7 +498,7 @@ def compile_multi(engines: list[RuntimeEngine], target: str = "sim") -> Compiled
 
 **Buffer naming convention**: multi-config에서 각 config의 버퍼는 `cfg{idx}:{tensor_name}` 키로 구분된다. 예: `cfg0:data_in`, `cfg1:data_in`, `cfg2:data_out`.
 
-**Verify 시 config_group 참조**: `_verify_immediate()`는 `Operation.config_group`을 참조하여 해당 config의 `views[config_group]`과 `cfg{config_group}:` prefix를 사용해 올바른 버퍼 데이터에 접근한다.
+**Auto-verify 시 config_group 참조**: `_run_auto_verification()`은 config_group별로 `views[config_group]`과 `cfg{config_group}:` prefix를 사용해 올바른 버퍼 데이터에 접근한다.
 
 ---
 
@@ -768,8 +730,8 @@ Shape validation 이후, DSL 연산 목록에서 텐서의 방향(Direction)을 
 
 | DSL Operation | 추론 방향 |
 |---------------|----------|
-| `push_tensor`, `send_tensor` | `HOST_TO_DEV` |
-| `pull_tensor`, `recv_tensor` | `DEV_TO_HOST` |
+| `push_tensor` | `HOST_TO_DEV` |
+| `pull_tensor` | `DEV_TO_HOST` |
 | `configure` | 해당 없음 (register only) |
 
 ### 8.2 동작
@@ -1259,20 +1221,12 @@ def _lower_to_ir(self, view, ops):
         first_cmd_id = next_cmd_id
         new_cmds = []
 
-        if op.kind == OpKind.LOAD_TENSOR:
-            new_cmds, next_cmd_id = self._lower_load(
-                op, view, next_cmd_id, op_to_cmd_range)
-
-        elif op.kind == OpKind.STORE_TENSOR:
-            new_cmds, next_cmd_id = self._lower_store(
-                op, view, next_cmd_id, op_to_cmd_range)
-
-        elif op.kind == OpKind.PUSH_TENSOR:
-            new_cmds, next_cmd_id = self._lower_push(
+        if op.kind == OpKind.PUSH_TENSOR:
+            new_cmds, next_cmd_id = self._lower_push_tensor(
                 op, view, next_cmd_id, op_to_cmd_range)
 
         elif op.kind == OpKind.PULL_TENSOR:
-            new_cmds, next_cmd_id = self._lower_pull(
+            new_cmds, next_cmd_id = self._lower_pull_tensor(
                 op, view, next_cmd_id, op_to_cmd_range)
 
         elif op.kind == OpKind.WRITE_REGISTER:
@@ -1295,14 +1249,6 @@ def _lower_to_ir(self, view, ops):
             new_cmds, next_cmd_id = self._lower_barrier(
                 op, view, next_cmd_id, op_to_cmd_range)
 
-        elif op.kind == OpKind.SEND_TENSOR:
-            new_cmds, next_cmd_id = self._lower_send_tensor(
-                op, view, next_cmd_id, op_to_cmd_range)
-
-        elif op.kind == OpKind.RECV_TENSOR:
-            new_cmds, next_cmd_id = self._lower_recv_tensor(
-                op, view, next_cmd_id, op_to_cmd_range)
-
         else:
             raise CompilationError(f"Unknown OpKind: {op.kind}")
 
@@ -1320,70 +1266,7 @@ def _lower_to_ir(self, view, ops):
 
 ### 12.3 Individual Lowering Methods
 
-**LOAD/STORE:**
-
-```python
-def _lower_load(self, op, view, next_cmd_id, op_to_cmd_range):
-    exposed = view.exposed_tensors[op.tensor.name]
-    dep_ids = self._resolve_deps(op.dep, op_to_cmd_range)
-    cmd = Command(
-        op=OpCode.LOAD, cmd_id=next_cmd_id,
-        buffer_id=self._buffer_ids[exposed.name],
-        size=exposed._serialized_size,
-        dep=dep_ids)
-    return [cmd], next_cmd_id + 1
-
-def _lower_store(self, op, view, next_cmd_id, op_to_cmd_range):
-    exposed = view.exposed_tensors[op.tensor.name]
-    dep_ids = self._resolve_deps(op.dep, op_to_cmd_range)
-    cmd = Command(
-        op=OpCode.STORE, cmd_id=next_cmd_id,
-        buffer_id=self._buffer_ids[exposed.name],
-        size=exposed._serialized_size,
-        dep=dep_ids)
-    return [cmd], next_cmd_id + 1
-```
-
-**PUSH/PULL:**
-
-```python
-def _lower_push(self, op, view, next_cmd_id, op_to_cmd_range):
-    exposed = view.exposed_tensors[op.tensor.name]
-    iface = view.top_spec.get_interface(exposed.top_interface)
-    dep_ids = self._resolve_deps(op.dep, op_to_cmd_range)
-
-    # 멀티포트 (array 또는 split) 처리
-    if exposed._port_buffers:
-        commands = []
-        for port_name, port_data in exposed._port_buffers.items():
-            cmd = Command(
-                op=OpCode.PUSH, cmd_id=next_cmd_id,
-                interface_id=self._get_iface_id(port_name),
-                buffer_id=self._buffer_ids[f"{exposed.name}:{port_name}"],
-                protocol=iface.protocol,
-                phys_addr=exposed.address or 0,
-                size=len(port_data),
-                role=self._determine_role(iface.protocol, OpCode.PUSH),
-                probe=op.probe,
-                dep=dep_ids if not commands else [])
-            commands.append(cmd)
-            next_cmd_id += 1
-        return commands, next_cmd_id
-
-    cmd = Command(
-        op=OpCode.PUSH, cmd_id=next_cmd_id,
-        interface_id=self._get_iface_id(exposed.top_interface),
-        buffer_id=self._buffer_ids[exposed.name],
-        protocol=iface.protocol,
-        phys_addr=exposed.address or 0,
-        size=exposed._serialized_size,
-        role=self._determine_role(iface.protocol, OpCode.PUSH),
-        probe=op.probe,
-        dep=dep_ids)
-    return [cmd], next_cmd_id + 1
-```
-
-(`_lower_pull`은 `_lower_push`와 구조 동일, OpCode.PULL 사용)
+`push_tensor`와 `pull_tensor`는 alias registry를 참조하여 LOAD/STORE IR을 자동으로 생성하거나 skip한다. 별도의 `load_tensor`/`store_tensor` DSL 메서드는 없다.
 
 ### 12.4 Dependency Resolution
 
@@ -1445,17 +1328,17 @@ def _lower_configure(self, op, view, next_cmd_id, op_to_cmd_range):
 
 **첫 WRITE_REG만 dep을 갖는 이유:** 후속 WRITE_REG는 같은 AXI-Lite BFM 큐를 대상으로 하여 자연스럽게 직렬화된다.
 
-### 12.6 Shorthand Expansion (Alias-Aware)
+### 12.6 push_tensor / pull_tensor Lowering (Alias-Aware)
 
-Shorthand(`send_tensor`, `recv_tensor`)는 alias registry를 참조하여 LOAD/STORE를 자동으로 skip한다. 사용자 DSL 코드 변경 없이 alias 선언만으로 최적화된 Command를 생성한다.
+`push_tensor`는 내부적으로 LOAD + PUSH IR을 생성하고, `pull_tensor`는 PULL + STORE IR을 생성한다. alias registry를 참조하여 LOAD/STORE를 자동으로 skip한다. 사용자 DSL 코드 변경 없이 alias 선언만으로 최적화된 Command를 생성한다.
 
 ```python
-def _lower_send_tensor(self, op, view, next_cmd_id, op_to_cmd_range):
-    """send_tensor의 alias-aware lowering.
+def _lower_push_tensor(self, op, view, next_cmd_id, op_to_cmd_range):
+    """push_tensor의 alias-aware lowering.
 
     - alias target (alias(src, t)가 선언됨): PUSH만 생성. LOAD skip.
       auto-dependency: src의 PULL cmd_id에 issue dep 추가.
-    - alias 아님: LOAD + PUSH 생성 (기존 동작).
+    - alias 아님: LOAD + PUSH 생성.
     """
     exposed = view.exposed_tensors[op.tensor.name]
     iface = view.top_spec.get_interface(exposed.top_interface)
@@ -1499,12 +1382,12 @@ def _lower_send_tensor(self, op, view, next_cmd_id, op_to_cmd_range):
     return commands, next_cmd_id
 
 
-def _lower_recv_tensor(self, op, view, next_cmd_id, op_to_cmd_range):
-    """recv_tensor의 alias-aware lowering.
+def _lower_pull_tensor(self, op, view, next_cmd_id, op_to_cmd_range):
+    """pull_tensor의 alias-aware lowering.
 
     - alias source (alias(t, dst)가 선언됨): PULL만 생성. STORE skip.
       데이터는 SHM에 남아서 downstream consumer가 사용.
-    - alias 아님: PULL + STORE 생성 (기존 동작).
+    - alias 아님: PULL + STORE 생성.
     """
     exposed = view.exposed_tensors[op.tensor.name]
     iface = view.top_spec.get_interface(exposed.top_interface)

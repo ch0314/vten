@@ -260,18 +260,14 @@ class ComplexPipelineKernel(Kernel):
 
 | 레벨 | 연산 | 의미 | MM (AXI4) 동작 | Stream 동작 |
 |------|------|------|----------------|-------------|
-| L1: Host↔Mem | `load_tensor` | Host → Device Memory | SHM 적재 | N/A |
-| | `store_tensor` | Device Memory → Host | SHM 읽기 | N/A |
-| L2: Accel↔Mem | `push_tensor` | Accel이 텐서 소비 | BFM 슬레이브가 accel 읽기에 응답 | BFM이 데이터 구동 |
-| | `pull_tensor` | Accel이 텐서 생성 | BFM 슬레이브가 accel 쓰기 수신 | BFM이 데이터 캡처 |
-| L3: Control | `write_register` | 레지스터 설정 | AXI-Lite 쓰기 | — |
+| Data | `push_tensor` | Host → DUT 데이터 전송 | LOAD + PUSH (alias target이면 PUSH만) | LOAD + PUSH |
+| | `pull_tensor` | DUT → Host 데이터 수신 | PULL + STORE (alias source이면 PULL만) | PULL + STORE |
+| Control | `write_register` | 레지스터 설정 | AXI-Lite 쓰기 | — |
 | | `read_register` | 레지스터 조회 | AXI-Lite 읽기 | — |
 | | `poll_register` | 조건 충족까지 블록 | AXI-Lite 반복 읽기 | — |
 | | `configure` | auto_bind 전체 레지스터 쓰기 | 모든 auto_bind WRITE_REG | — |
 | | `barrier` | 전역 동기화 펜스 | 모든 진행 중 연산 대기 | — |
-| Shorthand | `send_tensor` | = load + push (자동, alias 시 push만) | 두 단계 모두 | push만 |
-| | `recv_tensor` | = pull + store (자동, alias source 시 pull만) | 두 단계 모두 | pull만 |
-| | `alias` | 버퍼 재사용 선언 (Invocation 간) | 동일 | 동일 |
+| Utility | `alias` | 버퍼 재사용 선언 (Invocation 간) | 동일 | 동일 |
 | | `config_boundary` | multi-config 그룹 경계 표시 | BARRIER 삽입 + config_group 증가 | 동일 |
 
 ### 3.2 Dependency Model
@@ -292,31 +288,26 @@ def run(self, ctx, cfg):
     kernel = ctx.instantiate("conv3d_top", **cfg)
     kernel.generate_inputs(seed=42)
 
-    # Phase 1: Host → Device Memory
-    l1 = ctx.load_tensor(kernel.ifm)
-    l2 = ctx.load_tensor(kernel.weight)
-
-    # Phase 2: Auto-configure (주소 레지스터, 형상 레지스터, BFM 주소 맵)
+    # Phase 1: Auto-configure (주소 레지스터, 형상 레지스터, BFM 주소 맵)
     ctx.configure(kernel)
 
-    # Phase 3: 가속기 시작
-    w0 = ctx.write_register(kernel.ctrl, {"start": 1}, dep=[l1, l2])
+    # Phase 2: 데이터 전송 + 가속기 시작
+    push1 = ctx.push_tensor(kernel.ifm)       # LOAD + PUSH 자동 생성
+    push2 = ctx.push_tensor(kernel.weight)     # LOAD + PUSH 자동 생성
+    w0 = ctx.write_register(kernel.ctrl, {"start": 1}, dep=[push1, push2])
 
-    # Phase 4: Accel이 메모리에서 읽고, 계산하고, 결과 기록
-    push1 = ctx.push_tensor(kernel.ifm, dep=w0)
-    push2 = ctx.push_tensor(kernel.weight, dep=w0)
-    pull1 = ctx.pull_tensor(kernel.ofm, dep=[push1, push2])
+    # Phase 3: Accel이 메모리에서 읽고, 계산하고, 결과 기록
+    pull1 = ctx.pull_tensor(kernel.ofm, dep=w0)  # PULL + STORE 자동 생성
 
-    # Phase 5: done 대기
+    # Phase 4: done 대기
     p1 = ctx.poll_register(kernel.ctrl, "done", dep=w0)
     pull1.add_commit_dependency(p1)
 
-    # Phase 6: Device Memory → Host + 검증
-    s1 = ctx.store_tensor(kernel.ofm, dep=pull1)
-    ctx.verify(s1)  # golden 자동 계산 (forward(**inputs) 호출)
+    # Phase 5: 실행 + 검증
+    ctx.run(verify=True)  # golden 자동 계산 (forward(**inputs) 호출)
 ```
 
-### 3.4 사용 예시: Stream Interface (Shorthand)
+### 3.4 사용 예시: Stream Interface
 
 ```python
 def run(self, ctx, cfg):
@@ -324,9 +315,9 @@ def run(self, ctx, cfg):
     kernel.generate_inputs(seed=42)
 
     w0 = ctx.write_register(kernel.ctrl, {"start": 1})
-    push1 = ctx.push_tensor(kernel.ifm, dep=w0)
-    pull1 = ctx.pull_tensor(kernel.ofm, dep=push1)
-    ctx.verify(pull1)  # golden 자동 계산
+    push1 = ctx.push_tensor(kernel.ifm, dep=w0)     # LOAD + PUSH 자동 생성
+    pull1 = ctx.pull_tensor(kernel.ofm, dep=push1)   # PULL + STORE 자동 생성
+    ctx.run(verify=True)  # golden 자동 계산
 ```
 
 ### 3.5 configure() 동작
@@ -342,9 +333,9 @@ def run(self, ctx, cfg):
     kernel = ctx.instantiate("conv3d_top", **cfg)
     kernel.generate_inputs(seed=42)
 
-    ctx.load_tensor(kernel.ifm)
-    ctx.load_tensor(kernel.weight)
     ctx.configure(kernel)       # ← auto_bind 레지스터 여기서 쓰기
+    ctx.push_tensor(kernel.ifm)     # LOAD + PUSH 자동 생성
+    ctx.push_tensor(kernel.weight)  # LOAD + PUSH 자동 생성
     ctx.write_register(kernel.ctrl, {"start": 1})
     # ...
 ```
@@ -380,14 +371,14 @@ def alias(self, src: TensorRef, dst: TensorRef) -> None:
     """dst가 src의 SHM 버퍼를 직접 재사용하도록 선언.
 
     Parameters:
-        src: 이전 Invocation의 출력 텐서 (보통 recv_tensor 대상).
-        dst: 이후 Invocation의 입력 텐서 (보통 send_tensor 소스).
+        src: 이전 Invocation의 출력 텐서 (보통 pull_tensor 대상).
+        dst: 이후 Invocation의 입력 텐서 (보통 push_tensor 소스).
 
     Effects:
         - dst는 src와 동일한 buffer_id를 받는다 (새 SHM 할당 없음).
         - IR lowering 시 자동으로:
-          - recv_tensor(src): STORE를 건너뜀 (src가 alias source이므로).
-          - send_tensor(dst): LOAD를 건너뜀 (dst가 alias target이므로).
+          - pull_tensor(src): STORE를 건너뜀 (src가 alias source이므로).
+          - push_tensor(dst): LOAD를 건너뜀 (dst가 alias target이므로).
         - Auto-dependency: dst를 소비하는 첫 Command는 src를 쓴
           마지막 Command(PULL)에 자동 의존.
         - Buffer Descriptor direction이 BIDIRECTIONAL로 승격.
@@ -405,17 +396,17 @@ def alias(self, src: TensorRef, dst: TensorRef) -> None:
     """
 ```
 
-#### 3.7.2 Alias-Aware 동작 (send_tensor / recv_tensor)
+#### 3.7.2 Alias-Aware 동작 (push_tensor / pull_tensor)
 
-기존 `send_tensor`, `recv_tensor` API는 변경 없음. IR lowering 시 alias registry를 참조하여 자동으로 최적화한다.
+`push_tensor`, `pull_tensor` API는 내부적으로 LOAD/STORE를 자동 생성한다. IR lowering 시 alias registry를 참조하여 자동으로 최적화한다.
 
-| 상황 | send_tensor(t) | recv_tensor(t) |
+| 상황 | push_tensor(t) | pull_tensor(t) |
 |------|----------------|----------------|
 | t가 alias target | PUSH만 (LOAD skip) | — |
 | t가 alias source | — | PULL만 (STORE skip) |
-| t가 alias 없음 | LOAD + PUSH (기존) | PULL + STORE (기존) |
+| t가 alias 없음 | LOAD + PUSH | PULL + STORE |
 
-사용자는 항상 `send_tensor`/`recv_tensor`만 사용한다. alias 여부에 따른 Command 생성은 Runtime이 결정한다.
+사용자는 항상 `push_tensor`/`pull_tensor`만 사용한다. alias 여부에 따른 LOAD/STORE Command 생성은 Runtime이 결정한다.
 
 #### 3.7.3 Multiple Consumers (Fan-out)
 
@@ -455,35 +446,27 @@ def run(self, ctx, cfg):
 
     # ── Invocation 0: 외부 입력 ──
     layers[0].ifm.fill_random(seed=0)
-    ctx.send_tensor(layers[0].ifm)
-    ctx.send_tensor(layers[0].weight)
+    ctx.push_tensor(layers[0].ifm)       # LOAD + PUSH
+    ctx.push_tensor(layers[0].weight)    # LOAD + PUSH
     ctx.configure(layers[0])
     w = ctx.write_register(layers[0].ctrl, {"start": 1})
-    recv0 = ctx.recv_tensor(layers[0].ofm, dep=w)
+    recv0 = ctx.pull_tensor(layers[0].ofm, dep=w)   # PULL + STORE
     poll = ctx.poll_register(layers[0].ctrl, "done", dep=w)
     recv0.add_commit_dependency(poll)
 
     # ── Invocations 1–4: alias chaining ──
     for i in range(1, 5):
         ctx.alias(layers[i - 1].ofm, layers[i].ifm)
-        ctx.send_tensor(layers[i].weight)
+        ctx.push_tensor(layers[i].weight)   # LOAD + PUSH
         ctx.configure(layers[i])
         w = ctx.write_register(layers[i].ctrl, {"start": 1}, dep=recv0)
-        ctx.send_tensor(layers[i].ifm, dep=recv0)  # aliased → PUSH only
-        recv0 = ctx.recv_tensor(layers[i].ofm, dep=w)
+        ctx.push_tensor(layers[i].ifm, dep=recv0)  # aliased → PUSH only
+        recv0 = ctx.pull_tensor(layers[i].ofm, dep=w)   # PULL + STORE (or PULL only if aliased)
         poll = ctx.poll_register(layers[i].ctrl, "done", dep=w)
         recv0.add_commit_dependency(poll)
 
-    # ── 실행 ──
-    ctx.run()
-
-    # ── Golden ──
-    golden = layers[0].forward(ifm=layers[0].ifm.logical_data,
-                                weight=layers[0].weight.logical_data)["ofm"]
-    for i in range(1, 5):
-        golden = layers[i].forward(ifm=golden,
-                                    weight=layers[i].weight.logical_data)["ofm"]
-    ctx.verify(recv0, golden)
+    # ── 실행 + 검증 ──
+    ctx.run(verify=True)  # golden 자동 계산 (forward() chain)
 ```
 
 #### 3.8.2 Pattern 2: Chunked Batch (SHM 용량 관리)
@@ -505,24 +488,21 @@ def run(self, ctx, cfg):
 
         for i in range(chunk_start, chunk_end):
             if i == 0:
-                ctx.send_tensor(layers[0].ifm)
+                ctx.push_tensor(layers[0].ifm)       # LOAD + PUSH
             else:
                 ctx.alias(layers[i - 1].ofm, layers[i].ifm)
-                ctx.send_tensor(layers[i].ifm,
-                                dep=prev_recv if i > chunk_start else None)
+                ctx.push_tensor(layers[i].ifm,
+                                dep=prev_recv if i > chunk_start else None)  # aliased → PUSH only
 
-            ctx.send_tensor(layers[i].weight)
+            ctx.push_tensor(layers[i].weight)   # LOAD + PUSH
             ctx.configure(layers[i])
             w = ctx.write_register(layers[i].ctrl, {"start": 1},
                                    dep=prev_recv if i > chunk_start else None)
-            prev_recv = ctx.recv_tensor(layers[i].ofm, dep=w)
+            prev_recv = ctx.pull_tensor(layers[i].ofm, dep=w)   # PULL + STORE
             poll = ctx.poll_register(layers[i].ctrl, "done", dep=w)
             prev_recv.add_commit_dependency(poll)
 
-        ctx.run()  # chunk마다 Batch 제출, Data Region 보존
-
-    golden = compute_golden_chain(layers)  # forward(**inputs) chain
-    ctx.verify(prev_recv, golden)
+        ctx.run(verify=True)  # chunk마다 Batch 제출, Data Region 보존, golden 자동 검증
 ```
 
 Host↔Backend 핸드셰이크: ceil(10/5) = 2회.
@@ -541,15 +521,15 @@ def run(self, ctx, cfg):
 
     for i in range(5):
         if i == 0:
-            ctx.send_tensor(layers[0].ifm)
+            ctx.push_tensor(layers[0].ifm)       # LOAD + PUSH
         else:
             ctx.alias(layers[i - 1].ofm, layers[i].ifm)
-            ctx.send_tensor(layers[i].ifm)    # cross-Batch alias → PUSH only
+            ctx.push_tensor(layers[i].ifm)    # cross-Batch alias → PUSH only
 
-        ctx.send_tensor(layers[i].weight)
+        ctx.push_tensor(layers[i].weight)   # LOAD + PUSH
         ctx.configure(layers[i])
         w = ctx.write_register(layers[i].ctrl, {"start": 1})
-        result = ctx.recv_tensor(layers[i].ofm, dep=w)
+        result = ctx.pull_tensor(layers[i].ofm, dep=w)   # PULL + STORE
         poll = ctx.poll_register(layers[i].ctrl, "done", dep=w)
         result.add_commit_dependency(poll)
 
@@ -566,10 +546,9 @@ def run(self, ctx, cfg):
                 weight=layers[i].weight.logical_data)["ofm"]
 
         if compute_confidence(hw_output) > cfg["early_exit_threshold"]:
-            ctx.verify(result, golden)
-            return
+            return  # early exit
 
-    ctx.verify(result, golden)
+    ctx.run(verify=True)  # final verification
 ```
 
 #### 3.8.4 Pattern 4: Host Transform (강제 Batch 분리)
@@ -582,11 +561,11 @@ def run(self, ctx, cfg):
     layer1 = ctx.instantiate("conv3d_top", **cfg["layer1"])  # ifm: int8
 
     # ── Batch 0 ──
-    ctx.send_tensor(layer0.ifm)
-    ctx.send_tensor(layer0.weight)
+    ctx.push_tensor(layer0.ifm)       # LOAD + PUSH
+    ctx.push_tensor(layer0.weight)    # LOAD + PUSH
     ctx.configure(layer0)
     w = ctx.write_register(layer0.ctrl, {"start": 1})
-    result0 = ctx.recv_tensor(layer0.ofm, dep=w)
+    result0 = ctx.pull_tensor(layer0.ofm, dep=w)   # PULL + STORE
     poll = ctx.poll_register(layer0.ctrl, "done", dep=w)
     result0.add_commit_dependency(poll)
     ctx.run()
@@ -598,17 +577,14 @@ def run(self, ctx, cfg):
     layer1.ifm.data = ifm_int8
 
     # ── Batch 1 ──
-    ctx.send_tensor(layer1.ifm)       # NOT aliased → LOAD + PUSH
-    ctx.send_tensor(layer1.weight)
+    ctx.push_tensor(layer1.ifm)       # NOT aliased → LOAD + PUSH
+    ctx.push_tensor(layer1.weight)    # LOAD + PUSH
     ctx.configure(layer1)
     w = ctx.write_register(layer1.ctrl, {"start": 1})
-    result1 = ctx.recv_tensor(layer1.ofm, dep=w)
+    result1 = ctx.pull_tensor(layer1.ofm, dep=w)   # PULL + STORE
     poll = ctx.poll_register(layer1.ctrl, "done", dep=w)
     result1.add_commit_dependency(poll)
-    ctx.run()
-
-    golden1 = compute_requantized_golden(layer0, layer1, scale)  # forward(**inputs) chain
-    ctx.verify(result1, golden1)
+    ctx.run(verify=True)  # golden 자동 계산
 ```
 
 #### 3.8.5 Pattern Selection Guide
@@ -621,7 +597,7 @@ Q: 중간 결과에 대한 Host 개입이 필요한가?
 └─ Yes → Q: 어떤 종류의 Host 개입인가?
          ├─ 동적 제어 흐름 (결과 기반 분기)      → Pattern 3
          ├─ 데이터 변환 (dtype 변환)              → Pattern 4
-         └─ 디버그 검증 (per-Invocation golden)   → Pattern 3 + ctx.verify()
+         └─ 디버그 검증 (per-Invocation golden)   → Pattern 3 + ctx.run(verify=True)
 ```
 
 ---
@@ -877,21 +853,19 @@ class TestNPUTopCustom(TestScenario):
         npu = ctx.instantiate("npu_top", **cfg)
         npu.generate_inputs(seed=42)
 
-        l1 = ctx.load_tensor(npu.ifm)
-        l2 = ctx.load_tensor(npu.weight)
         ctx.configure(npu)
 
-        w0 = ctx.write_register(npu.ctrl, {"start": 1}, dep=[l1, l2])
+        push1 = ctx.push_tensor(npu.ifm)       # LOAD + PUSH 자동 생성
+        push2 = ctx.push_tensor(npu.weight)     # LOAD + PUSH 자동 생성
 
-        push1 = ctx.push_tensor(npu.ifm, dep=w0)
-        push2 = ctx.push_tensor(npu.weight, dep=w0)
-        pull1 = ctx.pull_tensor(npu.ofm, dep=[push1, push2])
+        w0 = ctx.write_register(npu.ctrl, {"start": 1}, dep=[push1, push2])
+
+        pull1 = ctx.pull_tensor(npu.ofm, dep=w0)   # PULL + STORE 자동 생성
 
         p1 = ctx.poll_register(npu.ctrl, "done", dep=w0)
         pull1.add_commit_dependency(p1)
 
-        s1 = ctx.store_tensor(npu.ofm, dep=pull1)
-        ctx.verify(s1)  # golden 자동 계산 (forward(**inputs) chain)
+        ctx.run(verify=True)  # golden 자동 계산 (forward(**inputs) chain)
 ```
 
 MACKernel 코드는 **수정 없이** NPUTopKernel 내에서 재사용된다.
@@ -937,15 +911,12 @@ runtime (test config)  >  Kernel.default_params  >  vten.toml [parameters]
 사용자 코드:
 
 ```python
-ctx.load_tensor(kernel.ifm)
-ctx.load_tensor(kernel.weight)
 ctx.configure(kernel)
+ctx.push_tensor(kernel.ifm)        # → LOAD + PUSH 생성
+ctx.push_tensor(kernel.weight)     # → LOAD + PUSH 생성
 ctx.write_register(kernel.ctrl, {"start": 1})
-ctx.push_tensor(kernel.ifm)
-ctx.push_tensor(kernel.weight)
-ctx.pull_tensor(kernel.ofm)
+ctx.pull_tensor(kernel.ofm)        # → PULL + STORE 생성
 ctx.poll_register(kernel.ctrl, "done")
-ctx.store_tensor(kernel.ofm)
 ```
 
 Runtime이 생성하는 IR:

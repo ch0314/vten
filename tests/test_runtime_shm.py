@@ -559,8 +559,8 @@ class TestDataRegion:
         inst = ctx.instantiate(TinyKernel, spec=spec)
         inst.x.data = torch.tensor([10, 20, 30, 40], dtype=torch.int8)
 
-        ctx.send_tensor(inst.x)
-        ctx.recv_tensor(inst.y)
+        ctx.push_tensor(inst.x)
+        ctx.pull_tensor(inst.y)
         ctx.run()
 
         compiled = ctx._last_compiled
@@ -609,8 +609,8 @@ class TestDataRegion:
         inst = ctx.instantiate(TinyKernel2, spec=spec)
         inst.x.data = torch.tensor([10, 20, 30, 40], dtype=torch.int8)
 
-        ctx.send_tensor(inst.x)
-        ctx.recv_tensor(inst.y)
+        ctx.push_tensor(inst.x)
+        ctx.pull_tensor(inst.y)
         ctx.run()
 
         compiled = ctx._last_compiled

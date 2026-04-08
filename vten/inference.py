@@ -361,8 +361,8 @@ class InferenceSession:
         # Assign data and let the normal compile pipeline handle layout+serialize
         tensor.data = data
 
-        # Use send_tensor to record LOAD+PUSH ops
-        h = ctx.send_tensor(tensor)
+        # Use push_tensor to record LOAD+PUSH ops
+        h = ctx.push_tensor(tensor)
 
         # Compile and execute to create the BO on device
         result = ctx.run()

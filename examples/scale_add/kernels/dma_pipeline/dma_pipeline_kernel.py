@@ -71,16 +71,14 @@ class DmaPipelineKernel(CompositeKernel):
         return {"data_out": x.clamp(-128, 127).to(torch.int8)}
 
     def run(self, ctx) -> None:
-        h_load = ctx.load_tensor(self.data_in)
-
         # Push input to AXI4 BFM (ReadDMA reads from here)
-        h_push = ctx.push_tensor(self.data_in, dep=h_load)
+        h_push = ctx.push_tensor(self.data_in)
 
         # Pull output — dispatch early so AXI4 BFM has PULL entry
-        h_pull = ctx.pull_tensor(self.data_out, dep=h_load)
+        h_pull = ctx.pull_tensor(self.data_out, dep=h_push)
 
         # Configure all sub-kernels (auto_bind + runtime_params registers)
-        h_cfg = ctx.configure(self, dep=h_load)
+        h_cfg = ctx.configure(self, dep=h_push)
 
         # Start all sub-kernels
         h_start_rdma = ctx.write_register(self.rdma_ctrl, {"start": 1}, dep=h_cfg)
@@ -99,5 +97,3 @@ class DmaPipelineKernel(CompositeKernel):
         h_pull.add_commit_dependency(h_poll_scale)
         h_pull.add_commit_dependency(h_poll_offset)
         h_pull.add_commit_dependency(h_poll_wdma)
-
-        ctx.verify(h_pull, self.forward()["data_out"])

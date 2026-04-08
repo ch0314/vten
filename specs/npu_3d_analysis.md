@@ -571,7 +571,7 @@ class NPU3DKernel(CompositeKernel):
 | VSYNC trigger | WRITE_REG | Write 1 to VSYNC offset |
 | Poll LAYER_DONE | POLL_REG | ctrl_fmapio, offset 0x054 |
 | Read OFM from DDR | STORE | fmapIO DDR BFM에서 데이터 회수 |
-| Compare golden | COMPARE | PyTorch ref vs HW output |
+| Compare golden | (Host-side) | run(verify=True)로 PyTorch ref vs HW output |
 
 ### 11.4 Scheduler 파라미터
 
@@ -657,7 +657,7 @@ output logic            psum2act_vld;
 - `__init_subclass__`로 tensor.name 자동 설정 확인
 - `generate_inputs(seed)` — int8 IFM, int8 weight, int32 bias 생성
 - `forward()` — conv3d golden reference (F.conv3d + bias_shift + relu/clip)
-- `verify()` — ±1 tolerance (기본 allclose 대신 커스텀)
+- verification — ±1 tolerance (기본 allclose 대신 커스텀)
 - `bind()` — 6개 AXI4-Lite를 bank tuple `("ctrl", "dma")` 형태로 바인딩
 
 **test_composite.py** — NPU 3D는 단일 Kernel이므로 직접 해당 없음
@@ -707,11 +707,11 @@ output logic            psum2act_vld;
 
 **test_runtime_ir.py** — NPU 3D IR lowering
 - CONFIGURE → 6개 IP의 auto_bind register를 N × WRITE_REG로 확장
-- LOAD_TENSOR → 1× LOAD (IFM, Weight, Bias 각각)
-- Weight LOAD → split 32포트이므로 32× LOAD commands
+- PUSH_TENSOR → LOAD + PUSH (IFM, Weight, Bias 각각)
+- Weight PUSH_TENSOR → split 32포트이므로 32× LOAD + PUSH commands
 - WRITE_REG(vsync) → 1× WRITE_REG per IP
 - POLL_REG(layer_done) → 1× POLL_REG (ctrl_fmapio 0x054)
-- STORE_TENSOR → 1× STORE (OFM)
+- PULL_TENSOR → PULL + STORE (OFM)
 
 **test_runtime_shm.py** — SHM 이미지
 - Command slot: LOAD cmd에 `phys_addr`, `size`, `buffer_id` 정확히 인코딩

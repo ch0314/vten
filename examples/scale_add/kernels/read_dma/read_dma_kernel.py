@@ -37,17 +37,14 @@ class ReadDMAKernel(Kernel):
         self.data_in.fill_random(generator=rng)
 
     def run(self, ctx) -> None:
-        h_load = ctx.load_tensor(self.data_in)
-        h_push = ctx.push_tensor(self.data_in, dep=h_load)
+        h_push = ctx.push_tensor(self.data_in)
 
-        h_cfg = ctx.configure(self, dep=h_load)
-        h_pull = ctx.pull_tensor(self.data_out, dep=h_load)
+        h_cfg = ctx.configure(self, dep=h_push)
+        h_pull = ctx.pull_tensor(self.data_out, dep=h_push)
 
         h_start = ctx.write_register(self.ctrl, {"start": 1}, dep=h_cfg)
         h_poll = ctx.poll_register(self.ctrl, "done", dep=h_start)
         h_pull.add_commit_dependency(h_poll)
-
-        ctx.verify(h_pull, self.forward())
 
     def forward(self, **inputs) -> dict[str, torch.Tensor]:
         """Golden reference: DMA is identity."""
