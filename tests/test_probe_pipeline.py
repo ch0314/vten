@@ -533,7 +533,7 @@ class TestControllerProbeError:
 
     @pytest.fixture(autouse=True)
     def _load_sv(self):
-        sv_path = Path(__file__).resolve().parent.parent / "vten_sv" / "vten_shm_controller.sv"
+        sv_path = Path(__file__).resolve().parent.parent / "vten" / "sv" / "vten_shm_controller.sv"
         self.text = sv_path.read_text()
 
     def test_probe_error_port_declared(self):
@@ -563,7 +563,7 @@ class TestProbeBfmSV:
 
     @pytest.fixture(autouse=True)
     def _load_sv(self):
-        sv_path = Path(__file__).resolve().parent.parent / "vten_sv" / "vten_bfm_probe.sv"
+        sv_path = Path(__file__).resolve().parent.parent / "vten" / "sv" / "vten_bfm_probe.sv"
         self.text = sv_path.read_text()
 
     def test_probe_error_output_declared(self):

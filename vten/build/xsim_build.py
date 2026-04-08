@@ -160,8 +160,8 @@ class XsimBuildPipeline(BuildPipeline):
         super().__init__(project, config)
         xsim_cfg = config.get("backend", {}).get("xsim", {})
         self._vivado_path = xsim_cfg.get("vivado_path", "")
-        self._vten_root = Path(__file__).resolve().parent.parent.parent
-        self._vten_sv_dir = self._vten_root / "vten_sv"
+        self._vten_root = Path(__file__).resolve().parent.parent
+        self._vten_sv_dir = self._vten_root / "sv"
         self._cache = load_cache(project / "build" / ".cache.json")
         # Normalize [ip] table format to [[ip]] list format
         self._config["ip"] = self._normalize_ip_config(self._config.get("ip"))

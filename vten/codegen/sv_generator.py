@@ -565,7 +565,7 @@ class SVGenerator:
         # Resolve vten_sv_dir: either from build context or auto-detect
         vten_sv_dir = ctx.build.vten_sv_dir
         if not vten_sv_dir:
-            candidate = Path(__file__).resolve().parent.parent.parent / "vten_sv"
+            candidate = Path(__file__).resolve().parent.parent / "sv"
             if candidate.exists():
                 vten_sv_dir = str(candidate)
             else:

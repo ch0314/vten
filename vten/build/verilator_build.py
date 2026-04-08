@@ -44,8 +44,8 @@ class VerilatorBuildPipeline(BuildPipeline):
         self._trace = veri_cfg.get("trace", False)
         self._opt_level = veri_cfg.get("opt_level", 3)
         self._extra_args = veri_cfg.get("extra_args", [])
-        self._vten_root = Path(__file__).resolve().parent.parent.parent
-        self._vten_sv_dir = self._vten_root / "vten_sv"
+        self._vten_root = Path(__file__).resolve().parent.parent
+        self._vten_sv_dir = self._vten_root / "sv"
         self._cache = load_cache(project / "build" / ".cache.json")
 
         # Vivado path for UNISIM/XPM library resolution

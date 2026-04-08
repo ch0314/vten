@@ -24,7 +24,7 @@ def _vten_templates_dir() -> Path:
 
 
 def _vten_sv_dir() -> Path:
-    return Path(__file__).resolve().parent.parent.parent / "vten_sv"
+    return Path(__file__).resolve().parent.parent / "sv"
 
 
 def _render(template_name: str, context: dict) -> str:

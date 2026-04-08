@@ -15,7 +15,7 @@ import pytest
 # ── Paths ──
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-VTEN_SV = PROJECT_ROOT / "vten_sv"
+VTEN_SV = PROJECT_ROOT / "vten" / "sv"
 STUBS_DIR = PROJECT_ROOT / "tests" / "phase3" / "stubs"
 WRAPPERS_DIR = PROJECT_ROOT / "tests" / "phase3" / "wrappers"
 BUILD_DIR = PROJECT_ROOT / "build" / "verilator"

@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-VTEN_SV_DIR = Path(__file__).resolve().parent.parent / "vten_sv"
+VTEN_SV_DIR = Path(__file__).resolve().parent.parent / "vten" / "sv"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 

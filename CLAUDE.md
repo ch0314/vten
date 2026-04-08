@@ -96,6 +96,21 @@ vten/
 │   ├── codegen/               # Phase 4: Jinja2 code generation
 │   │   ├── __init__.py
 │   │   └── sv_generator.py
+│   ├── sv/                    # Phase 3: SystemVerilog library (fixed)
+│   │   ├── vten_types.svh
+│   │   ├── vten_dpi_imports.svh
+│   │   ├── vten_bfm_cmd_if.sv
+│   │   ├── vten_shm_controller.sv
+│   │   ├── vten_command_scheduler.sv
+│   │   ├── vten_bfm_axi4s.sv
+│   │   ├── vten_bfm_axi4.sv
+│   │   ├── vten_bfm_axilite.sv
+│   │   ├── vten_bfm_probe.sv
+│   │   ├── vten_shm_bridge.c
+│   │   └── vten_shm_bridge.h
+│   ├── templates/             # Phase 4: Jinja2 templates
+│   │   ├── sim/               # xsim/verilator testbench templates
+│   │   └── xrt/               # XRT build templates
 │   └── cli/                   # Phase 4: CLI commands
 │       ├── __init__.py
 │       ├── main.py
@@ -103,24 +118,6 @@ vten/
 │       ├── build.py
 │       ├── run.py
 │       └── report.py
-├── vten_sv/                   # Phase 3: SystemVerilog library (fixed)
-│   ├── vten_types.svh
-│   ├── vten_dpi_imports.svh
-│   ├── vten_bfm_cmd_if.sv
-│   ├── vten_shm_controller.sv
-│   ├── vten_command_scheduler.sv
-│   ├── vten_bfm_axi4s.sv
-│   ├── vten_bfm_axi4.sv
-│   ├── vten_bfm_axilite.sv
-│   ├── vten_bfm_probe.sv
-│   ├── vten_shm_bridge.c
-│   └── vten_shm_bridge.h
-├── templates/                 # Phase 4: Jinja2 templates
-│   ├── tb_top.sv.j2
-│   ├── bfm_instantiation.sv.j2
-│   ├── wire_declarations.sv.j2
-│   ├── project_setup.tcl.j2
-│   └── resolve_order.tcl
 ├── tests/                     # pytest 테스트
 │   ├── conftest.py
 │   ├── test_tensor.py
@@ -172,7 +169,7 @@ Phase 2: Runtime Engine     ← specs: 00 + 02
    완료 기준: DSL → IR → SHM 이미지 생성, Full Trace 기대값 일치
 
 Phase 3: SV + C Backend     ← specs: 00 + 04 + 05
-   vten_sv/ 디렉토리
+   vten/sv/ 디렉토리
    완료 기준: gcc 컴파일 성공, xvlog 구문 통과, BFM 단위 테스트
 
 Phase 4: Integration        ← specs: 00 + 06
@@ -266,11 +263,11 @@ pytest tests/ --cov=vten --cov-report=term-missing
 
 ```bash
 # SV 구문 검사
-xvlog --sv vten_sv/*.sv
+xvlog --sv vten/sv/*.sv
 
 # DPI-C 공유 라이브러리 빌드
 gcc -shared -fPIC -o build/lib/libvten_shm.so \
-    vten_sv/vten_shm_bridge.c -lrt -lpthread
+    vten/sv/vten_shm_bridge.c -lrt -lpthread
 
 # Elaboration (DPI-C 링크 포함)
 xelab tb_top --sv_lib build/lib/libvten_shm -timescale 1ns/1ps

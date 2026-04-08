@@ -31,7 +31,7 @@ vten = "vten.cli.main:main"
 include = ["vten*"]
 
 [tool.setuptools.package-data]
-vten = ["templates/**/*"]
+vten = ["templates/**/*", "sv/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
