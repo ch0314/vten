@@ -695,13 +695,13 @@ result = ctx.run(verify=True)       # 1회 xsim 실행으로 3개 config 검증 
 ```python
 with KernelExecutor(MyKernel, backend=b, params={...}) as npu:
     # 배치 1
-    y1 = npu(t_in=x1)["t_out"]     # open_session → submit → wait
+    y1 = npu(t_in=x1)["t_out"]     # backend.execute() — 첫 호출: sim 기동 + 실행
     assert torch.equal(y1, expected1)
 
     # 배치 2 (동일 xsim 프로세스 재사용)
-    y2 = npu(t_in=x2)["t_out"]     # submit_batch → wait_batch
+    y2 = npu(t_in=x2)["t_out"]     # backend.execute() — 이후 호출: SHM 업데이트 + 실행
     assert torch.equal(y2, expected2)
-                                    # close_session (context manager exit)
+                                    # backend.cleanup() (context manager exit)
 ```
 
 ---

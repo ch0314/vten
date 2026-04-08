@@ -327,41 +327,58 @@ class BackendResult:
         return self.output_buffers.get(buffer_id, b"")
 ```
 
-### 5.5 Session Management Methods
+### 5.5 Session Auto-Management
 
-SimBackend가 제공하는 multi-batch 세션 인터페이스. 단일 시뮬레이터 프로세스에서 여러 배치를 연속 실행한다.
+SimBackend는 `execute()` 내부에서 세션 수명주기를 자동으로 관리한다. Caller는 세션 상태를 추적하거나 전파할 필요가 없다.
 
 ```python
 class Backend(abc.ABC):
-    @property
-    def supports_session(self) -> bool:
-        """세션 모드 지원 여부. 기본 False."""
-        return False
+    @abstractmethod
+    def execute(self, compiled: CompiledResult) -> BackendResult:
+        """Execute compiled result. SimBackend auto-manages session:
+        - 첫 호출: SHM 생성 + 시뮬레이터 기동 + 초기 배치 제출
+        - 이후 호출: SHM data region 업데이트 + 배치 제출 (시뮬레이터 재사용)
+        """
+        ...
 
-    def open_session(self, compiled: CompiledResult) -> None:
-        """세션 시작 + 초기 배치 제출."""
-        raise NotImplementedError
+    @abstractmethod
+    def cleanup(self) -> None:
+        """Close active session (if any) and release resources. Idempotent."""
+        ...
 
-    def submit_batch(self, compiled: CompiledResult) -> None:
-        """세션 내 후속 배치 제출 (SHM data region 덮어쓰기)."""
-        raise NotImplementedError
+    def __enter__(self) -> Backend:
+        return self
 
-    def wait_batch(self) -> BackendResult:
-        """현재 배치 완료 대기 (시뮬레이터 유지)."""
-        raise NotImplementedError
-
-    def close_session(self) -> None:
-        """세션 종료: SHUTDOWN + 정리."""
-        raise NotImplementedError
+    def __exit__(self, *exc) -> None:
+        self.cleanup()
 ```
 
-**Alias 제약**: `submit_batch()`가 SHM data region을 덮어쓰므로, sim backend에서는 cross-batch alias가 동작하지 않는다. `KernelExecutor`는 `compile_target == "sim"`일 때 auto-alias를 비활성화한다.
+**Caller 패턴**:
+```python
+with backend:                          # __exit__ → cleanup() → 세션 종료 보장
+    for batch in batches:
+        ctx = ExecutionContext(backend=backend, ...)
+        scenario.run(ctx, cfg)
+        result = ctx.run()             # → backend.execute(compiled)
+```
+
+**Session protocol (내부 구현)**:
+
+SimBackend에 `_session_active: bool` 필드가 있으며, `execute()` 내부에서 분기:
+- `_session_active == False` → SHM 생성 + sim 기동 (기존 `open_session` 로직)
+- `_session_active == True` → SHM 업데이트 + batch 제출 (기존 `submit_batch` 로직)
+
+`cleanup()` 호출 시: `_session_active == True`이면 SHUTDOWN 전송 + 프로세스 종료 + SHM 정리.
+
+레거시 session 메서드(`open_session`, `submit_batch`, `wait_batch`, `close_session`)는 하위 호환성을 위해 유지하되, 내부적으로 `execute()`와 `cleanup()`에 위임한다.
+
+**Alias 제약**: 후속 `execute()` 호출이 SHM data region을 덮어쓰므로, sim backend에서는 cross-batch alias가 동작하지 않는다.
 
 ### 5.6 클래스 계층
 
 ```
 Backend (ABC)
-├── SimBackend (ABC) — SHM 핸드셰이크 공통 로직 + Session 관리
+├── SimBackend (ABC) — SHM 핸드셰이크 + execute() 내 Session 자동 관리
 │   ├── XsimBackend — Vivado xsim 프로세스 관리
 │   └── VerilatorBackend — Verilator 바이너리 관리
 └── XrtBackend — XRT/pyxrt 기반 FPGA 실행
