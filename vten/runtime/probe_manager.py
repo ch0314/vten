@@ -72,33 +72,15 @@ def resolve_internal_probe_golden(
 
 def collect_probe_golden_tensors(
     pending_ops: list[Operation],
-    verifications: list,
-    compute_auto_golden_fn,
 ) -> dict[str, torch.Tensor]:
-    """Collect golden tensors for probe-enabled PULL operations.
+    """Collect probe tensor names from probe-enabled PULL operations.
 
-    Args:
-        pending_ops: Current batch of operations.
-        verifications: List of VerificationTask objects.
-        compute_auto_golden_fn: Callable(op_handle) → torch.Tensor.
-
-    Returns:
-        tensor_name → golden torch.Tensor.
+    Returns empty dict — probe golden data is populated via
+    internal_probe_golden path, not through this function.
     """
     probe_tensor_names: set[str] = set()
     for op in pending_ops:
         if op.probe and op.tensor is not None:
             probe_tensor_names.add(op.tensor.name)
 
-    probe_golden: dict[str, torch.Tensor] = {}
-    for task in verifications:
-        op = task.op_handle.op
-        if op.tensor is None:
-            continue
-        tensor_name = op.tensor.name
-        if tensor_name in probe_tensor_names and tensor_name not in probe_golden:
-            golden = task.golden
-            if golden is None:
-                golden = compute_auto_golden_fn(task.op_handle)
-            probe_golden[tensor_name] = golden
-    return probe_golden
+    return {}

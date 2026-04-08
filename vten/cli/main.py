@@ -64,6 +64,8 @@ def main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--gui", action="store_true", help="xsim GUI mode")
     run_parser.add_argument("-v", "--sim-verbose", action="store_true",
                             help="Enable simulator verbose output (+VTEN_VERBOSE)")
+    run_parser.add_argument("--verify", action="store_true",
+                            help="Auto-verify outputs against behavioral model golden")
     run_parser.add_argument("--config", nargs="*", help="Config overrides (K=V)")
 
     # vten report
@@ -163,6 +165,7 @@ def _dispatch(args: argparse.Namespace, log_level: str) -> None:
             gui=args.gui,
             sim_verbose=effective_sim_verbose,
             config_overrides=overrides or None,
+            verify=args.verify,
         )
 
     elif args.command == "report":

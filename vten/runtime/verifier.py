@@ -1,19 +1,13 @@
-"""Verification helpers — comparison, matching, and chunk utilities.
+"""Verification helpers — comparison and matching utilities.
 
-Extracted from ExecutionContext. Pure/static functions only; stateful
-orchestration (run_deferred_verifications) stays in ExecutionContext.
+Extracted from ExecutionContext. Pure/static functions only.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 
 from vten.errors import VerificationError
-
-if TYPE_CHECKING:
-    from vten.runtime.flattener import ExposedTensor
 
 
 def compare(hw_output: torch.Tensor, golden: torch.Tensor) -> bool:
@@ -72,18 +66,3 @@ def check_match(
         msg += f"\n{detail}"
 
     raise VerificationError(msg, tensor=tensor_name, shape=effective_shape, max_diff=md)
-
-
-def chunk_element_info(
-    exposed: ExposedTensor,
-    chunk_index: int,
-    chunk_total: int,
-    chunks_spec: int | list[int] | None,
-) -> tuple[int, tuple[int, ...]]:
-    """Compute element count and shape for a single chunk."""
-    total_elems = exposed.origin_tensor._element_count
-    if isinstance(chunks_spec, list):
-        chunk_elems = chunks_spec[chunk_index]
-    else:
-        chunk_elems = total_elems // chunk_total
-    return chunk_elems, (chunk_elems,)

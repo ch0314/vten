@@ -135,10 +135,10 @@ def expand_globs(project: Path, patterns: list[str]) -> list[str]:
 
 
 def render_template(name: str, context: dict) -> str:
-    """Render a Jinja2 template from the templates/ directory."""
-    vten_root = Path(__file__).resolve().parent.parent.parent
+    """Render a Jinja2 template from the sim templates directory."""
+    sim_templates = Path(__file__).resolve().parent.parent / "templates" / "sim"
     env = jinja2.Environment(
-        loader=jinja2.FileSystemLoader(str(vten_root / "templates")),
+        loader=jinja2.FileSystemLoader(str(sim_templates)),
     )
     return env.get_template(name).render(context)
 

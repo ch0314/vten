@@ -2,9 +2,7 @@
 
 Spec reference: 02_runtime_engine.md §11
 
-v2: Unified resolve_registers() replaces resolve_config_registers,
-    resolve_composite_config_registers, resolve_runtime_param_registers.
-    Register name matching replaces role/alias/config_map.
+v2: Unified resolve_registers() with auto_bind + param-name matching.
 """
 
 from __future__ import annotations
@@ -96,11 +94,7 @@ def resolve_registers(view: FlattenedKernelView) -> list[RegisterBindingEntry]:
     return bindings
 
 
-# Keep legacy names as aliases for backward compatibility during migration
-resolve_auto_binds = resolve_registers
-resolve_config_registers = lambda view: []
-resolve_composite_config_registers = lambda view: []
-resolve_runtime_param_registers = lambda view: []
+resolve_auto_binds = resolve_registers  # legacy alias used by tests
 
 
 def _compute_auto_bind_value(

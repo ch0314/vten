@@ -101,10 +101,6 @@ class ExecutionContext:
         self._current_config_group: int = 0  # tracks current group index
         # Internal probe golden (composite internal wires)
         self._internal_probe_golden: dict[tuple[str, str], torch.Tensor] = {}
-        # Auto-golden cache: id(kernel_instance) → forward() result dict
-        self._golden_cache: dict[int, dict[str, torch.Tensor]] = {}
-        # Deferred verifications (probe golden collection still reads this)
-        self._verifications: list = []
         # Declarative probe support
         self._declarative_probes: list[str] = []
         self._internal_probe_requests: list[tuple[str, str]] = []
@@ -273,11 +269,7 @@ class ExecutionContext:
 
     def _collect_probe_golden_tensors(self) -> dict[str, torch.Tensor]:
         from vten.runtime.probe_manager import collect_probe_golden_tensors
-        return collect_probe_golden_tensors(
-            self._pending_ops,
-            self._verifications,
-            self._compute_auto_golden,
-        )
+        return collect_probe_golden_tensors(self._pending_ops)
 
     # ── Declarative Probes ──
 
@@ -353,246 +345,57 @@ class ExecutionContext:
         from vten.runtime.output_reader import make_deserialize_fn
         return make_deserialize_fn(view, exposed)
 
-    @staticmethod
-    def _read_tensor_bytes(name, exposed, compiled, backend_result, buffer_prefix=""):
-        from vten.runtime.output_reader import read_tensor_bytes
-        return read_tensor_bytes(name, exposed, compiled, backend_result, buffer_prefix)
+    # ── Auto-verify ──
 
-    @staticmethod
-    def _read_chunk_bytes(name, exposed, compiled, backend_result, chunk_index, buffer_prefix=""):
-        from vten.runtime.output_reader import read_chunk_bytes
-        return read_chunk_bytes(name, exposed, compiled, backend_result, chunk_index, buffer_prefix)
-
-    # ── Auto-golden ──
-
-    def _find_kernel_for_tensor(self, tensor_name: str) -> object | None:
-        """Find the kernel class instance that owns the given tensor name."""
-        for ki in self._kernels.values():
-            inst = ki.kernel_class_instance
-            if inst is None:
-                continue
-            try:
-                inst.get_tensor(tensor_name)
-                return inst
-            except AttributeError:
-                pass
-            # Check auto-exposed tensors (CompositeKernel)
-            auto_exposed = getattr(type(inst), "_auto_exposed", {})
-            for (_sub, _tname), exposed_name in auto_exposed.items():
-                if exposed_name == tensor_name:
-                    return inst
-        return None
-
-    def _run_forward(self, kernel_inst: object) -> dict[str, torch.Tensor]:
-        """Run forward() on a kernel instance, handling Composite vs Simple.
-
-        CompositeKernel: forward() with no args (auto-chain with layout).
-        Simple Kernel: collect H2D tensor data, apply layout, forward(**inputs).
-        """
-        from vten.runtime.golden import run_forward
-
-        return run_forward(kernel_inst)
-
-    def _compute_auto_golden(self, op_handle) -> torch.Tensor:
-        """Compute golden tensor automatically from kernel's forward().
-
-        1. Find kernel that owns the tensor
-        2. Run forward() (cached per kernel instance)
-        3. Extract the relevant output
-        4. Handle format conversion (e.g., packed uint8 → int32)
-        5. Handle chunk slicing
-        """
-        from vten.runtime.serializer import StreamSerializer
-
-        op = op_handle.op
-        tensor_name = op.tensor.name
-
-        # Find owning kernel
-        kernel_inst = self._find_kernel_for_tensor(tensor_name)
-        if kernel_inst is None:
-            raise VerificationError(
-                f"Auto-golden: cannot find kernel for tensor '{tensor_name}'",
-                tensor=tensor_name,
-            )
-
-        # Run forward() with caching
-        cache_key = id(kernel_inst)
-        if cache_key not in self._golden_cache:
-            self._golden_cache[cache_key] = self._run_forward(kernel_inst)
-        fwd_result = self._golden_cache[cache_key]
-
-        if tensor_name not in fwd_result:
-            raise VerificationError(
-                f"Auto-golden: forward() did not produce '{tensor_name}'. "
-                f"Available: {list(fwd_result.keys())}",
-                tensor=tensor_name,
-            )
-
-        golden = fwd_result[tensor_name]
-
-        # Format conversion: if forward() dtype differs from tensor dtype
-        origin_tensor = op.tensor
-        target_dtype = origin_tensor.dtype
-        if golden.dtype != target_dtype:
-            # Check if this is a packed → unpacked case (e.g., uint8 → int32)
-            # Try deserializing via the interface's packing scheme
-            if self._last_compiled is not None:
-                compiled = self._last_compiled
-                config_group = getattr(op, "config_group", 0)
-                if config_group > 0 and compiled.views and config_group < len(compiled.views):
-                    view = compiled.views[config_group]
-                else:
-                    view = compiled.flattened_view
-
-                exposed = view.exposed_tensors.get(tensor_name)
-                if exposed is not None:
-                    try:
-                        iface = view.top_spec.get_interface(exposed.top_interface)
-                        if iface.packing is not None:
-                            serializer = StreamSerializer(iface.packing)
-                            raw_bytes = serializer.serialize(golden)
-                            element_count = origin_tensor._element_count
-                            shape = origin_tensor._resolved_shape
-                            golden = serializer.deserialize(
-                                raw_bytes, element_count, shape,
-                                dtype=target_dtype,
-                            )
-                    except (KeyError, AttributeError):
-                        pass
-
-            # Fallback: simple dtype cast
-            if golden.dtype != target_dtype:
-                golden = golden.to(target_dtype)
-
-        # Flatten for comparison
-        golden = golden.flatten()
-
-        # Chunk slicing
-        if op.chunk_index is not None:
-            total_elems = origin_tensor._element_count
-            if isinstance(op.chunks_spec, list):
-                chunk_elems = op.chunks_spec[op.chunk_index]
-                start = sum(op.chunks_spec[:op.chunk_index])
-            else:
-                chunk_elems = total_elems // op.chunk_total
-                start = op.chunk_index * chunk_elems
-            golden = golden[start:start + chunk_elems]
-
-        return golden
-
-    # ── Verification internals ──
-
-    def _verify_immediate(self, op_handle, golden) -> None:
-        """Eager verification: read HW output from SHM and compare to golden."""
-        from vten.runtime.serializer import StreamSerializer
-
-        compiled = self._last_compiled
-        backend_result = self._last_backend_result
-
-        tensor_name = op_handle.op.tensor.name
-        op = op_handle.op
-
-        # Multi-config: use correct view and buffer prefix for config group
-        config_group = getattr(op, "config_group", 0)
-        if config_group > 0 and compiled.views and config_group < len(compiled.views):
-            view = compiled.views[config_group]
-            buffer_prefix = f"cfg{config_group}:"
-        else:
-            view = compiled.flattened_view
-            buffer_prefix = ""
-
-        exposed = view.exposed_tensors[tensor_name]
-
-        # Chunked: read only this chunk's buffer
-        if op.chunk_index is not None:
-            raw_bytes = self._read_chunk_bytes(
-                tensor_name, exposed, compiled, backend_result,
-                op.chunk_index, buffer_prefix=buffer_prefix,
-            )
-        else:
-            raw_bytes = self._read_tensor_bytes(
-                tensor_name, exposed, compiled, backend_result,
-                buffer_prefix=buffer_prefix,
-            )
-
-        if not raw_bytes:
-            chunk_label = (
-                f" chunk {op.chunk_index}" if op.chunk_index is not None else ""
-            )
-            raise VerificationError(
-                f"No data returned for tensor '{tensor_name}'{chunk_label}. "
-                f"SHM may have been cleaned up.",
-                tensor=tensor_name,
-            )
-
-        iface = view.top_spec.get_interface(
-            exposed.top_interface
-        )
-        packing = iface.packing
-        if packing is None:
-            raise VerificationError(
-                f"No packing scheme for interface '{exposed.top_interface}'",
-                tensor=tensor_name,
-            )
-
-        serializer = StreamSerializer(packing)
-
-        # For chunked ops, compute per-chunk element count and shape
-        if op.chunk_index is not None:
-            element_count, shape = self._chunk_element_info(
-                exposed, op.chunk_index, op.chunk_total, op.chunks_spec,
-            )
-        else:
-            element_count = exposed.origin_tensor._element_count
-            shape = exposed.origin_tensor._resolved_shape
-
-        hw_output = serializer.deserialize(
-            raw_bytes,
-            element_count,
-            shape,
-            dtype=golden.dtype if golden is not None else None,
-        )
-
-        # Flatten to match golden (which is flattened in _compute_auto_golden)
-        hw_output = hw_output.flatten()
-
-        self._check_match(tensor_name, hw_output, golden, shape=shape)
-
-    @staticmethod
-    def _chunk_element_info(exposed, chunk_index, chunk_total, chunks_spec):
-        from vten.runtime.verifier import chunk_element_info
-        return chunk_element_info(exposed, chunk_index, chunk_total, chunks_spec)
-
-    def _auto_verify_all(self, compiled, backend_result) -> tuple[int, list]:
+    def _auto_verify_all(self, compiled, output_tensors) -> tuple[int, list]:
         """Auto-verify all DEV_TO_HOST tensors against forward() golden.
+
+        Uses compute_golden_outputs() for logical-format comparison.
+        Stores golden on output tensors for inference chain propagation.
 
         Returns (count, list[VerificationResult]).
         """
         from vten.reporting import VerificationResult
-        from vten.spec.models import Direction
+        from vten.runtime.golden import compute_golden_outputs
+        from vten.runtime.verifier import check_match
 
         view = compiled.flattened_view
         results: list[VerificationResult] = []
         first_error: VerificationError | None = None
 
-        for tensor_name, exposed in view.exposed_tensors.items():
-            if exposed.direction != Direction.DEV_TO_HOST:
+        # Collect golden from all registered kernels
+        golden_map: dict[str, torch.Tensor] = {}
+        for ki in self._kernels.values():
+            inst = ki.kernel_class_instance
+            if inst is None:
+                continue
+            try:
+                kg = compute_golden_outputs(
+                    inst, view, buffer_ids=compiled.buffer_ids,
+                )
+                golden_map.update(kg)
+            except Exception:
+                logger.debug("compute_golden_outputs failed for %s", ki, exc_info=True)
+
+        for name, out_tensor in output_tensors.items():
+            golden = golden_map.get(name)
+            if golden is None:
+                continue
+            hw = out_tensor.data
+            if hw is None:
                 continue
 
             try:
-                # Find a matching op to build auto-golden context
-                op_handle = self._find_pull_op_handle(tensor_name)
-                if op_handle is None:
-                    continue
-                golden = self._compute_auto_golden(op_handle)
-                self._verify_immediate(op_handle, golden)
+                check_match(name, hw.flatten(), golden.flatten(),
+                            shape=tuple(golden.shape))
                 results.append(VerificationResult(
-                    tensor_name=tensor_name,
+                    tensor_name=name,
                     passed=True,
                 ))
+                out_tensor.golden = golden
             except VerificationError as e:
                 results.append(VerificationResult(
-                    tensor_name=tensor_name,
+                    tensor_name=name,
                     passed=False,
                     max_diff=e.max_diff,
                     shape=e.shape,
@@ -607,34 +410,6 @@ class ExecutionContext:
             raise first_error
 
         return count, results
-
-    def _find_pull_op_handle(self, tensor_name: str):
-        """Find the last PULL_TENSOR OperationHandle for a given tensor name."""
-        # Search in the ops that were compiled (saved before clearing)
-        compiled = self._last_compiled
-        if compiled is None:
-            return None
-        for op in reversed(compiled.ops):
-            if (op.kind == OpKind.PULL_TENSOR
-                    and op.tensor is not None
-                    and op.tensor.name == tensor_name):
-                return OperationHandle(op=op)
-        return None
-
-    @staticmethod
-    def _compare(hw_output, golden):
-        from vten.runtime.verifier import compare
-        return compare(hw_output, golden)
-
-    @staticmethod
-    def _max_diff(hw_output, golden):
-        from vten.runtime.verifier import max_diff
-        return max_diff(hw_output, golden)
-
-    @staticmethod
-    def _check_match(tensor_name, hw_output, golden, *, shape=None):
-        from vten.runtime.verifier import check_match
-        return check_match(tensor_name, hw_output, golden, shape=shape)
 
     # ── Execution ──
 
@@ -779,10 +554,8 @@ class ExecutionContext:
             verification_results: list = []
             if verify:
                 verification_count, verification_results = (
-                    self._auto_verify_all(compiled, backend_result)
+                    self._auto_verify_all(compiled, output_tensors)
                 )
-
-            self._golden_cache.clear()
 
             logger.debug("execution complete: status=%s, cycles=%d, verifications=%d/%d",
                          status, total_cycles,

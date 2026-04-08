@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from vten.errors import CompilationError, DependencyLimitError
 from vten.spec.models import (
+    DEFAULT_DATA_WIDTH,
     OpCode,
     OpKind,
     Protocol,
@@ -34,7 +35,7 @@ class BFMConfig:
 
     interface_name: str
     protocol: Protocol
-    data_width: int = 256
+    data_width: int = DEFAULT_DATA_WIDTH
     addr_width: int = 64
     role: str = "slave"
     address_ranges: list[tuple[int, int, int]] = field(default_factory=list)

@@ -13,7 +13,13 @@ from copy import deepcopy
 from pathlib import Path
 
 from vten.errors import BuildError
-from vten.spec.models import InterfaceSpec, KernelSpec, Protocol, RegisterBankSpec
+from vten.spec.models import (
+    DEFAULT_DATA_WIDTH,
+    InterfaceSpec,
+    KernelSpec,
+    Protocol,
+    RegisterBankSpec,
+)
 from vten.spec.parser import parse_kernel_spec
 
 
@@ -512,7 +518,7 @@ def _generate_port_lines(iface_name: str, iface: InterfaceSpec) -> list[str]:
                 lines.append(f"input  logic          {rp}_tready")
                 lines.append(f"output logic          {rp}_tlast")
     elif iface.protocol == Protocol.AXI4:
-        dw = iface.data_width or 256
+        dw = iface.data_width or DEFAULT_DATA_WIDTH
         aw = iface.addr_width or 64
         rp = iface.ext_port
         sw = dw // 8

@@ -12,7 +12,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-XRT_BINDING_DIR="$PROJECT_DIR/vten/xrt_binding"
+XRT_BINDING_DIR="$PROJECT_DIR/vten/backend/_xrt_binding"
 
 # Check XRT SDK
 if [ -n "$XILINX_XRT" ]; then

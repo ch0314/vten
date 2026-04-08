@@ -16,11 +16,11 @@ from pathlib import Path
 
 import jinja2
 
-from vten.spec.models import KernelSpec, Protocol
+from vten.spec.models import DEFAULT_DATA_WIDTH, KernelSpec, Protocol
 
 
 def _vten_templates_dir() -> Path:
-    return Path(__file__).resolve().parent.parent.parent / "templates"
+    return Path(__file__).resolve().parent.parent / "templates" / "xrt"
 
 
 def _vten_sv_dir() -> Path:
@@ -91,7 +91,7 @@ def _build_interfaces_context(spec: KernelSpec) -> dict[str, dict]:
         # Shared base properties
         base = {
             "protocol": iface.protocol.value,
-            "data_width": iface.data_width or 256,
+            "data_width": iface.data_width or DEFAULT_DATA_WIDTH,
             "addr_width": iface.addr_width or 64,
             "rtl_port": iface.rtl_port,
             "buffer_size": 4096,

@@ -180,7 +180,7 @@ class XrtBackend(Backend):
             except ImportError as e:
                 raise BackendError(
                     "XRT Python bindings not available. "
-                    "Build vten_xrt: cd vten/xrt_binding && mkdir build "
+                    "Build vten_xrt: cd vten/backend/_xrt_binding && mkdir build "
                     "&& cd build && cmake .. && make && pip install . "
                     "Or install XRT runtime: https://github.com/Xilinx/XRT"
                 ) from e

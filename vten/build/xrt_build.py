@@ -324,7 +324,7 @@ class XrtBuildPipeline(BuildPipeline):
         import jinja2
 
         output_dir = self._build_dir(kernel_dir)
-        template_dir = Path(__file__).resolve().parent.parent.parent / "templates"
+        template_dir = Path(__file__).resolve().parent.parent / "templates" / "sim"
         env = jinja2.Environment(
             loader=jinja2.FileSystemLoader(str(template_dir)),
             keep_trailing_newline=True,

@@ -171,7 +171,7 @@ class InferenceSession:
                 Tensor(on_device) → skip (BO already on device)
             verify: If True, compare HW output against behavioral model
                     golden (same CompositeKernel.forward() chain as vten run).
-                    Golden data is stored on output Tensor._golden_data for
+                    Golden data is stored on output Tensor.golden for
                     multi-layer chaining.
             **params: Kernel parameters (merged with base_params).
 
@@ -241,19 +241,15 @@ class InferenceSession:
         # Execute kernel's DSL sequence
         ki.run(ctx)
 
-        # Compile + execute
-        result = ctx.run()
+        # Compile + execute (+ verify if requested)
+        result = ctx.run(verify=verify)
 
         # Log execution summary (phase-by-phase)
         self._log_execution_summary()
 
         # Output Tensor objects (with BO binding for HW backends)
+        # Golden is set on output tensors by _auto_verify_all when verify=True
         outputs = {name: t for name, t in result.output_tensors.items()}
-
-        # Verify against behavioral model golden
-        if verify:
-            self._verify_outputs(ki.kernel_class_instance, inputs, outputs,
-                                 compiled=ctx._last_compiled)
 
         run_elapsed = _time.monotonic() - run_t0
         logger.info("  total: %s", format_elapsed(run_elapsed))
@@ -275,43 +271,6 @@ class InferenceSession:
             elif p.phase == "recv":
                 logger.info("  recv: %d tensors (%s)", p.n_tensors, format_size(p.n_bytes))
             # trigger: skip (vsync detail unnecessary)
-
-    def _verify_outputs(
-        self,
-        kernel_inst: object,
-        inputs: dict[str, torch.Tensor | Tensor],
-        outputs: dict[str, Tensor],
-        compiled: object | None = None,
-    ) -> None:
-        """Verify HW outputs against golden using shared golden computation.
-
-        Uses runtime.golden.compute_golden_outputs() — identical logic to
-        CLI's _compute_auto_golden + _apply_unlayout path.
-
-        Sub-kernel tensor data is already set from input binding in run().
-        For device-resident inputs (chained outputs), the golden/data from
-        the previous layer was set on the sub-kernel tensor during binding.
-        """
-        from vten.runtime.golden import compute_golden_outputs
-
-        if compiled is None:
-            return
-
-        view = compiled.flattened_view
-
-        # compute_golden_outputs uses the same forward() + format conversion
-        # + unlayout pipeline as CLI verification
-        golden_map = compute_golden_outputs(kernel_inst, view)
-
-        for name, out_tensor in outputs.items():
-            golden = golden_map.get(name)
-            if golden is None:
-                continue
-            hw_logical = out_tensor.cpu()
-            from vten.runtime.verifier import check_match
-            check_match(name, hw_logical, golden)
-            logger.info("verify: %s PASS shape=%s", name, tuple(hw_logical.shape))
-            out_tensor.golden = golden
 
     def upload(
         self,
@@ -383,7 +342,7 @@ class InferenceSession:
         t._element_count = tensor._element_count
 
         # Store logical data for golden chain (verify mode)
-        t._golden_data = data
+        t.golden = data
 
         is_hw = self._backend.compile_target == "hw"
 

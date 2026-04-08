@@ -243,6 +243,7 @@ class TestMainRunDispatch:
             gui=False,
             sim_verbose=False,
             config_overrides=None,
+            verify=False,
         )
 
     @patch("vten.cli.run.run_test")
@@ -260,6 +261,7 @@ class TestMainRunDispatch:
             gui=False,
             sim_verbose=False,
             config_overrides=None,
+            verify=False,
         )
 
     @patch("vten.cli.run.run_test")

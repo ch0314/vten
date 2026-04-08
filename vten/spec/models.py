@@ -263,6 +263,10 @@ class XrtInterfaceConfig:
     memory_bank_index: int | None = None
 
 
+# ── Interface defaults ──
+
+DEFAULT_DATA_WIDTH = 256  # bits — override via interface spec data_width
+
 # ── InterfaceSpec (§5.7) ──
 
 

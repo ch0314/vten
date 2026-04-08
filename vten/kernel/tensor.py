@@ -115,17 +115,6 @@ class Tensor:
             raise RuntimeError("shape not resolved")
         return self._element_count
 
-    # ── Golden data backward compat ──
-
-    @property
-    def _golden_data(self) -> torch.Tensor | None:
-        """Backward-compat alias for .golden."""
-        return self.golden
-
-    @_golden_data.setter
-    def _golden_data(self, value: torch.Tensor | None) -> None:
-        self.golden = value
-
     # ── Verification ──
 
     def verify(self, golden: torch.Tensor | None = None) -> None:

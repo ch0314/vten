@@ -381,20 +381,6 @@ class TestTensorVerification:
         t.golden = golden
         assert torch.equal(t.golden, golden)
 
-    def test_golden_data_alias_read(self):
-        """_golden_data property delegates to .golden (backward compat)."""
-        t = self._make_tensor()
-        golden = torch.tensor([10, 20, 30, 40], dtype=torch.int8)
-        t.golden = golden
-        assert torch.equal(t._golden_data, golden)
-
-    def test_golden_data_alias_write(self):
-        """_golden_data setter updates .golden."""
-        t = self._make_tensor()
-        golden = torch.tensor([10, 20, 30, 40], dtype=torch.int8)
-        t._golden_data = golden
-        assert torch.equal(t.golden, golden)
-
     def test_verify_pass(self):
         """Matching data → verified=True, max_diff=0."""
         t = self._make_tensor()

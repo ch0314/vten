@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from vten.runtime.ir import BFMConfig
-from vten.spec.models import Protocol
+from vten.spec.models import DEFAULT_DATA_WIDTH, Protocol
 
 if TYPE_CHECKING:
     from vten.runtime.flattener import FlattenedKernelView
@@ -47,7 +47,7 @@ def synthesize_bfm_configs(
                     bfm_configs[flat_name] = BFMConfig(
                         interface_name=flat_name,
                         protocol=iface_spec.protocol,
-                        data_width=iface_spec.data_width or 256,
+                        data_width=iface_spec.data_width or DEFAULT_DATA_WIDTH,
                         role="slave" if iface_spec.protocol == Protocol.AXI4 else "master",
                         address_ranges=sorted(address_ranges),
                     )
@@ -55,7 +55,7 @@ def synthesize_bfm_configs(
                 bfm_configs[top_iface_name] = BFMConfig(
                     interface_name=top_iface_name,
                     protocol=iface_spec.protocol,
-                    data_width=iface_spec.data_width or 256,
+                    data_width=iface_spec.data_width or DEFAULT_DATA_WIDTH,
                     role="slave" if iface_spec.protocol == Protocol.AXI4 else "master",
                     address_ranges=sorted(address_ranges),
                 )

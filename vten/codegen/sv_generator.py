@@ -556,7 +556,7 @@ class SVGenerator:
         sched_params = self._compute_scheduler_params(num_commands=num_commands)
         iface_to_bfm = self._generate_bfm_index_mapping()
 
-        template_dir = Path(__file__).resolve().parent.parent.parent / "templates"
+        template_dir = Path(__file__).resolve().parent.parent / "templates" / "sim"
         env = jinja2.Environment(
             loader=jinja2.FileSystemLoader(str(template_dir)),
             keep_trailing_newline=True,

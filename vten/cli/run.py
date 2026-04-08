@@ -15,6 +15,7 @@ from pathlib import Path
 from vten.backend.registry import get_backend, resolve_backend_name
 from vten.cli.config import load_project_config
 from vten.errors import BackendError, ProbeMismatchError, VTenError, VerificationError
+from vten.spec.models import DEFAULT_DATA_WIDTH
 
 logger = logging.getLogger(__name__)
 
@@ -278,7 +279,7 @@ def _build_bfm_configs(kernel_dir: Path) -> list:
         configs.append(BFMConfig(
             interface_name=name,
             protocol=iface.protocol,
-            data_width=iface.data_width or 256,
+            data_width=iface.data_width or DEFAULT_DATA_WIDTH,
             addr_width=iface.addr_width or 64,
             role="slave",
         ))
@@ -497,6 +498,7 @@ def _run_single_test(
     backend_name: str,
     backend_inst,
     config_overrides: dict | None = None,
+    verify: bool = False,
     gui: bool = False,
 ) -> None:
     """Execute a single test scenario and write results."""
@@ -558,8 +560,7 @@ def _run_single_test(
 
                 if ctx._pending_ops:
                     # Scenario recorded DSL ops — ctx.run() handles everything
-                    # including deferred verifications
-                    batch_result = ctx.run()
+                    batch_result = ctx.run(verify=verify)
                     session_open = ctx._session_open
                     batch_count = ctx._batch_count
                     configs_passed += 1
@@ -738,6 +739,7 @@ def run_test(
     gui: bool = False,
     sim_verbose: bool = False,
     config_overrides: dict | None = None,
+    verify: bool = False,
 ) -> None:
     """Discover, execute, and record results for test scenario(s).
 
@@ -814,6 +816,7 @@ def run_test(
                 backend_inst=backend_inst,
                 config_overrides=config_overrides,
                 gui=gui,
+                verify=verify,
             )
     finally:
         os.chdir(prev_cwd)

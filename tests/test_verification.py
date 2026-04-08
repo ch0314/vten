@@ -286,63 +286,63 @@ class TestXsimBufferReader:
 
 
 class TestVerificationCompare:
-    """ExecutionContext._compare and _max_diff static methods."""
+    """compare() and max_diff() from vten.runtime.verifier."""
 
     def test_compare_equal_int_tensors(self):
-        from vten.runtime.context import ExecutionContext
+        from vten.runtime.verifier import compare
 
         a = torch.tensor([1, 2, 3])
         b = torch.tensor([1, 2, 3])
-        assert ExecutionContext._compare(a, b) is True
+        assert compare(a, b) is True
 
     def test_compare_unequal_int_tensors(self):
-        from vten.runtime.context import ExecutionContext
+        from vten.runtime.verifier import compare
 
         a = torch.tensor([1, 2, 3])
         b = torch.tensor([1, 2, 4])
-        assert ExecutionContext._compare(a, b) is False
+        assert compare(a, b) is False
 
     def test_compare_float_within_tolerance(self):
-        from vten.runtime.context import ExecutionContext
+        from vten.runtime.verifier import compare
 
         a = torch.tensor([1.0, 2.0, 3.0])
         b = torch.tensor([1.0, 2.0, 3.0 + 1e-7])
-        assert ExecutionContext._compare(a, b) is True
+        assert compare(a, b) is True
 
     def test_compare_float_outside_tolerance(self):
-        from vten.runtime.context import ExecutionContext
+        from vten.runtime.verifier import compare
 
         a = torch.tensor([1.0, 2.0, 3.0])
         b = torch.tensor([1.0, 2.0, 4.0])
-        assert ExecutionContext._compare(a, b) is False
+        assert compare(a, b) is False
 
     def test_compare_shape_mismatch(self):
-        from vten.runtime.context import ExecutionContext
+        from vten.runtime.verifier import compare
 
         a = torch.tensor([1, 2, 3])
         b = torch.tensor([[1, 2, 3]])
-        assert ExecutionContext._compare(a, b) is False
+        assert compare(a, b) is False
 
     def test_max_diff_zero(self):
-        from vten.runtime.context import ExecutionContext
+        from vten.runtime.verifier import max_diff
 
         a = torch.tensor([1, 2, 3])
         b = torch.tensor([1, 2, 3])
-        assert ExecutionContext._max_diff(a, b) == 0.0
+        assert max_diff(a, b) == 0.0
 
     def test_max_diff_nonzero(self):
-        from vten.runtime.context import ExecutionContext
+        from vten.runtime.verifier import max_diff
 
         a = torch.tensor([1, 2, 10])
         b = torch.tensor([1, 2, 3])
-        assert ExecutionContext._max_diff(a, b) == 7.0
+        assert max_diff(a, b) == 7.0
 
     def test_max_diff_float(self):
-        from vten.runtime.context import ExecutionContext
+        from vten.runtime.verifier import max_diff
 
         a = torch.tensor([1.0, 2.5])
         b = torch.tensor([1.0, 2.0])
-        assert abs(ExecutionContext._max_diff(a, b) - 0.5) < 1e-6
+        assert abs(max_diff(a, b) - 0.5) < 1e-6
 
 
 class TestAutoVerification:
@@ -387,13 +387,6 @@ class TestAutoVerification:
         # Without backend, run(verify=True) should not raise
         result = ctx.run(verify=True)
         assert result.status == "DONE"
-
-    def test_verifications_list_empty_by_default(self):
-        """_verifications list is empty (no deferred verify API)."""
-        from vten.runtime.context import ExecutionContext
-
-        ctx = ExecutionContext()
-        assert ctx._verifications == []
 
 
 # ═══════════════════════════════════════════════════════════════════

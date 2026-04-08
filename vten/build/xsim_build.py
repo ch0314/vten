@@ -33,7 +33,7 @@ from vten.build.common import (
 from vten.codegen.sv_generator import SVGenerator
 from vten.errors import BuildError
 from vten.runtime.ir import BFMConfig
-from vten.spec.models import InterfaceSpec, KernelSpec, Protocol
+from vten.spec.models import DEFAULT_DATA_WIDTH, InterfaceSpec, KernelSpec, Protocol
 from vten.spec.parser import parse_kernel_spec
 
 logger = logging.getLogger(__name__)
@@ -132,7 +132,7 @@ def _derive_bfm_configs(spec: KernelSpec) -> list[BFMConfig]:
                 configs.append(BFMConfig(
                     interface_name=flat_name,
                     protocol=iface.protocol,
-                    data_width=iface.data_width or 256,
+                    data_width=iface.data_width or DEFAULT_DATA_WIDTH,
                     addr_width=iface.addr_width or 64,
                     role=_infer_bfm_role(iface),
                 ))
@@ -140,7 +140,7 @@ def _derive_bfm_configs(spec: KernelSpec) -> list[BFMConfig]:
             configs.append(BFMConfig(
                 interface_name=name,
                 protocol=iface.protocol,
-                data_width=iface.data_width or 256,
+                data_width=iface.data_width or DEFAULT_DATA_WIDTH,
                 addr_width=iface.addr_width or 64,
                 role=_infer_bfm_role(iface),
             ))
@@ -542,7 +542,7 @@ class XsimBuildPipeline(BuildPipeline):
                 f"Vivado project not found: {xpr_path}. Run project_setup first."
             )
 
-        tcl = self._vten_root / "templates" / "resolve_order.tcl"
+        tcl = Path(__file__).resolve().parent.parent / "templates" / "sim" / "resolve_order.tcl"
         log_dir = kernel_dir / "build" / "logs"
         run_vivado(
             self._vivado_path, tcl, xpr_path, tb_top, prj_out,
