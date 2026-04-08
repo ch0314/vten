@@ -1123,11 +1123,7 @@ class SimBackend(Backend):
 
         return _read
 
-    # ── Session protocol (multi-batch) ──
-
-    @property
-    def supports_session(self) -> bool:
-        return True
+    # ── Session batch update (internal) ──
 
     def _submit_batch_internal(self, compiled: CompiledResult) -> None:
         """Update SHM in-place for a subsequent batch within an active session."""
@@ -1152,24 +1148,6 @@ class SimBackend(Backend):
         self._sem_h2b.post()
         logger.log(5, "[session] batch submitted (cmds=%d, bufs=%d)",
                      layout.num_commands, layout.num_buffers)
-
-    # ── Session protocol (legacy, delegates to execute/cleanup) ──
-
-    def open_session(self, compiled: CompiledResult) -> None:
-        """Open persistent session. Prefer execute() for auto-management."""
-        self.execute(compiled)
-
-    def submit_batch(self, compiled: CompiledResult) -> None:
-        """Submit batch in open session. Prefer execute() for auto-management."""
-        self.execute(compiled)
-
-    def wait_batch(self) -> BackendResult:
-        """No-op — execute() already waits for completion."""
-        return self._last_backend_result
-
-    def close_session(self) -> None:
-        """Close session. Prefer cleanup() for full resource release."""
-        self.cleanup()
 
     def _read_stats_from_shm(self) -> list[CmdStats]:
         """Parse per-command stats from SHM Stats Region."""

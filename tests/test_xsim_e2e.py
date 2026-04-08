@@ -279,14 +279,7 @@ class TestEdgeCases:
                 ctx.run(verify=True)
         finally:
             os.chdir(prev_cwd)
-            try:
-                backend.close_session()
-            except Exception:
-                pass
-            try:
-                backend.cleanup()
-            except Exception:
-                pass
+            backend.cleanup()
 
     @pytest.mark.xsim
     def test_broken_passthrough_probe_fail(self):
@@ -313,12 +306,5 @@ class TestEdgeCases:
                 ctx.run(verify=True)
         finally:
             os.chdir(prev_cwd)
-            try:
-                backend.close_session()
-            except Exception:
-                pass
-            try:
-                backend.cleanup()
-            except Exception:
-                pass
+            backend.cleanup()
 

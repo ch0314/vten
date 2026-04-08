@@ -641,12 +641,12 @@ class TestConfigureLowering:
 
     def test_auto_bind_param_resolution(self):
         """auto_bind with param: "${IN_CH}" → resolved integer value."""
-        from vten.runtime.binder import resolve_auto_binds
+        from vten.runtime.binder import resolve_registers
 
         view, lowering, inst = _make_ir_setup(
             _make_mem_spec(), MemKernel, runtime_params={"IN_CH": 32}
         )
-        view._register_bindings = resolve_auto_binds(view)
+        view._register_bindings = resolve_registers(view)
         op = Operation(kind=OpKind.CONFIGURE, kernel=None)
         cmds, _ = _lower_ops(view, lowering, [op])
         # Only 'in_ch' has auto_bind
@@ -657,7 +657,7 @@ class TestConfigureLowering:
 
     def test_auto_bind_address_bits(self):
         """auto_bind with address + bits: split 64-bit address."""
-        from vten.runtime.binder import resolve_auto_binds
+        from vten.runtime.binder import resolve_registers
 
         regs = [
             RegisterSpec(
@@ -674,7 +674,7 @@ class TestConfigureLowering:
             spec, MemKernel, runtime_params={"IN_CH": 32}
         )
         view.exposed_tensors["ifm"].set_address(0x0000_1000_DEAD_BEEF)
-        view._register_bindings = resolve_auto_binds(view)
+        view._register_bindings = resolve_registers(view)
 
         op = Operation(kind=OpKind.CONFIGURE, kernel=None)
         cmds, _ = _lower_ops(view, lowering, [op])
@@ -686,7 +686,7 @@ class TestConfigureLowering:
 
     def test_auto_bind_size_bytes(self):
         """auto_bind with value: 'size_bytes'."""
-        from vten.runtime.binder import resolve_auto_binds
+        from vten.runtime.binder import resolve_registers
 
         regs = [
             RegisterSpec(
@@ -699,7 +699,7 @@ class TestConfigureLowering:
             spec, MemKernel, runtime_params={"IN_CH": 32}
         )
         view.exposed_tensors["ifm"]._serialized_size = 2048
-        view._register_bindings = resolve_auto_binds(view)
+        view._register_bindings = resolve_registers(view)
 
         op = Operation(kind=OpKind.CONFIGURE, kernel=None)
         cmds, _ = _lower_ops(view, lowering, [op])
@@ -708,7 +708,7 @@ class TestConfigureLowering:
 
     def test_configure_cmds_chain_sequentially(self):
         """Configure WRITE_REGs chain: first gets parent dep, rest chain to previous."""
-        from vten.runtime.binder import resolve_auto_binds
+        from vten.runtime.binder import resolve_registers
 
         regs = [
             RegisterSpec(name="reg_a", offset=0x010, auto_bind=AutoBindSpec(param="${IN_CH}")),
@@ -718,7 +718,7 @@ class TestConfigureLowering:
         view, lowering, inst = _make_ir_setup(
             spec, MemKernel, runtime_params={"IN_CH": 32}
         )
-        view._register_bindings = resolve_auto_binds(view)
+        view._register_bindings = resolve_registers(view)
 
         # Create a preceding op to generate a dep
         push_op = Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("ifm"))
@@ -996,12 +996,12 @@ class TestNPU3DFullIR:
 
     def test_expected_command_sequence(self):
         """NPU 3D simplified: push → configure → write_reg → poll → pull."""
-        from vten.runtime.binder import resolve_auto_binds
+        from vten.runtime.binder import resolve_registers
 
         view, lowering, inst = _make_ir_setup(
             _make_mem_spec(), MemKernel, runtime_params={"IN_CH": 32}
         )
-        view._register_bindings = resolve_auto_binds(view)
+        view._register_bindings = resolve_registers(view)
 
         ops = [
             Operation(kind=OpKind.PUSH_TENSOR, tensor=inst.get_tensor("ifm")),
@@ -1043,7 +1043,7 @@ class TestNPU3DFullIR:
 
     def test_register_offsets_include_bank(self):
         """Register offsets use absolute_offset (with bank_offset)."""
-        from vten.runtime.binder import resolve_auto_binds
+        from vten.runtime.binder import resolve_registers
         from vten.runtime.flattener import (
             ExposedTensor,
             FlattenedKernelView,
@@ -1094,7 +1094,7 @@ class TestNPU3DFullIR:
             probe_points=[],
             connections=[],
         )
-        view._register_bindings = resolve_auto_binds(view)
+        view._register_bindings = resolve_registers(view)
 
         lowering = IRLowering(view)
         op = Operation(kind=OpKind.CONFIGURE, kernel=None)

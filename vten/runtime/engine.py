@@ -154,7 +154,7 @@ class RuntimeEngine:
 
         # Stage 5: auto_bind resolution
         logger.log(5, "Stage 5: auto_bind resolution")
-        self._resolve_auto_binds(view)
+        self._resolve_registers(view)
 
         # Stage 6: IR lowering
         logger.log(5, "Stage 6: IR lowering")
@@ -1198,7 +1198,7 @@ class RuntimeEngine:
 
     # ── Stage 5: auto_bind + config register Resolution ──
 
-    def _resolve_auto_binds(self, view: FlattenedKernelView) -> None:
+    def _resolve_registers(self, view: FlattenedKernelView) -> None:
         view._register_bindings = resolve_registers(view)
 
     # ── Stage 6b: BFM Configuration Synthesis ──

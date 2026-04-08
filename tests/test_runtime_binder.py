@@ -3,7 +3,7 @@
 Spec reference: 02_runtime_engine.md §11, 00_data_models.md §5.3
 NPU 3D patterns: npu_3d_analysis.md §4
 
-Tests parse_bit_range(), resolve_auto_binds(), _compute_auto_bind_value()
+Tests parse_bit_range(), resolve_registers(), _compute_auto_bind_value()
 for address bit-slicing, size_bytes, size_beats, size_elements, param, expr.
 """
 
@@ -418,16 +418,16 @@ class TestAutoBindParam:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §11.5 — resolve_auto_binds (full integration)
+# §11.5 — resolve_registers (full integration)
 # ═══════════════════════════════════════════════════════════════════
 
 
 class TestResolveAutoBinds:
-    """resolve_auto_binds() processes all auto_bind registers."""
+    """resolve_registers() processes all auto_bind registers."""
 
     def test_returns_binding_entries(self):
-        """resolve_auto_binds returns list of RegisterBindingEntry."""
-        from vten.runtime.binder import RegisterBindingEntry, resolve_auto_binds
+        """resolve_registers returns list of RegisterBindingEntry."""
+        from vten.runtime.binder import RegisterBindingEntry, resolve_registers
 
         regs = [
             RegisterSpec(
@@ -437,13 +437,13 @@ class TestResolveAutoBinds:
             ),
         ]
         view = _make_view_with_registers(regs)
-        bindings = resolve_auto_binds(view)
+        bindings = resolve_registers(view)
         assert len(bindings) == 1
         assert isinstance(bindings[0], RegisterBindingEntry)
 
     def test_binding_entry_fields(self):
         """RegisterBindingEntry has correct register_name and resolved_value."""
-        from vten.runtime.binder import resolve_auto_binds
+        from vten.runtime.binder import resolve_registers
 
         regs = [
             RegisterSpec(
@@ -453,7 +453,7 @@ class TestResolveAutoBinds:
             ),
         ]
         view = _make_view_with_registers(regs)
-        bindings = resolve_auto_binds(view)
+        bindings = resolve_registers(view)
         b = bindings[0]
         assert b.register_name == "_self.in_ch"
         assert b.resolved_value == 64
@@ -462,7 +462,7 @@ class TestResolveAutoBinds:
 
     def test_skips_non_auto_bind(self):
         """Registers without auto_bind are skipped."""
-        from vten.runtime.binder import resolve_auto_binds
+        from vten.runtime.binder import resolve_registers
 
         regs = [
             RegisterSpec(name="vsync", offset=0x050, fields={"trigger": "0:0"}),
@@ -473,14 +473,14 @@ class TestResolveAutoBinds:
             ),
         ]
         view = _make_view_with_registers(regs)
-        bindings = resolve_auto_binds(view)
+        bindings = resolve_registers(view)
         # Only in_ch has auto_bind
         assert len(bindings) == 1
         assert bindings[0].register_name == "_self.in_ch"
 
     def test_npu_3d_address_split_bindings(self):
         """NPU 3D pattern: address LSB/MSB pair resolved correctly."""
-        from vten.runtime.binder import resolve_auto_binds
+        from vten.runtime.binder import resolve_registers
 
         regs = [
             RegisterSpec(
@@ -497,7 +497,7 @@ class TestResolveAutoBinds:
         view = _make_view_with_registers(regs)
         view.exposed_tensors["ifm"].set_address(0x0000_0001_8000_0000)
 
-        bindings = resolve_auto_binds(view)
+        bindings = resolve_registers(view)
         assert len(bindings) == 2
 
         lsb_binding = [b for b in bindings if "lsb" in b.register_name][0]
@@ -508,7 +508,7 @@ class TestResolveAutoBinds:
 
     def test_multiple_param_bindings(self):
         """Multiple param auto_binds all resolved."""
-        from vten.runtime.binder import resolve_auto_binds
+        from vten.runtime.binder import resolve_registers
 
         regs = [
             RegisterSpec(
@@ -523,7 +523,7 @@ class TestResolveAutoBinds:
             ),
         ]
         view = _make_view_with_registers(regs)
-        bindings = resolve_auto_binds(view)
+        bindings = resolve_registers(view)
         assert len(bindings) == 2
         values = {b.register_name: b.resolved_value for b in bindings}
         assert values["_self.size_reg"] == 32
@@ -531,7 +531,7 @@ class TestResolveAutoBinds:
 
     def test_kernel_path_format(self):
         """kernel_path is '{view_name}.{sub_name}.{interface_name}'."""
-        from vten.runtime.binder import resolve_auto_binds
+        from vten.runtime.binder import resolve_registers
 
         regs = [
             RegisterSpec(
@@ -541,7 +541,7 @@ class TestResolveAutoBinds:
             ),
         ]
         view = _make_view_with_registers(regs)
-        bindings = resolve_auto_binds(view)
+        bindings = resolve_registers(view)
         assert bindings[0].kernel_path == "SimpleKernel._self.ctrl"
 
 

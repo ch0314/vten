@@ -94,7 +94,6 @@ def resolve_registers(view: FlattenedKernelView) -> list[RegisterBindingEntry]:
     return bindings
 
 
-resolve_auto_binds = resolve_registers  # legacy alias used by tests
 
 
 def _compute_auto_bind_value(
