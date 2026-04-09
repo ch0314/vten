@@ -172,11 +172,15 @@ class Kernel:
 
     @classmethod
     def _discover_composite(cls) -> type | None:
-        """Scan sibling kernel directories for CompositeKernel that contains this class."""
+        """Scan sibling kernel directories for CompositeKernel that contains this class.
+
+        When multiple composites contain this kernel, prefer the one with
+        the most sub-kernels (fullest upstream chain for generate_inputs).
+        """
         import importlib.util
         from pathlib import Path
 
-        from vten.kernel.composite import _lookup_composite
+        from vten.kernel.composite import _composite_registry, _same_kernel_class
 
         src = getattr(sys.modules.get(cls.__module__, None), "__file__", None)
         if src is None:
@@ -206,11 +210,18 @@ class Kernel:
                     spec.loader.exec_module(module)
             except Exception:
                 continue
-            # Check if registry now has our class
-            result = _lookup_composite(cls)
-            if result is not None:
-                return result
-        return None
+
+        best: type | None = None
+        best_count = 0
+        for reg_cls, comp_cls in _composite_registry.items():
+            if _same_kernel_class(reg_cls, cls):
+                n = len(getattr(comp_cls, "_sub_kernel_refs", {}))
+                if n > best_count:
+                    best = comp_cls
+                    best_count = n
+        if best is not None:
+            _composite_registry[cls] = best
+        return best
 
     def forward(self, **inputs: torch.Tensor) -> dict[str, torch.Tensor]:
         """Compute golden reference outputs from inputs.

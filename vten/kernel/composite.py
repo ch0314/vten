@@ -540,7 +540,9 @@ def _make_composite_kernel():
                     continue
                 try:
                     outputs = sub_cls.forward(sub_inst, **fwd_inputs)
-                except (NotImplementedError, TypeError) as e:
+                except Exception as e:
+                    # Cycle-dependent nodes may fail (missing inputs,
+                    # None tensors, etc.) — skip gracefully.
                     logger.debug("auto-chain: %s.forward() skipped: %s", sub_name, e)
                     continue
                 for out_name, out_data in outputs.items():
