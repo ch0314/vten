@@ -367,6 +367,7 @@ class TestSimple(TestScenario):
         with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
             mock_get_backend.return_value = mock_backend
+            mock_backend.working_directory.return_value = project
             mock_backend.execute.return_value = MagicMock(status=2, stats=[])  # DONE
 
             run_test(str(project), kernel_name="passthrough", test_name="TestSimple")
@@ -391,6 +392,7 @@ class TestPass(TestScenario):
         with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
             mock_get_backend.return_value = mock_backend
+            mock_backend.working_directory.return_value = project
             mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             run_test(str(project), kernel_name="passthrough", test_name="TestPass")
@@ -417,6 +419,7 @@ class TestStats(TestScenario):
         with patch("vten.cli.run.get_backend") as mock_get_backend:
             mock_backend = MagicMock()
             mock_get_backend.return_value = mock_backend
+            mock_backend.working_directory.return_value = project
             mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             run_test(str(project), kernel_name="passthrough", test_name="TestStats")
@@ -660,6 +663,7 @@ class {class_name}(TestScenario):
                 side_effect=lambda *a: mock_backend.cleanup()
             )
             mock_get_backend.return_value = mock_backend
+            mock_backend.working_directory.return_value = project
             mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             # run_test should catch the error and write FAIL, or re-raise
@@ -703,6 +707,7 @@ class {class_name}(TestScenario):
                 side_effect=lambda *a: mock_backend.cleanup()
             )
             mock_get_backend.return_value = mock_backend
+            mock_backend.working_directory.return_value = project
             mock_backend.execute.side_effect = BackendError("error_code=1, DECERR")
 
             try:
@@ -744,6 +749,7 @@ class {class_name}(TestScenario):
                 side_effect=lambda *a: mock_backend.cleanup()
             )
             mock_get_backend.return_value = mock_backend
+            mock_backend.working_directory.return_value = project
             mock_backend.execute.side_effect = VTenTimeoutError("300s exceeded")
 
             try:
@@ -841,6 +847,7 @@ class TestOK(TestScenario):
                 side_effect=lambda *a: mock_backend.cleanup()
             )
             mock_get_backend.return_value = mock_backend
+            mock_backend.working_directory.return_value = project
             mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             run_test(str(project), kernel_name="passthrough", test_name="TestOK")
@@ -867,6 +874,7 @@ class TestOK(TestScenario):
                 side_effect=lambda *a: mock_backend.cleanup()
             )
             mock_get_backend.return_value = mock_backend
+            mock_backend.working_directory.return_value = project
             mock_backend.execute.side_effect = Exception("sim crashed")
 
             try:
@@ -892,6 +900,7 @@ class TestOK(TestScenario):
                 side_effect=lambda *a: mock_backend.cleanup()
             )
             mock_get_backend.return_value = mock_backend
+            mock_backend.working_directory.return_value = project
             mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             run_test(str(project), kernel_name="passthrough", test_name="TestOK")

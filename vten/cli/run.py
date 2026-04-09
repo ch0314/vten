@@ -279,18 +279,10 @@ def run_test(
     backend_name = resolve_backend_name(config, cli_backend=backend)
     backend_inst = get_backend(backend_name, config)
 
-    # Change CWD so relative paths resolve correctly.
-    # For XRT backend, use kernel build/xrt/ to contain runtime artifacts
-    # (emconfig.json, device_trace, run_summary, etc.) that XRT dumps to CWD.
-    # For sim backends, use project root for kernel_spec relative paths.
     import os
     prev_cwd = os.getcwd()
-    if backend_name == "xrt":
-        xrt_cwd = kernel_dir / "build" / "xrt"
-        xrt_cwd.mkdir(parents=True, exist_ok=True)
-        os.chdir(str(xrt_cwd))
-    else:
-        os.chdir(str(project))
+    run_cwd = backend_inst.working_directory(kernel_dir, project)
+    os.chdir(str(run_cwd))
     try:
         with backend_inst:
             for test_idx, (scenario_name, scenario) in enumerate(scenarios, 1):

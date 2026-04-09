@@ -10,6 +10,7 @@ import abc
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from vten.errors import BackendError, BFMError, PollTimeoutError, ProbeMismatchError
@@ -205,6 +206,10 @@ class Backend(abc.ABC):
         skip LOAD+PUSH. No-op by default (SIM backends).
         """
         pass
+
+    def working_directory(self, kernel_dir: Path, project_dir: Path) -> Path:
+        """Return CWD for test execution. Default: project root."""
+        return project_dir
 
     @property
     def compile_target(self) -> CompileTarget:

@@ -689,6 +689,12 @@ class XrtBackend(Backend):
             self._interpreter._buffers[buffer_id] = bo
             self._interpreter._prebound.add(buffer_id)
 
+    def working_directory(self, kernel_dir: Path, project_dir: Path) -> Path:
+        """XRT dumps artifacts (emconfig, traces) to CWD — isolate them."""
+        xrt_dir = kernel_dir / "build" / "xrt"
+        xrt_dir.mkdir(parents=True, exist_ok=True)
+        return xrt_dir
+
     @property
     def compile_target(self) -> CompileTarget:
         return CompileTarget.HW
