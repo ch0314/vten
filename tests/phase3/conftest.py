@@ -61,7 +61,7 @@ requires_verilator = pytest.mark.skipif(
 
 # ── SHM Constants (imported from single source of truth) ──
 
-from vten.runtime.shm import (  # noqa: E402
+from vten.backend.sim.shm_constants import (  # noqa: E402
     CACHE_LINE,
     BUF_DESC_SIZE,
     CMD_SLOT_SIZE,

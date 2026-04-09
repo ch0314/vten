@@ -9,7 +9,7 @@ from __future__ import annotations
 import abc
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import TYPE_CHECKING
 
 from vten.errors import BackendError, BFMError, PollTimeoutError, ProbeMismatchError
@@ -17,6 +17,23 @@ from vten.errors import TimeoutError as VTenTimeoutError
 
 if TYPE_CHECKING:
     from vten.runtime.engine import CompiledResult
+
+
+# ── CompileTarget — backend type identifier ──
+
+
+class CompileTarget(Enum):
+    SIM = "sim"
+    HW = "hw"
+
+    def __eq__(self, other: object) -> bool:
+        """Support string comparison for backward compatibility."""
+        if isinstance(other, str):
+            return self.value == other
+        return super().__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash(self.value)
 
 
 # ── BackendErrorCode — 00_data_models.md §10.13 ──
@@ -190,11 +207,11 @@ class Backend(abc.ABC):
         pass
 
     @property
-    def compile_target(self) -> str:
-        """Compile target for RuntimeEngine.compile().
+    def compile_target(self) -> CompileTarget:
+        """Compile target for backend type identification.
 
-        Returns "sim" for simulation backends (includes SHM packing),
-        "hw" for hardware backends (skips SHM packing).
+        Returns CompileTarget.SIM for simulation backends,
+        CompileTarget.HW for hardware backends.
         """
-        return "sim"
+        return CompileTarget.SIM
 

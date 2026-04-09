@@ -12,7 +12,7 @@ TestDmaPipelineStore: store_tensor() readback after pull.
 import sys
 from pathlib import Path
 
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 
 
 class TestDmaPipeline(TestScenario):

@@ -14,7 +14,7 @@ from vten.spec.models import Direction
 if TYPE_CHECKING:
     from vten.kernel.tensor import Tensor
     from vten.runtime.engine import CompiledResult
-    from vten.runtime.flattener import ExposedTensor, FlattenedKernelView
+    from vten.runtime.kernel_view import ExposedTensor, FlattenedKernelView
 
 
 def read_output_tensors(

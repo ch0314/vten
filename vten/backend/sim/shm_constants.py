@@ -1,6 +1,6 @@
-"""Stage 7: SHM Packing.
+"""SHM protocol constants.
 
-SHM constants, BufferDescriptor, SHMBufferAllocator, and packing functions.
+Binary layout, magic, version, offsets, slot sizes, flags, and encoding maps.
 
 Spec reference: 00_data_models.md §11, 02_runtime_engine.md §14
 """
@@ -8,15 +8,11 @@ Spec reference: 00_data_models.md §11, 02_runtime_engine.md §14
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
 
 from vten.spec.models import CommandStatus, Direction, OpCode, Protocol, Role
 
-if TYPE_CHECKING:
-    from vten.runtime.ir import Command
-
-# ── SHM Constants ──
+# ── Region sizes ──
 
 CONTROL_SIZE = 256
 CMD_SLOT_SIZE = 64
@@ -24,10 +20,13 @@ STATS_SLOT_SIZE = 32
 BUF_DESC_SIZE = 24
 CACHE_LINE = 64
 
+# ── Magic & version ──
+
 SHM_MAGIC = 0x5654454E  # "VTEN"
 PROTOCOL_VERSION = 0x00000003
 
-# Protocol encoding for SHM
+# ── Protocol encoding for SHM ──
+
 PROTOCOL_ENCODING = {
     Protocol.AXI4S: 1,
     Protocol.AXI4: 2,
@@ -45,19 +44,22 @@ DIRECTION_ENCODING = {
     Direction.BIDIRECTIONAL: 2,
 }
 
-# Host status values (Control Region offset 0x08)
+# ── Host status values (Control Region offset 0x08) ──
+
 HOST_STATUS_IDLE = 0
 HOST_STATUS_CMD_READY = 1
 HOST_STATUS_ACK = 2
 HOST_STATUS_SHUTDOWN = 3
 
-# Backend status values (Control Region offset 0x0C)
+# ── Backend status values (Control Region offset 0x0C) ──
+
 BACKEND_STATUS_IDLE = 0
 BACKEND_STATUS_RUNNING = 1
 BACKEND_STATUS_DONE = 2
 BACKEND_STATUS_ERROR = 3
 
-# SHM Control Header flags (offset 0x88)
+# ── SHM Control Header flags (offset 0x88) ──
+
 FLAG_STATS_ENABLED = 0x01
 FLAG_PROGRESS_ENABLED = 0x02
 FLAG_WAVEFORM_DUMP = 0x04
@@ -160,7 +162,7 @@ def pack_control_header(
 
 
 def pack_command_slot(
-    image: bytearray, offset: int, cmd: Command
+    image: bytearray, offset: int, cmd: object
 ) -> None:
     """Pack a single 64-byte command slot."""
     struct.pack_into("<H", image, offset + 0x00, cmd.op.value)

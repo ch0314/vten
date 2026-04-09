@@ -280,8 +280,8 @@ class TestInferenceMode:
         assert "data_in" in ctx._bound_bos
         assert ctx._bound_bos["data_in"] is bo
 
-    def test_push_tensor_skip_data_when_bound(self):
-        """push_tensor() with bound BO sets _skip_data flag."""
+    def test_push_tensor_device_resident_when_bound(self):
+        """push_tensor() with bound BO sets _device_resident flag."""
         ctx = ExecutionContext(project_params={"N": 32}, mode="inference")
         ki = ctx.instantiate(StreamKernel, spec=_stream_spec(), N=32)
 
@@ -289,8 +289,8 @@ class TestInferenceMode:
         ctx.bind_device_buffer(ki.get_tensor("data_in"), bo)
 
         h = ctx.push_tensor(ki.get_tensor("data_in"))
-        # The recorded op should have _skip_data=True
-        assert h.op._skip_data is True
+        # The recorded op should have _device_resident=True
+        assert h.op._device_resident is True
 
     def test_push_tensor_normal_when_not_bound(self):
         """push_tensor() without bound BO records normally."""
@@ -299,7 +299,7 @@ class TestInferenceMode:
         ki.get_tensor("data_in").data = torch.zeros(32, dtype=torch.int8)
 
         h = ctx.push_tensor(ki.get_tensor("data_in"))
-        assert h.op._skip_data is False
+        assert h.op._device_resident is False
 
     def test_pull_tensor_recorded_in_inference(self):
         """pull_tensor() in inference mode records PULL_TENSOR."""

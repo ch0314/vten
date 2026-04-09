@@ -14,7 +14,7 @@ from vten.errors import BindingError
 from vten.spec.models import AutoBindSpec
 
 if TYPE_CHECKING:
-    from vten.runtime.flattener import FlattenedKernelView
+    from vten.runtime.kernel_view import FlattenedKernelView
 
 
 @dataclass

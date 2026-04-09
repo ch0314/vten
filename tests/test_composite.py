@@ -344,8 +344,8 @@ class TestConnectionValidation:
 
     def test_dtype_mismatch_allowed_for_internal_wires(self):
         """Internal wire connections allow dtype mismatch (physical bytes)."""
-        from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.flattener import KernelInstance
+        from vten.runtime.flatten import _validate_connection_dtypes
+        from vten.runtime.kernel_view import KernelInstance
         from vten.spec.models import KernelSpec
 
         SrcF32, DstI8 = self._make_dtype_mismatch_kernels()
@@ -376,13 +376,12 @@ class TestConnectionValidation:
                 inst_t._resolve_shape(ki._resolver)
             sub_kernels[name] = ki
 
-        engine = RuntimeEngine(kernels={}, ops=[], project_params={})
         # Internal wire connections skip dtype check — physical bytes on wire
-        engine._validate_connection_dtypes([conn], sub_kernels)
+        _validate_connection_dtypes([conn], sub_kernels)
 
     def test_duplicate_connection_source_raises(self):
         """Same source interface in two connections should raise."""
-        from vten.runtime.engine import RuntimeEngine
+        from vten.runtime.flatten import _validate_no_duplicate_connections
 
         SrcKernel, DstKernel = self._make_simple_kernels()
 
@@ -403,9 +402,8 @@ class TestConnectionValidation:
                 src.data_out >> dst2.data_in,
             ]
 
-        engine = RuntimeEngine(kernels={}, ops=[], project_params={})
         with pytest.raises(Exception, match="Duplicate connection source"):
-            engine._validate_no_duplicate_connections(
+            _validate_no_duplicate_connections(
                 DupSrcComposite.connections, {},
             )
 

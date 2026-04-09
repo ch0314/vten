@@ -14,7 +14,7 @@ import os
 import subprocess
 import threading
 
-from vten.backend.sim_base import SimBackend
+from vten.backend.sim.base import SimBackend
 
 logger = logging.getLogger(__name__)
 

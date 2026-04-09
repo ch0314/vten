@@ -52,7 +52,7 @@ def _npu_40_bfm_configs() -> list[BFMConfig]:
 
 def _large_shm_image(num_commands: int = 256) -> bytes:
     """NPU-scale SHM image with control + command slots + stats + buffers."""
-    from vten.runtime.shm import CMD_SLOT_SIZE, CONTROL_SIZE
+    from vten.backend.sim.shm_constants import CMD_SLOT_SIZE, CONTROL_SIZE
 
     # Control region + command slots
     size = CONTROL_SIZE + num_commands * CMD_SLOT_SIZE
@@ -245,7 +245,7 @@ class TestXsimBackendSubmit:
 
     def test_is_sim_backend_subclass(self):
         """XsimBackend inherits from SimBackend."""
-        from vten.backend.sim_base import SimBackend
+        from vten.backend.sim.base import SimBackend
         from vten.backend.xsim import XsimBackend
 
         assert issubclass(XsimBackend, SimBackend)
@@ -404,7 +404,7 @@ class TestXsimBackendNPUScale:
 
     def test_npu_large_shm_image_size(self):
         """NPU-scale SHM image (256 commands) is substantial."""
-        from vten.runtime.shm import CMD_SLOT_SIZE, CONTROL_SIZE
+        from vten.backend.sim.shm_constants import CMD_SLOT_SIZE, CONTROL_SIZE
 
         image = _large_shm_image(256)
         expected_min = CONTROL_SIZE + 256 * CMD_SLOT_SIZE
@@ -436,19 +436,19 @@ class TestXsimBackendSHMConstants:
 
     def test_control_size(self):
         """Control region is 256 bytes."""
-        from vten.runtime.shm import CONTROL_SIZE
+        from vten.backend.sim.shm_constants import CONTROL_SIZE
 
         assert CONTROL_SIZE == 256
 
     def test_cmd_slot_size(self):
         """Command slot is 64 bytes."""
-        from vten.runtime.shm import CMD_SLOT_SIZE
+        from vten.backend.sim.shm_constants import CMD_SLOT_SIZE
 
         assert CMD_SLOT_SIZE == 64
 
     def test_host_status_values(self):
         """Host status: IDLE=0, CMD_READY=1, ACK=2, SHUTDOWN=3."""
-        from vten.runtime.shm import (
+        from vten.backend.sim.shm_constants import (
             HOST_STATUS_ACK,
             HOST_STATUS_CMD_READY,
             HOST_STATUS_IDLE,
@@ -462,7 +462,7 @@ class TestXsimBackendSHMConstants:
 
     def test_backend_status_values(self):
         """Backend status: IDLE=0, RUNNING=1, DONE=2, ERROR=3."""
-        from vten.runtime.shm import (
+        from vten.backend.sim.shm_constants import (
             BACKEND_STATUS_DONE,
             BACKEND_STATUS_ERROR,
             BACKEND_STATUS_IDLE,
@@ -492,7 +492,7 @@ class TestXsimBackendHandshake:
 
     def _make_control_buf(self) -> bytearray:
         """Create a 256-byte control region with MAGIC+VERSION."""
-        from vten.runtime.shm import CONTROL_SIZE
+        from vten.backend.sim.shm_constants import CONTROL_SIZE
         buf = bytearray(CONTROL_SIZE)
         struct.pack_into("<I", buf, 0x00, 0x5654454E)  # MAGIC
         struct.pack_into("<I", buf, 0x04, 0x00000003)  # VERSION
@@ -502,7 +502,7 @@ class TestXsimBackendHandshake:
 
     def test_host_writes_cmd_ready_to_buffer(self):
         """Host writes CMD_READY(1) at offset 0x08 in SHM buffer."""
-        from vten.runtime.shm import HOST_STATUS_CMD_READY
+        from vten.backend.sim.shm_constants import HOST_STATUS_CMD_READY
 
         buf = self._make_control_buf()
         # Host action: set CMD_READY
@@ -513,7 +513,7 @@ class TestXsimBackendHandshake:
 
     def test_backend_writes_running_to_buffer(self):
         """Backend writes RUNNING(1) at offset 0x0C in SHM buffer."""
-        from vten.runtime.shm import BACKEND_STATUS_RUNNING
+        from vten.backend.sim.shm_constants import BACKEND_STATUS_RUNNING
 
         buf = self._make_control_buf()
         struct.pack_into("<I", buf, self.BACKEND_STATUS_OFF, BACKEND_STATUS_RUNNING)
@@ -522,7 +522,7 @@ class TestXsimBackendHandshake:
 
     def test_normal_handshake_buffer_sequence(self):
         """Full normal handshake: IDLE→CMD_READY→RUNNING→DONE→ACK→IDLE."""
-        from vten.runtime.shm import (
+        from vten.backend.sim.shm_constants import (
             BACKEND_STATUS_DONE,
             BACKEND_STATUS_IDLE,
             BACKEND_STATUS_RUNNING,
@@ -561,7 +561,7 @@ class TestXsimBackendHandshake:
 
     def test_error_handshake_buffer_sequence(self):
         """Error flow: IDLE→CMD_READY→RUNNING→ERROR (backend writes error fields)."""
-        from vten.runtime.shm import (
+        from vten.backend.sim.shm_constants import (
             BACKEND_STATUS_ERROR,
             BACKEND_STATUS_RUNNING,
             HOST_STATUS_CMD_READY,
@@ -584,7 +584,7 @@ class TestXsimBackendHandshake:
 
     def test_shutdown_buffer_write(self):
         """Host writes SHUTDOWN(3) to buffer, backend reads it."""
-        from vten.runtime.shm import HOST_STATUS_SHUTDOWN
+        from vten.backend.sim.shm_constants import HOST_STATUS_SHUTDOWN
 
         buf = self._make_control_buf()
         struct.pack_into("<I", buf, self.HOST_STATUS_OFF, HOST_STATUS_SHUTDOWN)

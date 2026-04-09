@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from vten.backend.base import Backend, BackendResult
+from vten.backend.base import Backend, BackendResult, CompileTarget
 from vten.errors import BackendError
 from vten.log import format_size
 
@@ -690,9 +690,8 @@ class XrtBackend(Backend):
             self._interpreter._prebound.add(buffer_id)
 
     @property
-    def compile_target(self) -> str:
-        """HW backend skips SHM packing (Stage 7)."""
-        return "hw"
+    def compile_target(self) -> CompileTarget:
+        return CompileTarget.HW
 
     def cleanup(self) -> None:
         """Release XRT resources and remove hw_emu artifacts. Idempotent."""

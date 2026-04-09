@@ -194,7 +194,7 @@ class TestEnsureProbeMappings:
 
     def _make_view_and_engine(self):
         from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.flattener import (
+        from vten.runtime.kernel_view import (
             FlattenedKernelView,
             InterfaceMapping,
         )
@@ -243,7 +243,7 @@ class TestEnsureProbeMappings:
 
     def test_already_probed_not_duplicated(self):
         """If probe point already exists, don't create another."""
-        from vten.runtime.flattener import ProbePoint
+        from vten.runtime.kernel_view import ProbePoint
 
         view, engine, mapping = self._make_view_and_engine()
         mapping.mapping_type = MappingType.INTERNAL_PROBE
@@ -278,13 +278,13 @@ class TestScenarioProbesField:
     """TestScenario has a `probes` attribute."""
 
     def test_default_none(self):
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         ts = TestScenario()
         assert ts.probes is None
 
     def test_probes_set(self):
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         class MyTest(TestScenario):
             kernel = "scale_add"

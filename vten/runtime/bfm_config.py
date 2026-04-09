@@ -11,7 +11,7 @@ from vten.runtime.ir import BFMConfig
 from vten.spec.models import DEFAULT_DATA_WIDTH, Protocol
 
 if TYPE_CHECKING:
-    from vten.runtime.flattener import FlattenedKernelView
+    from vten.runtime.kernel_view import FlattenedKernelView
     from vten.runtime.ir import Command
 
 

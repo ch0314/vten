@@ -40,7 +40,7 @@ class TestSHMConstants:
     """Verify SHM constants are importable and correct."""
 
     def test_import_constants(self):
-        from vten.runtime.shm import (
+        from vten.backend.sim.shm_constants import (
             SHM_MAGIC, PROTOCOL_VERSION,
             CONTROL_SIZE as CS, CMD_SLOT_SIZE as CSS,
             STATS_SLOT_SIZE as SSS, BUF_DESC_SIZE as BDS,
@@ -53,14 +53,14 @@ class TestSHMConstants:
         assert CL == 64
 
     def test_magic_number(self):
-        from vten.runtime.shm import SHM_MAGIC
+        from vten.backend.sim.shm_constants import SHM_MAGIC
         assert SHM_MAGIC == 0x5654454E
         # 0x5654454E stored as little-endian 4 bytes:
         # byte0=0x4E('N'), byte1=0x45('E'), byte2=0x54('T'), byte3=0x56('V')
         assert SHM_MAGIC.to_bytes(4, "little") == b"NETV"
 
     def test_protocol_version(self):
-        from vten.runtime.shm import PROTOCOL_VERSION
+        from vten.backend.sim.shm_constants import PROTOCOL_VERSION
         assert PROTOCOL_VERSION == 0x00000003
 
 
@@ -74,7 +74,7 @@ class TestSHMSizeCalculation:
 
     @pytest.fixture()
     def calc_size(self):
-        from vten.runtime.shm import calculate_shm_size
+        from vten.backend.sim.shm_constants import calculate_shm_size
         return calculate_shm_size
 
     def test_minimal_1_cmd_1_buf(self, calc_size):
@@ -347,7 +347,7 @@ class TestSHMBufferAllocator:
 
     @pytest.fixture()
     def allocator_cls(self):
-        from vten.runtime.shm import SHMBufferAllocator
+        from vten.backend.sim.shm_constants import SHMBufferAllocator
         return SHMBufferAllocator
 
     def test_first_buffer_at_offset_0(self, allocator_cls):
@@ -480,7 +480,7 @@ class TestSHMImageIntegrity:
     def pack_control_header(self):
         """Return the control header packing function."""
         try:
-            from vten.runtime.shm import _pack_control_header
+            from vten.backend.sim.shm_constants import _pack_control_header
             return _pack_control_header
         except ImportError:
             pytest.skip("_pack_control_header not yet implemented")
@@ -625,7 +625,7 @@ class TestDataRegion:
         # ProbePoint.serialized_golden → data region with flags=0x01
         # This requires a Composite kernel with Internal() + declarative probes
         # which is complex to set up. Verify the mechanism exists.
-        from vten.runtime.flattener import ProbePoint
+        from vten.runtime.kernel_view import ProbePoint
         pp = ProbePoint(connection=None, interface_mapping=None)
         assert pp.serialized_golden is None
         assert pp.golden_buffer_id is None

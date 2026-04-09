@@ -38,7 +38,7 @@ class Operation:
     chunks_spec: int | list[int] | None = None  # original chunks arg
     config_group: int = 0  # multi-config group index (set by config_boundary)
     # Inference mode hints (used by IR lowering)
-    _skip_data: bool = False  # send_tensor: BO already on device, skip LOAD+PUSH data
+    _device_resident: bool = False  # send_tensor: BO already on device, skip LOAD+PUSH data
 
 
 @dataclass

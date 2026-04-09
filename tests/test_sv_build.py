@@ -298,7 +298,7 @@ class TestCtypesRoundTrip:
     def shm_image(self):
         """Create a minimal SHM image using Phase 2 packing functions."""
         from vten.runtime.ir import Command
-        from vten.runtime.shm import (
+        from vten.backend.sim.shm_constants import (
             BUF_DESC_SIZE,
             CMD_SLOT_SIZE,
             CONTROL_SIZE,
@@ -464,7 +464,7 @@ class TestCtypesRoundTrip:
     def test_npu_3d_write_reg_command(self, shm_image):
         """Verify WRITE_REG command packing for NPU register access."""
         from vten.runtime.ir import Command
-        from vten.runtime.shm import CMD_SLOT_SIZE, pack_command_slot
+        from vten.backend.sim.shm_constants import CMD_SLOT_SIZE, pack_command_slot
         from vten.spec.models import OpCode, Protocol
 
         # NPU 3D: write in_depth register at offset 0x014
@@ -488,7 +488,7 @@ class TestCtypesRoundTrip:
     def test_npu_3d_poll_reg_command(self, shm_image):
         """Verify POLL_REG command packing: mask + expected for layer_done."""
         from vten.runtime.ir import Command
-        from vten.runtime.shm import CMD_SLOT_SIZE, pack_command_slot
+        from vten.backend.sim.shm_constants import CMD_SLOT_SIZE, pack_command_slot
         from vten.spec.models import OpCode, Protocol
 
         # NPU 3D: poll layer_done at offset 0x054, mask=1, expected=1
@@ -510,7 +510,7 @@ class TestCtypesRoundTrip:
     def test_npu_3d_axi4_push_with_phys_addr(self, shm_image):
         """Verify AXI4 PUSH with 64-bit physical address for DDR access."""
         from vten.runtime.ir import Command
-        from vten.runtime.shm import CMD_SLOT_SIZE, pack_command_slot
+        from vten.backend.sim.shm_constants import CMD_SLOT_SIZE, pack_command_slot
         from vten.spec.models import OpCode, Protocol, Role
 
         # NPU 3D: PUSH IFM via DDR port, phys_addr=0x8000_0000
@@ -535,7 +535,7 @@ class TestCtypesRoundTrip:
     def test_npu_3d_probe_command(self, shm_image):
         """Verify probe PULL command with golden_buf_id."""
         from vten.runtime.ir import Command
-        from vten.runtime.shm import CMD_SLOT_SIZE, pack_command_slot
+        from vten.backend.sim.shm_constants import CMD_SLOT_SIZE, pack_command_slot
         from vten.spec.models import OpCode, Protocol, Role
 
         cmd = Command(
@@ -554,7 +554,7 @@ class TestCtypesRoundTrip:
 
     def test_npu_3d_40_command_batch_size(self):
         """NPU 3D full layer: ~40 commands fit in SHM correctly."""
-        from vten.runtime.shm import (
+        from vten.backend.sim.shm_constants import (
             CACHE_LINE,
             CMD_SLOT_SIZE,
             CONTROL_SIZE,

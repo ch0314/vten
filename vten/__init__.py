@@ -7,7 +7,7 @@ from vten.kernel.tensor import Tensor
 from vten.spec.models import Direction
 
 # Level 1: Test
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 
 # Level 2: Inference
 from vten.inference import InferenceModule, InferenceSession

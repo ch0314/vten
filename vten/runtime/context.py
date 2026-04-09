@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from vten.kernel.tensor import Tensor
-    from vten.runtime.flattener import KernelInstance
+    from vten.runtime.kernel_view import KernelInstance
 
 
 # ── AliasRegistry ──
@@ -108,7 +108,7 @@ class ExecutionContext:
 
     def instantiate(self, kernel_class: type, spec=None, **params) -> KernelInstance:
         """Create and initialize a kernel instance with eager resolution."""
-        from vten.runtime.flattener import KernelInstance
+        from vten.runtime.kernel_view import KernelInstance
 
         if spec is None:
             # Try to load from kernel_class.spec
@@ -142,7 +142,7 @@ class ExecutionContext:
         """Provide tensor data to DUT. Generates LOAD + PUSH IR commands."""
         if self._mode == "inference" and tensor.name in self._bound_bos:
             return self._record(OpKind.PUSH_TENSOR, tensor=tensor, dep=dep,
-                                probe=probe, _skip_data=True)
+                                probe=probe, _device_resident=True)
         return self._record(
             OpKind.PUSH_TENSOR, tensor=tensor, dep=dep, probe=probe
         )
@@ -290,21 +290,6 @@ class ExecutionContext:
             self._internal_probe_golden,
         )
 
-    def _compute_shm_flags(self) -> int:
-        """Compute SHM control header flags from backend config."""
-        from vten.runtime.shm import (
-            FLAG_PAUSE_ON_MISMATCH,
-            FLAG_WAVEFORM_DUMP,
-        )
-        flags = 0  # FLAG_STATS_ENABLED is always added by engine
-        if self._backend and hasattr(self._backend, "_config"):
-            cfg = self._backend._config
-            if cfg.get("_waveform"):
-                flags |= FLAG_WAVEFORM_DUMP
-            if cfg.get("_gui"):
-                flags |= FLAG_PAUSE_ON_MISMATCH
-        return flags
-
     # ── Inference mode: device buffer binding ──
 
     def bind_device_buffer(self, tensor: Tensor, bo: object) -> None:
@@ -326,8 +311,9 @@ class ExecutionContext:
         self, compiled: object, backend_result: object,
     ) -> dict:
         from vten.runtime.output_reader import read_output_tensors
+        from vten.backend.base import CompileTarget
         is_hw = (self._backend is not None
-                 and self._backend.compile_target == "hw")
+                 and self._backend.compile_target == CompileTarget.HW)
         get_bo = (
             self._backend.get_buffer_object
             if is_hw and self._backend is not None else None
@@ -411,7 +397,7 @@ class ExecutionContext:
 
     # ── Execution ──
 
-    def _compile_multi_config(self, target: str) -> object:
+    def _compile_multi_config(self) -> object:
         """Split pending ops by config boundaries and compile as multi-config batch."""
         from vten.runtime.engine import RuntimeEngine
 
@@ -442,7 +428,7 @@ class ExecutionContext:
                 quiet=(self._mode == "inference"),
             ))
 
-        return RuntimeEngine.compile_multi(engines, target=target)
+        return RuntimeEngine.compile_multi(engines)
 
     def run(self, *, verify: bool = False) -> ExecutionResult:
         """Compile pending ops → submit → wait → return ExecutionResult.
@@ -459,10 +445,8 @@ class ExecutionContext:
 
         logger.log(5, "ExecutionContext.run(): %d pending ops", len(self._pending_ops))
 
-        target = self._backend.compile_target if self._backend else "sim"
-
         if self._config_boundaries:
-            compiled = self._compile_multi_config(target)
+            compiled = self._compile_multi_config()
         else:
             engine = RuntimeEngine(
                 kernels=self._kernels,
@@ -472,12 +456,9 @@ class ExecutionContext:
                 quiet=(self._mode == "inference"),
             )
             probe_golden_tensors = self._collect_probe_golden_tensors()
-            shm_flags = self._compute_shm_flags()
             compiled = engine.compile(
-                target=target,
                 probe_golden_tensors=probe_golden_tensors or None,
                 internal_probe_golden=self._internal_probe_golden or None,
-                flags=shm_flags,
             )
 
         self._last_compiled = compiled

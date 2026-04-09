@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from vten.runtime.flattener import ExposedTensor, FlattenedKernelView
+    from vten.runtime.kernel_view import ExposedTensor, FlattenedKernelView
 
 
 def apply_layout(

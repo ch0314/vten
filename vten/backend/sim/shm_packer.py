@@ -1,6 +1,6 @@
-"""SHM image packing — Stage 7 of the compile pipeline.
+"""SHM image packing — packs IR commands + tensor data into SHM binary image.
 
-Extracted from RuntimeEngine to keep engine.py focused on IR generation (Stages 0–6).
+Consumed exclusively by SimBackend.execute().
 """
 
 from __future__ import annotations
@@ -9,12 +9,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from vten.spec.models import OpCode
-from vten.runtime.shm import (
+from vten.backend.sim.shm_constants import (
     BUF_DESC_SIZE,
     CACHE_LINE,
     CMD_SLOT_SIZE,
     CONTROL_SIZE,
     DIRECTION_ENCODING,
+    FLAG_STATS_ENABLED,
     STATS_SLOT_SIZE,
     SHMBufferAllocator,
     calculate_shm_size,
@@ -26,7 +27,7 @@ from vten.runtime.shm import (
 
 if TYPE_CHECKING:
     from vten.dsl.operations import Operation
-    from vten.runtime.flattener import ExposedTensor, FlattenedKernelView
+    from vten.runtime.kernel_view import ExposedTensor, FlattenedKernelView
     from vten.runtime.ir import Command
 
 
@@ -65,7 +66,6 @@ def _pack_shm_common(
     Returns:
         (image, layout, data_region_offset)
     """
-    from vten.runtime.shm import FLAG_STATS_ENABLED
     from vten.spec.models import CommandStatus
 
     num_commands = len(commands)

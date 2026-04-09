@@ -120,7 +120,7 @@ def _make_mem_spec(registers=None) -> KernelSpec:
 
 def _make_ir_setup(spec, kernel_class, runtime_params=None, alias_registry=None):
     """Create (view, IRLowering, kernel_instance) for testing."""
-    from vten.runtime.flattener import (
+    from vten.runtime.kernel_view import (
         ExposedTensor,
         FlattenedKernelView,
         InterfaceMapping,
@@ -1044,7 +1044,7 @@ class TestNPU3DFullIR:
     def test_register_offsets_include_bank(self):
         """Register offsets use absolute_offset (with bank_offset)."""
         from vten.runtime.binder import resolve_registers
-        from vten.runtime.flattener import (
+        from vten.runtime.kernel_view import (
             ExposedTensor,
             FlattenedKernelView,
             InterfaceMapping,

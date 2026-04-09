@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from vten.backend.base import Backend
-from vten.backend.sim_base import SimBackend
+from vten.backend.sim.base import SimBackend
 
 
 # ── Helpers ──

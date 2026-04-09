@@ -102,7 +102,7 @@ class TestIRLoweringOffsets:
     def test_buffer_id_offset(self):
         """Buffer IDs start from buffer_id_start."""
         from vten.runtime.ir import IRLowering
-        from vten.runtime.flattener import KernelInstance
+        from vten.runtime.kernel_view import KernelInstance
 
         spec = _stream_spec()
         ctx = ExecutionContext(project_params={"N": 32})
@@ -215,7 +215,7 @@ class TestCompileMulti:
     def test_shm_header_valid(self):
         """Merged SHM image has valid header."""
         from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.shm import SHM_MAGIC, PROTOCOL_VERSION
+        from vten.backend.sim.shm_constants import SHM_MAGIC, PROTOCOL_VERSION
 
         e1 = self._make_engine(N=32)
         e2 = self._make_engine(N=32)
@@ -278,7 +278,7 @@ class TestConfigBoundary:
             from vten.runtime.engine import RuntimeEngine
 
             if self_ctx._config_boundaries:
-                compiled = self_ctx._compile_multi_config("sim")
+                compiled = self_ctx._compile_multi_config()
             else:
                 engine = RuntimeEngine(
                     kernels=self_ctx._kernels,
@@ -286,7 +286,7 @@ class TestConfigBoundary:
                     project_params=self_ctx._project_params,
                     alias_registry=self_ctx._alias_registry,
                 )
-                compiled = engine.compile(target="sim")
+                compiled = engine.compile()
             compiled_results.append(compiled)
             return ExecutionResult(status="DONE")
 
@@ -323,7 +323,7 @@ class TestConfigBoundary:
             from vten.runtime.engine import RuntimeEngine
 
             if self_ctx._config_boundaries:
-                compiled = self_ctx._compile_multi_config("sim")
+                compiled = self_ctx._compile_multi_config()
             else:
                 engine = RuntimeEngine(
                     kernels=self_ctx._kernels,
@@ -331,7 +331,7 @@ class TestConfigBoundary:
                     project_params=self_ctx._project_params,
                     alias_registry=self_ctx._alias_registry,
                 )
-                compiled = engine.compile(target="sim")
+                compiled = engine.compile()
             compiled_results.append(compiled)
             return ExecutionResult(status="DONE")
 

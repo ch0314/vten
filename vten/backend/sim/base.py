@@ -10,8 +10,6 @@ Spec reference: 04_backend_xsim.md §1-6, 08_backend_abstraction.md §5.2, §7.2
 from __future__ import annotations
 
 import abc
-import ctypes
-import ctypes.util
 import json
 import logging
 import os
@@ -23,12 +21,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from vten.backend.base import Backend, BackendResult, CmdStats, raise_backend_error
-from vten.log import format_elapsed, format_size
-from vten.errors import BackendError
-from vten.errors import TimeoutError as VTenTimeoutError
-
-logger = logging.getLogger(__name__)
-from vten.runtime.shm import (
+from vten.backend.sim.semaphore import PosixSemaphore
+from vten.backend.sim.shm_constants import (
     BACKEND_STATUS_DONE,
     BACKEND_STATUS_ERROR,
     BACKEND_STATUS_IDLE,
@@ -41,6 +35,11 @@ from vten.runtime.shm import (
     HOST_STATUS_SHUTDOWN,
     STATS_SLOT_SIZE,
 )
+from vten.log import format_elapsed, format_size
+from vten.errors import BackendError
+from vten.errors import TimeoutError as VTenTimeoutError
+
+logger = logging.getLogger(__name__)
 
 # Diagnostic name maps derived from enums (single source of truth)
 from vten.spec.models import CommandStatus, OpCode
@@ -56,100 +55,6 @@ _BACKEND_STATUS_NAMES = {
 
 if TYPE_CHECKING:
     from vten.runtime.engine import CompiledResult
-
-
-# ── POSIX Named Semaphore wrapper ──
-
-
-class _PosixSemaphore:
-    """Thin ctypes wrapper around POSIX named semaphores.
-
-    Falls back gracefully when POSIX APIs are unavailable (non-Linux, etc.).
-    """
-
-    _lib = None
-    _available = None
-
-    @classmethod
-    def _load(cls) -> bool:
-        if cls._available is not None:
-            return cls._available
-        for libname in ("pthread", "rt", "c"):
-            path = ctypes.util.find_library(libname)
-            if path:
-                try:
-                    cls._lib = ctypes.CDLL(path, use_errno=True)
-                    if hasattr(cls._lib, "sem_open"):
-                        cls._available = True
-                        return True
-                except OSError:
-                    continue
-        cls._available = False
-        return False
-
-    def __init__(self, name: str, *, create: bool = False) -> None:
-        self._name = name.encode("utf-8")
-        self._sem = None
-
-        if not self._load():
-            return
-
-        lib = self._lib
-        lib.sem_open.restype = ctypes.c_void_p
-        if create:
-            self._sem = lib.sem_open(
-                self._name, ctypes.c_int(os.O_CREAT), ctypes.c_uint(0o644), ctypes.c_uint(0),
-            )
-        else:
-            self._sem = lib.sem_open(self._name, ctypes.c_int(0))
-
-        SEM_FAILED = ctypes.c_void_p(-1).value
-        if self._sem is None or self._sem == SEM_FAILED:
-            self._sem = None
-
-    def post(self) -> None:
-        if self._sem is None:
-            return
-        self._lib.sem_post(ctypes.c_void_p(self._sem))
-
-    def wait(self) -> bool:
-        if self._sem is None:
-            return True
-        return self._lib.sem_wait(ctypes.c_void_p(self._sem)) == 0
-
-    def timedwait(self, timeout_s: float) -> bool:
-        """Wait with timeout. Returns True if acquired, False on timeout."""
-        if self._sem is None:
-            return True
-
-        if not hasattr(self._lib, "sem_timedwait"):
-            return self.wait()
-
-        class _timespec(ctypes.Structure):
-            _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
-
-        deadline = time.time() + timeout_s
-        ts = _timespec()
-        ts.tv_sec = int(deadline)
-        ts.tv_nsec = int((deadline - int(deadline)) * 1_000_000_000)
-
-        result = self._lib.sem_timedwait(ctypes.c_void_p(self._sem), ctypes.byref(ts))
-        return result == 0
-
-    def close(self) -> None:
-        if self._sem is None:
-            return
-        try:
-            self._lib.sem_close(ctypes.c_void_p(self._sem))
-        except Exception:
-            pass
-        self._sem = None
-
-    def unlink(self) -> None:
-        try:
-            self._lib.sem_unlink(self._name)
-        except Exception:
-            pass
 
 
 # ── SimBackend ──
@@ -189,30 +94,69 @@ class SimBackend(Backend):
         self._process: subprocess.Popen | None = None
         self._shm = None  # multiprocessing.shared_memory.SharedMemory
         self._session_id: str | None = None
-        self._sem_h2b: _PosixSemaphore | None = None
-        self._sem_b2h: _PosixSemaphore | None = None
+        self._sem_h2b: PosixSemaphore | None = None
+        self._sem_b2h: PosixSemaphore | None = None
         self._session_active: bool = False
         self._batch_count: int = 0
         self._last_backend_result: BackendResult | None = None
 
     # ── Backend ABC: execute() ──
 
+    def _pack_shm_image(self, compiled: CompiledResult) -> tuple[bytes, object]:
+        """Pack CompiledResult into SHM binary image.
+
+        Returns (shm_image_bytes, shm_layout).
+        """
+        from vten.backend.sim.shm_packer import pack_shm, pack_shm_multi, SHMLayout
+        from vten.backend.sim.shm_constants import (
+            FLAG_PAUSE_ON_MISMATCH,
+            FLAG_WAVEFORM_DUMP,
+        )
+
+        # Compute SHM flags from backend config
+        flags = 0
+        if self._config.get("_waveform"):
+            flags |= FLAG_WAVEFORM_DUMP
+        if self._config.get("_gui"):
+            flags |= FLAG_PAUSE_ON_MISMATCH
+
+        is_multi = compiled.views is not None and len(compiled.views) > 1
+        if is_multi:
+            view_buffer_ids = compiled.view_buffer_ids or []
+            shm_image = pack_shm_multi(compiled.views, view_buffer_ids, compiled.commands)
+            # Multi-config: layout not available (full repack each time)
+            layout = SHMLayout(
+                cmd_offset=0, stats_offset=0, bufdesc_offset=0,
+                data_region_offset=0, num_commands=len(compiled.commands),
+                num_buffers=0, total_size=len(shm_image),
+            )
+        else:
+            shm_image, layout = pack_shm(
+                compiled.flattened_view, compiled.commands,
+                compiled.buffer_ids, compiled.ops, flags=flags,
+            )
+
+        return shm_image, layout
+
     def execute(self, compiled: CompiledResult) -> BackendResult:
         """Execute compiled result. Session is managed automatically.
 
-        First call: creates SHM, starts simulator, submits first batch.
-        Subsequent calls: updates SHM in-place, submits new batch.
+        Packs SHM image from CompiledResult, then:
+        - First call: creates SHM, starts simulator, submits first batch.
+        - Subsequent calls: updates SHM in-place, submits new batch.
         Simulator stays alive until cleanup() is called.
         """
         self._probe_buffer_map = getattr(compiled, "probe_buffer_map", {})
+        shm_image, shm_layout = self._pack_shm_image(compiled)
+
         self._batch_count += 1
         if not self._session_active:
             logger.debug("──── batch #%d (new session) ────", self._batch_count)
-            self._submit_shm(compiled.shm_image, compiled.bfm_configs)
+            self._submit_shm(shm_image, compiled.bfm_configs)
             self._session_active = True
         else:
             logger.debug("──── batch #%d (session reuse) ────", self._batch_count)
-            self._submit_batch_internal(compiled)
+            self._submit_batch_internal_raw(shm_image, shm_layout)
         result = self._wait_completion()
         self._last_backend_result = result
         return result
@@ -371,8 +315,8 @@ class SimBackend(Backend):
             self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_IDLE)
 
         # Create named semaphore pair
-        self._sem_h2b = _PosixSemaphore(f"/vten_{self._session_id}_h2b", create=True)
-        self._sem_b2h = _PosixSemaphore(f"/vten_{self._session_id}_b2h", create=True)
+        self._sem_h2b = PosixSemaphore(f"/vten_{self._session_id}_h2b", create=True)
+        self._sem_b2h = PosixSemaphore(f"/vten_{self._session_id}_b2h", create=True)
         logger.log(5, "[handshake 1] semaphores created: h2b, b2h (session=%s)",
                      self._session_id)
 
@@ -413,7 +357,7 @@ class SimBackend(Backend):
         logger.log(5, "[handshake 4] CMD_READY signaled")
 
     # Progress polling interval (seconds)
-    _PROGRESS_POLL_INTERVAL = 5.0
+    _PROGRESS_POLL_INTERVAL = 10.0
 
     # Quiet period: suppress progress/heartbeat for fast executions (seconds)
     _QUIET_PERIOD = 4.0
@@ -1125,20 +1069,15 @@ class SimBackend(Backend):
 
     # ── Session batch update (internal) ──
 
-    def _submit_batch_internal(self, compiled: CompiledResult) -> None:
+    def _submit_batch_internal_raw(self, shm_image: bytes, shm_layout: object) -> None:
         """Update SHM in-place for a subsequent batch within an active session."""
         if self._shm is None:
             raise BackendError("no active session")
 
-        layout = compiled.shm_layout
-        if layout is None:
-            raise BackendError("CompiledResult missing shm_layout for session batch")
-
-        shm_image = compiled.shm_image
         buf = self._shm.buf
 
-        if layout.total_size > len(buf):
-            self._resize_shm(layout.total_size)
+        if shm_layout.total_size > len(buf):
+            self._resize_shm(shm_layout.total_size)
             buf = self._shm.buf
 
         buf[:len(shm_image)] = shm_image
@@ -1147,7 +1086,7 @@ class SimBackend(Backend):
         self._write_shm_u32(self.HOST_STATUS_OFFSET, HOST_STATUS_CMD_READY)
         self._sem_h2b.post()
         logger.log(5, "[session] batch submitted (cmds=%d, bufs=%d)",
-                     layout.num_commands, layout.num_buffers)
+                     shm_layout.num_commands, shm_layout.num_buffers)
 
     def _read_stats_from_shm(self) -> list[CmdStats]:
         """Parse per-command stats from SHM Stats Region."""

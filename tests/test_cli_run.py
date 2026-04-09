@@ -24,46 +24,46 @@ class TestTestScenario:
     """TestScenario: base class for user-defined test scenarios."""
 
     def test_base_class_exists(self):
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         assert TestScenario is not None
 
     def test_has_kernel_attribute(self):
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         assert hasattr(TestScenario, "kernel")
 
     def test_has_configs_attribute(self):
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         assert hasattr(TestScenario, "configs")
 
     def test_has_run_method(self):
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         assert callable(getattr(TestScenario, "run", None))
 
     def test_run_raises_not_implemented(self):
         """Base class run() raises NotImplementedError."""
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         scenario = TestScenario()
         with pytest.raises(NotImplementedError):
             scenario.run(None, {})  # type: ignore[arg-type]
 
     def test_kernel_default_empty(self):
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         assert TestScenario.kernel == ""
 
     def test_configs_default_none(self):
         """configs=None means single execution with vten.toml parameters."""
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         assert TestScenario.configs is None
 
     def test_subclass_with_configs(self):
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         class MyTest(TestScenario):
             kernel = "conv3d"
@@ -79,7 +79,7 @@ class TestTestScenario:
         assert len(MyTest.configs) == 2
 
     def test_subclass_single_config(self):
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         class SimpleTest(TestScenario):
             kernel = "passthrough"
@@ -90,7 +90,7 @@ class TestTestScenario:
         assert SimpleTest.configs is None
 
     def test_subclass_instantiation(self):
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         class MyTest(TestScenario):
             kernel = "test"
@@ -105,7 +105,7 @@ class TestTestScenario:
         """run(self, ctx, cfg) — spec §14.1."""
         import inspect
 
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         sig = inspect.signature(TestScenario.run)
         params = list(sig.parameters.keys())
@@ -127,7 +127,7 @@ class TestDiscoverTest:
         """Helper: create a test file with a TestScenario subclass."""
         configs_line = f"    configs = {configs}" if configs else ""
         content = f"""\
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 
 class {class_name}(TestScenario):
     kernel = "{kernel}"
@@ -139,7 +139,7 @@ class {class_name}(TestScenario):
         (tests_dir / filename).write_text(content)
 
     def test_discover_by_class_name(self, tmp_path: Path):
-        from vten.cli.run import discover_test
+        from vten.cli.discovery import discover_test
 
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
@@ -149,7 +149,7 @@ class {class_name}(TestScenario):
         assert scenario.__class__.__name__ == "TestConv3D"
 
     def test_discover_by_class_name_case_insensitive(self, tmp_path: Path):
-        from vten.cli.run import discover_test
+        from vten.cli.discovery import discover_test
 
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
@@ -159,7 +159,7 @@ class {class_name}(TestScenario):
         assert scenario.__class__.__name__ == "TestConv3D"
 
     def test_discover_by_snake_case(self, tmp_path: Path):
-        from vten.cli.run import discover_test
+        from vten.cli.discovery import discover_test
 
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
@@ -170,7 +170,7 @@ class {class_name}(TestScenario):
 
     def test_discover_by_filename(self, tmp_path: Path):
         """'conv3d' matches tests/test_conv3d.py."""
-        from vten.cli.run import discover_test
+        from vten.cli.discovery import discover_test
 
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
@@ -180,7 +180,7 @@ class {class_name}(TestScenario):
         assert scenario.__class__.__name__ == "TestConv3D"
 
     def test_discover_not_found_error(self, tmp_path: Path):
-        from vten.cli.run import discover_test
+        from vten.cli.discovery import discover_test
 
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
@@ -190,14 +190,14 @@ class {class_name}(TestScenario):
 
     def test_discover_scans_test_files_only(self, tmp_path: Path):
         """Only test_*.py files are scanned, not other .py files."""
-        from vten.cli.run import discover_test
+        from vten.cli.discovery import discover_test
 
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
 
         # Non-test file should be ignored
         (tests_dir / "helper.py").write_text("""\
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 class HelperScenario(TestScenario):
     kernel = "helper"
     def run(self, ctx, cfg): pass
@@ -208,7 +208,7 @@ class HelperScenario(TestScenario):
 
     def test_discover_ambiguous_error(self, tmp_path: Path):
         """Multiple matches raise error."""
-        from vten.cli.run import discover_test
+        from vten.cli.discovery import discover_test
 
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
@@ -221,7 +221,8 @@ class HelperScenario(TestScenario):
 
     def test_discover_returns_instance(self, tmp_path: Path):
         """discover_test returns an instantiated TestScenario, not the class."""
-        from vten.cli.run import TestScenario, discover_test
+        from vten.cli.scenario import TestScenario
+        from vten.cli.discovery import discover_test
 
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
@@ -232,7 +233,7 @@ class HelperScenario(TestScenario):
 
     def test_discover_empty_dir_error(self, tmp_path: Path):
         """Empty tests directory raises not found."""
-        from vten.cli.run import discover_test
+        from vten.cli.discovery import discover_test
 
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
@@ -242,7 +243,7 @@ class HelperScenario(TestScenario):
 
     def test_discover_preserves_kernel_attribute(self, tmp_path: Path):
         """Discovered instance retains kernel class attribute."""
-        from vten.cli.run import discover_test
+        from vten.cli.discovery import discover_test
 
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
@@ -253,7 +254,7 @@ class HelperScenario(TestScenario):
 
     def test_discover_preserves_configs(self, tmp_path: Path):
         """Discovered instance retains configs class attribute."""
-        from vten.cli.run import discover_test
+        from vten.cli.discovery import discover_test
 
         tests_dir = tmp_path / "tests"
         tests_dir.mkdir()
@@ -355,7 +356,7 @@ compile_options = ["-timescale", "1ns/1ps"]
         project = self._setup_project(tmp_path)
         # Create a test scenario file in kernel's tests/ dir
         (project / "kernels" / "passthrough" / "tests" / "test_simple.py").write_text("""\
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 class TestSimple(TestScenario):
     kernel = "passthrough"
     def run(self, ctx, cfg):
@@ -380,7 +381,7 @@ class TestSimple(TestScenario):
 
         project = self._setup_project(tmp_path)
         (project / "kernels" / "passthrough" / "tests" / "test_pass.py").write_text("""\
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 class TestPass(TestScenario):
     kernel = "passthrough"
     def run(self, ctx, cfg):
@@ -406,7 +407,7 @@ class TestPass(TestScenario):
 
         project = self._setup_project(tmp_path)
         (project / "kernels" / "passthrough" / "tests" / "test_stats.py").write_text("""\
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 class TestStats(TestScenario):
     kernel = "passthrough"
     def run(self, ctx, cfg):
@@ -451,7 +452,7 @@ class TestStats(TestScenario):
 
         project = self._setup_project(tmp_path)
         (project / "kernels" / "passthrough" / "tests" / "test_wave.py").write_text("""\
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 class TestWave(TestScenario):
     kernel = "passthrough"
     def run(self, ctx, cfg):
@@ -485,7 +486,7 @@ class TestVtenRunExecution:
 
     def test_single_config_run_called_once(self):
         """TestScenario.configs=None → run() called exactly once."""
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         class SingleTest(TestScenario):
             kernel = "test"
@@ -502,7 +503,7 @@ class TestVtenRunExecution:
 
     def test_multi_config_run_called_per_config(self):
         """TestScenario.configs=[a, b] → run() called for each config."""
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         call_args: list[dict] = []
 
@@ -524,7 +525,7 @@ class TestVtenRunExecution:
 
     def test_npu_multi_layer_configs(self):
         """NPU 3D: 28-layer U-Net configs list."""
-        from vten.cli.run import TestScenario
+        from vten.cli.scenario import TestScenario
 
         class NPUUNetTest(TestScenario):
             kernel = "npu_3d"
@@ -634,7 +635,7 @@ compile_options = ["-timescale", "1ns/1ps"]
         (kernel_dir / "build" / "generated").mkdir()
 
         (kernel_dir / "tests" / "test_scenario.py").write_text(f"""\
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 
 class {class_name}(TestScenario):
     kernel = "passthrough"
@@ -819,7 +820,7 @@ compile_options = ["-timescale", "1ns/1ps"]
         (kernel_dir / "build" / "generated").mkdir()
 
         (kernel_dir / "tests" / "test_ok.py").write_text("""\
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 class TestOK(TestScenario):
     kernel = "passthrough"
     def run(self, ctx, cfg):

@@ -9,6 +9,7 @@ from vten.backend.base import (
     BackendResult,
     BatchResult,
     CmdStats,
+    CompileTarget,
     raise_backend_error,
 )
 from vten.backend.registry import (
@@ -24,6 +25,7 @@ __all__ = [
     "BackendResult",
     "BatchResult",
     "CmdStats",
+    "CompileTarget",
     "available_backends",
     "get_backend",
     "get_build_pipeline",

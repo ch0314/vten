@@ -38,4 +38,5 @@ testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
     "xsim: requires xsim (Vivado simulator) for E2E execution",
+    "npu_3d: tests specific to NPU_3D accelerator (skip with -m 'not npu_3d')",
 ]

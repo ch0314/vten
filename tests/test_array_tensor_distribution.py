@@ -17,7 +17,7 @@ import torch
 from vten.dsl.operations import Operation, OperationHandle
 from vten.kernel.base import Kernel
 from vten.kernel.tensor import Tensor
-from vten.runtime.flattener import (
+from vten.runtime.kernel_view import (
     ExposedTensor,
     FlattenedKernelView,
     InterfaceMapping,
@@ -554,7 +554,7 @@ class TestArrayFullPipeline:
             ops=ops,
             project_params={},
         )
-        result = engine.compile(target="sim")
+        result = engine.compile()
 
         # Verify commands: should have 4 PUSH commands
         push_cmds = [c for c in result.commands if c.op == OpCode.PUSH]
@@ -600,7 +600,7 @@ class TestArrayFullPipeline:
             ops=ops,
             project_params={},
         )
-        result = engine.compile(target="sim")
+        result = engine.compile()
 
         load_cmds = [c for c in result.commands if c.op == OpCode.LOAD]
         push_cmds = [c for c in result.commands if c.op == OpCode.PUSH]
@@ -633,7 +633,7 @@ class TestArrayFullPipeline:
             ops=ops,
             project_params={},
         )
-        result = engine.compile(target="sim")
+        result = engine.compile()
 
         # 4 BFMs for the 4-element array
         assert len(result.bfm_configs) == 4
@@ -669,7 +669,7 @@ class TestArrayCodegenIntegration:
         engine = RuntimeEngine(
             kernels={"ArrayKernel": inst}, ops=ops, project_params={},
         )
-        result = engine.compile(target="sim")
+        result = engine.compile()
 
         gen = SVGenerator(spec, result.bfm_configs, {})
         files = gen.generate(str(tmp_path), num_commands=len(result.commands))
@@ -704,7 +704,7 @@ class TestArrayCodegenIntegration:
         engine = RuntimeEngine(
             kernels={"ArrayKernel": inst}, ops=ops, project_params={},
         )
-        result = engine.compile(target="sim")
+        result = engine.compile()
 
         gen = SVGenerator(spec, result.bfm_configs, {})
         files = gen.generate(str(tmp_path), num_commands=len(result.commands))
@@ -734,7 +734,7 @@ class TestArrayCodegenIntegration:
         engine = RuntimeEngine(
             kernels={"ArrayKernel": inst}, ops=ops, project_params={},
         )
-        result = engine.compile(target="sim")
+        result = engine.compile()
 
         assert len(result.bfm_configs) == 4
         gen = SVGenerator(spec, result.bfm_configs, {})
@@ -750,7 +750,7 @@ class TestArrayCodegenIntegration:
         """SHM image contains correct split data for each element buffer."""
         import struct
         from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.shm import CONTROL_SIZE, CMD_SLOT_SIZE, STATS_SLOT_SIZE, BUF_DESC_SIZE, CACHE_LINE
+        from vten.backend.sim.shm_constants import CONTROL_SIZE, CMD_SLOT_SIZE, STATS_SLOT_SIZE, BUF_DESC_SIZE, CACHE_LINE
 
         spec = _make_array_spec([2])
         inst = KernelInstance(
@@ -767,7 +767,7 @@ class TestArrayCodegenIntegration:
         engine = RuntimeEngine(
             kernels={"ArrayKernel": inst}, ops=ops, project_params={},
         )
-        result = engine.compile(target="sim")
+        result = engine.compile()
 
         # Verify we have 2 distinct buffer_ids in tensor_data
         assert len(result.tensor_data) == 2

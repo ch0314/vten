@@ -71,7 +71,7 @@ def _make_simple_spec(registers=None) -> KernelSpec:
 
 def _make_view_with_registers(registers, runtime_params=None):
     """Build FlattenedKernelView with given registers on 'ctrl' interface."""
-    from vten.runtime.flattener import (
+    from vten.runtime.kernel_view import (
         ExposedTensor,
         FlattenedKernelView,
         InterfaceMapping,

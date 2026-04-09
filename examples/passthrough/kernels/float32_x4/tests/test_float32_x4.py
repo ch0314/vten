@@ -1,4 +1,4 @@
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 
 
 class TestFloat32X4(TestScenario):

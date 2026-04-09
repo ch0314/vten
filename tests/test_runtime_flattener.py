@@ -17,6 +17,7 @@ import torch
 from vten.errors import BindingError, ValidationError
 from vten.kernel.base import Kernel, RegisterHandle, register
 from vten.kernel.tensor import Tensor
+from vten.runtime.flatten import wrap_unit_as_flat
 from vten.spec.models import (
     AutoBindSpec,
     Direction,
@@ -143,7 +144,7 @@ def _make_kernel_instance(
     kernel_class, spec, project_params=None, runtime_params=None
 ):
     """Helper to create and initialize a KernelInstance."""
-    from vten.runtime.flattener import KernelInstance
+    from vten.runtime.kernel_view import KernelInstance
 
     inst = KernelInstance(
         name=kernel_class.__name__,
@@ -157,7 +158,7 @@ def _make_kernel_instance(
 
 def _make_flat_view(kernel_instance, mappings=None, exposed=None):
     """Build FlattenedKernelView for a Unit kernel."""
-    from vten.runtime.flattener import (
+    from vten.runtime.kernel_view import (
         ExposedTensor,
         FlattenedKernelView,
         InterfaceMapping,
@@ -282,7 +283,7 @@ class TestKernelInstance:
 
     def test_getattr_raises_for_uninitialized(self):
         """__getattr__ raises AttributeError when not initialized."""
-        from vten.runtime.flattener import KernelInstance
+        from vten.runtime.kernel_view import KernelInstance
 
         inst = KernelInstance(
             name="test",
@@ -322,7 +323,7 @@ class TestExposedTensor:
     @pytest.fixture()
     def exposed_with_data(self):
         """ExposedTensor wrapping a resolved tensor with data."""
-        from vten.runtime.flattener import ExposedTensor
+        from vten.runtime.kernel_view import ExposedTensor
 
         t = Tensor(shape=(4,), dtype=torch.int8, interface="test_iface")
         t.name = "test_tensor"
@@ -387,7 +388,7 @@ class TestInterfaceMapping:
     """InterfaceMapping creation and MappingType variants."""
 
     def test_external_mapping(self):
-        from vten.runtime.flattener import InterfaceMapping
+        from vten.runtime.kernel_view import InterfaceMapping
 
         m = InterfaceMapping(
             sub_kernel="_self",
@@ -402,7 +403,7 @@ class TestInterfaceMapping:
 
     def test_external_bank_mapping(self):
         """EXTERNAL_BANK with non-zero bank_offset (NPU composite)."""
-        from vten.runtime.flattener import InterfaceMapping
+        from vten.runtime.kernel_view import InterfaceMapping
 
         m = InterfaceMapping(
             sub_kernel="fmapio",
@@ -415,7 +416,7 @@ class TestInterfaceMapping:
         assert m.mapping_type == MappingType.EXTERNAL_BANK
 
     def test_internal_mapping(self):
-        from vten.runtime.flattener import InterfaceMapping
+        from vten.runtime.kernel_view import InterfaceMapping
 
         m = InterfaceMapping(
             sub_kernel="fmapio",
@@ -429,7 +430,7 @@ class TestInterfaceMapping:
         assert m.top_interface is None
 
     def test_internal_probe_mapping(self):
-        from vten.runtime.flattener import InterfaceMapping
+        from vten.runtime.kernel_view import InterfaceMapping
 
         m = InterfaceMapping(
             sub_kernel="fmapio",
@@ -470,7 +471,7 @@ class TestFlattenedKernelView:
 
     def test_external_interfaces_excludes_internal(self):
         """INTERNAL mappings are not returned by external_interfaces()."""
-        from vten.runtime.flattener import (
+        from vten.runtime.kernel_view import (
             FlattenedKernelView,
             InterfaceMapping,
         )
@@ -538,7 +539,7 @@ class TestFlattenedKernelView:
 
     def test_registers_for_interface_with_bank_offset(self):
         """Bank offset is added to register offset."""
-        from vten.runtime.flattener import (
+        from vten.runtime.kernel_view import (
             ExposedTensor,
             FlattenedKernelView,
             InterfaceMapping,
@@ -576,7 +577,7 @@ class TestFlattenedKernelView:
 
     def test_resolve_auto_bind_tensor(self):
         """resolve_auto_bind_tensor() finds ExposedTensor by origin_path."""
-        from vten.runtime.flattener import ExposedTensor
+        from vten.runtime.kernel_view import ExposedTensor
 
         inst = _make_kernel_instance(
             FmapIOKernel,
@@ -608,66 +609,42 @@ class TestWrapUnitAsFlat:
 
     def test_unit_wrapping_creates_self_subkernel(self):
         """Unit kernel is wrapped with sub_kernel name '_self'."""
-        from vten.runtime.engine import RuntimeEngine
 
         inst = _make_kernel_instance(
             PassthroughKernel, _make_passthrough_spec(), runtime_params={"SIZE": 16}
         )
-        engine = RuntimeEngine(
-            kernels={"PassthroughKernel": inst},
-            ops=[],
-            project_params={},
-        )
-        view = engine._wrap_unit_as_flat(inst)
+        view = wrap_unit_as_flat(inst)
         assert "_self" in view.sub_kernels
         assert view.sub_kernels["_self"] is inst
 
     def test_unit_wrapping_creates_external_mappings(self):
         """All interfaces become EXTERNAL mappings."""
-        from vten.runtime.engine import RuntimeEngine
 
         inst = _make_kernel_instance(
             PassthroughKernel, _make_passthrough_spec(), runtime_params={"SIZE": 16}
         )
-        engine = RuntimeEngine(
-            kernels={"PassthroughKernel": inst},
-            ops=[],
-            project_params={},
-        )
-        view = engine._wrap_unit_as_flat(inst)
+        view = wrap_unit_as_flat(inst)
         for m in view.interface_mappings:
             assert m.mapping_type == MappingType.EXTERNAL
             assert m.sub_kernel == "_self"
 
     def test_unit_wrapping_exposes_all_tensors(self):
         """All kernel tensors become exposed tensors."""
-        from vten.runtime.engine import RuntimeEngine
 
         inst = _make_kernel_instance(
             PassthroughKernel, _make_passthrough_spec(), runtime_params={"SIZE": 16}
         )
-        engine = RuntimeEngine(
-            kernels={"PassthroughKernel": inst},
-            ops=[],
-            project_params={},
-        )
-        view = engine._wrap_unit_as_flat(inst)
+        view = wrap_unit_as_flat(inst)
         assert "data_in" in view.exposed_tensors
         assert "data_out" in view.exposed_tensors
 
     def test_exposed_tensor_origin_path(self):
         """Exposed tensor origin_path is '_self.<tensor_name>'."""
-        from vten.runtime.engine import RuntimeEngine
 
         inst = _make_kernel_instance(
             PassthroughKernel, _make_passthrough_spec(), runtime_params={"SIZE": 16}
         )
-        engine = RuntimeEngine(
-            kernels={"PassthroughKernel": inst},
-            ops=[],
-            project_params={},
-        )
-        view = engine._wrap_unit_as_flat(inst)
+        view = wrap_unit_as_flat(inst)
         assert view.exposed_tensors["data_in"].origin_path == "_self.data_in"
 
 
@@ -682,7 +659,7 @@ class TestNPU3DFlattenedView:
     @pytest.fixture()
     def npu_view(self):
         """Simulate NPU 3D composite with fmapIO + bias_loader sub-kernels."""
-        from vten.runtime.flattener import (
+        from vten.runtime.kernel_view import (
             ExposedTensor,
             FlattenedKernelView,
             InterfaceMapping,

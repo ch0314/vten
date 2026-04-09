@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from vten.runtime.flattener import FlattenedKernelView
+    from vten.runtime.kernel_view import FlattenedKernelView
 
 logger = logging.getLogger(__name__)
 

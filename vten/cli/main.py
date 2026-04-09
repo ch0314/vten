@@ -68,6 +68,11 @@ def main(argv: list[str] | None = None) -> None:
                             help="Auto-verify outputs against behavioral model golden")
     run_parser.add_argument("--config", nargs="*", help="Config overrides (K=V)")
 
+    # vten list
+    list_parser = sub.add_parser("list", help="List test scenarios for a kernel")
+    list_parser.add_argument("--kernel", required=True, help="Kernel name")
+    list_parser.add_argument("--project", default=".", help="Project directory")
+
     # vten report
     report_parser = sub.add_parser("report", help="Generate report")
     report_parser.add_argument("--project-dir", default=".", help="Project directory")
@@ -167,6 +172,10 @@ def _dispatch(args: argparse.Namespace, log_level: str) -> None:
             config_overrides=overrides or None,
             verify=args.verify,
         )
+
+    elif args.command == "list":
+        from vten.cli.list_cmd import list_tests
+        list_tests(project_dir=args.project, kernel_name=args.kernel)
 
     elif args.command == "report":
         from vten.cli.report import generate_report

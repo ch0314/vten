@@ -33,7 +33,7 @@ class TestProbeGoldenSerialization:
 
     def _make_view_with_probe(self):
         """Create a FlattenedKernelView with one probe point."""
-        from vten.runtime.flattener import (
+        from vten.runtime.kernel_view import (
             FlattenedKernelView,
             KernelInstance,
             ProbePoint,
@@ -151,7 +151,7 @@ class TestProbeBufferMap:
 
     @staticmethod
     def _make_view(probe_points):
-        from vten.runtime.flattener import FlattenedKernelView
+        from vten.runtime.kernel_view import FlattenedKernelView
         from vten.spec.models import KernelSpec
 
         return FlattenedKernelView(
@@ -166,7 +166,7 @@ class TestProbeBufferMap:
 
     def test_single_probe_with_buffer(self):
         from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.flattener import ProbePoint
+        from vten.runtime.kernel_view import ProbePoint
 
         class MockConn:
             source_sub = "sub"
@@ -181,7 +181,7 @@ class TestProbeBufferMap:
 
     def test_multiple_probes(self):
         from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.flattener import ProbePoint
+        from vten.runtime.kernel_view import ProbePoint
 
         class MockConn:
             source_sub = "sub"
@@ -199,7 +199,7 @@ class TestProbeBufferMap:
     def test_probe_without_buffer_skipped(self):
         """Probes without golden_buffer_id are not included."""
         from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.flattener import ProbePoint
+        from vten.runtime.kernel_view import ProbePoint
 
         class MockConn:
             source_sub = "sub"
@@ -276,7 +276,7 @@ class TestMismatchFileParsing:
 
     def _make_backend(self, mismatch_dir):
         """Create a minimal SimBackend-like object with _parse_mismatch_file."""
-        from vten.backend.sim_base import SimBackend
+        from vten.backend.sim.base import SimBackend
 
         # SimBackend is abstract, so we instantiate minimally
         class _Stub(SimBackend):
@@ -326,7 +326,7 @@ class TestMismatchFileParsing:
         assert result == []
 
     def test_no_mismatch_dir_returns_empty(self):
-        from vten.backend.sim_base import SimBackend
+        from vten.backend.sim.base import SimBackend
 
         class _Stub(SimBackend):
             def _start_simulator(self):

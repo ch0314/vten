@@ -7,7 +7,7 @@ TestScaleAdd: parametrized via configs for parameter sweep.
 TestScaleAddProbe: probe=True on pull for beat-level BFM verification.
 """
 
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 
 
 class TestScaleAdd(TestScenario):

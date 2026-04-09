@@ -230,8 +230,8 @@ class TestConnectionValidationNegative:
 
     def test_dtype_mismatch_allowed_for_internal_wires(self):
         """int8 → float32 on internal wire is OK (physical bytes on wire)."""
-        from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.flattener import KernelInstance
+        from vten.runtime.flatten import _validate_connection_dtypes
+        from vten.runtime.kernel_view import KernelInstance
         from vten.runtime.resolver import ParameterResolver
         from vten.spec.models import KernelSpec
 
@@ -259,13 +259,12 @@ class TestConnectionValidationNegative:
                 inst_t._resolve_shape(ki._resolver)
             sub_kernels[name] = ki
 
-        engine = RuntimeEngine(kernels={}, ops=[], project_params={})
         # Internal wire connections skip dtype check
-        engine._validate_connection_dtypes([conn], sub_kernels)
+        _validate_connection_dtypes([conn], sub_kernels)
 
     def test_duplicate_source_raises(self):
         """Same source interface in two connections → ValidationError."""
-        from vten.runtime.engine import RuntimeEngine
+        from vten.runtime.flatten import _validate_no_duplicate_connections
 
         class _Dst2(Kernel):
             spec = "d2.yaml"
@@ -284,16 +283,15 @@ class TestConnectionValidationNegative:
                 src.data_out >> dst2.data_in,
             ]
 
-        engine = RuntimeEngine(kernels={}, ops=[], project_params={})
         with pytest.raises(ValidationError, match="Duplicate connection source"):
-            engine._validate_no_duplicate_connections(
+            _validate_no_duplicate_connections(
                 _DupSrcComposite.connections, {},
             )
 
     def test_dangling_internal_raises(self):
         """Internal() interface with no connection → ValidationError."""
-        from vten.runtime.engine import RuntimeEngine
-        from vten.runtime.flattener import InterfaceMapping
+        from vten.runtime.flatten import _validate_internal_coverage
+        from vten.runtime.kernel_view import InterfaceMapping
         from vten.spec.models import MappingType
 
         mappings = [
@@ -309,10 +307,9 @@ class TestConnectionValidationNegative:
             ),
         ]
 
-        engine = RuntimeEngine(kernels={}, ops=[], project_params={})
         # No connections at all — both internal interfaces are dangling
         with pytest.raises(ValidationError, match="no connection"):
-            engine._validate_internal_coverage(mappings, [], {})
+            _validate_internal_coverage(mappings, [], {})
 
 
 # ═══════════════════════════════════════════════════════════════════

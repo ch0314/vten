@@ -137,7 +137,7 @@ def _build_shm_with_buffers(
         buffers: {buffer_id: data_bytes}
         num_commands: number of command slots
     """
-    from vten.runtime.shm import (
+    from vten.backend.sim.shm_constants import (
         BUF_DESC_SIZE,
         CMD_SLOT_SIZE,
         CONTROL_SIZE,
@@ -271,7 +271,7 @@ class TestXsimBufferReader:
         backend = self._make_backend_with_shm(image)
         reader = backend._make_buffer_reader()
         # Modify the data in-place (simulating DUT writing output)
-        from vten.runtime.shm import BUF_DESC_SIZE, CONTROL_SIZE, CMD_SLOT_SIZE, STATS_SLOT_SIZE
+        from vten.backend.sim.shm_constants import BUF_DESC_SIZE, CONTROL_SIZE, CMD_SLOT_SIZE, STATS_SLOT_SIZE
         data_region = struct.unpack_from("<Q", image, 0x30)[0]
         buf_desc_off = struct.unpack_from("<Q", image, 0x28)[0]
         buf_data_off = struct.unpack_from("<Q", image, buf_desc_off + 0x08)[0]
@@ -402,7 +402,7 @@ class TestXsimWaitReturnsReader:
         from unittest.mock import MagicMock
 
         from vten.backend.xsim import XsimBackend
-        from vten.runtime.shm import BACKEND_STATUS_DONE
+        from vten.backend.sim.shm_constants import BACKEND_STATUS_DONE
 
         # Build SHM image with a buffer
         data = b"\x42" * 8
@@ -447,7 +447,8 @@ class TestRunTestVerification:
 
     def test_verification_error_sets_fail(self, tmp_path):
         """VerificationError during run causes FAIL status."""
-        from vten.cli.run import run_test, TestScenario
+        from vten.cli.run import run_test
+        from vten.cli.scenario import TestScenario
 
         # Create minimal project structure
         kernel_dir = tmp_path / "kernels" / "test_k"
@@ -472,7 +473,7 @@ interfaces:
 
         # Create test that raises VerificationError
         (tests_dir / "test_verify.py").write_text("""
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 from vten.errors import VerificationError
 
 class TestVerify(TestScenario):

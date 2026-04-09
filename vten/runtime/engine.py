@@ -36,23 +36,22 @@ from vten.runtime.binder import (
     RegisterBindingEntry,
     resolve_registers,
 )
-from vten.runtime.flattener import (
+from vten.runtime.kernel_view import (
     ExposedTensor,
     FlattenedKernelView,
-    InterfaceMapping,
     KernelInstance,
     ProbePoint,
+)
+from vten.runtime.flatten import (
+    flatten_composite,
+    infer_direction_unit,
+    is_composite,
+    wrap_unit_as_flat,
 )
 from vten.runtime.ir import BFMConfig, Command, IRLowering, _determine_role
 from vten.runtime.resolver import ParameterResolver
 from vten.runtime.serializer import MultiPortSerializer, StreamSerializer
-from vten.runtime.shm_packer import (
-    _block_split_data,
-    _parse_split_spec,
-    SHMLayout,
-    pack_shm,
-    pack_shm_multi,
-)
+from vten.backend.sim.shm_packer import _block_split_data, _parse_split_spec
 
 if TYPE_CHECKING:
     from vten.dsl.operations import Operation
@@ -65,7 +64,6 @@ if TYPE_CHECKING:
 @dataclass
 class CompiledResult:
     commands: list[Command]
-    shm_image: bytes
     bfm_configs: list[BFMConfig]
     buffer_ids: dict[str, int]
     flattened_view: FlattenedKernelView
@@ -73,11 +71,27 @@ class CompiledResult:
     probe_reports: list[ProbePoint] = field(default_factory=list)
     tensor_data: dict[int, bytes] = field(default_factory=dict)
     iface_id_to_name: dict[int, str] = field(default_factory=dict)
-    shm_layout: SHMLayout | None = None
     views: list[FlattenedKernelView] | None = None  # multi-config: all views
+    view_buffer_ids: list[dict[str, int]] | None = None  # multi-config: per-view buffer_ids
     probe_buffer_map: dict[int, int] = field(default_factory=dict)  # probe_index → golden_buffer_id
     prebound_buffers: dict[int, object] = field(default_factory=dict)  # buffer_id → xrt.bo (inference)
     mode: str = "verification"  # "verification" or "inference"
+
+    @property
+    def shm_image(self) -> bytes:
+        """Pack SHM image on demand (for tests / backward compat)."""
+        if self.flattened_view is None:
+            return b""
+        from vten.backend.sim.shm_packer import pack_shm, pack_shm_multi
+
+        if self.views and len(self.views) > 1:
+            view_bids = self.view_buffer_ids or []
+            return pack_shm_multi(self.views, view_bids, self.commands)
+        img, _ = pack_shm(
+            self.flattened_view, self.commands,
+            self.buffer_ids, self.ops,
+        )
+        return img
 
 
 # ── RuntimeEngine ──
@@ -100,7 +114,7 @@ class RuntimeEngine:
         self._alias_registry = alias_registry
         self._quiet = quiet
 
-    # ── Internal: Stages 0–6 (IR generation, no SHM packing) ──
+    # ── Internal: Stages 0–9 (IR generation, no SHM packing) ──
 
     def _compile_ir(
         self,
@@ -114,7 +128,7 @@ class RuntimeEngine:
         list[BFMConfig],
         dict[int, str],
     ]:
-        """Run Stages 0–6 and return intermediate results.
+        """Run Stages 0–9 and return intermediate results.
 
         Returns:
             (view, commands, buffer_ids, bfm_configs, iface_id_to_name)
@@ -123,10 +137,10 @@ class RuntimeEngine:
 
         # Stage 0: Flatten or wrap
         logger.log(5, "Stage 0: flatten/wrap")
-        if self._is_composite(kernel):
-            view = self._flatten_composite(kernel)
+        if is_composite(kernel):
+            view = flatten_composite(kernel, self._project_params)
         else:
-            view = self._wrap_unit_as_flat(kernel)
+            view = wrap_unit_as_flat(kernel)
 
         # Stage 1: Parameter resolution (re-validate)
         logger.log(5, "Stage 1: parameter resolution")
@@ -136,28 +150,28 @@ class RuntimeEngine:
         logger.log(5, "Stage 2: shape resolution")
         self._resolve_shapes(view)
 
-        # Stage 2b: Refine direction from operations
-        logger.log(5, "Stage 2b: direction refinement")
+        # Stage 3: Direction refinement from operations
+        logger.log(5, "Stage 3: direction refinement")
         self._refine_directions_from_ops(view)
 
-        # Stage 3: Tensor serialization
-        logger.log(5, "Stage 3: tensor serialization")
+        # Stage 4: Tensor serialization
+        logger.log(5, "Stage 4: tensor serialization")
         self._serialize_tensors(view)
 
-        # Stage 3b: Probe golden serialization
-        logger.log(5, "Stage 3b: probe golden serialization")
+        # Stage 5: Probe golden serialization
+        logger.log(5, "Stage 5: probe golden serialization")
         self._serialize_probe_golden(view)
 
-        # Stage 4: Address allocation
-        logger.log(5, "Stage 4: address allocation")
+        # Stage 6: Address allocation
+        logger.log(5, "Stage 6: address allocation")
         self._allocate_addresses(view)
 
-        # Stage 5: auto_bind resolution
-        logger.log(5, "Stage 5: auto_bind resolution")
+        # Stage 7: auto_bind resolution
+        logger.log(5, "Stage 7: auto_bind resolution")
         self._resolve_registers(view)
 
-        # Stage 6: IR lowering
-        logger.log(5, "Stage 6: IR lowering")
+        # Stage 8: IR lowering
+        logger.log(5, "Stage 8: IR lowering")
         lowering = IRLowering(view, self._alias_registry)
         commands, buffer_ids = lowering.lower(
             self._ops,
@@ -174,8 +188,8 @@ class RuntimeEngine:
         if logger.isEnabledFor(logging.DEBUG):
             self._log_ir_commands(commands, iface_id_to_name, buffer_ids)
 
-        # Stage 6b: BFM configuration synthesis
-        logger.log(5, "Stage 6b: BFM config synthesis")
+        # Stage 9: BFM configuration synthesis
+        logger.log(5, "Stage 9: BFM config synthesis")
         bfm_configs = self._synthesize_bfm_configs(view, commands, buffer_ids)
 
         return view, commands, buffer_ids, bfm_configs, iface_id_to_name
@@ -203,23 +217,21 @@ class RuntimeEngine:
 
     def compile(
         self,
-        target: str = "sim",
         probe_golden_tensors: dict | None = None,
         internal_probe_golden: dict | None = None,
-        flags: int = 0,
     ) -> CompiledResult:
-        """Run the 8-stage compile pipeline.
+        """Run the compile pipeline (Stages 0–9).
+
+        Produces backend-agnostic IR commands + tensor data.
+        SHM packing is handled by SimBackend.execute().
 
         Args:
-            target: "sim" for SIM backends (includes Stage 7 SHM packing),
-                    "hw" for HW backends (skips SHM packing).
             probe_golden_tensors: tensor_name → torch.Tensor golden data for probe.
             internal_probe_golden: (sub_name, tensor_name) → torch.Tensor for
                 composite internal probe golden data.
-            flags: SHM control header flags (e.g. FLAG_WAVEFORM_DUMP).
         """
         t0 = time.perf_counter()
-        logger.log(5, "compile pipeline starting (target=%s, ops=%d)", target, len(self._ops))
+        logger.log(5, "compile pipeline starting (ops=%d)", len(self._ops))
 
         view, commands, buffer_ids, bfm_configs, iface_id_to_name = (
             self._compile_ir()
@@ -234,17 +246,8 @@ class RuntimeEngine:
             self._ensure_probe_mappings(view, internal_probe_golden)
             self._serialize_probe_golden(view, internal_probe_golden)
 
-        # Stage 7: SHM packing (SIM path only)
-        probe_buffer_map: dict[int, int] = {}
-        shm_layout: SHMLayout | None = None
-        if target == "sim":
-            logger.log(5, "Stage 7: SHM packing")
-            shm_image, shm_layout = pack_shm(view, commands, buffer_ids, self._ops, flags=flags)
-            logger.log(5, "SHM image: %d bytes", len(shm_image))
-            # Build probe_index → golden_buffer_id mapping for plusargs
-            probe_buffer_map = self._build_probe_buffer_map(view)
-        else:
-            shm_image = b""
+        # Build probe_index → golden_buffer_id mapping
+        probe_buffer_map = self._build_probe_buffer_map(view)
 
         tensor_data = self._collect_tensor_data(view, buffer_ids)
 
@@ -254,7 +257,6 @@ class RuntimeEngine:
 
         return CompiledResult(
             commands=commands,
-            shm_image=shm_image,
             bfm_configs=bfm_configs,
             buffer_ids=buffer_ids,
             flattened_view=view,
@@ -262,7 +264,6 @@ class RuntimeEngine:
             probe_reports=view.probe_points,
             tensor_data=tensor_data,
             iface_id_to_name=iface_id_to_name,
-            shm_layout=shm_layout,
             probe_buffer_map=probe_buffer_map,
             mode="inference" if self._quiet else "verification",
         )
@@ -381,435 +382,7 @@ class RuntimeEngine:
             raise CompilationError("No kernels instantiated")
         return next(iter(self._kernels.values()))
 
-    # ── Stage 0: Flattening ──
-
-    def _wrap_unit_as_flat(self, kernel: KernelInstance) -> FlattenedKernelView:
-        """Wrap a Unit kernel as FlattenedKernelView with _self sub-kernel."""
-        mappings: list[InterfaceMapping] = []
-        for iface in kernel.spec.interfaces.values():
-            mappings.append(
-                InterfaceMapping(
-                    sub_kernel="_self",
-                    sub_interface=iface.name,
-                    mapping_type=MappingType.EXTERNAL,
-                    top_interface=iface.name,
-                    bank_name=None,
-                    bank_offset=0,
-                )
-            )
-
-        exposed: dict[str, ExposedTensor] = {}
-        for tensor in kernel.tensors():
-            direction = self._infer_direction_unit(tensor, kernel.spec)
-            exposed[tensor.name] = ExposedTensor(
-                name=tensor.name,
-                origin_path=f"_self.{tensor.name}",
-                origin_tensor=tensor,
-                top_interface=tensor.interface,
-                direction=direction,
-            )
-
-        return FlattenedKernelView(
-            name=kernel.name,
-            top_spec=kernel.spec,
-            sub_kernels={"_self": kernel},
-            interface_mappings=mappings,
-            exposed_tensors=exposed,
-            probe_points=[],
-            connections=[],
-        )
-
-    def _is_composite(self, kernel: KernelInstance) -> bool:
-        """Check if a KernelInstance wraps a CompositeKernel."""
-        return bool(getattr(kernel.kernel_class, "_sub_kernel_refs", None))
-
-    def _flatten_composite(self, kernel: KernelInstance) -> FlattenedKernelView:
-        """Flatten a CompositeKernel into FlattenedKernelView.
-
-        v2: Uses _sub_kernel_refs, auto-expose, auto-prefix registers.
-        No more interface_map, config_map, bind(), expose(), Internal().
-        """
-        from vten.kernel.composite import Connection
-        from vten.spec.parser import load_kernel_spec
-
-        composite_instance = kernel.kernel_class_instance
-        composite_cls = kernel.kernel_class
-        top_spec = kernel.spec
-
-        # ── Phase A: Sub-kernel instantiation ──
-        existing_subs = kernel._sub_kernel_instances
-        sub_kernels: dict[str, KernelInstance] = {}
-        sub_kernel_refs = getattr(composite_cls, "_sub_kernel_refs", {})
-
-        import os
-        from pathlib import Path as _P
-        _proj_dir = _P(
-            self._project_params.get("_project_dir", os.getcwd())
-        )
-
-        for ref_name, sub_cls in sub_kernel_refs.items():
-            if existing_subs and ref_name in existing_subs:
-                sub_ki = existing_subs[ref_name]
-                sub_spec_path = getattr(sub_cls, "spec", "")
-                if sub_spec_path and not sub_ki.spec.interfaces:
-                    resolved = _proj_dir / sub_spec_path if not _P(sub_spec_path).is_absolute() else _P(sub_spec_path)
-                    sub_ki.spec = load_kernel_spec(resolved)
-            else:
-                sub_spec_path = getattr(sub_cls, "spec", "")
-                if sub_spec_path:
-                    resolved = _proj_dir / sub_spec_path if not _P(sub_spec_path).is_absolute() else _P(sub_spec_path)
-                    sub_spec = load_kernel_spec(resolved)
-                else:
-                    sub_spec = KernelSpec(
-                        kernel_name=sub_cls.__name__,
-                        rtl_top=sub_cls.__name__,
-                    )
-                sub_ki = KernelInstance(
-                    name=ref_name,
-                    spec=sub_spec,
-                    kernel_class=sub_cls,
-                    runtime_params=dict(kernel.runtime_params),
-                )
-                sub_ki.initialize(self._project_params)
-            sub_kernels[ref_name] = sub_ki
-
-        # Synthesize top-level spec for composite kernels if missing
-        if not top_spec.interfaces:
-            cached = getattr(kernel.kernel_class, "_synthesized_spec", None)
-            if cached is not None:
-                top_spec = cached
-            else:
-                import os
-                from pathlib import Path as _Path
-                from vten.build.composite import synthesize_spec
-                project_dir = _Path(
-                    self._project_params.get("_project_dir", os.getcwd())
-                )
-                top_spec = synthesize_spec(
-                    kernel.kernel_class, project_dir, kernel.name,
-                )
-                kernel.kernel_class._synthesized_spec = top_spec
-            kernel.spec = top_spec
-
-        # ── Phase B: Interface mapping (auto-inferred) ──
-        connections = getattr(composite_cls, "_connections", []) or []
-        connected_tensors = getattr(composite_cls, "_connected_tensors", set())
-        auto_exposed = getattr(composite_cls, "_auto_exposed", {})
-        mappings: list[InterfaceMapping] = []
-
-        for ref_name, sub_ki in sub_kernels.items():
-            sub_spec = sub_ki.spec
-            for sub_iface_name in sub_spec.interface_names():
-                # Check if this interface's tensors are connected (internal)
-                is_internal = False
-                for t_name, t_desc in sub_ki.kernel_class._tensor_descriptors.items():
-                    if t_desc.interface == sub_iface_name:
-                        if (ref_name, t_name) in connected_tensors:
-                            is_internal = True
-                            break
-
-                if is_internal:
-                    # Internal connection → INTERNAL_PROBE (always probe-capable)
-                    mappings.append(InterfaceMapping(
-                        sub_kernel=ref_name,
-                        sub_interface=sub_iface_name,
-                        mapping_type=MappingType.INTERNAL_PROBE,
-                        top_interface=None,
-                        bank_name=None,
-                        bank_offset=0,
-                    ))
-                else:
-                    # Auto-expose → EXTERNAL with auto-prefix
-                    top_iface = f"{ref_name}_{sub_iface_name}"
-                    mappings.append(InterfaceMapping(
-                        sub_kernel=ref_name,
-                        sub_interface=sub_iface_name,
-                        mapping_type=MappingType.EXTERNAL,
-                        top_interface=top_iface,
-                        bank_name=None,
-                        bank_offset=0,
-                    ))
-
-        # ── Phase C: Auto-exposed tensor collection ──
-        exposed: dict[str, ExposedTensor] = {}
-
-        for (sub_name, tensor_name), _t_name in auto_exposed.items():
-            sub_ki = sub_kernels[sub_name]
-            origin_tensor = sub_ki.get_tensor(tensor_name)
-            direction = self._infer_direction_composite(
-                sub_name, origin_tensor, mappings, sub_ki.spec
-            )
-            # Find top_interface for this tensor
-            top_iface = f"{sub_name}_{origin_tensor.interface}"
-            # Key by tensor_name for lookup by op.tensor.name;
-            # if conflict (same tensor_name from different sub-kernels),
-            # fall back to prefixed name
-            exposed_name = tensor_name
-            if exposed_name in exposed:
-                exposed_name = f"{sub_name}_{tensor_name}"
-            exposed[exposed_name] = ExposedTensor(
-                name=exposed_name,
-                origin_path=f"{sub_name}.{tensor_name}",
-                origin_tensor=origin_tensor,
-                top_interface=top_iface,
-                direction=direction,
-            )
-
-        # ── Phase D: Probe point collection ──
-        probe_points: list[ProbePoint] = []
-        probed_ifaces: set[tuple[str, str]] = set()
-        probe_mapping_by_key: dict[tuple[str, str], InterfaceMapping] = {}
-        for m in mappings:
-            if m.mapping_type == MappingType.INTERNAL_PROBE:
-                key = (m.sub_kernel, m.sub_interface)
-                probed_ifaces.add(key)
-                probe_mapping_by_key[key] = m
-
-        for conn in connections:
-            src_key = (conn.source_sub, conn.source_interface)
-            dst_iface = conn.dest_interface
-            dst_key = (conn.dest_sub, dst_iface) if dst_iface else None
-
-            matched_key = None
-            if src_key in probed_ifaces:
-                matched_key = src_key
-            elif dst_key is not None and dst_key in probed_ifaces:
-                matched_key = dst_key
-
-            if matched_key is not None:
-                m = probe_mapping_by_key[matched_key]
-                probe_points.append(
-                    ProbePoint(connection=conn, interface_mapping=m)
-                )
-
-        # ── Phase E: Validation ──
-        self._validate_flattened(
-            mappings, exposed, connections, top_spec, sub_kernels
-        )
-
-        view = FlattenedKernelView(
-            name=kernel.name,
-            top_spec=top_spec,
-            sub_kernels=sub_kernels,
-            interface_mappings=mappings,
-            exposed_tensors=exposed,
-            probe_points=probe_points,
-            connections=connections,
-        )
-        return view
-
-    # _parse_mapping removed in v2 (auto-inferred interface mappings)
-
-    def _infer_direction_composite(
-        self,
-        sub_kernel_name: str,
-        tensor: Tensor,
-        mappings: list[InterfaceMapping],
-        sub_spec: KernelSpec,
-    ) -> Direction:
-        """Infer tensor direction for CompositeKernel exposed tensors."""
-        if tensor.direction is not None:
-            return tensor.direction
-        # Fall back to unit inference using sub-kernel spec
-        return self._infer_direction_unit(tensor, sub_spec)
-
-    # _find_connection_for_interface and _find_dest_interface_name
-    # removed in v2 (Connection has direct .dest_interface property)
-
-    def _validate_flattened(
-        self,
-        mappings: list[InterfaceMapping],
-        exposed: dict[str, ExposedTensor],
-        connections: list,
-        top_spec: KernelSpec,
-        sub_kernels: dict[str, KernelInstance] | None = None,
-    ) -> None:
-        """Build-time validation of flattened view."""
-        # Validate all exposed tensors reference valid top interfaces
-        external_ifaces = {
-            m.top_interface
-            for m in mappings
-            if m.mapping_type in (MappingType.EXTERNAL, MappingType.EXTERNAL_BANK)
-            and m.top_interface is not None
-        }
-        for name, exp in exposed.items():
-            if exp.top_interface not in external_ifaces:
-                raise ValidationError(
-                    f"ExposedTensor '{name}' maps to top_interface "
-                    f"'{exp.top_interface}' which has no EXTERNAL mapping."
-                )
-
-        # Connection validations (composite only)
-        if not connections or not sub_kernels:
-            return
-
-        self._validate_connection_protocols(connections, sub_kernels)
-        self._validate_connection_dtypes(connections, sub_kernels)
-        self._validate_internal_coverage(mappings, connections, sub_kernels)
-        self._validate_no_duplicate_connections(connections, sub_kernels)
-
-    def _validate_connection_protocols(
-        self,
-        connections: list,
-        sub_kernels: dict[str, KernelInstance],
-    ) -> None:
-        """Validate that connected interfaces use the same protocol."""
-        for conn in connections:
-            src_ki = sub_kernels.get(conn.source_sub)
-            dst_ki = sub_kernels.get(conn.dest_sub)
-            if not src_ki or not dst_ki:
-                continue
-            src_iface = src_ki.spec.interfaces.get(conn.source_interface)
-            dest_iface_name = getattr(conn, "dest_interface", None)
-            if not dest_iface_name:
-                continue
-            dst_iface = dst_ki.spec.interfaces.get(dest_iface_name)
-            if src_iface and dst_iface and src_iface.protocol != dst_iface.protocol:
-                raise ProtocolMismatchError(
-                    f"Connection {conn.source_sub}.{conn.source_interface} "
-                    f"({src_iface.protocol.value}) → "
-                    f"{conn.dest_sub}.{dest_iface_name} "
-                    f"({dst_iface.protocol.value}): protocol mismatch"
-                )
-
-    def _validate_connection_dtypes(
-        self,
-        connections: list,
-        sub_kernels: dict[str, KernelInstance],
-    ) -> None:
-        """Validate that connected tensors have matching dtype.
-
-        For internal (RTL wire) connections, dtype mismatch is allowed
-        because the physical bus carries raw bytes regardless of the
-        logical dtype declared on each tensor.
-        """
-        for conn in connections:
-            # Internal wires pass physical bytes — dtype semantics don't apply
-            if getattr(conn, "is_internal_wire", True):
-                continue
-            src_ki = sub_kernels.get(conn.source_sub)
-            dst_ki = sub_kernels.get(conn.dest_sub)
-            if not src_ki or not dst_ki:
-                continue
-            try:
-                src_tensor = src_ki.get_tensor(conn.source_name)
-                dst_tensor = dst_ki.get_tensor(conn.dest_name)
-            except (RuntimeError, AttributeError):
-                continue
-            if (
-                src_tensor.dtype != dst_tensor.dtype
-                and conn.transform is None
-            ):
-                raise ConnectionDtypeMismatchError(
-                    f"Connection {conn.source_sub}.{conn.source_name} "
-                    f"(dtype={src_tensor.dtype}) → "
-                    f"{conn.dest_sub}.{conn.dest_name} "
-                    f"(dtype={dst_tensor.dtype}): "
-                    f"dtype mismatch without explicit transform"
-                )
-
-    def _validate_internal_coverage(
-        self,
-        mappings: list[InterfaceMapping],
-        connections: list,
-        sub_kernels: dict[str, KernelInstance],
-    ) -> None:
-        """Validate that all Internal() interfaces are covered by connections."""
-        internal_ifaces: set[tuple[str, str]] = set()
-        for m in mappings:
-            if m.mapping_type in (MappingType.INTERNAL, MappingType.INTERNAL_PROBE):
-                internal_ifaces.add((m.sub_kernel, m.sub_interface))
-
-        # Probe interfaces don't need connections
-        probe_ifaces = {
-            (m.sub_kernel, m.sub_interface)
-            for m in mappings
-            if m.mapping_type == MappingType.INTERNAL_PROBE
-        }
-        must_connect = internal_ifaces - probe_ifaces
-
-        connected: set[tuple[str, str]] = set()
-        for conn in connections:
-            connected.add((conn.source_sub, conn.source_interface))
-            dest_iface_name = getattr(conn, "dest_interface", None)
-            if dest_iface_name:
-                connected.add((conn.dest_sub, dest_iface_name))
-
-        dangling = must_connect - connected
-        if dangling:
-            dangling_desc = ", ".join(
-                f"{sub}.{iface}" for sub, iface in sorted(dangling)
-            )
-            raise ValidationError(
-                f"Internal interfaces have no connection: {dangling_desc}"
-            )
-
-    def _validate_no_duplicate_connections(
-        self,
-        connections: list,
-        sub_kernels: dict[str, KernelInstance],
-    ) -> None:
-        """Validate no interface appears in multiple connections."""
-        seen_src: set[tuple[str, str]] = set()
-        seen_dst: set[tuple[str, str]] = set()
-        for conn in connections:
-            src_key = (conn.source_sub, conn.source_interface)
-            if src_key in seen_src:
-                raise ValidationError(
-                    f"Duplicate connection source: "
-                    f"{conn.source_sub}.{conn.source_interface}"
-                )
-            seen_src.add(src_key)
-
-            dest_iface_name = getattr(conn, "dest_interface", None)
-            if dest_iface_name:
-                dst_key = (conn.dest_sub, dest_iface_name)
-                if dst_key in seen_dst:
-                    raise ValidationError(
-                        f"Duplicate connection destination: "
-                        f"{conn.dest_sub}.{dest_iface_name}"
-                    )
-                seen_dst.add(dst_key)
-
-    def _infer_direction_unit(self, tensor, spec) -> Direction:
-        """Resolve tensor direction: explicit value first, then protocol inference.
-
-        Priority:
-          1. tensor.direction (explicit) — use as-is
-          2. AXI4-Stream — infer from interface role (master=H2D, slave=D2H)
-          3. AXI4 (MM) — default HOST_TO_DEV with warning
-          4. Fallback — HOST_TO_DEV
-        """
-        # Step 1: Explicit direction takes precedence
-        if tensor.direction is not None:
-            return tensor.direction
-
-        # Step 2: Protocol-based inference
-        try:
-            iface = spec.get_interface(tensor.interface)
-        except KeyError:
-            return Direction.HOST_TO_DEV
-
-        if iface.protocol == Protocol.AXI4S:
-            if hasattr(iface, "role") and iface.role == Role.SLAVE:
-                return Direction.DEV_TO_HOST
-            return Direction.HOST_TO_DEV
-
-        if iface.protocol == Protocol.AXI4:
-            # AXI4 MM: same port can have read/write tensors.
-            # Without explicit direction, default H2D with warning.
-            import warnings
-            warnings.warn(
-                f"Tensor '{tensor.name}' on AXI4 interface "
-                f"'{tensor.interface}' has no explicit direction; "
-                f"defaulting to HOST_TO_DEV. Consider setting "
-                f"direction=Direction.HOST_TO_DEV or "
-                f"direction=Direction.DEV_TO_HOST explicitly.",
-                stacklevel=2,
-            )
-            return Direction.HOST_TO_DEV
-
-        return Direction.HOST_TO_DEV
+    # Stage 0 logic (flatten/wrap/validate/direction) is in vten.runtime.flatten
 
     # ── Stage 1: Parameter Resolution ──
 
@@ -858,7 +431,7 @@ class RuntimeEngine:
                     f"{src._element_count} vs {dst._element_count} elements."
                 )
 
-    # ── Stage 2b: Direction Refinement from Operations ──
+    # ── Stage 3: Direction Refinement from Operations ──
 
     def _refine_directions_from_ops(self, view: FlattenedKernelView) -> None:
         """Refine ExposedTensor.direction using actual DSL operations.
@@ -897,7 +470,7 @@ class RuntimeEngine:
                 if exposed.origin_tensor.data is None:
                     exposed.direction = Direction.DEV_TO_HOST
 
-    # ── Stage 3: Tensor Serialization ──
+    # ── Stage 4: Tensor Serialization ──
 
     def _serialize_tensors(self, view: FlattenedKernelView) -> None:
         for name, exposed in view.exposed_tensors.items():
@@ -922,9 +495,9 @@ class RuntimeEngine:
                     self._alias_registry
                     and self._alias_registry.is_alias_target(name)
                 )
-                # Check if this tensor's send op has _skip_data (inference: BO on device)
+                # Check if this tensor's send op has _device_resident (inference: BO on device)
                 skip_data = any(
-                    getattr(op, '_skip_data', False)
+                    getattr(op, '_device_resident', False)
                     for op in self._ops
                     if op.tensor is not None and op.tensor.name == name
                 )
@@ -1028,7 +601,7 @@ class RuntimeEngine:
         from vten.runtime.layout import apply_unlayout
         return apply_unlayout(view, exposed, data)
 
-    # ── Stage 3b: Dynamic Probe Mapping + Golden Serialization ──
+    # ── Stage 5: Dynamic Probe Mapping + Golden Serialization ──
 
     def _ensure_probe_mappings(
         self,
@@ -1172,7 +745,7 @@ class RuntimeEngine:
                 serialized_golden=serialized,
             ))
 
-    # ── Stage 4: Address Allocation ──
+    # ── Stage 6: Address Allocation ──
 
     def _allocate_addresses(self, view: FlattenedKernelView) -> None:
         allocators: dict[str, AddressAllocator] = {}
@@ -1196,12 +769,12 @@ class RuntimeEngine:
             )
             exposed.set_address(addr)
 
-    # ── Stage 5: auto_bind + config register Resolution ──
+    # ── Stage 7: auto_bind + config register Resolution ──
 
     def _resolve_registers(self, view: FlattenedKernelView) -> None:
         view._register_bindings = resolve_registers(view)
 
-    # ── Stage 6b: BFM Configuration Synthesis ──
+    # ── Stage 9: BFM Configuration Synthesis ──
 
     def _synthesize_bfm_configs(
         self,
@@ -1215,8 +788,6 @@ class RuntimeEngine:
     @staticmethod
     def compile_multi(
         engines: list[RuntimeEngine],
-        *,
-        target: str = "sim",
     ) -> CompiledResult:
         """Compile multiple config groups into a single batch.
 
@@ -1224,18 +795,14 @@ class RuntimeEngine:
         BARRIER commands inserted between groups. cmd_id and buffer_id
         are offset to maintain global uniqueness.
 
-        Args:
-            engines: List of RuntimeEngine instances, one per config group.
-            target: "sim" for SIM backends, "hw" for HW backends.
-
         Returns:
-            A single CompiledResult with merged commands and unified SHM image.
+            A single CompiledResult with merged commands.
         """
         if not engines:
             raise CompilationError("compile_multi requires at least one engine")
 
         if len(engines) == 1:
-            return engines[0].compile(target=target)
+            return engines[0].compile()
 
         t0 = time.perf_counter()
         logger.log(5, "compile_multi: %d config groups", len(engines))
@@ -1304,14 +871,6 @@ class RuntimeEngine:
                 all_commands.append(barrier_cmd)
                 next_cmd_id += 1
 
-        # Stage 7: SHM packing with merged data
-        if target == "sim":
-            logger.log(5, "Stage 7: multi-config SHM packing")
-            shm_image = pack_shm_multi(views, view_buffer_ids, all_commands)
-            logger.log(5, "SHM image: %d bytes", len(shm_image))
-        else:
-            shm_image = b""
-
         elapsed = time.perf_counter() - t0
         logger.debug("compile_multi complete: %d commands, %d buffers, %.1fms",
                      len(all_commands), len(all_buffer_ids), elapsed * 1000)
@@ -1323,7 +882,6 @@ class RuntimeEngine:
 
         return CompiledResult(
             commands=all_commands,
-            shm_image=shm_image,
             bfm_configs=all_bfm_configs,
             buffer_ids=all_buffer_ids,
             flattened_view=views[0],  # Primary view for output tensor reading
@@ -1332,5 +890,6 @@ class RuntimeEngine:
             tensor_data=all_tensor_data,
             iface_id_to_name=all_iface_id_to_name,
             views=views,  # all views for multi-config verify
+            view_buffer_ids=view_buffer_ids,
         )
 

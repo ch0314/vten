@@ -49,13 +49,13 @@ def _passthrough_compiled_result():
         Command(op=OpCode.LOAD, cmd_id=0, interface_id=0, buffer_id=0,
                 protocol=Protocol.AXI4S, size=128, role="master"),
         Command(op=OpCode.PUSH, cmd_id=1, interface_id=0, buffer_id=0,
-                protocol=Protocol.AXI4S, size=128, role="master", dep=0),
+                protocol=Protocol.AXI4S, size=128, role="master", dep=[0]),
         Command(op=OpCode.PULL, cmd_id=2, interface_id=1, buffer_id=1,
-                protocol=Protocol.AXI4S, size=128, role="slave", dep=1),
+                protocol=Protocol.AXI4S, size=128, role="slave", dep=[1]),
     ]
 
     # Minimal SHM image: control + 3 command slots
-    from vten.runtime.shm import CMD_SLOT_SIZE, CONTROL_SIZE
+    from vten.backend.sim.shm_constants import CMD_SLOT_SIZE, CONTROL_SIZE
     shm_size = CONTROL_SIZE + len(commands) * CMD_SLOT_SIZE
     buf = bytearray(shm_size)
     struct.pack_into("<I", buf, 0, 0x5654454E)  # MAGIC
@@ -64,7 +64,6 @@ def _passthrough_compiled_result():
 
     return CompiledResult(
         commands=commands,
-        shm_image=bytes(buf),
         bfm_configs=bfm_configs,
         buffer_ids={"data_in": 0, "data_out": 1},
         flattened_view=None,  # type: ignore[arg-type]
@@ -181,32 +180,41 @@ class TestCompiledResultToSVGenerator:
 
 
 class TestCompiledResultToBackend:
-    """CompiledResult.shm_image + bfm_configs → Backend.execute()."""
+    """CompiledResult + bfm_configs → Backend.execute()."""
 
-    def test_compiled_shm_image_is_bytes(self):
-        """shm_image from compile is bytes (submit expects bytes)."""
-        result = _passthrough_compiled_result()
-        assert isinstance(result.shm_image, bytes)
+    def _make_shm_image(self, num_commands: int) -> bytes:
+        """Build a minimal valid SHM image directly."""
+        from vten.backend.sim.shm_constants import CMD_SLOT_SIZE, CONTROL_SIZE
+        size = CONTROL_SIZE + num_commands * CMD_SLOT_SIZE
+        buf = bytearray(size)
+        struct.pack_into("<I", buf, 0, 0x5654454E)  # MAGIC
+        struct.pack_into("<I", buf, 4, 0x00000003)  # VERSION
+        struct.pack_into("<I", buf, 8, num_commands)
+        return bytes(buf)
 
-    def test_compiled_shm_image_has_magic(self):
-        """shm_image starts with VTEN magic."""
-        result = _passthrough_compiled_result()
-        magic = struct.unpack_from("<I", result.shm_image, 0)[0]
+    def test_shm_image_is_bytes(self):
+        """SHM image from pack is bytes."""
+        img = self._make_shm_image(3)
+        assert isinstance(img, bytes)
+
+    def test_shm_image_has_magic(self):
+        """SHM image starts with VTEN magic."""
+        img = self._make_shm_image(3)
+        magic = struct.unpack_from("<I", img, 0)[0]
         assert magic == 0x5654454E
 
-    def test_compiled_shm_image_has_version(self):
-        """shm_image has correct version field."""
-        result = _passthrough_compiled_result()
-        version = struct.unpack_from("<I", result.shm_image, 4)[0]
+    def test_shm_image_has_version(self):
+        """SHM image has correct version field."""
+        img = self._make_shm_image(3)
+        version = struct.unpack_from("<I", img, 4)[0]
         assert version == 0x00000003
 
-    def test_compiled_shm_image_size_sufficient(self):
-        """shm_image size >= CONTROL_SIZE + num_commands * CMD_SLOT_SIZE."""
-        from vten.runtime.shm import CMD_SLOT_SIZE, CONTROL_SIZE
-
-        result = _passthrough_compiled_result()
-        min_size = CONTROL_SIZE + len(result.commands) * CMD_SLOT_SIZE
-        assert len(result.shm_image) >= min_size
+    def test_shm_image_size_sufficient(self):
+        """SHM image size >= CONTROL_SIZE + num_commands * CMD_SLOT_SIZE."""
+        from vten.backend.sim.shm_constants import CMD_SLOT_SIZE, CONTROL_SIZE
+        img = self._make_shm_image(3)
+        min_size = CONTROL_SIZE + 3 * CMD_SLOT_SIZE
+        assert len(img) >= min_size
 
     def test_backend_execute_signature_compatible(self):
         """Backend.execute accepts (compiled: CompiledResult)."""
@@ -571,7 +579,7 @@ class TestMultiBatchLifecycle:
 
     def _make_shm_image(self, num_commands: int = 3) -> bytes:
         """Build a valid SHM image with given command count."""
-        from vten.runtime.shm import CMD_SLOT_SIZE, CONTROL_SIZE
+        from vten.backend.sim.shm_constants import CMD_SLOT_SIZE, CONTROL_SIZE
         size = CONTROL_SIZE + num_commands * CMD_SLOT_SIZE
         buf = bytearray(size)
         struct.pack_into("<I", buf, 0, 0x5654454E)  # MAGIC
@@ -627,7 +635,7 @@ class TestMultiBatchLifecycle:
 
     def test_npu_scale_shm_image_256_commands(self):
         """256-command SHM image (NPU batch size) has correct size."""
-        from vten.runtime.shm import CMD_SLOT_SIZE, CONTROL_SIZE
+        from vten.backend.sim.shm_constants import CMD_SLOT_SIZE, CONTROL_SIZE
 
         img = self._make_shm_image(256)
         expected = CONTROL_SIZE + 256 * CMD_SLOT_SIZE

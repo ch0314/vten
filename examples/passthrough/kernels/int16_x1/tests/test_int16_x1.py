@@ -1,4 +1,4 @@
-from vten.cli.run import TestScenario
+from vten.cli.scenario import TestScenario
 
 
 class TestInt16X1(TestScenario):

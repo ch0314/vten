@@ -187,7 +187,7 @@ class TestBridgeConstants:
 
     def test_constants_match_python(self):
         """C constants must exactly match vten.runtime.shm constants."""
-        from vten.runtime.shm import (
+        from vten.backend.sim.shm_constants import (
             BUF_DESC_SIZE,
             CMD_SLOT_SIZE,
             CONTROL_SIZE,

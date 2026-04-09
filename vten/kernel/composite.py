@@ -474,7 +474,7 @@ def _make_composite_kernel():
             # Strategy: create a temporary composite, run generate_inputs,
             # then manually chain upstream forwards to populate target's
             # connected inputs.
-            from vten.runtime.flattener import KernelInstance
+            from vten.runtime.kernel_view import KernelInstance
             from vten.spec.models import KernelSpec
 
             comp_spec = KernelSpec(
