@@ -38,18 +38,17 @@ class TestTestScenario:
 
         assert hasattr(TestScenario, "configs")
 
-    def test_has_run_method(self):
+    def test_has_seed_attribute(self):
         from vten.cli.scenario import TestScenario
 
-        assert callable(getattr(TestScenario, "run", None))
+        assert hasattr(TestScenario, "seed")
+        assert TestScenario.seed == 42
 
-    def test_run_raises_not_implemented(self):
-        """Base class run() raises NotImplementedError."""
+    def test_has_probes_attribute(self):
         from vten.cli.scenario import TestScenario
 
-        scenario = TestScenario()
-        with pytest.raises(NotImplementedError):
-            scenario.run(None, {})  # type: ignore[arg-type]
+        assert hasattr(TestScenario, "probes")
+        assert TestScenario.probes is None
 
     def test_kernel_default_empty(self):
         from vten.cli.scenario import TestScenario
@@ -101,17 +100,12 @@ class TestTestScenario:
         t = MyTest()
         assert isinstance(t, TestScenario)
 
-    def test_run_signature_has_ctx_and_cfg(self):
-        """run(self, ctx, cfg) — spec §14.1."""
-        import inspect
-
+    def test_pure_config_declaration(self):
+        """TestScenario is pure config — no run() method on base class."""
         from vten.cli.scenario import TestScenario
 
-        sig = inspect.signature(TestScenario.run)
-        params = list(sig.parameters.keys())
-        assert "self" in params
-        assert "ctx" in params
-        assert "cfg" in params
+        # Base class should NOT have run() — execution is in execute_batch
+        assert not hasattr(TestScenario, "run")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -349,28 +343,41 @@ compile_options = ["-timescale", "1ns/1ps"]
 
         assert callable(run_test)
 
+    def _mock_run_test(self, project, test_name, mock_batch=None):
+        """Helper: run run_test() with execute_batch and kernel discovery mocked."""
+        from vten.cli.run import run_test
+        from vten.cli.scenario import TestScenario
+        from vten.execution import BatchResult, ConfigResult
+
+        if mock_batch is None:
+            mock_result = MagicMock(
+                status="DONE", total_cycles=0, verification_count=0,
+                verification_results=[], per_command_stats=[],
+            )
+            mock_batch = BatchResult(configs=[
+                ConfigResult(config_index=0, result=mock_result),
+            ])
+
+        with patch("vten.cli.run.get_backend") as mock_get_backend, \
+             patch("vten.cli.run.execute_batch", return_value=mock_batch), \
+             patch.object(TestScenario, "_discover_kernel_class",
+                          return_value=MagicMock()):
+            mock_backend = MagicMock()
+            mock_get_backend.return_value = mock_backend
+            mock_backend.working_directory.return_value = project
+
+            run_test(str(project), kernel_name="passthrough", test_name=test_name)
+
     def test_run_test_creates_results_directory(self, tmp_path: Path):
         """run_test() creates results/<kernel>/<test_name>/ directory."""
-        from vten.cli.run import run_test
-
         project = self._setup_project(tmp_path)
-        # Create a test scenario file in kernel's tests/ dir
         (project / "kernels" / "passthrough" / "tests" / "test_simple.py").write_text("""\
 from vten.cli.scenario import TestScenario
 class TestSimple(TestScenario):
     kernel = "passthrough"
-    def run(self, ctx, cfg):
-        pass
 """)
 
-        # Mock backend to avoid needing real xsim
-        with patch("vten.cli.run.get_backend") as mock_get_backend:
-            mock_backend = MagicMock()
-            mock_get_backend.return_value = mock_backend
-            mock_backend.working_directory.return_value = project
-            mock_backend.execute.return_value = MagicMock(status=2, stats=[])  # DONE
-
-            run_test(str(project), kernel_name="passthrough", test_name="TestSimple")
+        self._mock_run_test(project, "TestSimple")
 
         # Results should exist under results/passthrough/
         results_dirs = list((project / "results").rglob("*")) if (project / "results").exists() else []
@@ -378,26 +385,15 @@ class TestSimple(TestScenario):
 
     def test_run_test_produces_summary_json(self, tmp_path: Path):
         """results/<kernel>/<test>/summary.json is created with status."""
-        from vten.cli.run import run_test
-
         project = self._setup_project(tmp_path)
         (project / "kernels" / "passthrough" / "tests" / "test_pass.py").write_text("""\
 from vten.cli.scenario import TestScenario
 class TestPass(TestScenario):
     kernel = "passthrough"
-    def run(self, ctx, cfg):
-        pass
 """)
 
-        with patch("vten.cli.run.get_backend") as mock_get_backend:
-            mock_backend = MagicMock()
-            mock_get_backend.return_value = mock_backend
-            mock_backend.working_directory.return_value = project
-            mock_backend.execute.return_value = MagicMock(status=2, stats=[])
+        self._mock_run_test(project, "TestPass")
 
-            run_test(str(project), kernel_name="passthrough", test_name="TestPass")
-
-        # Find summary.json somewhere under results/
         summary_files = list(project.rglob("summary.json"))
         assert len(summary_files) >= 1
         content = json.loads(summary_files[0].read_text())
@@ -405,24 +401,14 @@ class TestPass(TestScenario):
 
     def test_run_test_produces_stats_json(self, tmp_path: Path):
         """results/<kernel>/<test>/stats.json is created with command stats."""
-        from vten.cli.run import run_test
-
         project = self._setup_project(tmp_path)
         (project / "kernels" / "passthrough" / "tests" / "test_stats.py").write_text("""\
 from vten.cli.scenario import TestScenario
 class TestStats(TestScenario):
     kernel = "passthrough"
-    def run(self, ctx, cfg):
-        pass
 """)
 
-        with patch("vten.cli.run.get_backend") as mock_get_backend:
-            mock_backend = MagicMock()
-            mock_get_backend.return_value = mock_backend
-            mock_backend.working_directory.return_value = project
-            mock_backend.execute.return_value = MagicMock(status=2, stats=[])
-
-            run_test(str(project), kernel_name="passthrough", test_name="TestStats")
+        self._mock_run_test(project, "TestStats")
 
         stats_files = list(project.rglob("stats.json"))
         assert len(stats_files) >= 1
@@ -487,44 +473,30 @@ class TestWave(TestScenario):
 class TestVtenRunExecution:
     """Test execution flow: scenario discovery → config merge → run."""
 
-    def test_single_config_run_called_once(self):
-        """TestScenario.configs=None → run() called exactly once."""
+    def test_single_config_scenario(self):
+        """TestScenario.configs=None → single execution with base params."""
         from vten.cli.scenario import TestScenario
 
         class SingleTest(TestScenario):
             kernel = "test"
-            call_count = 0
-
-            def run(self, ctx, cfg):
-                SingleTest.call_count += 1
 
         t = SingleTest()
         assert t.configs is None
-        # Simulate: when configs is None, framework calls run once with base_cfg
-        t.run(MagicMock(), {})
-        assert SingleTest.call_count == 1
+        # When configs is None, execute_batch receives one config (base params)
 
-    def test_multi_config_run_called_per_config(self):
-        """TestScenario.configs=[a, b] → run() called for each config."""
+    def test_multi_config_scenario(self):
+        """TestScenario.configs=[a, b] → execute_batch receives all configs."""
         from vten.cli.scenario import TestScenario
-
-        call_args: list[dict] = []
 
         class MultiTest(TestScenario):
             kernel = "test"
             configs = [{"C": 32}, {"C": 64}]
 
-            def run(self, ctx, cfg):
-                call_args.append(cfg)
-
         t = MultiTest()
-        # Simulate: framework calls run for each config
-        for cfg in t.configs:
-            t.run(MagicMock(), cfg)
-
-        assert len(call_args) == 2
-        assert call_args[0]["C"] == 32
-        assert call_args[1]["C"] == 64
+        assert t.configs is not None
+        assert len(t.configs) == 2
+        assert t.configs[0]["C"] == 32
+        assert t.configs[1]["C"] == 64
 
     def test_npu_multi_layer_configs(self):
         """NPU 3D: 28-layer U-Net configs list."""
@@ -537,9 +509,6 @@ class TestVtenRunExecution:
                 {"IN_CH": 32, "OUT_CH": 32, "KERNEL_SIZE": 3, "IFM_STRIDE": 1, "OFM_STRIDE": 1},
                 {"IN_CH": 32, "OUT_CH": 64, "KERNEL_SIZE": 3, "IFM_STRIDE": 2, "OFM_STRIDE": 1},
             ]
-
-            def run(self, ctx, cfg):
-                pass
 
         t = NPUUNetTest()
         assert len(t.configs) == 3
@@ -580,11 +549,11 @@ class TestVtenRunExecution:
 
 
 class TestVtenRunErrors:
-    """Error handling: run_test() catches scenario errors → summary.json FAIL."""
+    """Error handling: execute_batch errors → summary.json FAIL."""
 
-    def _setup_project_with_scenario(self, tmp_path: Path, class_name: str,
-                                     run_body: str) -> Path:
-        """Helper: create project with custom TestScenario — multi-kernel layout."""
+    def _setup_project_with_scenario(self, tmp_path: Path,
+                                     class_name: str = "TestScenarioErr") -> Path:
+        """Helper: create project with a TestScenario — multi-kernel layout."""
         import yaml
 
         project = tmp_path / "proj"
@@ -642,125 +611,110 @@ from vten.cli.scenario import TestScenario
 
 class {class_name}(TestScenario):
     kernel = "passthrough"
-
-    def run(self, ctx, cfg):
-{run_body}
 """)
         return project
 
     def test_failing_scenario_summary_status_fail(self, tmp_path: Path):
-        """run_test() with raising scenario → summary.json status=FAIL."""
+        """execute_batch returns error → summary.json status=FAIL."""
         from vten.cli.run import run_test
+        from vten.cli.scenario import TestScenario
+        from vten.execution import BatchResult, ConfigResult
 
-        project = self._setup_project_with_scenario(
-            tmp_path, "TestFailing",
-            '        raise RuntimeError("Intentional test failure")',
-        )
+        project = self._setup_project_with_scenario(tmp_path, "TestFailing")
 
-        with patch("vten.cli.run.get_backend") as mock_get_backend:
+        fail_batch = BatchResult(configs=[
+            ConfigResult(
+                config_index=0,
+                error=RuntimeError("Intentional test failure"),
+            ),
+        ])
+
+        with patch("vten.cli.run.get_backend") as mock_get_backend, \
+             patch("vten.cli.run.execute_batch", return_value=fail_batch), \
+             patch.object(TestScenario, "_discover_kernel_class",
+                          return_value=MagicMock()):
             mock_backend = MagicMock()
             mock_backend.__exit__ = MagicMock(
                 side_effect=lambda *a: mock_backend.cleanup()
             )
             mock_get_backend.return_value = mock_backend
             mock_backend.working_directory.return_value = project
-            mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
-            # run_test should catch the error and write FAIL, or re-raise
-            try:
-                run_test(str(project), kernel_name="passthrough", test_name="TestFailing")
-            except (RuntimeError, Exception):
-                pass  # Framework may re-raise after writing summary
+            run_test(str(project), kernel_name="passthrough", test_name="TestFailing")
 
         # Check summary.json was written with FAIL
         summary_files = list(project.rglob("summary.json"))
-        if summary_files:
-            content = json.loads(summary_files[0].read_text())
-            assert content["status"] == "FAIL"
+        assert len(summary_files) >= 1
+        content = json.loads(summary_files[0].read_text())
+        assert content["status"] == "FAIL"
 
     def test_backend_error_captured_in_summary(self, tmp_path: Path):
         """BackendError during execute() → summary.json status=FAIL."""
         from vten.cli.run import run_test
+        from vten.cli.scenario import TestScenario
         from vten.errors import BackendError
+        from vten.execution import BatchResult, ConfigResult
 
-        # Scenario must record ops so ctx.run() calls backend.execute()
-        run_body = (
-            "        from vten.kernel.base import Kernel\n"
-            "        from vten.kernel.tensor import Tensor\n"
-            "        import torch\n"
-            "        class K(Kernel):\n"
-            "            data_in = Tensor(shape=(32,), dtype=torch.int8, interface='axi_stream_in')\n"
-            "            data_out = Tensor(shape=(32,), dtype=torch.int8, interface='axi_stream_out')\n"
-            "            def forward(self, **kw): return self.data_in.data.clone()\n"
-            "        ki = ctx.instantiate(K, N=32)\n"
-            "        ki.data_in.data = torch.zeros(32, dtype=torch.int8)\n"
-            "        ctx.push_tensor(ki.data_in)\n"
-            "        ctx.pull_tensor(ki.data_out)"
-        )
-        project = self._setup_project_with_scenario(
-            tmp_path, "TestBackendFail", run_body,
-        )
+        project = self._setup_project_with_scenario(tmp_path, "TestBackendFail")
 
-        with patch("vten.cli.run.get_backend") as mock_get_backend:
+        fail_batch = BatchResult(configs=[
+            ConfigResult(
+                config_index=0,
+                error=BackendError("error_code=1, DECERR"),
+            ),
+        ])
+
+        with patch("vten.cli.run.get_backend") as mock_get_backend, \
+             patch("vten.cli.run.execute_batch", return_value=fail_batch), \
+             patch.object(TestScenario, "_discover_kernel_class",
+                          return_value=MagicMock()):
             mock_backend = MagicMock()
             mock_backend.__exit__ = MagicMock(
                 side_effect=lambda *a: mock_backend.cleanup()
             )
             mock_get_backend.return_value = mock_backend
             mock_backend.working_directory.return_value = project
-            mock_backend.execute.side_effect = BackendError("error_code=1, DECERR")
 
-            try:
-                run_test(str(project), kernel_name="passthrough", test_name="TestBackendFail")
-            except (BackendError, Exception):
-                pass
+            run_test(str(project), kernel_name="passthrough", test_name="TestBackendFail")
 
         summary_files = list(project.rglob("summary.json"))
-        if summary_files:
-            content = json.loads(summary_files[0].read_text())
-            assert content["status"] == "FAIL"
+        assert len(summary_files) >= 1
+        content = json.loads(summary_files[0].read_text())
+        assert content["status"] == "FAIL"
 
     def test_timeout_error_captured_in_summary(self, tmp_path: Path):
         """TimeoutError during execute() → summary.json status=FAIL."""
         from vten.cli.run import run_test
+        from vten.cli.scenario import TestScenario
         from vten.errors import TimeoutError as VTenTimeoutError
+        from vten.execution import BatchResult, ConfigResult
 
-        # Scenario must record ops so ctx.run() calls backend.execute()
-        run_body = (
-            "        from vten.kernel.base import Kernel\n"
-            "        from vten.kernel.tensor import Tensor\n"
-            "        import torch\n"
-            "        class K(Kernel):\n"
-            "            data_in = Tensor(shape=(32,), dtype=torch.int8, interface='axi_stream_in')\n"
-            "            data_out = Tensor(shape=(32,), dtype=torch.int8, interface='axi_stream_out')\n"
-            "            def forward(self, **kw): return self.data_in.data.clone()\n"
-            "        ki = ctx.instantiate(K, N=32)\n"
-            "        ki.data_in.data = torch.zeros(32, dtype=torch.int8)\n"
-            "        ctx.push_tensor(ki.data_in)\n"
-            "        ctx.pull_tensor(ki.data_out)"
-        )
-        project = self._setup_project_with_scenario(
-            tmp_path, "TestTimeout", run_body,
-        )
+        project = self._setup_project_with_scenario(tmp_path, "TestTimeout")
 
-        with patch("vten.cli.run.get_backend") as mock_get_backend:
+        fail_batch = BatchResult(configs=[
+            ConfigResult(
+                config_index=0,
+                error=VTenTimeoutError("300s exceeded"),
+            ),
+        ])
+
+        with patch("vten.cli.run.get_backend") as mock_get_backend, \
+             patch("vten.cli.run.execute_batch", return_value=fail_batch), \
+             patch.object(TestScenario, "_discover_kernel_class",
+                          return_value=MagicMock()):
             mock_backend = MagicMock()
             mock_backend.__exit__ = MagicMock(
                 side_effect=lambda *a: mock_backend.cleanup()
             )
             mock_get_backend.return_value = mock_backend
             mock_backend.working_directory.return_value = project
-            mock_backend.execute.side_effect = VTenTimeoutError("300s exceeded")
 
-            try:
-                run_test(str(project), kernel_name="passthrough", test_name="TestTimeout")
-            except (VTenTimeoutError, Exception):
-                pass
+            run_test(str(project), kernel_name="passthrough", test_name="TestTimeout")
 
         summary_files = list(project.rglob("summary.json"))
-        if summary_files:
-            content = json.loads(summary_files[0].read_text())
-            assert content["status"] == "FAIL"
+        assert len(summary_files) >= 1
+        content = json.loads(summary_files[0].read_text())
+        assert content["status"] == "FAIL"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -829,18 +783,31 @@ compile_options = ["-timescale", "1ns/1ps"]
 from vten.cli.scenario import TestScenario
 class TestOK(TestScenario):
     kernel = "passthrough"
-    def run(self, ctx, cfg):
-        pass
 """)
         return project
+
+    def _mock_batch(self):
+        """Return a mock BatchResult for patching execute_batch."""
+        from vten.execution import BatchResult, ConfigResult
+        mock_result = MagicMock(
+            status="DONE", total_cycles=0, verification_count=0,
+            verification_results=[], per_command_stats=[],
+        )
+        return BatchResult(configs=[
+            ConfigResult(config_index=0, result=mock_result),
+        ])
 
     def test_backend_lifecycle_order_via_run_test(self, tmp_path: Path):
         """run_test() calls cleanup via `with backend:` context manager."""
         from vten.cli.run import run_test
+        from vten.cli.scenario import TestScenario
 
         project = self._setup_passing_project(tmp_path)
 
-        with patch("vten.cli.run.get_backend") as mock_get_backend:
+        with patch("vten.cli.run.get_backend") as mock_get_backend, \
+             patch("vten.cli.run.execute_batch", return_value=self._mock_batch()), \
+             patch.object(TestScenario, "_discover_kernel_class",
+                          return_value=MagicMock()):
             mock_backend = MagicMock()
             # Wire __exit__ to call cleanup(), matching Backend ABC behavior
             mock_backend.__exit__ = MagicMock(
@@ -848,7 +815,6 @@ class TestOK(TestScenario):
             )
             mock_get_backend.return_value = mock_backend
             mock_backend.working_directory.return_value = project
-            mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             run_test(str(project), kernel_name="passthrough", test_name="TestOK")
 
@@ -859,23 +825,26 @@ class TestOK(TestScenario):
         )
 
     def test_cleanup_called_on_backend_error(self, tmp_path: Path):
-        """Backend.cleanup() called even when execute() raises.
+        """Backend.cleanup() called even when execute_batch raises.
 
-        Note: TestOK scenario records zero ops, so execute() is not called.
-        This test verifies cleanup is called via `with backend:` regardless.
+        Verifies cleanup is called via `with backend:` regardless.
         """
         from vten.cli.run import run_test
+        from vten.cli.scenario import TestScenario
 
         project = self._setup_passing_project(tmp_path)
 
-        with patch("vten.cli.run.get_backend") as mock_get_backend:
+        with patch("vten.cli.run.get_backend") as mock_get_backend, \
+             patch("vten.cli.run.execute_batch",
+                   side_effect=Exception("sim crashed")), \
+             patch.object(TestScenario, "_discover_kernel_class",
+                          return_value=MagicMock()):
             mock_backend = MagicMock()
             mock_backend.__exit__ = MagicMock(
                 side_effect=lambda *a: mock_backend.cleanup()
             )
             mock_get_backend.return_value = mock_backend
             mock_backend.working_directory.return_value = project
-            mock_backend.execute.side_effect = Exception("sim crashed")
 
             try:
                 run_test(str(project), kernel_name="passthrough", test_name="TestOK")
@@ -891,17 +860,20 @@ class TestOK(TestScenario):
     def test_summary_pass_when_all_configs_pass(self, tmp_path: Path):
         """run_test() produces summary with status=PASS on success."""
         from vten.cli.run import run_test
+        from vten.cli.scenario import TestScenario
 
         project = self._setup_passing_project(tmp_path)
 
-        with patch("vten.cli.run.get_backend") as mock_get_backend:
+        with patch("vten.cli.run.get_backend") as mock_get_backend, \
+             patch("vten.cli.run.execute_batch", return_value=self._mock_batch()), \
+             patch.object(TestScenario, "_discover_kernel_class",
+                          return_value=MagicMock()):
             mock_backend = MagicMock()
             mock_backend.__exit__ = MagicMock(
                 side_effect=lambda *a: mock_backend.cleanup()
             )
             mock_get_backend.return_value = mock_backend
             mock_backend.working_directory.return_value = project
-            mock_backend.execute.return_value = MagicMock(status=2, stats=[])
 
             run_test(str(project), kernel_name="passthrough", test_name="TestOK")
 

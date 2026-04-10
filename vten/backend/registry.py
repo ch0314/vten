@@ -20,6 +20,7 @@ _BACKEND_MAP: dict[str, tuple[str, str]] = {
     "xsim":      ("vten.backend.xsim",      "XsimBackend"),
     "verilator": ("vten.backend.verilator",  "VerilatorBackend"),
     "xrt":       ("vten.backend.xrt",        "XrtBackend"),
+    "cpu":       ("vten.backend.cpu",        "CpuBackend"),
 }
 
 _BUILD_MAP: dict[str, tuple[str, str]] = {

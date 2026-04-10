@@ -9,7 +9,10 @@ from vten.spec.models import Direction
 # Level 1: Test
 from vten.cli.scenario import TestScenario
 
-# Level 2: Inference
+# Level 2: Execution
+from vten.execution import BatchResult, ConfigResult, execute_batch
+
+# Level 3: Inference
 from vten.inference import InferenceModule, InferenceSession
 
 __all__ = [
@@ -21,6 +24,10 @@ __all__ = [
     "CompositeKernel",
     # Test
     "TestScenario",
+    # Execution
+    "execute_batch",
+    "BatchResult",
+    "ConfigResult",
     # Inference
     "InferenceSession",
     "InferenceModule",

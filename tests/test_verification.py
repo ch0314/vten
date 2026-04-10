@@ -446,9 +446,12 @@ class TestRunTestVerification:
     """run_test() properly catches VerificationError and tracks results."""
 
     def test_verification_error_sets_fail(self, tmp_path):
-        """VerificationError during run causes FAIL status."""
+        """VerificationError in execute_batch → FAIL status in summary."""
+        from unittest.mock import MagicMock, patch
+
         from vten.cli.run import run_test
         from vten.cli.scenario import TestScenario
+        from vten.execution import BatchResult, ConfigResult
 
         # Create minimal project structure
         kernel_dir = tmp_path / "kernels" / "test_k"
@@ -471,22 +474,38 @@ interfaces:
       elements_per_beat: 4
 """)
 
-        # Create test that raises VerificationError
+        # Create test scenario
         (tests_dir / "test_verify.py").write_text("""
 from vten.cli.scenario import TestScenario
-from vten.errors import VerificationError
 
 class TestVerify(TestScenario):
     kernel = "test_k"
-    def run(self, ctx, cfg):
-        raise VerificationError(tensor="ofm", shape=(4,), max_diff=1.0)
 """)
 
-        run_test(
-            project_dir=str(tmp_path),
-            kernel_name="test_k",
-            test_name="test_verify",
-        )
+        # Mock execute_batch to return VerificationError
+        fail_batch = BatchResult(configs=[
+            ConfigResult(
+                config_index=0,
+                error=VerificationError(tensor="ofm", shape=(4,), max_diff=1.0),
+            ),
+        ])
+
+        with patch("vten.cli.run.get_backend") as mock_get_backend, \
+             patch("vten.cli.run.execute_batch", return_value=fail_batch), \
+             patch.object(TestScenario, "_discover_kernel_class",
+                          return_value=MagicMock()):
+            mock_backend = MagicMock()
+            mock_backend.__exit__ = MagicMock(
+                side_effect=lambda *a: mock_backend.cleanup()
+            )
+            mock_get_backend.return_value = mock_backend
+            mock_backend.working_directory.return_value = tmp_path
+
+            run_test(
+                project_dir=str(tmp_path),
+                kernel_name="test_k",
+                test_name="test_verify",
+            )
 
         import json
         summary = json.loads((results_dir / "summary.json").read_text())

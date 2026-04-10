@@ -1,4 +1,7 @@
-"""TestScenario — base class for user-defined test scenarios.
+"""TestScenario — declarative test configuration.
+
+A TestScenario declares *what* to test (kernel + configs + probes).
+Execution is handled by ``execute_batch``.
 
 Spec reference: 06_codegen_and_cli.md §4.4
 """
@@ -11,44 +14,29 @@ from pathlib import Path
 
 
 class TestScenario:
-    """Base class for user-defined test scenarios.
+    """Declarative test configuration.
 
-    For kernels that implement ``run(self, ctx)``, subclasses can omit the
-    ``run`` method entirely.  The default implementation:
+    Declare the kernel name, one or more config dicts, and optional
+    probes.  Execution is handled by :func:`vten.execution.execute_batch`.
 
-    1. Discovers the Kernel class from ``self.kernel`` name.
-    2. Instantiates with *cfg* as runtime params.
-    3. Calls ``generate_inputs(seed=cfg.get("seed", 42))``.
-    4. Calls ``kernel.run(ctx)``.
+    Example::
+
+        class TestL5_128ch(TestScenario):
+            kernel = "npu_pipeline"
+            configs = [{"in_ch": 128, "out_ch": 128, ...}]
+            probes = ["scale.data_out"]
     """
 
     kernel: str = ""
     configs: list[dict] | None = None
     probes: list[str] | None = None
-
-    def run(self, ctx, cfg) -> None:
-        """Default run: auto-discover kernel class, instantiate, run."""
-        kernel_cls = self._discover_kernel_class()
-        if kernel_cls is None:
-            raise NotImplementedError(
-                f"{self.__class__.__name__} must either override run() "
-                f"or set 'kernel' to a valid kernel name."
-            )
-        k = ctx.instantiate(kernel_cls, **cfg)
-        ki = k.kernel_class_instance
-
-        # Register declarative probes before kernel execution
-        if self.probes:
-            ctx._register_declarative_probes(self.probes)
-
-        ki.generate_inputs(seed=cfg.get("seed", 42))
-        ki.run(ctx)
+    seed: int = 42
 
     def _discover_kernel_class(self) -> type | None:
         """Find Kernel subclass from self.kernel name.
 
         Searches ``kernels/{name}/{name}_kernel.py`` relative to the test
-        file location, which is the standard NPU_3D layout.
+        file location, which is the standard project layout.
         """
         if not self.kernel:
             return None

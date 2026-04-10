@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -22,15 +23,18 @@ def main(argv: list[str] | None = None) -> None:
                         help="Write debug log to file")
     sub = parser.add_subparsers(dest="command")
 
+    from vten.backend.registry import available_backends
+    _backends = available_backends()
+
     # vten init
     init_parser = sub.add_parser("init", help="Create project skeleton")
     init_parser.add_argument("project_dir", help="Project directory to create")
     init_parser.add_argument("--kernel", help="Add kernel directory to existing project")
     init_parser.add_argument("--backend", default=None,
-        choices=["xsim", "verilator", "xrt"],
+        choices=_backends,
         help="Target backend for new project (default: xsim)")
     init_parser.add_argument("--add-backend", default=None,
-        choices=["xsim", "verilator", "xrt"],
+        choices=_backends,
         help="Add backend section to existing project")
 
     # vten build
@@ -38,7 +42,7 @@ def main(argv: list[str] | None = None) -> None:
     build_parser.add_argument("--project", default=".", help="Project directory")
     build_parser.add_argument("--kernel", help="Build specific kernel only")
     build_parser.add_argument("--backend", default=None,
-        choices=["xsim", "verilator", "xrt"],
+        choices=_backends,
         help="Target backend (default: from vten.toml or xsim)")
     build_parser.add_argument("--stage", help="Run specific stage only")
     build_parser.add_argument("--upto", help="Run stages up to (inclusive)")
@@ -56,7 +60,7 @@ def main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--test", default=None, help="Test scenario name (omit to run all)")
     run_parser.add_argument("--project", default=".", help="Project directory")
     run_parser.add_argument("--backend", default=None,
-        choices=["xsim", "verilator", "xrt"],
+        choices=_backends,
         help="Target backend (default: from vten.toml or xsim)")
     run_parser.add_argument("--waveform", action="store_true", help="Enable waveform dump")
     run_parser.add_argument("--waveform-on-fail", action="store_true",
@@ -66,11 +70,24 @@ def main(argv: list[str] | None = None) -> None:
                             help="Enable simulator verbose output (+VTEN_VERBOSE)")
     run_parser.add_argument("--verify", action="store_true",
                             help="Auto-verify outputs against behavioral model golden")
-    run_parser.add_argument("--config", nargs="*", help="Config overrides (K=V)")
+    run_parser.add_argument("--config", nargs="*",
+                            help="Config: K=V pairs, JSON string, or module:VAR[idx]")
 
     # vten list
-    list_parser = sub.add_parser("list", help="List test scenarios for a kernel")
-    list_parser.add_argument("--kernel", required=True, help="Kernel name")
+    list_parser = sub.add_parser("list", help="List tests or params for a kernel")
+    list_sub = list_parser.add_subparsers(dest="list_command")
+
+    list_tests_parser = list_sub.add_parser("tests", help="List test scenarios")
+    list_tests_parser.add_argument("--kernel", required=True, help="Kernel name")
+    list_tests_parser.add_argument("--project", default=".", help="Project directory")
+
+    list_params_parser = list_sub.add_parser("params", help="Show kernel parameters")
+    list_params_parser.add_argument("--kernel", required=True, help="Kernel name")
+    list_params_parser.add_argument("--project", default=".", help="Project directory")
+
+    # Backward compat: vten list --kernel X (no subcommand) → list tests
+    list_parser.add_argument("--kernel", required=False, default=None,
+                             help="Kernel name (shorthand for: vten list tests --kernel)")
     list_parser.add_argument("--project", default=".", help="Project directory")
 
     # vten report
@@ -150,18 +167,21 @@ def _dispatch(args: argparse.Namespace, log_level: str) -> None:
         )
 
     elif args.command == "run":
+        from vten.cli.config_resolver import resolve_config
         from vten.cli.run import run_test
-        overrides = {}
-        if args.config:
-            for item in args.config:
-                k, v = item.split("=", 1)
-                overrides[k] = int(v) if v.isdigit() else v
+
+        project = args.project
+        kernels_base = Path(project).resolve() / "kernels"
+        overrides = resolve_config(
+            args.config or [], kernels_base=kernels_base,
+        ) if args.config else None
+
         # -v on run subcommand enables both sim verbose AND Python DEBUG
         effective_sim_verbose = args.sim_verbose or args.verbose
         if effective_sim_verbose and log_level != "DEBUG":
             setup_logging(level="DEBUG", log_file=args.log_file)
         run_test(
-            project_dir=args.project,
+            project_dir=project,
             kernel_name=args.kernel,
             test_name=args.test or "",
             backend=args.backend,
@@ -169,13 +189,23 @@ def _dispatch(args: argparse.Namespace, log_level: str) -> None:
             waveform_on_fail=args.waveform_on_fail,
             gui=args.gui,
             sim_verbose=effective_sim_verbose,
-            config_overrides=overrides or None,
+            config_overrides=overrides,
             verify=args.verify,
         )
 
     elif args.command == "list":
-        from vten.cli.list_cmd import list_tests
-        list_tests(project_dir=args.project, kernel_name=args.kernel)
+        list_cmd = getattr(args, "list_command", None)
+        if list_cmd == "params":
+            from vten.cli.list_cmd import list_params
+            list_params(project_dir=args.project, kernel_name=args.kernel)
+        else:
+            # Default: list tests (includes backward-compat 'vten list --kernel X')
+            from vten.cli.list_cmd import list_tests
+            kernel = args.kernel
+            if kernel is None:
+                print("usage: vten list tests --kernel KERNEL", file=sys.stderr)
+                sys.exit(1)
+            list_tests(project_dir=args.project, kernel_name=kernel)
 
     elif args.command == "report":
         from vten.cli.report import generate_report

@@ -232,45 +232,21 @@ class InferenceSession:
             self._run_count, label, input_desc,
         )
 
-        ctx = ExecutionContext(
+        from vten.execution import execute_batch
+
+        batch = execute_batch(
             backend=self._backend,
-            project_params=merged,
-            mode="inference",
+            kernel_class=kernel_class,
+            configs=[merged],
+            spec=spec,
+            inputs=inputs if inputs else None,
+            verify=verify,
             project_dir=self._project_dir,
+            quiet=True,
+            on_error="raise",
         )
-        ki = ctx.instantiate(kernel_class, spec=spec, **merged)
 
-        # Bind inputs
-        for name, data in inputs.items():
-            tensor = ki.get_tensor(name)
-            if isinstance(data, Tensor) and data.on_device:
-                # Device tensor → bind BO, skip LOAD+PUSH
-                # When verify=True, skip prebound and serialize fresh
-                # (eliminates upload/main-run BO discrepancy)
-                if not verify:
-                    ctx.bind_device_buffer(tensor, data._bo)
-                # Set host-side data for two purposes:
-                # 1. Stage 3 serialization (verify mode re-serializes fresh)
-                # 2. Golden computation in _verify_outputs() (forward() reads tensor data)
-                # Prefer golden (verified chain) > data (STORE readback) > zeros.
-                chain_data = data.golden if data.golden is not None else data.data
-                if chain_data is not None:
-                    tensor.data = chain_data
-                else:
-                    shape = tensor._resolved_shape or tensor.shape
-                    tensor.data = torch.zeros(shape, dtype=tensor.dtype)
-            else:
-                # Host tensor → assign data for normal LOAD+PUSH
-                if isinstance(data, Tensor):
-                    tensor.data = data.data
-                else:
-                    tensor.data = data
-
-        # Execute kernel's DSL sequence
-        ki.run(ctx)
-
-        # Compile + execute (+ verify if requested)
-        result = ctx.run(verify=verify)
+        result = batch.single()
 
         # Log execution summary (phase-by-phase)
         self._log_execution_summary()

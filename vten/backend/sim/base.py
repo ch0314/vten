@@ -754,12 +754,13 @@ class SimBackend(Backend):
     ) -> str:
         """Format heartbeat line showing summarized activity.
 
-        Groups stalled commands by opcode instead of listing each one.
-        Active commands (with deltas) are shown individually.
+        Only commands with beat/active progress are shown individually.
+        Stall-only and no-change commands are grouped by (opcode, label).
         Returns empty string if there is no meaningful activity to report.
         """
-        active_parts: list[str] = []  # cmds with actual progress
-        stalled: dict[str, list[int]] = {}  # op_name -> [cmd_ids] with no change
+        individual: list[str] = []
+        # (op_name, label) -> [cmd_ids]  for grouped commands
+        grouped: dict[tuple[str, str], list[int]] = {}
         any_activity = False
 
         for cmd_id, cs in cur.items():
@@ -777,48 +778,44 @@ class SimBackend(Backend):
             d_active = cs.active_cycles - ps.active_cycles
             d_stall = cs.stall_cycles - ps.stall_cycles
 
-            has_progress = d_beats > 0 or d_active > 0 or d_stall > 0
-            if has_progress:
+            if d_beats > 0 or d_active > 0 or d_stall > 0:
                 any_activity = True
 
-            # Active commands: show detail individually
-            if has_progress:
+            # Real progress = beat or active cycle movement
+            real_progress = d_beats > 0 or d_active > 0
+
+            if real_progress:
+                # Show individually with detail
                 frag = f"{op_name} cmd#{cmd_id}"
                 if op_name in ("PUSH", "PULL", "LOAD", "STORE") and cmd_size > 0:
                     expected = max(1, cmd_size // self._DEFAULT_BYTES_PER_BEAT)
                     pct = min(100, cs.total_beats * 100 // expected)
-                    frag += f" {pct}%"
-                    if d_beats > 0:
-                        throughput_bytes = d_beats * self._DEFAULT_BYTES_PER_BEAT
-                        throughput_str = format_size(throughput_bytes)
-                        frag += f" (+{d_beats} beats, ~{throughput_str}/poll)"
-                    elif d_stall > 0:
-                        frag += f" (stalling, +{d_stall} stall cyc)"
+                    throughput_bytes = d_beats * self._DEFAULT_BYTES_PER_BEAT
+                    throughput_str = format_size(throughput_bytes)
+                    frag += f" {pct}% (+{d_beats} beats, ~{throughput_str}/poll)"
                 elif op_name == "POLL_REG":
                     frag += f" {cs.total_beats} polls (+{d_beats})"
                 else:
-                    if d_active > 0:
-                        frag += f" (+{d_active} active cyc)"
-                    elif d_stall > 0:
-                        frag += f" (+{d_stall} stall cyc)"
+                    frag += f" (+{d_active} active cyc)"
                 if cs.last_active_cycle > 0:
                     frag += f" @cycle {cs.last_active_cycle}"
-                active_parts.append(frag)
+                individual.append(frag)
             else:
-                # Stalled: group by opcode
-                stalled.setdefault(op_name, []).append(cmd_id)
+                # Group by (opcode, label): stalling or no change
+                label = "stalling" if d_stall > 0 else "no change"
+                grouped.setdefault((op_name, label), []).append(cmd_id)
 
-        # Build stalled summary
-        stalled_parts: list[str] = []
-        for op_name, ids in stalled.items():
+        # Build grouped summaries
+        grouped_parts: list[str] = []
+        for (op_name, label), ids in grouped.items():
             if len(ids) == 1:
-                stalled_parts.append(f"{op_name} cmd#{ids[0]} (no change)")
+                grouped_parts.append(f"{op_name} cmd#{ids[0]} ({label})")
             else:
-                stalled_parts.append(
-                    f"{op_name} x{len(ids)} (no change, #{ids[0]}-#{ids[-1]})"
+                grouped_parts.append(
+                    f"{op_name} x{len(ids)} ({label}, #{ids[0]}-#{ids[-1]})"
                 )
 
-        parts = active_parts + stalled_parts
+        parts = individual + grouped_parts
         if not parts:
             return ""
         if not any_activity:
