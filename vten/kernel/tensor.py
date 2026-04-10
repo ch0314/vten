@@ -141,7 +141,7 @@ class Tensor:
         self.max_diff = (hw_flat - golden_flat).abs().max().item()
         self.verified = True
 
-        from vten.runtime.verifier import check_match
+        from vten.verifier import check_match
 
         check_match(self.name, hw, self.golden)
 

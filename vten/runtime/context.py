@@ -371,7 +371,7 @@ class ExecutionContext:
         """
         from vten.runtime.reporting import VerificationResult
         from vten.runtime.golden import compute_golden_outputs
-        from vten.runtime.verifier import check_match
+        from vten.verifier import check_match
 
         view = compiled.flattened_view
         results: list[VerificationResult] = []

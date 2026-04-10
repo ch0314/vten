@@ -286,59 +286,59 @@ class TestXsimBufferReader:
 
 
 class TestVerificationCompare:
-    """compare() and max_diff() from vten.runtime.verifier."""
+    """compare() and max_diff() from vten.verifier."""
 
     def test_compare_equal_int_tensors(self):
-        from vten.runtime.verifier import compare
+        from vten.verifier import compare
 
         a = torch.tensor([1, 2, 3])
         b = torch.tensor([1, 2, 3])
         assert compare(a, b) is True
 
     def test_compare_unequal_int_tensors(self):
-        from vten.runtime.verifier import compare
+        from vten.verifier import compare
 
         a = torch.tensor([1, 2, 3])
         b = torch.tensor([1, 2, 4])
         assert compare(a, b) is False
 
     def test_compare_float_within_tolerance(self):
-        from vten.runtime.verifier import compare
+        from vten.verifier import compare
 
         a = torch.tensor([1.0, 2.0, 3.0])
         b = torch.tensor([1.0, 2.0, 3.0 + 1e-7])
         assert compare(a, b) is True
 
     def test_compare_float_outside_tolerance(self):
-        from vten.runtime.verifier import compare
+        from vten.verifier import compare
 
         a = torch.tensor([1.0, 2.0, 3.0])
         b = torch.tensor([1.0, 2.0, 4.0])
         assert compare(a, b) is False
 
     def test_compare_shape_mismatch(self):
-        from vten.runtime.verifier import compare
+        from vten.verifier import compare
 
         a = torch.tensor([1, 2, 3])
         b = torch.tensor([[1, 2, 3]])
         assert compare(a, b) is False
 
     def test_max_diff_zero(self):
-        from vten.runtime.verifier import max_diff
+        from vten.verifier import max_diff
 
         a = torch.tensor([1, 2, 3])
         b = torch.tensor([1, 2, 3])
         assert max_diff(a, b) == 0.0
 
     def test_max_diff_nonzero(self):
-        from vten.runtime.verifier import max_diff
+        from vten.verifier import max_diff
 
         a = torch.tensor([1, 2, 10])
         b = torch.tensor([1, 2, 3])
         assert max_diff(a, b) == 7.0
 
     def test_max_diff_float(self):
-        from vten.runtime.verifier import max_diff
+        from vten.verifier import max_diff
 
         a = torch.tensor([1.0, 2.5])
         b = torch.tensor([1.0, 2.0])
