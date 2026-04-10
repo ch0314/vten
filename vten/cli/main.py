@@ -44,15 +44,19 @@ def main(argv: list[str] | None = None) -> None:
     build_parser.add_argument("--backend", default=None,
         choices=_backends,
         help="Target backend (default: from vten.toml or xsim)")
-    build_parser.add_argument("--stage", help="Run specific stage only")
-    build_parser.add_argument("--upto", help="Run stages up to (inclusive)")
+    _stages = ["project_setup", "dpi_c", "codegen", "compile_order", "compile"]
+    build_parser.add_argument("--stage", choices=_stages,
+                              help="Run specific stage only")
+    build_parser.add_argument("--upto", choices=_stages,
+                              help="Run stages up to (inclusive)")
     build_parser.add_argument("--force", action="store_true", help="Ignore cache, full rebuild")
     build_parser.add_argument("--clean", action="store_true",
                               help="Remove build artifacts before building")
     build_parser.add_argument("--skip-compile", action="store_true", help="Run codegen only")
     build_parser.add_argument("-v", "--verbose", action="store_true",
                               dest="build_verbose", help="Verbose output (DEBUG level)")
-    build_parser.add_argument("--config", nargs="*", help="Config overrides (K=V)")
+    build_parser.add_argument("--config", nargs="*", metavar="K=V",
+                              help="Config overrides (e.g. --config in_ch=64 out_ch=32)")
 
     # vten run
     run_parser = sub.add_parser("run", help="Run test")
@@ -70,8 +74,9 @@ def main(argv: list[str] | None = None) -> None:
                             help="Enable simulator verbose output (+VTEN_VERBOSE)")
     run_parser.add_argument("--verify", action="store_true",
                             help="Auto-verify outputs against behavioral model golden")
-    run_parser.add_argument("--config", nargs="*",
-                            help="Config: K=V pairs, JSON string, or module:VAR[idx]")
+    run_parser.add_argument("--config", nargs="*", metavar="SPEC",
+                            help="Config overrides: K=V pairs, JSON '{\"k\":v}', "
+                                 "or module:VAR[idx] (e.g. model_configs:UNET_MINI[0])")
 
     # vten list
     list_parser = sub.add_parser("list", help="List tests or params for a kernel")

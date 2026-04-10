@@ -14,7 +14,7 @@ import torch
 
 from vten.dsl.operations import Operation, OperationHandle
 from vten.errors import VerificationError
-from vten.spec.models import Direction, OpKind
+from vten.spec.models import OpKind
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +189,13 @@ class ExecutionContext:
     # ── L3: Control ──
 
     def write_register(self, register, fields: dict, dep=None) -> OperationHandle:
+        """Write values to control register fields.
+
+        Args:
+            register: RegisterHandle from kernel (e.g. ``self.ctrl``).
+            fields: Field-value pairs (e.g. ``{"vsync": 1}``).
+            dep: Operation(s) that must complete before this write.
+        """
         return self._record(
             OpKind.WRITE_REGISTER,
             register_interface=register.interface_name,
@@ -197,6 +204,13 @@ class ExecutionContext:
         )
 
     def read_register(self, register, field_name: str, dep=None) -> OperationHandle:
+        """Read a single register field value from DUT.
+
+        Args:
+            register: RegisterHandle from kernel.
+            field_name: Name of the field to read.
+            dep: Operation(s) that must complete before this read.
+        """
         return self._record(
             OpKind.READ_REGISTER,
             register_interface=register.interface_name,
@@ -207,6 +221,14 @@ class ExecutionContext:
     def poll_register(
         self, register, field_name: str, *, expected: int | None = None, dep=None,
     ) -> OperationHandle:
+        """Poll a register field until it matches expected value.
+
+        Args:
+            register: RegisterHandle from kernel.
+            field_name: Name of the field to poll.
+            expected: Value to wait for (default: 1 for status flags).
+            dep: Operation(s) that must complete before polling starts.
+        """
         return self._record(
             OpKind.POLL_REGISTER,
             register_interface=register.interface_name,
@@ -216,12 +238,16 @@ class ExecutionContext:
         )
 
     def configure(self, kernel, dep=None) -> OperationHandle:
-        # If passed a Kernel class instance (from kernel.run(ctx)),
-        # resolve to the KernelInstance via back-reference
+        """Write all auto-bind register values for a kernel.
+
+        Emits WRITE_REG commands for all registers with auto_bind specs.
+        Typically the first operation in a kernel's run() method.
+        """
         resolved = getattr(kernel, "_kernel_instance", kernel)
         return self._record(OpKind.CONFIGURE, kernel=resolved, dep=dep)
 
     def barrier(self) -> OperationHandle:
+        """Insert a barrier: all prior operations must complete before any later ones."""
         return self._record(OpKind.BARRIER)
 
     # ── Multi-config ──
@@ -306,6 +332,7 @@ class ExecutionContext:
     # ── Buffer Aliasing ──
 
     def alias(self, src, dst) -> None:
+        """Alias dst tensor to share src's device buffer (zero-copy reuse)."""
         self._alias_registry.register(src, dst)
 
     # ── Output tensor reading ──

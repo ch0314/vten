@@ -12,10 +12,11 @@ v2: SubKernelBinding → _sub_kernel_refs, auto-expose,
 from __future__ import annotations
 
 import copy
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import torch
 
 from vten.errors import BindingError, ValidationError
 from vten.kernel.tensor import Tensor
@@ -69,33 +70,33 @@ class ExposedTensor:
     _interleave_unit: int | None = None
 
     @property
-    def data(self):
+    def data(self) -> torch.Tensor | None:
         return self.origin_tensor.data
 
     @data.setter
-    def data(self, value):
+    def data(self, value: torch.Tensor | None) -> None:
         self.origin_tensor.data = value
 
     @property
-    def shape(self):
+    def shape(self) -> tuple[int, ...] | None:
         return self.origin_tensor._resolved_shape
 
     @property
-    def element_count(self):
+    def element_count(self) -> int | None:
         return self.origin_tensor._element_count
 
     @property
-    def address(self):
+    def address(self) -> int | None:
         return self.origin_tensor._address
 
     def set_address(self, addr: int) -> None:
         self.origin_tensor._address = addr
 
-    def fill_random(self, generator=None) -> None:
+    def fill_random(self, generator: torch.Generator | None = None) -> None:
         self.origin_tensor.fill_random(generator=generator)
 
     @property
-    def dtype(self):
+    def dtype(self) -> torch.dtype:
         return self.origin_tensor.dtype
 
 
@@ -260,16 +261,18 @@ class KernelInstance:
             setattr(inst, attr_name, sub_ki.kernel_class_instance)
 
     def tensors(self) -> list[Tensor]:
+        """Return all Tensor descriptors from the underlying kernel instance."""
         if self.kernel_class_instance:
             return self.kernel_class_instance.tensors()
         return []
 
     def get_tensor(self, name: str) -> Tensor:
+        """Look up a tensor by name. Raises RuntimeError if not initialized."""
         if self.kernel_class_instance:
             return self.kernel_class_instance.get_tensor(name)
         raise RuntimeError(f"KernelInstance '{self.name}' not initialized")
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> object:
         """Delegate to kernel_class_instance for attribute access."""
         # Avoid infinite recursion for dataclass internals
         if name.startswith("_") or name in (

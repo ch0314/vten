@@ -15,17 +15,23 @@ from vten.errors import SpecValidationError, ValidationError
 
 
 class Protocol(Enum):
+    """AXI protocol type for DUT interfaces."""
+
     AXI4S = "axi4_stream"
     AXI4 = "axi4"
     AXI4L = "axi4_lite"
 
 
 class Role(Enum):
+    """Interface role: master drives, slave receives."""
+
     MASTER = "master"
     SLAVE = "slave"
 
 
 class Direction(Enum):
+    """Data transfer direction between host and device."""
+
     HOST_TO_DEV = "host_to_dev"
     DEV_TO_HOST = "dev_to_host"
     BIDIRECTIONAL = "bidirectional"
@@ -35,6 +41,8 @@ class Direction(Enum):
 
 
 class OpCode(Enum):
+    """SHM IR command opcode. Encoded in command slot byte 0."""
+
     LOAD = 1
     PUSH = 2
     PULL = 3
@@ -49,6 +57,8 @@ class OpCode(Enum):
 
 
 class OpKind(Enum):
+    """DSL record-phase operation kind. Lowered to OpCode at Stage 6."""
+
     PUSH_TENSOR = "push_tensor"
     PULL_TENSOR = "pull_tensor"
     WRITE_REGISTER = "write_register"
@@ -62,6 +72,8 @@ class OpKind(Enum):
 
 
 class MappingType(Enum):
+    """How a sub-kernel interface maps to the top-level composite."""
+
     EXTERNAL = "external"
     EXTERNAL_BANK = "external_bank"
     INTERNAL = "internal"
@@ -72,6 +84,8 @@ class MappingType(Enum):
 
 
 class CommandStatus(Enum):
+    """BFM command lifecycle state, reported in SHM stats region."""
+
     PENDING = 0
     ISSUED = 1
     ACTIVE = 2
@@ -84,12 +98,23 @@ class CommandStatus(Enum):
 
 @dataclass
 class CustomField:
+    """Single bit-field within a custom packing mode beat.
+
+    ``bits`` is (lo_bit, hi_bit) inclusive — e.g. (0, 7) for an 8-bit field.
+    """
+
     name: str
     bits: tuple[int, int]  # (lo_bit, hi_bit) inclusive
 
 
 @dataclass
 class PackingScheme:
+    """How tensor elements are packed into AXI bus beats.
+
+    Defines element width, elements per beat, bit/byte ordering,
+    and optional custom field layout for non-standard protocols.
+    """
+
     element_width: int
     elements_per_beat: int
     bit_order: str = "lsb_first"
@@ -131,17 +156,29 @@ class PackingScheme:
 
 @dataclass
 class PortDef:
+    """Physical port in a split interface (name + base address)."""
+
     name: str
     base_addr: int
 
 
 @dataclass
 class InterleaveSpec:
+    """Beat-level interleave distribution across array/split ports.
+
+    ``unit`` is the number of consecutive beats per port before rotating.
+    """
+
     unit: int
 
 
 @dataclass
 class SplitSpec:
+    """Multi-port split configuration for a single logical interface.
+
+    Splits one tensor across multiple physical ports for bandwidth.
+    """
+
     mode: str
     ports: list[PortDef]
     interleave: InterleaveSpec | None = None
@@ -152,6 +189,11 @@ class SplitSpec:
 
 @dataclass
 class ArraySpec:
+    """Array interface: one logical interface expanded to N physical instances.
+
+    Example: ``ArraySpec([32])`` on ``wgt`` → ``wgt_0`` ... ``wgt_31``.
+    """
+
     dimensions: list[int]
     flat_name_pattern: str | None = None  # auto: {name}_{i} or {name}_{i}_{j}
     interleave: InterleaveSpec | None = None  # beat-interleave distribution
@@ -194,6 +236,12 @@ class ArraySpec:
 
 @dataclass
 class AutoBindSpec:
+    """Auto-bind rule: automatically populate a register value at Stage 5.
+
+    Binds register fields to tensor addresses, parameter values,
+    or computed expressions without manual write_register() calls.
+    """
+
     tensor: str | None = None
     value: str | None = None
     bits: str | None = None
@@ -207,6 +255,12 @@ class AutoBindSpec:
 
 @dataclass
 class RegisterSpec:
+    """Single register definition within an AXI-Lite interface.
+
+    Maps a named register to a byte offset with optional bit-field
+    decomposition and auto-bind rules for automated configuration.
+    """
+
     name: str
     offset: int
     fields: dict[str, str] | None = None
@@ -215,7 +269,6 @@ class RegisterSpec:
     access: str = "rw"  # rw | ro | wo | w1c
     pulse: bool = False  # 1-cycle pulse (only with access=rw/wo)
     reset_value: int = 0
-    # v2: role, alias, default 삭제. Register는 순수 HW 맵.
 
     @property
     def width(self) -> int:
@@ -234,6 +287,8 @@ class RegisterSpec:
 
 @dataclass
 class MemoryRegion:
+    """Physical memory region for DMA buffer allocation (e.g. DDR, HBM)."""
+
     name: str
     base: int
     size: int
@@ -245,6 +300,8 @@ class MemoryRegion:
 
 @dataclass
 class RegisterBankSpec:
+    """Named register bank with base offset for composite sub-kernel mapping."""
+
     name: str
     base_offset: int
 
@@ -272,6 +329,13 @@ DEFAULT_DATA_WIDTH = 256  # bits — override via interface spec data_width
 
 @dataclass
 class InterfaceSpec:
+    """Complete interface specification from kernel_spec.yaml.
+
+    Describes one DUT interface: protocol, port mapping, data width,
+    tensor binding, packing scheme, register map, and optional
+    array/split expansion.
+    """
+
     name: str
     rtl_port: str
     protocol: Protocol
@@ -320,6 +384,12 @@ class InterfaceSpec:
 
 @dataclass
 class KernelSpec:
+    """Parsed kernel specification — the Python representation of kernel_spec.yaml.
+
+    Contains all metadata needed to generate testbench, allocate memory,
+    and drive BFMs for a single RTL module.
+    """
+
     kernel_name: str
     rtl_top: str
     parameters: dict[str, str | int] = field(default_factory=dict)

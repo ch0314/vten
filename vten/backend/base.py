@@ -45,6 +45,8 @@ class RunContext:
 
 
 class CompileTarget(Enum):
+    """Backend type: SIM (xsim/verilator) or HW (XRT on real FPGA)."""
+
     SIM = "sim"
     HW = "hw"
 
@@ -62,6 +64,8 @@ class CompileTarget(Enum):
 
 
 class BackendErrorCode(IntEnum):
+    """Error codes from SHM stats region (§10.13). Mapped to Python exceptions."""
+
     OK = 0
     ADDR_UNMATCH = 1
     POLL_TIMEOUT = 2
@@ -100,6 +104,12 @@ def raise_backend_error(code: int, cmd_id: int, message: str) -> None:
 
 @dataclass
 class CmdStats:
+    """Per-command performance metrics from SHM stats region.
+
+    Populated after execution. Provides cycle-accurate timing for
+    each IR command (LOAD, PUSH, PULL, STORE, WRITE_REG, etc.).
+    """
+
     cmd_id: int
     status: int
     issue_cycle: int
@@ -112,14 +122,17 @@ class CmdStats:
 
     @property
     def latency_cycles(self) -> int:
+        """Total cycles from issue to commit."""
         return self.commit_cycle - self.issue_cycle
 
     @property
     def active_window(self) -> int:
+        """Cycles between first and last active beat (inclusive)."""
         return self.last_active_cycle - self.first_active_cycle + 1
 
     @property
     def utilization(self) -> float:
+        """Ratio of active cycles to active window (0.0 ~ 1.0)."""
         window = self.active_window
         if window == 0:
             return 0.0
@@ -127,6 +140,7 @@ class CmdStats:
 
     @property
     def bus_efficiency(self) -> float:
+        """Ratio of active cycles to total latency (0.0 ~ 1.0)."""
         latency = self.latency_cycles
         if latency == 0:
             return 0.0
@@ -138,6 +152,12 @@ class CmdStats:
 
 @dataclass
 class BackendResult:
+    """Raw execution result from a backend (SIM or HW).
+
+    Contains per-command stats, error info, and output buffer data.
+    Converted to user-facing ``ExecutionResult`` by ``ExecutionContext``.
+    """
+
     status: int
     error_code: int = 0
     error_cmd_id: int = 0
@@ -168,6 +188,8 @@ class BackendResult:
 
 @dataclass
 class BatchResult:
+    """Aggregated result for a multi-config batch execution."""
+
     status: str
     total_cycles: int
     per_command_stats: list[CmdStats]

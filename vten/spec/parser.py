@@ -20,11 +20,9 @@ from vten.spec.models import (
     KernelSpec,
     MemoryRegion,
     PackingScheme,
-    PortDef,
     Protocol,
     RegisterBankSpec,
     RegisterSpec,
-    SplitSpec,
 )
 
 
@@ -343,17 +341,6 @@ def _parse_packing(raw: dict) -> PackingScheme:
     if "bus_width" in raw:
         scheme._explicit_bus_width = raw["bus_width"]
     return scheme
-
-
-def _parse_split(raw: dict) -> SplitSpec:
-    ports = [
-        PortDef(name=p["name"], base_addr=p["base_addr"])
-        for p in raw["ports"]
-    ]
-    interleave = None
-    if "interleave" in raw:
-        interleave = InterleaveSpec(unit=raw["interleave"]["unit"])
-    return SplitSpec(mode=raw["mode"], ports=ports, interleave=interleave)
 
 
 def _expand_register_array(entry: dict) -> list[dict]:

@@ -16,27 +16,17 @@ logger = logging.getLogger(__name__)
 
 from vten.errors import (
     CompilationError,
-    ConnectionDtypeMismatchError,
     ConnectionShapeMismatchError,
-    ProtocolMismatchError,
     SerializationError,
     ShapeMismatchError,
-    ValidationError,
 )
-from vten.kernel.tensor import Tensor
 from vten.spec.models import (
     Direction,
-    KernelSpec,
     MappingType,
     OpCode,
-    Protocol,
-    Role,
 )
 from vten.runtime.address import AddressAllocator
-from vten.runtime.binder import (
-    RegisterBindingEntry,
-    resolve_registers,
-)
+from vten.runtime.binder import resolve_registers
 from vten.runtime.kernel_view import (
     ExposedTensor,
     FlattenedKernelView,
@@ -45,11 +35,10 @@ from vten.runtime.kernel_view import (
 )
 from vten.runtime.flatten import (
     flatten_composite,
-    infer_direction_unit,
     is_composite,
     wrap_unit_as_flat,
 )
-from vten.runtime.ir import BFMConfig, Command, IRLowering, _determine_role
+from vten.runtime.ir import BFMConfig, Command, IRLowering
 from vten.runtime.resolver import ParameterResolver
 from vten.runtime.serializer import MultiPortSerializer, StreamSerializer
 from vten.backend.sim.shm_packer import _block_split_data, _parse_split_spec
