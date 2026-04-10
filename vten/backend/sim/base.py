@@ -92,23 +92,8 @@ class SimBackend(Backend):
         self._submit_timeout_s = cfg.get("submit_timeout_s", 300)
         self._timeout_ms = cfg.get("timeout_ms", 10000)
 
-        # Initialise RunContext from legacy _ keys (backward compat).
-        # Callers should prefer set_run_context() for typed access.
-        self._run_ctx = RunContext(
-            project_dir=Path(project_config.get("_project_dir", ".")),
-            kernel_build_dir=(
-                Path(project_config["_kernel_build_dir"])
-                if "_kernel_build_dir" in project_config else None
-            ),
-            waveform=bool(project_config.get("_waveform")),
-            waveform_on_fail=bool(project_config.get("_waveform_on_fail")),
-            gui=bool(project_config.get("_gui")),
-            sim_verbose=bool(project_config.get("_sim_verbose")),
-            mismatch_dir=(
-                Path(project_config["_mismatch_dir"])
-                if "_mismatch_dir" in project_config else None
-            ),
-        )
+        # Default RunContext — callers must call set_run_context() before use.
+        self._run_ctx = RunContext()
 
         # Runtime state — all None until submit
         self._process: subprocess.Popen | None = None

@@ -25,11 +25,11 @@ if TYPE_CHECKING:
 
 @dataclass
 class RunContext:
-    """Runtime execution context passed to backends and pipelines.
+    """Typed runtime state for backend execution.
 
-    Replaces the ``_`` prefix keys that were previously injected into the
-    project config dict (e.g. ``config["_project_dir"]``).  This gives
-    type-safe access and keeps the user-facing config dict clean.
+    Backends receive this via ``set_run_context()`` before execution.
+    The runtime pipeline receives ``project_dir`` as an explicit parameter
+    via ``ExecutionContext(project_dir=...)``.
     """
 
     project_dir: Path = field(default_factory=lambda: Path("."))

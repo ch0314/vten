@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from vten.errors import BindingError, ValidationError
@@ -134,7 +135,7 @@ class KernelInstance:
     _resolver: ParameterResolver | None = None
     _sub_kernel_instances: dict[str, KernelInstance] | None = None
 
-    def initialize(self, project_params: dict) -> None:
+    def initialize(self, project_params: dict, *, project_dir: Path | None = None) -> None:
         """Initialize: resolve parameters + shapes, create Kernel instance.
 
         v2 order:
@@ -188,9 +189,11 @@ class KernelInstance:
             instance_tensor._resolve_shape(self._resolver)
 
         # Resolve ExposedTensor for CompositeKernel
-        self._resolve_exposed_tensors(project_params)
+        self._resolve_exposed_tensors(project_params, project_dir=project_dir)
 
-    def _resolve_exposed_tensors(self, project_params: dict) -> None:
+    def _resolve_exposed_tensors(
+        self, project_params: dict, *, project_dir: Path | None = None,
+    ) -> None:
         """For CompositeKernel: create sub-kernel instances for auto-exposed tensors."""
         inst = self.kernel_class_instance
         sub_kernel_refs = getattr(inst.__class__, "_sub_kernel_refs", {})
@@ -205,11 +208,9 @@ class KernelInstance:
             sub_spec = None
             if sub_spec_path:
                 try:
-                    from pathlib import Path as _Path
                     from vten.spec.parser import load_kernel_spec
-                    project_dir = project_params.get("_project_dir")
-                    if project_dir:
-                        spec_file = _Path(project_dir) / sub_spec_path
+                    if project_dir is not None:
+                        spec_file = project_dir / sub_spec_path
                     else:
                         spec_file = sub_spec_path
                     sub_spec = load_kernel_spec(spec_file)
@@ -226,7 +227,7 @@ class KernelInstance:
                 kernel_class=sub_cls,
                 runtime_params=merged_params,
             )
-            sub_ki.initialize(project_params)
+            sub_ki.initialize(project_params, project_dir=project_dir)
             self._sub_kernel_instances[attr_name] = sub_ki
 
         # Create ExposedTensor proxies for auto-exposed tensors

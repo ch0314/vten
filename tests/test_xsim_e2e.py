@@ -35,23 +35,29 @@ def _add_kernel_path(kernel_dir: str | Path) -> None:
 
 def _load_passthrough_env(kernel_name: str = "passthrough"):
     """Load passthrough project environment with specified kernel build dir."""
+    from vten.backend.base import RunContext
     project = Path("examples/passthrough").resolve()
     config = load_project_config(project)
-    config["_project_dir"] = str(project)
-    config["_kernel_build_dir"] = str(project / "kernels" / kernel_name / "build")
     backend_name = resolve_backend_name(config)
     backend = get_backend(backend_name, config)
+    backend.set_run_context(RunContext(
+        project_dir=project,
+        kernel_build_dir=project / "kernels" / kernel_name / "build",
+    ))
     return project, config, backend
 
 
 def _load_scale_add_env(kernel_name: str = "scale_add"):
     """Load scale_add project environment with specified kernel build dir."""
+    from vten.backend.base import RunContext
     project = Path("examples/scale_add").resolve()
     config = load_project_config(project)
-    config["_project_dir"] = str(project)
-    config["_kernel_build_dir"] = str(project / "kernels" / kernel_name / "build")
     backend_name = resolve_backend_name(config)
     backend = get_backend(backend_name, config)
+    backend.set_run_context(RunContext(
+        project_dir=project,
+        kernel_build_dir=project / "kernels" / kernel_name / "build",
+    ))
     return project, config, backend
 
 

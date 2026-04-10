@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time as _time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -84,6 +85,7 @@ class InferenceSession:
                 base_params = merged
         self._backend = backend
         self._base_params = base_params or {}
+        self._project_dir = Path(project_dir).resolve()
         self._run_count = 0  # tracks run() calls for logging
         # Auto-configure vten logging if no handlers set (library user mode)
         vten_root = logging.getLogger("vten")
@@ -134,8 +136,6 @@ class InferenceSession:
         if kernel is not None:
             kernel_dir = project / "kernels" / kernel
             kernel_build_dir = kernel_dir / "build"
-            # Legacy compat: some code paths still read _kernel_build_dir
-            project_config["_kernel_build_dir"] = str(kernel_build_dir)
 
         run_ctx = RunContext(
             project_dir=project,
@@ -236,6 +236,7 @@ class InferenceSession:
             backend=self._backend,
             project_params=merged,
             mode="inference",
+            project_dir=self._project_dir,
         )
         ki = ctx.instantiate(kernel_class, spec=spec, **merged)
 
@@ -340,6 +341,7 @@ class InferenceSession:
             backend=self._backend,
             project_params=merged,
             mode="inference",
+            project_dir=self._project_dir,
         )
         ki = ctx.instantiate(upload_cls, spec=spec, **merged)
         tensor = ki.get_tensor(tensor_name)

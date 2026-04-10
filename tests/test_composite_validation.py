@@ -65,11 +65,12 @@ class TestScaleAddGolden:
 
     def _run_golden(self, N=1024, scale_factor=2, offset_value=1, seed=42):
         """Instantiate, fill, forward, return result."""
-        project_dir = str(
+        project_dir = (
             Path(__file__).resolve().parent.parent / "examples" / "scale_add"
         )
         ctx = ExecutionContext(
-            project_params={"N": N, "_project_dir": project_dir}
+            project_params={"N": N},
+            project_dir=project_dir,
         )
         k = ctx.instantiate(
             ScaleAddKernel, N=N,
@@ -130,11 +131,12 @@ class TestDmaPipelineGolden:
     """DmaPipelineKernel.forward() golden correctness."""
 
     def _run_golden(self, N=1024, scale_factor=2, offset_value=1, seed=42):
-        project_dir = str(
+        project_dir = (
             Path(__file__).resolve().parent.parent / "examples" / "scale_add"
         )
         ctx = ExecutionContext(
-            project_params={"N": N, "_project_dir": project_dir}
+            project_params={"N": N},
+            project_dir=project_dir,
         )
         k = ctx.instantiate(
             DmaPipelineKernel, N=N,
@@ -170,14 +172,13 @@ class TestEdgeCaseN:
     """CompositeKernel with various N sizes."""
 
     def _project_dir(self):
-        return str(
-            Path(__file__).resolve().parent.parent / "examples" / "scale_add"
-        )
+        return Path(__file__).resolve().parent.parent / "examples" / "scale_add"
 
     @pytest.mark.parametrize("N", [32, 64, 96, 4096])
     def test_scale_add_n(self, N):
         ctx = ExecutionContext(
-            project_params={"N": N, "_project_dir": self._project_dir()}
+            project_params={"N": N},
+            project_dir=self._project_dir(),
         )
         k = ctx.instantiate(ScaleAddKernel, N=N, scale_factor=2, offset_value=1)
         k.generate_inputs(seed=42)
@@ -188,7 +189,8 @@ class TestEdgeCaseN:
     @pytest.mark.parametrize("N", [32, 64, 4096])
     def test_dma_pipeline_n(self, N):
         ctx = ExecutionContext(
-            project_params={"N": N, "_project_dir": self._project_dir()}
+            project_params={"N": N},
+            project_dir=self._project_dir(),
         )
         k = ctx.instantiate(DmaPipelineKernel, N=N, scale_factor=2, offset_value=1)
         k.generate_inputs(seed=42)
@@ -321,14 +323,13 @@ class TestCompilePipeline:
     """Verify compile pipeline internals for composite kernels."""
 
     def _project_dir(self):
-        return str(
-            Path(__file__).resolve().parent.parent / "examples" / "scale_add"
-        )
+        return Path(__file__).resolve().parent.parent / "examples" / "scale_add"
 
     def test_sub_kernel_reuse(self):
         """_sub_kernel_instances tensors are same objects as ExposedTensor origins."""
         ctx = ExecutionContext(
-            project_params={"N": 32, "_project_dir": self._project_dir()}
+            project_params={"N": 32},
+            project_dir=self._project_dir(),
         )
         k = ctx.instantiate(ScaleAddKernel, N=32)
         k.generate_inputs(seed=42)
@@ -347,10 +348,11 @@ class TestCompilePipeline:
         project_dir = self._project_dir()
         old_cwd = os.getcwd()
         try:
-            os.chdir(project_dir)
+            os.chdir(str(project_dir))
 
             ctx = ExecutionContext(
-                project_params={"N": 32, "_project_dir": project_dir}
+                project_params={"N": 32},
+                project_dir=project_dir,
             )
             k = ctx.instantiate(ScaleAddKernel, N=32)
             k.generate_inputs(seed=42)
@@ -366,7 +368,8 @@ class TestCompilePipeline:
             ]
             engine = RuntimeEngine(
                 kernels=ctx._kernels, ops=ops,
-                project_params={"N": 32, "_project_dir": project_dir},
+                project_params={"N": 32},
+                project_dir=project_dir,
             )
             result1 = engine.compile()
 
@@ -379,7 +382,8 @@ class TestCompilePipeline:
             k2.generate_inputs(seed=42)
             engine2 = RuntimeEngine(
                 kernels=ctx._kernels, ops=ops,
-                project_params={"N": 32, "_project_dir": project_dir},
+                project_params={"N": 32},
+                project_dir=project_dir,
             )
             result2 = engine2.compile()
             assert ScaleAddKernel._synthesized_spec is cached
@@ -389,19 +393,20 @@ class TestCompilePipeline:
                 delattr(ScaleAddKernel, "_synthesized_spec")
 
     def test_project_dir_from_params(self):
-        """_project_dir in project_params is used, not CWD."""
+        """project_dir parameter is used, not CWD."""
         project_dir = self._project_dir()
         # Set CWD to a directory that does NOT contain kernel specs
         old_cwd = os.getcwd()
         try:
             os.chdir("/tmp")
             ctx = ExecutionContext(
-                project_params={"N": 32, "_project_dir": project_dir}
+                project_params={"N": 32},
+                project_dir=project_dir,
             )
             k = ctx.instantiate(ScaleAddKernel, N=32)
             k.generate_inputs(seed=42)
 
-            # Should still resolve specs correctly via _project_dir
+            # Should still resolve specs correctly via project_dir
             assert k._sub_kernel_instances is not None
             assert "scale" in k._sub_kernel_instances
         finally:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -84,11 +85,13 @@ class ExecutionContext:
         backend: object | None = None,
         project_params: dict | None = None,
         mode: str = "verification",
+        project_dir: Path | None = None,
     ) -> None:
         self._pending_ops: list[Operation] = []
         self._kernels: dict[str, KernelInstance] = {}
         self._backend = backend
         self._project_params = project_params or {}
+        self._project_dir = project_dir
         self._mode = mode  # "verification" or "inference"
         self._bound_bos: dict[str, object] = {}  # tensor_name → xrt.bo
         self._alias_registry = AliasRegistry()
@@ -132,7 +135,7 @@ class ExecutionContext:
             kernel_class=kernel_class,
             runtime_params=params,
         )
-        instance.initialize(self._project_params)
+        instance.initialize(self._project_params, project_dir=self._project_dir)
         self._kernels[instance.name] = instance
         return instance
 
@@ -426,6 +429,7 @@ class ExecutionContext:
                 project_params=params,
                 alias_registry=self._alias_registry,
                 quiet=(self._mode == "inference"),
+                project_dir=self._project_dir,
             ))
 
         return RuntimeEngine.compile_multi(engines)
@@ -454,6 +458,7 @@ class ExecutionContext:
                 project_params=self._project_params,
                 alias_registry=self._alias_registry,
                 quiet=(self._mode == "inference"),
+                project_dir=self._project_dir,
             )
             probe_golden_tensors = self._collect_probe_golden_tensors()
             compiled = engine.compile(

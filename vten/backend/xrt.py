@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from vten.backend.base import Backend, BackendResult, CompileTarget
+from vten.backend.base import Backend, BackendResult, CompileTarget, RunContext
 from vten.errors import BackendError
 from vten.log import format_size
 
@@ -48,14 +48,8 @@ class XrtBackend(Backend):
         self._poll_timeout_ms = xrt_cfg.get("poll_timeout_ms", default_timeout)
         self._config = project_config
 
-        # Initialise RunContext from legacy _ keys (backward compat)
-        self._run_ctx = RunContext(
-            project_dir=Path(project_config.get("_project_dir", ".")),
-            kernel_build_dir=(
-                Path(project_config["_kernel_build_dir"])
-                if "_kernel_build_dir" in project_config else None
-            ),
-        )
+        # Default RunContext — callers must call set_run_context() before use.
+        self._run_ctx = RunContext()
 
         # Auto-discover xclbin from kernel build directory
         if not self._xclbin_path:
@@ -72,6 +66,12 @@ class XrtBackend(Backend):
         self._interpreter: Any = None
         self._emu_run_dir: Path | None = None  # hw_emu .run/<PID> to clean up
         self._xrt_ini_created: bool = False  # whether we auto-created xrt.ini
+
+    def set_run_context(self, ctx: RunContext) -> None:
+        """Override to re-discover xclbin when RunContext provides kernel_build_dir."""
+        super().set_run_context(ctx)
+        if not self._xclbin_path:
+            self._xclbin_path = self._discover_xclbin()
 
     def _discover_xclbin(self) -> str:
         """Auto-discover xclbin from kernel build directory.

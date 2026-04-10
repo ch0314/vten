@@ -80,14 +80,10 @@ def _run_single_test(
             if "build_params" not in cfg and "build_params" in config:
                 cfg["build_params"] = config["build_params"]
 
-            # Propagate project-level paths into per-config params
-            for _pk in ("_project_dir", "_kernel_build_dir"):
-                if _pk in config and _pk not in cfg:
-                    cfg[_pk] = config[_pk]
-
             ctx = ExecutionContext(
                 backend=backend_inst,
                 project_params=cfg,
+                project_dir=project,
             )
             scenario.run(ctx, cfg)
 
@@ -276,11 +272,6 @@ def run_test(
         gui=gui,
         sim_verbose=sim_verbose,
     )
-
-    # Keep legacy _ keys in config for backward compat (runtime pipeline
-    # reads _project_dir from project_params, not from RunContext yet).
-    config["_project_dir"] = str(project)
-    config["_kernel_build_dir"] = str(kernel_dir / "build")
 
     backend_name = resolve_backend_name(config, cli_backend=backend)
     backend_inst = get_backend(backend_name, config)

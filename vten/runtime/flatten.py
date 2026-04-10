@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from vten.errors import (
@@ -134,6 +135,8 @@ def wrap_unit_as_flat(kernel: KernelInstance) -> FlattenedKernelView:
 def flatten_composite(
     kernel: KernelInstance,
     project_params: dict,
+    *,
+    project_dir: Path | None = None,
 ) -> FlattenedKernelView:
     """Flatten a CompositeKernel into FlattenedKernelView.
 
@@ -154,9 +157,7 @@ def flatten_composite(
 
     import os
     from pathlib import Path as _P
-    _proj_dir = _P(
-        project_params.get("_project_dir", os.getcwd())
-    )
+    _proj_dir = project_dir if project_dir is not None else _P(os.getcwd())
 
     for ref_name, sub_cls in sub_kernel_refs.items():
         if existing_subs and ref_name in existing_subs:
@@ -181,7 +182,7 @@ def flatten_composite(
                 kernel_class=sub_cls,
                 runtime_params=dict(kernel.runtime_params),
             )
-            sub_ki.initialize(project_params)
+            sub_ki.initialize(project_params, project_dir=project_dir)
         sub_kernels[ref_name] = sub_ki
 
     # Synthesize top-level spec for composite kernels if missing
@@ -191,13 +192,10 @@ def flatten_composite(
             top_spec = cached
         else:
             import os
-            from pathlib import Path as _Path
             from vten.build.composite import synthesize_spec
-            project_dir = _Path(
-                project_params.get("_project_dir", os.getcwd())
-            )
+            _synth_dir = project_dir if project_dir is not None else Path(os.getcwd())
             top_spec = synthesize_spec(
-                kernel.kernel_class, project_dir, kernel.name,
+                kernel.kernel_class, _synth_dir, kernel.name,
             )
             kernel.kernel_class._synthesized_spec = top_spec
         kernel.spec = top_spec

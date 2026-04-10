@@ -9,6 +9,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
@@ -107,12 +108,14 @@ class RuntimeEngine:
         project_params: dict,
         alias_registry: AliasRegistry | None = None,
         quiet: bool = False,
+        project_dir: Path | None = None,
     ) -> None:
         self._kernels = kernels
         self._ops = ops
         self._project_params = project_params
         self._alias_registry = alias_registry
         self._quiet = quiet
+        self._project_dir = project_dir
 
     # ── Internal: Stages 0–9 (IR generation, no SHM packing) ──
 
@@ -138,7 +141,8 @@ class RuntimeEngine:
         # Stage 0: Flatten or wrap
         logger.log(5, "Stage 0: flatten/wrap")
         if is_composite(kernel):
-            view = flatten_composite(kernel, self._project_params)
+            view = flatten_composite(kernel, self._project_params,
+                                       project_dir=self._project_dir)
         else:
             view = wrap_unit_as_flat(kernel)
 
