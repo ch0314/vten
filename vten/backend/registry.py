@@ -29,18 +29,20 @@ _BUILD_MAP: dict[str, tuple[str, str]] = {
 }
 
 
-def get_backend(name: str, config: dict) -> Backend:
+def get_backend(name: str, config: dict, **kwargs) -> Backend:
     """Create a backend instance by name (lazy import).
 
     Args:
         name: Backend name ("xsim", "verilator", "xrt").
         config: Project configuration dict (from vten.toml).
+        **kwargs: Extra keyword arguments forwarded to the backend
+            constructor (e.g. ``persistent=True`` for XrtBackend).
 
     Returns:
         Backend instance.
 
     Raises:
-        ValueError: Unknown backend name.
+        VTenError: Unknown backend name.
     """
     if name not in _BACKEND_MAP:
         raise VTenError(
@@ -49,7 +51,7 @@ def get_backend(name: str, config: dict) -> Backend:
     module_path, class_name = _BACKEND_MAP[name]
     mod = importlib.import_module(module_path)
     cls = getattr(mod, class_name)
-    return cls(config)
+    return cls(config, **kwargs)
 
 
 def get_build_pipeline(name: str, project: Path, config: dict) -> BuildPipeline:

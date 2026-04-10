@@ -42,13 +42,14 @@ logger = logging.getLogger(__name__)
 def _find_tool(name: str, config: dict) -> str:
     """Find vivado/v++/emconfigutil binary path.
 
-    Search order: PATH → [backend.xrt].vivado_path config.
+    Search order: PATH → [tools]/[backend.xrt].vivado_path config.
     """
     found = shutil.which(name)
     if found:
         return found
 
-    vivado_path = config.get("backend", {}).get("xrt", {}).get("vivado_path", "")
+    from vten.cli.config import resolve_tool_path
+    vivado_path = resolve_tool_path(config, "vivado_path", "xrt")
     if vivado_path:
         candidate = Path(vivado_path) / "bin" / name
         if candidate.exists():
@@ -436,7 +437,7 @@ class XrtBuildPipeline(BuildPipeline):
         if not vivado:
             raise BuildError(
                 "vivado not found in PATH. Source Vivado settings or set "
-                "[backend.xrt].vivado_path in vten.toml.\n"
+                "[tools].vivado_path in vten.toml.\n"
                 "To generate artifacts only: vten build --backend xrt --upto gen_xrt_packaging"
             )
 

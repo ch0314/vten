@@ -104,16 +104,20 @@ class InferenceSession:
     ) -> tuple[Backend, dict]:
         """Create backend from name with auto-discovery.
 
+        Uses the central backend registry so that adding a new backend
+        only requires updating ``vten.backend.registry``.
+
         Returns (backend, project_config) so caller can extract build_params.
         """
         from pathlib import Path
 
-        _SIM_BACKENDS = ("xsim", "verilator")
-        _SUPPORTED = ("xrt", *_SIM_BACKENDS)
-        if backend_name not in _SUPPORTED:
+        from vten.backend.registry import available_backends, get_backend
+
+        supported = available_backends()
+        if backend_name not in supported:
             raise ValueError(
                 f"unsupported inference backend: {backend_name!r}"
-                f" (supported: {', '.join(_SUPPORTED)})"
+                f" (supported: {', '.join(supported)})"
             )
 
         # Load vten.toml if it exists
@@ -128,19 +132,14 @@ class InferenceSession:
             kernel_dir = project / "kernels" / kernel
             project_config["_kernel_build_dir"] = str(kernel_dir / "build")
 
+        # XRT-specific: inject target and enable persistent BO pool
+        kwargs: dict[str, Any] = {}
         if backend_name == "xrt":
-            from vten.backend.xrt import XrtBackend
-
             project_config.setdefault("backend", {}).setdefault("xrt", {})["target"] = target
-            return XrtBackend(project_config, persistent=True), project_config
+            kwargs["persistent"] = True
 
-        if backend_name == "xsim":
-            from vten.backend.xsim import XsimBackend
-            return XsimBackend(project_config), project_config
-
-        # verilator
-        from vten.backend.verilator import VerilatorBackend
-        return VerilatorBackend(project_config), project_config
+        backend = get_backend(backend_name, project_config, **kwargs)
+        return backend, project_config
 
     @classmethod
     def from_xclbin(

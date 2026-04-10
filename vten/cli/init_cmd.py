@@ -15,7 +15,6 @@ from vten.errors import VTenError
 _BACKEND_TOML_TEMPLATES: dict[str, str] = {
     "xsim": """\
 [backend.xsim]
-vivado_path = "/tools/Xilinx/Vivado/2023.2"
 part = "xcu250-figd2104-2L-e"
 compile_options = ["-timescale", "1ns/1ps"]
 timeout_ms = 0
@@ -53,6 +52,9 @@ def _make_toml_content(name: str, backend: str) -> str:
 name = "{name}"
 version = "0.1.0"
 default_backend = "{backend}"
+
+[tools]
+vivado_path = "/tools/Xilinx/Vivado/2023.2"
 
 [parameters]
 

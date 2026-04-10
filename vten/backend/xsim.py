@@ -71,8 +71,8 @@ class XsimBackend(SimBackend):
 
     def __init__(self, project_config: dict) -> None:
         super().__init__(project_config, backend_section="xsim")
-        xsim_cfg = project_config.get("backend", {}).get("xsim", {})
-        self._vivado_path = xsim_cfg.get("vivado_path", "")
+        from vten.cli.config import resolve_tool_path
+        self._vivado_path = resolve_tool_path(project_config, "vivado_path", "xsim")
 
     def _start_simulator(self) -> None:
         """Launch xsim subprocess with session_id plusarg.
@@ -163,7 +163,7 @@ class XsimBackend(SimBackend):
             raise BackendError(
                 f"xsim not found: {xsim_bin}\n"
                 f"Check that Vivado is installed and "
-                f"vivado_path is set in vten.toml [backend.xsim]"
+                f"vivado_path is set in vten.toml [tools] or [backend.xsim]"
             )
 
         # Stream xsim stdout through Python logger in a background thread

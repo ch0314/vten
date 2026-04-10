@@ -158,8 +158,8 @@ class XsimBuildPipeline(BuildPipeline):
 
     def __init__(self, project: Path, config: dict) -> None:
         super().__init__(project, config)
-        xsim_cfg = config.get("backend", {}).get("xsim", {})
-        self._vivado_path = xsim_cfg.get("vivado_path", "")
+        from vten.cli.config import resolve_tool_path
+        self._vivado_path = resolve_tool_path(config, "vivado_path", "xsim")
         self._vten_root = Path(__file__).resolve().parent.parent
         self._vten_sv_dir = self._vten_root / "sv"
         self._cache = load_cache(project / "build" / ".cache.json")

@@ -49,12 +49,8 @@ class VerilatorBuildPipeline(BuildPipeline):
         self._cache = load_cache(project / "build" / ".cache.json")
 
         # Vivado path for UNISIM/XPM library resolution
-        self._vivado_path = veri_cfg.get("vivado_path", "")
-        if not self._vivado_path:
-            # Fallback: try xsim backend config
-            self._vivado_path = (
-                config.get("backend", {}).get("xsim", {}).get("vivado_path", "")
-            )
+        from vten.cli.config import resolve_tool_path
+        self._vivado_path = resolve_tool_path(config, "vivado_path", "verilator")
 
     def stages(self) -> list[str]:
         return list(self._STAGES)

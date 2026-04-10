@@ -293,3 +293,57 @@ class TestVtenTomlNPU:
         _write_toml(tmp_path, NPU_3D_TOML)
         config = load_project_config(tmp_path)
         assert config["backend"]["xsim"]["submit_timeout_s"] == 300
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §3  resolve_tool_path
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestResolveToolPath:
+    """[tools] section with per-backend fallback."""
+
+    def test_tools_section_vivado(self):
+        from vten.cli.config import resolve_tool_path
+        config = {"tools": {"vivado_path": "/opt/vivado"}}
+        assert resolve_tool_path(config, "vivado_path") == "/opt/vivado"
+
+    def test_tools_short_form(self):
+        from vten.cli.config import resolve_tool_path
+        config = {"tools": {"vivado": "/opt/vivado"}}
+        assert resolve_tool_path(config, "vivado_path") == "/opt/vivado"
+
+    def test_backend_override_takes_precedence(self):
+        from vten.cli.config import resolve_tool_path
+        config = {
+            "tools": {"vivado_path": "/opt/vivado"},
+            "backend": {"xsim": {"vivado_path": "/tools/vivado"}},
+        }
+        assert resolve_tool_path(config, "vivado_path", "xsim") == "/tools/vivado"
+
+    def test_fallback_to_tools_when_backend_missing(self):
+        from vten.cli.config import resolve_tool_path
+        config = {
+            "tools": {"vivado_path": "/opt/vivado"},
+            "backend": {"xsim": {}},
+        }
+        assert resolve_tool_path(config, "vivado_path", "xsim") == "/opt/vivado"
+
+    def test_empty_when_nothing_configured(self):
+        from vten.cli.config import resolve_tool_path
+        assert resolve_tool_path({}, "vivado_path") == ""
+        assert resolve_tool_path({}, "vivado_path", "xsim") == ""
+
+    def test_no_backend_arg_uses_tools_only(self):
+        from vten.cli.config import resolve_tool_path
+        config = {
+            "tools": {"vivado_path": "/opt/vivado"},
+            "backend": {"xsim": {"vivado_path": "/tools/vivado"}},
+        }
+        # Without backend arg, only [tools] is checked
+        assert resolve_tool_path(config, "vivado_path") == "/opt/vivado"
+
+    def test_verilator_path(self):
+        from vten.cli.config import resolve_tool_path
+        config = {"tools": {"verilator_path": "/usr/bin/verilator"}}
+        assert resolve_tool_path(config, "verilator_path") == "/usr/bin/verilator"

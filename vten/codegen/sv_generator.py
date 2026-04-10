@@ -271,9 +271,10 @@ class SVGenerator:
             reset_active_low=self.spec.reset_active_low,
         )
 
+        from vten.cli.config import resolve_tool_path
         xsim_cfg = self.config.get("backend", {}).get("xsim", {})
         build = BuildContext(
-            vivado_path=xsim_cfg.get("vivado_path", ""),
+            vivado_path=resolve_tool_path(self.config, "vivado_path", "xsim"),
             rtl_sources=rtl_cfg.get("sources", []),
             include_dirs=rtl_cfg.get("include_dirs", []),
             generated_sv=[],
