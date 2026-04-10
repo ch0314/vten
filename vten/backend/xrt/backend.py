@@ -629,7 +629,7 @@ class XrtBackend(Backend):
         if self._device is None:
             self._init_device()
 
-        from vten.backend.xrt_interpreter import CommandInterpreter
+        from vten.backend.xrt.interpreter import CommandInterpreter
 
         ip_map = self._build_ip_map(compiled)
         mem_bank_map = self._build_mem_bank_map(compiled)

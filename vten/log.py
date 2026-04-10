@@ -59,12 +59,13 @@ _COMPONENT_MAP: dict[str, str] = {
     "vten.xsim": "sim",
     "vten.backend.verilator": "verilator",
     "vten.backend.xrt": "xrt",
+    "vten.backend.xrt.backend": "xrt",
+    "vten.backend.xrt.interpreter": "interp",
     "vten.build.base": "build",
     "vten.build.xsim_build": "build.xsim",
     "vten.build.xrt_build": "build.xrt",
     "vten.build.verilator_build": "build.veri",
     "vten.inference": "inference",
-    "vten.backend.xrt_interpreter": "interp",
 }
 
 _COMPONENT_WIDTH = max(len(v) for v in _COMPONENT_MAP.values())
