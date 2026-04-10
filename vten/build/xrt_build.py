@@ -28,6 +28,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from vten.build.base import BuildPipeline
@@ -296,19 +297,27 @@ class XrtBuildPipeline(BuildPipeline):
         log_file: Path,
         stage_name: str,
     ) -> None:
-        """Run a subprocess, stream output to log file, raise on failure."""
+        """Run a subprocess, stream output to log file (and stdout in DEBUG)."""
+        verbose = logger.isEnabledFor(logging.DEBUG)
         with open(log_file, "w") as f:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=str(cwd),
-                stdout=f,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
             )
-        if result.returncode != 0:
+            for line in proc.stdout:
+                if verbose:
+                    sys.stdout.write(line)
+                f.write(line)
+            proc.wait()
+        if proc.returncode != 0:
             lines = log_file.read_text().splitlines()
             tail = "\n".join(lines[-20:])
             raise BuildError(
-                f"{stage_name} failed (exit {result.returncode}).\n"
+                f"{stage_name} failed (exit {proc.returncode}).\n"
                 f"Log: {log_file}\n"
                 f"--- last 20 lines ---\n{tail}"
             )
@@ -542,6 +551,17 @@ class XrtBuildPipeline(BuildPipeline):
                     f"[{len(dst_ports)}]"
                 )
 
+            # Validate data_width compatibility
+            src_iface = self._find_stream_interface(src_spec, src_tensor)
+            dst_iface = self._find_stream_interface(dst_spec, dst_tensor)
+            if (src_iface and dst_iface
+                    and src_iface.data_width != dst_iface.data_width):
+                raise BuildError(
+                    f"Stream data_width mismatch: "
+                    f"{src_sub}.{src_tensor} ({src_iface.data_width}b) >> "
+                    f"{dst_sub}.{dst_tensor} ({dst_iface.data_width}b)"
+                )
+
             for sp, dp in zip(src_ports, dst_ports):
                 stream_entries.append(
                     f"stream_connect={src_kname}_1.{sp}:{dst_kname}_1.{dp}"
@@ -624,6 +644,18 @@ class XrtBuildPipeline(BuildPipeline):
             f"Cannot resolve stream port for '{tensor_name}' "
             f"in kernel '{spec.kernel_name}'"
         )
+
+    @staticmethod
+    def _find_stream_interface(spec, tensor_name: str):
+        """Return the InterfaceSpec for a stream tensor, or None."""
+        if tensor_name in spec.interfaces:
+            return spec.interfaces[tensor_name]
+        for _iname, iface in spec.interfaces.items():
+            if iface.tensor == tensor_name or (
+                iface.tensors and tensor_name in iface.tensors
+            ):
+                return iface
+        return None
 
     def _stage_vpp_link_composite(
         self,

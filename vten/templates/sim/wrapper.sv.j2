@@ -478,11 +478,7 @@ module {{ kernel_name }} #(
 {% endfor %}
 
     // ── Core ──
-    {{ kernel_name }}_core #(
-{% for pname, pval in parameters.items() %}
-        .{{ pname }}({{ pname }}){{ "," if not loop.last else "" }}
-{% endfor %}
-    ) u_core (
+    {{ kernel_name }}_core u_core (
         .{{ core_clock_name }}({{ clock_name }}),
         .{{ core_reset_name }}({{ reset_name }}),
 {# Collect all core ports into a flat list to handle trailing comma correctly #}

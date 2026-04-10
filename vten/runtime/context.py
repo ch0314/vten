@@ -509,6 +509,11 @@ class ExecutionContext:
                 verification_count, verification_results = (
                     self._auto_verify_all(compiled, output_tensors)
                 )
+                passed = sum(1 for v in verification_results if getattr(v, 'passed', False))
+                if passed > 0:
+                    names = [v.tensor_name for v in verification_results if getattr(v, 'passed', False)]
+                    logger.info("  verify: %d/%d PASS (%s)", passed, verification_count,
+                                ", ".join(names))
 
             logger.debug("execution complete: status=%s, cycles=%d, verifications=%d/%d",
                          status, total_cycles,

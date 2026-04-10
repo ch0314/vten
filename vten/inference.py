@@ -64,7 +64,7 @@ class InferenceSession:
         """Create an inference session.
 
         Args:
-            backend: Backend instance, or backend name ("xrt") for auto-setup.
+            backend: Backend instance, or name ("xrt", "xsim", "verilator").
             base_params: Default parameters for all run() calls.
             kernel: Kernel name for xclbin auto-discovery (e.g. "npu_pipeline").
             target: "hw" or "hw_emu" (used with string backend).
@@ -108,10 +108,13 @@ class InferenceSession:
         """
         from pathlib import Path
 
-        if backend_name != "xrt":
-            raise ValueError(f"unsupported inference backend: {backend_name!r}")
-
-        from vten.backend.xrt import XrtBackend
+        _SIM_BACKENDS = ("xsim", "verilator")
+        _SUPPORTED = ("xrt", *_SIM_BACKENDS)
+        if backend_name not in _SUPPORTED:
+            raise ValueError(
+                f"unsupported inference backend: {backend_name!r}"
+                f" (supported: {', '.join(_SUPPORTED)})"
+            )
 
         # Load vten.toml if it exists
         project = Path(project_dir).resolve()
@@ -121,15 +124,23 @@ class InferenceSession:
             from vten.cli.config import load_project_config
             project_config = load_project_config(project)
 
-        # Inject backend target
-        project_config.setdefault("backend", {}).setdefault("xrt", {})["target"] = target
-
-        # Auto-discover xclbin from project build structure
         if kernel is not None:
             kernel_dir = project / "kernels" / kernel
             project_config["_kernel_build_dir"] = str(kernel_dir / "build")
 
-        return XrtBackend(project_config, persistent=True), project_config
+        if backend_name == "xrt":
+            from vten.backend.xrt import XrtBackend
+
+            project_config.setdefault("backend", {}).setdefault("xrt", {})["target"] = target
+            return XrtBackend(project_config, persistent=True), project_config
+
+        if backend_name == "xsim":
+            from vten.backend.xsim import XsimBackend
+            return XsimBackend(project_config), project_config
+
+        # verilator
+        from vten.backend.verilator import VerilatorBackend
+        return VerilatorBackend(project_config), project_config
 
     @classmethod
     def from_xclbin(
@@ -192,14 +203,20 @@ class InferenceSession:
 
         # Layer banner — show run number and key params for context
         label = params.get("name", "") or kernel_class.__name__
-        n_device = sum(
-            1 for d in inputs.values()
+        host_names = [
+            name for name, d in inputs.items()
+            if not (isinstance(d, Tensor) and d.on_device)
+        ]
+        device_names = [
+            name for name, d in inputs.items()
             if isinstance(d, Tensor) and d.on_device
-        )
-        n_host = len(inputs) - n_device
-        input_desc = f"{n_host} host"
-        if n_device:
-            input_desc += f", {n_device} device"
+        ]
+        parts = []
+        if host_names:
+            parts.append(f"host: {', '.join(host_names)}")
+        if device_names:
+            parts.append(f"device: {', '.join(device_names)}")
+        input_desc = "; ".join(parts) or "no inputs"
         logger.info(
             "──── run #%d: %s (%s) ────",
             self._run_count, label, input_desc,
@@ -320,41 +337,47 @@ class InferenceSession:
         # Assign data and let the normal compile pipeline handle layout+serialize
         tensor.data = data
 
-        # Use push_tensor to record LOAD+PUSH ops
-        h = ctx.push_tensor(tensor)
-
-        # Compile and execute to create the BO on device
-        result = ctx.run()
-
-        # Extract BO from interpreter
-        compiled = ctx._last_compiled
-        view = compiled.flattened_view
-        exposed = view.exposed_tensors.get(tensor_name)
-
-        t = Tensor(
-            shape=tensor._resolved_shape or tensor.shape,
-            dtype=tensor.dtype,
-            interface=tensor.interface,
-            direction=tensor.direction,
-        )
-        t.name = tensor_name
-        t._resolved_shape = tensor._resolved_shape
-        t._element_count = tensor._element_count
-
-        # Store logical data for golden chain (verify mode)
-        t.golden = data
-
         is_hw = self._backend.compile_target == "hw"
 
-        if is_hw and exposed is not None:
-            buffer_id = compiled.buffer_ids.get(tensor_name)
-            if buffer_id is not None:
-                bo = self._backend.get_buffer_object(buffer_id)
-                if bo is not None:
-                    bo_size = bo.size() if hasattr(bo, "size") else exposed._serialized_size
-                    t._bind_bo(bo, bo_size)
+        if is_hw:
+            # HW: execute LOAD+PUSH to create BO on device
+            h = ctx.push_tensor(tensor)
+            result = ctx.run()
+
+            compiled = ctx._last_compiled
+            view = compiled.flattened_view
+            exposed = view.exposed_tensors.get(tensor_name)
+
+            t = Tensor(
+                shape=tensor._resolved_shape or tensor.shape,
+                dtype=tensor.dtype,
+                interface=tensor.interface,
+                direction=tensor.direction,
+            )
+            t.name = tensor_name
+            t._resolved_shape = tensor._resolved_shape
+            t._element_count = tensor._element_count
+            t.golden = data
+
+            if exposed is not None:
+                buffer_id = compiled.buffer_ids.get(tensor_name)
+                if buffer_id is not None:
+                    bo = self._backend.get_buffer_object(buffer_id)
+                    if bo is not None:
+                        bo_size = bo.size() if hasattr(bo, "size") else exposed._serialized_size
+                        t._bind_bo(bo, bo_size)
         else:
-            # SIM: store host data
+            # SIM: no device memory — just store host data for later run()
+            t = Tensor(
+                shape=tensor._resolved_shape or tensor.shape,
+                dtype=tensor.dtype,
+                interface=tensor.interface,
+                direction=tensor.direction,
+            )
+            t.name = tensor_name
+            t._resolved_shape = tensor._resolved_shape
+            t._element_count = tensor._element_count
+            t.golden = data
             t.data = data
 
         return t

@@ -208,7 +208,6 @@ class TestTestbenchContext:
         assert ctx.reset_name == "rst_n"
         assert ctx.reset_active_low is True
         assert ctx.clock_period_ns == 10.0
-        assert ctx.timeout_cycles == 1_000_000
 
     def test_custom_clock_reset(self):
         from vten.codegen.sv_generator import TestbenchContext

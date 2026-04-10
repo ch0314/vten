@@ -51,7 +51,6 @@ class TestbenchContext:
     reset_name: str = "rst_n"
     reset_active_low: bool = True
     clock_period_ns: float = 10.0
-    timeout_cycles: int = 1_000_000
 
 
 @dataclass
@@ -580,7 +579,6 @@ class SVGenerator:
             "reset_name": ctx.tb.reset_name,
             "reset_active_low": ctx.tb.reset_active_low,
             "clock_period_ns": ctx.tb.clock_period_ns,
-            "timeout_cycles": ctx.tb.timeout_cycles,
             "max_cmds": sched_params["max_cmds"],
             "max_bfms": sched_params["max_bfms"],
             "max_ifaces": sched_params["max_ifaces"],

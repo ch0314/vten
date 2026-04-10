@@ -98,6 +98,14 @@ module vten_bfm_axi4s #(
                              current_cmd.size, current_cmd.size / BYTES_PER_BEAT);
             end
 
+            // Periodic stats flush to SHM (every 512 cycles).
+            // Placed before execute so finish_command() overwrites if it fires.
+            if (cmd_active && cycle_count[8:0] == 9'b0)
+                vten_write_cmd_stats(current_cmd.cmd_id, CMD_ISSUED,
+                    issue_cycle, 0,
+                    (first_active == 0) ? 0 : first_active,
+                    last_active, active_cycles, total_beats, stall_cycles);
+
             if (cmd_active) begin
                 if (MODE == "MASTER") execute_master();
                 else                  execute_slave();

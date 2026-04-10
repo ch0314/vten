@@ -46,6 +46,10 @@ module vten_bfm_axilite #(
     int poll_count;
     int issue_cycle;
 
+    // Activity counters (for stall detection by host)
+    int first_active, last_active;
+    int active_cycles, stall_cycles;
+
     // Write handshake phase tracking
     logic aw_accepted;
     logic w_accepted;
@@ -107,7 +111,18 @@ module vten_bfm_axilite #(
                 issue_cycle <= cycle_count;
                 aw_accepted <= 0;
                 w_accepted  <= 0;
+                first_active  <= 0;
+                last_active   <= 0;
+                active_cycles <= 0;
+                stall_cycles  <= 0;
             end
+
+            // Periodic stats flush to SHM (every 512 cycles)
+            if (cmd_active && cycle_count[8:0] == 9'b0)
+                vten_write_cmd_stats(current_cmd.cmd_id, CMD_ISSUED,
+                    issue_cycle, 0,
+                    (first_active == 0) ? 0 : first_active,
+                    last_active, active_cycles, poll_count, stall_cycles);
 
             if (cmd_active) begin
                 case (current_cmd.opcode)
@@ -194,9 +209,16 @@ module vten_bfm_axilite #(
             aw_accepted <= 1;
         end
 
+        // Stall: AR accepted, waiting for R response
+        if (aw_accepted && !(m_rvalid && m_rready))
+            stall_cycles <= stall_cycles + 1;
+
         if (m_rvalid && m_rready) begin
             m_rready    <= 0;
             aw_accepted <= 0;  // reset for next poll iteration
+            active_cycles <= active_cycles + 1;
+            if (first_active == 0) first_active <= cycle_count;
+            last_active <= cycle_count;
             if ((m_rdata & current_cmd.reg_mask[DATA_W-1:0]) ==
                 current_cmd.reg_expected[DATA_W-1:0]) begin
                 if (verbose)
@@ -235,12 +257,13 @@ module vten_bfm_axilite #(
         else
             cmd_if.done_error_code <= ERR_OK;               // 0
 
-        // Write stats for non-poll commands
+        // Write stats (READ_REG already writes its own in do_read)
         if (current_cmd.opcode != OP_READ_REG) begin
             vten_write_cmd_stats(current_cmd.cmd_id,
                 error ? CMD_ERROR : CMD_COMMITTED,
                 issue_cycle, cycle_count,
-                0, 0, 0, 0, 0);
+                (first_active == 0) ? 0 : first_active,
+                last_active, active_cycles, poll_count, stall_cycles);
         end
     endtask
 endmodule

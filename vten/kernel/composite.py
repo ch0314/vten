@@ -186,7 +186,7 @@ def _topo_sort(connections: list[Connection], sub_names: set[str]) -> list[str]:
 
 def _make_composite_kernel():
     """Deferred import to avoid circular dependency with Kernel."""
-    from vten.kernel.base import Kernel
+    from vten.kernel.base import Kernel, RegisterHandle
     from vten.kernel.tensor import Tensor
 
     class CompositeKernel(Kernel):
@@ -242,6 +242,15 @@ def _make_composite_kernel():
             # Register sub-kernel → composite mapping
             for ref_class in cls._sub_kernel_refs.values():
                 _composite_registry[ref_class] = cls
+
+            # Auto-register {ref_name}_ctrl for each sub-kernel
+            # (skip if user already declared it explicitly)
+            for ref_name in cls._sub_kernel_refs:
+                ctrl_name = f"{ref_name}_ctrl"
+                if ctrl_name not in cls._register_handles:
+                    handle = RegisterHandle(ctrl_name)
+                    setattr(cls, ctrl_name, handle)
+                    cls._register_handles[ctrl_name] = handle
 
         @classmethod
         def topo_sort_sub_kernels(cls) -> list[str]:

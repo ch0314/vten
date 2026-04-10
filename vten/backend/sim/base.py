@@ -279,7 +279,7 @@ class SimBackend(Backend):
         old_size = self._shm.size
         shm_name = self._shm.name  # e.g. "vten_abc123"
 
-        logger.info("[session] resizing SHM: %d → %d bytes", old_size, new_size)
+        logger.debug("[session] resizing SHM: %d → %d bytes", old_size, new_size)
 
         # ftruncate the underlying POSIX SHM object to grow it.
         # SharedMemory doesn't expose fd, so open it directly.
@@ -357,7 +357,7 @@ class SimBackend(Backend):
         logger.log(5, "[handshake 4] CMD_READY signaled")
 
     # Progress polling interval (seconds)
-    _PROGRESS_POLL_INTERVAL = 10.0
+    _PROGRESS_POLL_INTERVAL = 20.0
 
     # Quiet period: suppress progress/heartbeat for fast executions (seconds)
     _QUIET_PERIOD = 4.0
@@ -728,6 +728,8 @@ class SimBackend(Backend):
                         expected = max(1, cmd_size // self._DEFAULT_BYTES_PER_BEAT)
                         pct = min(100, s.total_beats * 100 // expected)
                         cmd_info += f" {pct}% ({s.total_beats}/{expected} beats)"
+                    elif op_name == "POLL_REG":
+                        cmd_info += f" {s.total_beats} polls"
                     elif s.stall_cycles > 100:
                         cmd_info += f" stalled {s.stall_cycles} cyc"
 
@@ -745,11 +747,14 @@ class SimBackend(Backend):
         prev: dict[int, _CmdSnapshot],
         cmd_meta: list[dict],
     ) -> str:
-        """Format heartbeat line showing per-BFM activity deltas.
+        """Format heartbeat line showing summarized activity.
 
+        Groups stalled commands by opcode instead of listing each one.
+        Active commands (with deltas) are shown individually.
         Returns empty string if there is no meaningful activity to report.
         """
-        parts: list[str] = []
+        active_parts: list[str] = []  # cmds with actual progress
+        stalled: dict[str, list[int]] = {}  # op_name -> [cmd_ids] with no change
         any_activity = False
 
         for cmd_id, cs in cur.items():
@@ -767,36 +772,48 @@ class SimBackend(Backend):
             d_active = cs.active_cycles - ps.active_cycles
             d_stall = cs.stall_cycles - ps.stall_cycles
 
-            if d_beats > 0 or d_active > 0 or d_stall > 0:
+            has_progress = d_beats > 0 or d_active > 0 or d_stall > 0
+            if has_progress:
                 any_activity = True
 
-            # Build per-command heartbeat fragment
-            frag = f"{op_name} cmd#{cmd_id}"
-            if op_name in ("PUSH", "PULL", "LOAD", "STORE") and cmd_size > 0:
-                expected = max(1, cmd_size // self._DEFAULT_BYTES_PER_BEAT)
-                pct = min(100, cs.total_beats * 100 // expected)
-                frag += f" {pct}%"
-                if d_beats > 0:
-                    throughput_bytes = d_beats * self._DEFAULT_BYTES_PER_BEAT
-                    throughput_str = format_size(throughput_bytes)
-                    frag += f" (+{d_beats} beats, ~{throughput_str}/poll)"
-                elif d_stall > 0:
-                    frag += f" (stalling, +{d_stall} stall cyc)"
+            # Active commands: show detail individually
+            if has_progress:
+                frag = f"{op_name} cmd#{cmd_id}"
+                if op_name in ("PUSH", "PULL", "LOAD", "STORE") and cmd_size > 0:
+                    expected = max(1, cmd_size // self._DEFAULT_BYTES_PER_BEAT)
+                    pct = min(100, cs.total_beats * 100 // expected)
+                    frag += f" {pct}%"
+                    if d_beats > 0:
+                        throughput_bytes = d_beats * self._DEFAULT_BYTES_PER_BEAT
+                        throughput_str = format_size(throughput_bytes)
+                        frag += f" (+{d_beats} beats, ~{throughput_str}/poll)"
+                    elif d_stall > 0:
+                        frag += f" (stalling, +{d_stall} stall cyc)"
+                elif op_name == "POLL_REG":
+                    frag += f" {cs.total_beats} polls (+{d_beats})"
                 else:
-                    frag += " (no change)"
-            elif op_name == "POLL_REG":
-                frag += f" polling (+{d_stall} stall cyc)"
+                    if d_active > 0:
+                        frag += f" (+{d_active} active cyc)"
+                    elif d_stall > 0:
+                        frag += f" (+{d_stall} stall cyc)"
+                if cs.last_active_cycle > 0:
+                    frag += f" @cycle {cs.last_active_cycle}"
+                active_parts.append(frag)
             else:
-                if d_active > 0:
-                    frag += f" (+{d_active} active cyc)"
-                elif d_stall > 0:
-                    frag += f" (+{d_stall} stall cyc)"
+                # Stalled: group by opcode
+                stalled.setdefault(op_name, []).append(cmd_id)
 
-            if cs.last_active_cycle > 0:
-                frag += f" @cycle {cs.last_active_cycle}"
+        # Build stalled summary
+        stalled_parts: list[str] = []
+        for op_name, ids in stalled.items():
+            if len(ids) == 1:
+                stalled_parts.append(f"{op_name} cmd#{ids[0]} (no change)")
+            else:
+                stalled_parts.append(
+                    f"{op_name} x{len(ids)} (no change, #{ids[0]}-#{ids[-1]})"
+                )
 
-            parts.append(frag)
-
+        parts = active_parts + stalled_parts
         if not parts:
             return ""
         if not any_activity:

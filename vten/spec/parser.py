@@ -356,12 +356,93 @@ def _parse_split(raw: dict) -> SplitSpec:
     return SplitSpec(mode=raw["mode"], ports=ports, interleave=interleave)
 
 
+def _expand_register_array(entry: dict) -> list[dict]:
+    """Expand a ``register_array`` shorthand into a flat list of register dicts.
+
+    Supported keys inside the ``register_array`` block:
+        name   – name pattern with ``{i}`` placeholder (required)
+        count  – number of elements (required)
+        width  – bit-width for each register (default 32)
+        addr_pair – if True, expand each element into ``_lo`` (31:0) and
+                    ``_hi`` (63:32) pairs (default False)
+        auto_bind – template; ``{i}`` in ``offset`` is substituted per index
+        access, pulse, reset_value – forwarded as-is
+    """
+    spec = entry["register_array"]
+    name_pattern: str = spec["name"]
+    count: int = spec["count"]
+    width: int = spec.get("width", 32)
+    addr_pair: bool = spec.get("addr_pair", False)
+    ab_template: dict | None = spec.get("auto_bind")
+    access = spec.get("access", "rw")
+    pulse = spec.get("pulse", False)
+    reset_value = spec.get("reset_value", 0)
+
+    expanded: list[dict] = []
+    for i in range(count):
+        base_name = name_pattern.replace("{i}", str(i))
+
+        def _make_auto_bind(bits: str | None) -> dict | None:
+            if ab_template is None:
+                return None
+            ab = dict(ab_template)
+            if "offset" in ab and isinstance(ab["offset"], str):
+                ab["offset"] = ab["offset"].replace("{i}", str(i))
+            if bits is not None:
+                ab["bits"] = bits
+            return ab
+
+        if addr_pair:
+            # Insert _lo/_hi before the index so that wgt_addr_{i}
+            # expands to wgt_addr_lo_0, wgt_addr_hi_0 (not wgt_addr_0_lo).
+            lo_name = name_pattern.replace("_{i}", "_lo_{i}").replace("{i}", str(i))
+            hi_name = name_pattern.replace("_{i}", "_hi_{i}").replace("{i}", str(i))
+            expanded.append({
+                "name": lo_name,
+                "width": 32,
+                "auto_bind": _make_auto_bind("31:0"),
+                "access": access,
+                "pulse": pulse,
+                "reset_value": reset_value,
+            })
+            expanded.append({
+                "name": hi_name,
+                "width": 32,
+                "auto_bind": _make_auto_bind("63:32"),
+                "access": access,
+                "pulse": pulse,
+                "reset_value": reset_value,
+            })
+        else:
+            reg: dict = {
+                "name": base_name,
+                "width": width,
+                "access": access,
+                "pulse": pulse,
+                "reset_value": reset_value,
+            }
+            ab = _make_auto_bind(None)
+            if ab is not None:
+                reg["auto_bind"] = ab
+            expanded.append(reg)
+
+    return expanded
+
+
 def _parse_registers(
     raw: list, interface_name: str, user_register_base: int = 0x14
 ) -> list[RegisterSpec]:
+    # Pre-process: expand register_array entries inline
+    preprocessed: list[dict] = []
+    for r in raw:
+        if "register_array" in r:
+            preprocessed.extend(_expand_register_array(r))
+        else:
+            preprocessed.append(r)
+
     registers = []
     next_offset = user_register_base
-    for r in raw:
+    for r in preprocessed:
         # width shorthand: { name: foo, width: 10 } → fields: { foo: "9:0" }
         if "width" in r and "fields" not in r:
             w = r["width"]

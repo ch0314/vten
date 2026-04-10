@@ -444,6 +444,25 @@ module vten_bfm_axi4 #(
         end
     endtask
 
+    // ── Periodic stats flush to SHM (every 512 cycles) ──
+    // Separate always_ff so it doesn't interfere with R/W channel blocks.
+    // If check_completion ran first (blocking active=0), entry is skipped.
+    always_ff @(posedge clk) begin
+        if (cycle_count[8:0] == 9'b0) begin
+            foreach (active_table[i]) begin
+                if (active_table[i].active)
+                    vten_write_cmd_stats(
+                        active_table[i].cmd.cmd_id, CMD_ISSUED,
+                        active_table[i].issue_cycle, 0,
+                        (active_table[i].first_active == 0) ? 0 : active_table[i].first_active,
+                        active_table[i].last_active,
+                        active_table[i].active_cycles,
+                        active_table[i].total_beats,
+                        active_table[i].stall_cycles);
+            end
+        end
+    end
+
     // ── Done Queue drain: one per cycle to Scheduler ──
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

@@ -340,11 +340,4 @@ module tb_top;
 {% endfor %}
 {% endif %}
 
-    // ── Timeout ──
-    initial begin
-        #({{ timeout_cycles }} * {{ clock_period_ns }});
-        $display("TIMEOUT: simulation exceeded {{ timeout_cycles }} cycles");
-        $finish;
-    end
-
 endmodule
