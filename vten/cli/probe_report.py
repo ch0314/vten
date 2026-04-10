@@ -16,7 +16,7 @@ def enrich_stats(
     compiled: object | None,
 ) -> list[dict]:
     """Build enriched command stats dicts from CmdStats + CompiledResult."""
-    from vten.reporting import build_command_metadata, merge_stats_with_metadata
+    from vten.runtime.reporting import build_command_metadata, merge_stats_with_metadata
 
     if compiled is not None and compiled.commands:
         metadata = build_command_metadata(compiled)
@@ -24,7 +24,7 @@ def enrich_stats(
         return [e.to_dict() for e in enriched]
 
     # Fallback: no CompiledResult available (pre-built SHM path)
-    from vten.reporting import _status_name
+    from vten.runtime.reporting import _status_name
 
     return [
         {

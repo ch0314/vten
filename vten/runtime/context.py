@@ -369,7 +369,7 @@ class ExecutionContext:
 
         Returns (count, list[VerificationResult]).
         """
-        from vten.reporting import VerificationResult
+        from vten.runtime.reporting import VerificationResult
         from vten.runtime.golden import compute_golden_outputs
         from vten.runtime.verifier import check_match
 

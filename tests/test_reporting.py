@@ -109,19 +109,19 @@ class StubCompiledResult:
 class TestStatusName:
 
     def test_committed(self):
-        from vten.reporting import _status_name
+        from vten.runtime.reporting import _status_name
         assert _status_name(3) == "COMMITTED"
 
     def test_pending(self):
-        from vten.reporting import _status_name
+        from vten.runtime.reporting import _status_name
         assert _status_name(0) == "PENDING"
 
     def test_error(self):
-        from vten.reporting import _status_name
+        from vten.runtime.reporting import _status_name
         assert _status_name(4) == "ERROR"
 
     def test_unknown(self):
-        from vten.reporting import _status_name
+        from vten.runtime.reporting import _status_name
         result = _status_name(99)
         assert "UNKNOWN" in result
 
@@ -166,13 +166,13 @@ class TestBuildCommandMetadataUnit:
         )
 
     def test_metadata_count_matches_commands(self):
-        from vten.reporting import build_command_metadata
+        from vten.runtime.reporting import build_command_metadata
         compiled = self._make_compiled()
         metadata = build_command_metadata(compiled)
         assert len(metadata) == 3
 
     def test_push_metadata(self):
-        from vten.reporting import build_command_metadata
+        from vten.runtime.reporting import build_command_metadata
         compiled = self._make_compiled()
         metadata = build_command_metadata(compiled)
         push = metadata[0]
@@ -182,7 +182,7 @@ class TestBuildCommandMetadataUnit:
         assert push.size == 1024
 
     def test_pull_metadata(self):
-        from vten.reporting import build_command_metadata
+        from vten.runtime.reporting import build_command_metadata
         compiled = self._make_compiled()
         metadata = build_command_metadata(compiled)
         pull = metadata[1]
@@ -190,7 +190,7 @@ class TestBuildCommandMetadataUnit:
         assert pull.tensor_name == "data_out"
 
     def test_write_reg_no_tensor(self):
-        from vten.reporting import build_command_metadata
+        from vten.runtime.reporting import build_command_metadata
         compiled = self._make_compiled()
         metadata = build_command_metadata(compiled)
         wreg = metadata[2]
@@ -201,7 +201,7 @@ class TestBuildCommandMetadataUnit:
         assert wreg.reg_value == 42
 
     def test_sub_kernel_is_self_for_unit(self):
-        from vten.reporting import build_command_metadata
+        from vten.runtime.reporting import build_command_metadata
         compiled = self._make_compiled()
         metadata = build_command_metadata(compiled)
         # For unit kernel, sub_kernel derived from origin_path "_self.xxx"
@@ -216,7 +216,7 @@ class TestBuildCommandMetadataUnit:
 class TestBuildCommandMetadataComposite:
 
     def test_sub_kernel_populated(self):
-        from vten.reporting import build_command_metadata
+        from vten.runtime.reporting import build_command_metadata
         from vten.spec.models import OpCode, Protocol
 
         commands = [
@@ -258,7 +258,7 @@ class TestBuildCommandMetadataComposite:
 class TestMergeStatsWithMetadata:
 
     def test_basic_merge(self):
-        from vten.reporting import (
+        from vten.runtime.reporting import (
             CommandMetadata,
             merge_stats_with_metadata,
         )
@@ -289,7 +289,7 @@ class TestMergeStatsWithMetadata:
         assert e.active_cycles == 20
 
     def test_missing_metadata_fallback(self):
-        from vten.reporting import merge_stats_with_metadata
+        from vten.runtime.reporting import merge_stats_with_metadata
 
         stats = [StubCmdStats(cmd_id=5, status=3)]
         enriched = merge_stats_with_metadata(stats, [])
@@ -297,7 +297,7 @@ class TestMergeStatsWithMetadata:
         assert enriched[0].op_name == ""  # fallback
 
     def test_utilization_carried_through(self):
-        from vten.reporting import (
+        from vten.runtime.reporting import (
             CommandMetadata,
             merge_stats_with_metadata,
         )
@@ -330,7 +330,7 @@ class TestMergeStatsWithMetadata:
 class TestEnrichedCmdStatsToDict:
 
     def test_to_dict_basic_fields(self):
-        from vten.reporting import EnrichedCmdStats
+        from vten.runtime.reporting import EnrichedCmdStats
 
         e = EnrichedCmdStats(
             cmd_id=0, op_name="PUSH", interface_name="s_axis",
@@ -352,7 +352,7 @@ class TestEnrichedCmdStatsToDict:
         assert d["size"] == 1024
 
     def test_to_dict_no_tensor_for_barrier(self):
-        from vten.reporting import EnrichedCmdStats
+        from vten.runtime.reporting import EnrichedCmdStats
 
         e = EnrichedCmdStats(
             cmd_id=0, op_name="BARRIER", interface_name="",
@@ -370,7 +370,7 @@ class TestEnrichedCmdStatsToDict:
         assert "tensor" not in d
 
     def test_to_dict_sub_kernel_only_for_composite(self):
-        from vten.reporting import EnrichedCmdStats
+        from vten.runtime.reporting import EnrichedCmdStats
 
         # _self should not appear in output
         e = EnrichedCmdStats(
@@ -389,7 +389,7 @@ class TestEnrichedCmdStatsToDict:
         assert "sub_kernel" not in d
 
     def test_to_dict_reg_fields_for_write_reg(self):
-        from vten.reporting import EnrichedCmdStats
+        from vten.runtime.reporting import EnrichedCmdStats
 
         e = EnrichedCmdStats(
             cmd_id=0, op_name="WRITE_REG", interface_name="ctrl",
@@ -408,7 +408,7 @@ class TestEnrichedCmdStatsToDict:
         assert d["reg_value"] == 42
 
     def test_to_dict_probe_flag(self):
-        from vten.reporting import EnrichedCmdStats
+        from vten.runtime.reporting import EnrichedCmdStats
 
         e = EnrichedCmdStats(
             cmd_id=0, op_name="PUSH", interface_name="",
@@ -426,7 +426,7 @@ class TestEnrichedCmdStatsToDict:
         assert d["probe"] is True
 
     def test_to_dict_port_field(self):
-        from vten.reporting import EnrichedCmdStats
+        from vten.runtime.reporting import EnrichedCmdStats
 
         e = EnrichedCmdStats(
             cmd_id=0, op_name="PUSH", interface_name="",
@@ -452,13 +452,13 @@ class TestEnrichedCmdStatsToDict:
 class TestVerificationResult:
 
     def test_pass_result(self):
-        from vten.reporting import VerificationResult
+        from vten.runtime.reporting import VerificationResult
         vr = VerificationResult(tensor_name="out", passed=True)
         assert vr.passed
         assert vr.max_diff == 0.0
 
     def test_fail_result(self):
-        from vten.reporting import VerificationResult
+        from vten.runtime.reporting import VerificationResult
         vr = VerificationResult(
             tensor_name="out", passed=False,
             max_diff=0.5, shape=(32, 32),
@@ -471,7 +471,7 @@ class TestVerificationResult:
 class TestProbeResult:
 
     def test_probe_match(self):
-        from vten.reporting import ProbeResult
+        from vten.runtime.reporting import ProbeResult
         pr = ProbeResult(
             probe_point="mac_atu.ifm_in",
             connection="fmapIO.ifm_out -> mac_atu.ifm_in",
@@ -480,7 +480,7 @@ class TestProbeResult:
         assert pr.passed
 
     def test_probe_mismatch(self):
-        from vten.reporting import ProbeResult
+        from vten.runtime.reporting import ProbeResult
         pr = ProbeResult(
             probe_point="mac_atu.ifm_in",
             connection="fmapIO.ifm_out -> mac_atu.ifm_in",
