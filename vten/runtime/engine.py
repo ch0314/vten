@@ -40,8 +40,12 @@ from vten.runtime.flatten import (
 )
 from vten.runtime.ir import BFMConfig, Command, IRLowering
 from vten.runtime.resolver import ParameterResolver
-from vten.runtime.serializer import MultiPortSerializer, StreamSerializer
-from vten.backend.sim.shm_packer import _block_split_data, _parse_split_spec
+from vten.runtime.serializer import (
+    MultiPortSerializer,
+    StreamSerializer,
+    block_split_data,
+    parse_split_spec,
+)
 
 if TYPE_CHECKING:
     from vten.dsl.operations import Operation
@@ -533,7 +537,7 @@ class RuntimeEngine:
 
             # Multi-port split → _port_buffers
             if iface_spec.split:
-                split_spec = _parse_split_spec(iface_spec.split)
+                split_spec = parse_split_spec(iface_spec.split)
                 if exposed._serialized is not None:
                     splitter = MultiPortSerializer()
                     exposed._port_buffers = splitter.split_tensor(
@@ -577,7 +581,7 @@ class RuntimeEngine:
                     exposed._port_mode = "channel_interleave"
                     exposed._interleave_unit = iface_spec.array.interleave.unit
                 else:
-                    exposed._port_buffers = _block_split_data(
+                    exposed._port_buffers = block_split_data(
                         exposed._serialized, flat_names, exposed._serialized_size
                     )
                     exposed._port_mode = "block"

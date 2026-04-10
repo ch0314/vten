@@ -127,45 +127,6 @@ def _pack_shm_common(
     return image, layout, data_region_offset
 
 
-def _parse_split_spec(raw):
-    """Parse a raw dict or SplitSpec into a SplitSpec dataclass."""
-    from vten.spec.models import InterleaveSpec, PortDef, SplitSpec
-
-    if isinstance(raw, SplitSpec):
-        return raw
-    ports = [
-        PortDef(name=p["name"], base_addr=p.get("base_addr", 0))
-        for p in raw.get("ports", [])
-    ]
-    interleave = None
-    if "interleave" in raw:
-        interleave = InterleaveSpec(unit=raw["interleave"]["unit"])
-    return SplitSpec(mode=raw["mode"], ports=ports, interleave=interleave)
-
-
-def _block_split_data(
-    serialized: bytes | None,
-    flat_names: list[str],
-    serialized_size: int,
-) -> dict[str, bytes]:
-    """Block-split serialized data (or allocate empty) across port names."""
-    n = len(flat_names)
-    if serialized is not None:
-        data = serialized
-        chunk_size = len(data) // n
-        remainder = len(data) % n
-        result = {}
-        offset = 0
-        for i, fname in enumerate(flat_names):
-            sz = chunk_size + (1 if i < remainder else 0)
-            result[fname] = data[offset : offset + sz]
-            offset += sz
-        return result
-    else:
-        per_elem_size = serialized_size // n
-        return {fname: bytes(per_elem_size) for fname in flat_names}
-
-
 # ── Public packing API ──
 
 
