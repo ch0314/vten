@@ -18,6 +18,7 @@ import subprocess
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from vten.backend.base import Backend, BackendResult, CmdStats, raise_backend_error
@@ -85,10 +86,29 @@ class SimBackend(Backend):
     STATS_ENABLED_OFFSET = 0x88
 
     def __init__(self, project_config: dict, backend_section: str) -> None:
+        from vten.backend.base import RunContext
         self._config = project_config
         cfg = project_config.get("backend", {}).get(backend_section, {})
         self._submit_timeout_s = cfg.get("submit_timeout_s", 300)
         self._timeout_ms = cfg.get("timeout_ms", 10000)
+
+        # Initialise RunContext from legacy _ keys (backward compat).
+        # Callers should prefer set_run_context() for typed access.
+        self._run_ctx = RunContext(
+            project_dir=Path(project_config.get("_project_dir", ".")),
+            kernel_build_dir=(
+                Path(project_config["_kernel_build_dir"])
+                if "_kernel_build_dir" in project_config else None
+            ),
+            waveform=bool(project_config.get("_waveform")),
+            waveform_on_fail=bool(project_config.get("_waveform_on_fail")),
+            gui=bool(project_config.get("_gui")),
+            sim_verbose=bool(project_config.get("_sim_verbose")),
+            mismatch_dir=(
+                Path(project_config["_mismatch_dir"])
+                if "_mismatch_dir" in project_config else None
+            ),
+        )
 
         # Runtime state — all None until submit
         self._process: subprocess.Popen | None = None
@@ -113,11 +133,11 @@ class SimBackend(Backend):
             FLAG_WAVEFORM_DUMP,
         )
 
-        # Compute SHM flags from backend config
+        # Compute SHM flags from run context
         flags = 0
-        if self._config.get("_waveform"):
+        if self._run_ctx.waveform:
             flags |= FLAG_WAVEFORM_DUMP
-        if self._config.get("_gui"):
+        if self._run_ctx.gui:
             flags |= FLAG_PAUSE_ON_MISMATCH
 
         is_multi = compiled.views is not None and len(compiled.views) > 1
@@ -243,7 +263,7 @@ class SimBackend(Backend):
     def _parse_mismatch_file(self) -> list[dict]:
         """Parse mismatches.jsonl written by the C bridge."""
         import json
-        mismatch_dir = self._config.get("_mismatch_dir")
+        mismatch_dir = self._run_ctx.mismatch_dir
         if not mismatch_dir:
             return []
         mismatch_path = os.path.join(str(mismatch_dir), "mismatches.jsonl")
@@ -384,7 +404,7 @@ class SimBackend(Backend):
         if self._sem_b2h is None or self._shm is None:
             return BackendResult(status=BACKEND_STATUS_DONE)
 
-        gui_mode = self._config.get("_gui")
+        gui_mode = self._run_ctx.gui
 
         # Step [8]: Wait for backend done/error signal with progress polling
         # GUI mode: extend timeout to 24h — user controls simulation interactively

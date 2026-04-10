@@ -128,9 +128,19 @@ class InferenceSession:
             from vten.cli.config import load_project_config
             project_config = load_project_config(project)
 
+        # Build RunContext for typed runtime state
+        from vten.backend.base import RunContext
+        kernel_build_dir = None
         if kernel is not None:
             kernel_dir = project / "kernels" / kernel
-            project_config["_kernel_build_dir"] = str(kernel_dir / "build")
+            kernel_build_dir = kernel_dir / "build"
+            # Legacy compat: some code paths still read _kernel_build_dir
+            project_config["_kernel_build_dir"] = str(kernel_build_dir)
+
+        run_ctx = RunContext(
+            project_dir=project,
+            kernel_build_dir=kernel_build_dir,
+        )
 
         # XRT-specific: inject target and enable persistent BO pool
         kwargs: dict[str, Any] = {}
@@ -139,6 +149,7 @@ class InferenceSession:
             kwargs["persistent"] = True
 
         backend = get_backend(backend_name, project_config, **kwargs)
+        backend.set_run_context(run_ctx)
         return backend, project_config
 
     @classmethod

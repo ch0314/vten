@@ -57,7 +57,7 @@ def _run_single_test(
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # Set mismatch dir for probe logging (C bridge reads via env var)
-    config["_mismatch_dir"] = str(results_dir)
+    backend_inst._run_ctx.mismatch_dir = results_dir
 
     configs_passed = 0
     total_cycles = 0
@@ -197,8 +197,9 @@ def _run_single_test(
     ))
 
     # Waveform file management
-    if config.get("_waveform"):
-        build_dir = Path(config.get("_kernel_build_dir", "."))
+    rctx = backend_inst._run_ctx
+    if rctx.waveform:
+        build_dir = rctx.kernel_build_dir or Path(".")
         # Look for .wdb files in common locations
         for wdb_glob in [build_dir / "*.wdb",
                          build_dir / "generated" / "*.wdb",
@@ -213,7 +214,7 @@ def _run_single_test(
                 break
 
         # waveform_on_fail: delete wdb on PASS
-        if config.get("_waveform_on_fail") and status == "PASS":
+        if rctx.waveform_on_fail and status == "PASS":
             wdb_file = results_dir / "waveform.wdb"
             if wdb_file.exists():
                 wdb_file.unlink()
@@ -264,20 +265,26 @@ def run_test(
         logger.info("discovered %d test(s): %s",
                      len(scenarios), [n for n, _ in scenarios])
 
-    # Inject kernel-level paths into config
+    # Build RunContext for backend (typed runtime state)
+    from vten.backend.base import RunContext
+
+    run_ctx = RunContext(
+        project_dir=project,
+        kernel_build_dir=kernel_dir / "build",
+        waveform=waveform or waveform_on_fail,
+        waveform_on_fail=waveform_on_fail,
+        gui=gui,
+        sim_verbose=sim_verbose,
+    )
+
+    # Keep legacy _ keys in config for backward compat (runtime pipeline
+    # reads _project_dir from project_params, not from RunContext yet).
     config["_project_dir"] = str(project)
     config["_kernel_build_dir"] = str(kernel_dir / "build")
-    if waveform or waveform_on_fail:
-        config["_waveform"] = True
-    if waveform_on_fail:
-        config["_waveform_on_fail"] = True
-    if gui:
-        config["_gui"] = True
-    if sim_verbose:
-        config["_sim_verbose"] = True
 
     backend_name = resolve_backend_name(config, cli_backend=backend)
     backend_inst = get_backend(backend_name, config)
+    backend_inst.set_run_context(run_ctx)
 
     import os
     prev_cwd = os.getcwd()

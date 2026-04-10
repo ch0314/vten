@@ -42,24 +42,24 @@ class VerilatorBackend(SimBackend):
         produced by the VerilatorBuildPipeline make stage.
         """
         # Locate binary: obj_dir/Vtb_top (Verilator output) or root Vtb_top
-        kernel_build = self._config.get("_kernel_build_dir")
+        kernel_build = self._run_ctx.kernel_build_dir
         if kernel_build:
-            obj_dir_binary = os.path.join(kernel_build, "obj_dir", "Vtb_top")
-            root_binary = os.path.join(kernel_build, "Vtb_top")
+            kb = str(kernel_build)
+            obj_dir_binary = os.path.join(kb, "obj_dir", "Vtb_top")
+            root_binary = os.path.join(kb, "Vtb_top")
             binary = obj_dir_binary if os.path.exists(obj_dir_binary) else root_binary
         else:
             veri_cfg = self._config.get("backend", {}).get("verilator", {})
-            sim_dir = veri_cfg.get("sim_dir",
-                          self._config.get("_project_dir", "."))
+            sim_dir = veri_cfg.get("sim_dir", str(self._run_ctx.project_dir))
             binary = os.path.join(sim_dir, "Vtb_top")
 
         # Resolve relative paths against project dir
-        project_dir = self._config.get("_project_dir", ".")
+        project_dir = str(self._run_ctx.project_dir)
         if not os.path.isabs(binary):
             binary = os.path.normpath(os.path.join(project_dir, binary))
 
         # Working directory: kernel build dir or project dir
-        cwd = kernel_build or project_dir
+        cwd = str(kernel_build) if kernel_build else project_dir
 
         cmd = [
             binary,
@@ -74,9 +74,8 @@ class VerilatorBackend(SimBackend):
         logger.debug("verilator cwd: %s", cwd)
 
         env = os.environ.copy()
-        mismatch_dir = self._config.get("_mismatch_dir")
-        if mismatch_dir:
-            env["VTEN_MISMATCH_DIR"] = str(mismatch_dir)
+        if self._run_ctx.mismatch_dir:
+            env["VTEN_MISMATCH_DIR"] = str(self._run_ctx.mismatch_dir)
         try:
             self._process = subprocess.Popen(
                 cmd,

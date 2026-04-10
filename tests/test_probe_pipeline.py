@@ -276,6 +276,8 @@ class TestMismatchFileParsing:
 
     def _make_backend(self, mismatch_dir):
         """Create a minimal SimBackend-like object with _parse_mismatch_file."""
+        from pathlib import Path
+        from vten.backend.base import RunContext
         from vten.backend.sim.base import SimBackend
 
         # SimBackend is abstract, so we instantiate minimally
@@ -283,10 +285,10 @@ class TestMismatchFileParsing:
             def _start_simulator(self):
                 pass
 
-        config = {"_mismatch_dir": str(mismatch_dir)}
-        # Bypass __init__ and set config directly
+        # Bypass __init__ and set config + _run_ctx directly
         obj = object.__new__(_Stub)
-        obj._config = config
+        obj._config = {}
+        obj._run_ctx = RunContext(mismatch_dir=Path(mismatch_dir))
         return obj
 
     def test_parse_single_mismatch(self, tmp_path):
@@ -326,6 +328,7 @@ class TestMismatchFileParsing:
         assert result == []
 
     def test_no_mismatch_dir_returns_empty(self):
+        from vten.backend.base import RunContext
         from vten.backend.sim.base import SimBackend
 
         class _Stub(SimBackend):
@@ -334,6 +337,7 @@ class TestMismatchFileParsing:
 
         obj = object.__new__(_Stub)
         obj._config = {}
+        obj._run_ctx = RunContext()  # mismatch_dir=None
         result = obj._parse_mismatch_file()
         assert result == []
 

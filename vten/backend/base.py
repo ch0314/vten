@@ -1,4 +1,4 @@
-"""Backend base: ABC, error codes, result types.
+"""Backend base: ABC, error codes, result types, RunContext.
 
 Spec reference: 00_data_models.md §10.13, §13, 06_codegen_and_cli.md §5,
                 08_backend_abstraction.md §5
@@ -18,6 +18,27 @@ from vten.errors import TimeoutError as VTenTimeoutError
 
 if TYPE_CHECKING:
     from vten.runtime.engine import CompiledResult
+
+
+# ── RunContext — runtime execution state (replaces _ prefix keys) ──
+
+
+@dataclass
+class RunContext:
+    """Runtime execution context passed to backends and pipelines.
+
+    Replaces the ``_`` prefix keys that were previously injected into the
+    project config dict (e.g. ``config["_project_dir"]``).  This gives
+    type-safe access and keeps the user-facing config dict clean.
+    """
+
+    project_dir: Path = field(default_factory=lambda: Path("."))
+    kernel_build_dir: Path | None = None
+    waveform: bool = False
+    waveform_on_fail: bool = False
+    gui: bool = False
+    sim_verbose: bool = False
+    mismatch_dir: Path | None = None
 
 
 # ── CompileTarget — backend type identifier ──
@@ -162,7 +183,18 @@ class Backend(abc.ABC):
     All backends must implement execute() and cleanup().
     SIM backends may additionally override shutdown() for process signalling.
     SimBackend auto-manages session lifecycle within execute().
+
+    Subclasses store ``_run_ctx`` for typed access to runtime state
+    (project_dir, waveform flags, etc.).  The context is set via
+    ``set_run_context()`` or by the ``run_ctx`` constructor kwarg
+    on concrete backends.
     """
+
+    _run_ctx: RunContext
+
+    def set_run_context(self, ctx: RunContext) -> None:
+        """Attach (or replace) the runtime execution context."""
+        self._run_ctx = ctx
 
     @abc.abstractmethod
     def execute(self, compiled: CompiledResult) -> BackendResult:

@@ -90,16 +90,14 @@ class XsimBackend(SimBackend):
         snapshot = "tb_top"  # Stage 5 uses --snapshot tb_top
 
         # xsim working directory: kernel build dir > xsim_dir config > project dir
-        kernel_build = self._config.get("_kernel_build_dir")
+        kernel_build = self._run_ctx.kernel_build_dir
         if kernel_build:
-            xsim_cwd = kernel_build
+            xsim_cwd = str(kernel_build)
         else:
             xsim_cfg = self._config.get("backend", {}).get("xsim", {})
-            xsim_cwd = self._config.get("_xsim_dir",
-                           xsim_cfg.get("xsim_dir",
-                               self._config.get("_project_dir", ".")))
+            xsim_cwd = xsim_cfg.get("xsim_dir", str(self._run_ctx.project_dir))
         # Resolve relative paths against project dir
-        project_dir = self._config.get("_project_dir", ".")
+        project_dir = str(self._run_ctx.project_dir)
         if not os.path.isabs(xsim_cwd):
             xsim_cwd = os.path.normpath(os.path.join(project_dir, xsim_cwd))
 
@@ -109,7 +107,7 @@ class XsimBackend(SimBackend):
             "--testplusarg", f"TIMEOUT_MS={self._timeout_ms}",
         ]
 
-        if self._config.get("_sim_verbose"):
+        if self._run_ctx.sim_verbose:
             cmd.extend(["--testplusarg", "VTEN_VERBOSE"])
 
         # Probe golden buffer ID plusargs for passive probe BFMs
@@ -117,15 +115,15 @@ class XsimBackend(SimBackend):
         for probe_idx, buf_id in probe_map.items():
             cmd.extend(["--testplusarg", f"PROBE_GOLDEN_{probe_idx}={buf_id}"])
 
-        if self._config.get("_gui"):
+        if self._run_ctx.gui:
             cmd.append("--gui")
             logger.info("xsim GUI opened. In Tcl console:")
             logger.info("  run all     — start simulation")
             logger.info("  run 1000ns  — step forward")
-            if self._config.get("_waveform"):
+            if self._run_ctx.waveform:
                 logger.info("  source generated/waveform.tcl  — add waveform signals")
             logger.info("Probe mismatches will pause with $stop.")
-        elif self._config.get("_waveform"):
+        elif self._run_ctx.waveform:
             # Batch waveform: use TCL script for log_wave + run all
             tcl_path = os.path.join(xsim_cwd, "generated", "waveform.tcl")
             if os.path.isfile(tcl_path):
@@ -142,9 +140,8 @@ class XsimBackend(SimBackend):
         # Always capture stdout via PIPE so we can route through Python logging
         # Build env with optional VTEN_MISMATCH_DIR for probe mismatch logging
         env = os.environ.copy()
-        mismatch_dir = self._config.get("_mismatch_dir")
-        if mismatch_dir:
-            env["VTEN_MISMATCH_DIR"] = str(mismatch_dir)
+        if self._run_ctx.mismatch_dir:
+            env["VTEN_MISMATCH_DIR"] = str(self._run_ctx.mismatch_dir)
         try:
             self._process = subprocess.Popen(
                 cmd,
@@ -167,7 +164,7 @@ class XsimBackend(SimBackend):
             )
 
         # Stream xsim stdout through Python logger in a background thread
-        sim_verbose = self._config.get("_sim_verbose")
+        sim_verbose = self._run_ctx.sim_verbose
         self._stdout_thread = threading.Thread(
             target=self._stream_stdout,
             args=(self._process.stdout, sim_verbose),

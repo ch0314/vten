@@ -35,6 +35,7 @@ class XrtBackend(Backend):
     """
 
     def __init__(self, project_config: dict, persistent: bool = False) -> None:
+        from vten.backend.base import RunContext
         self._persistent = persistent
         xrt_cfg = project_config.get("backend", {}).get("xrt", {})
         self._xclbin_path = xrt_cfg.get("xclbin_path", "")
@@ -46,6 +47,15 @@ class XrtBackend(Backend):
         default_timeout = 36000000000 if target == "hw_emu" else 30000000
         self._poll_timeout_ms = xrt_cfg.get("poll_timeout_ms", default_timeout)
         self._config = project_config
+
+        # Initialise RunContext from legacy _ keys (backward compat)
+        self._run_ctx = RunContext(
+            project_dir=Path(project_config.get("_project_dir", ".")),
+            kernel_build_dir=(
+                Path(project_config["_kernel_build_dir"])
+                if "_kernel_build_dir" in project_config else None
+            ),
+        )
 
         # Auto-discover xclbin from kernel build directory
         if not self._xclbin_path:
@@ -71,7 +81,7 @@ class XrtBackend(Backend):
         """
         import logging
 
-        build_dir = self._config.get("_kernel_build_dir", "")
+        build_dir = str(self._run_ctx.kernel_build_dir) if self._run_ctx.kernel_build_dir else ""
         if not build_dir:
             return ""
 
