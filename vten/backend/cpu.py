@@ -50,12 +50,14 @@ class CpuBackend(Backend):
 
         view = compiled.flattened_view
 
-        # Find kernel instance from compiled view
-        kernel_inst = None
-        for ki in view.sub_kernels.values():
-            if ki.kernel_class_instance is not None:
-                kernel_inst = ki.kernel_class_instance
-                break
+        # Use top-level kernel instance (Composite or Simple)
+        kernel_inst = compiled.kernel_instance
+        if kernel_inst is None:
+            # Fallback for backward compat: first sub-kernel
+            for ki in view.sub_kernels.values():
+                if ki.kernel_class_instance is not None:
+                    kernel_inst = ki.kernel_class_instance
+                    break
 
         if kernel_inst is None:
             logger.warning("cpu backend: no kernel instance found, returning empty")

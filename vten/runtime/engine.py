@@ -69,6 +69,7 @@ class CompiledResult:
     view_buffer_ids: list[dict[str, int]] | None = None  # multi-config: per-view buffer_ids
     probe_buffer_map: dict[int, int] = field(default_factory=dict)  # probe_index → golden_buffer_id
     prebound_buffers: dict[int, object] = field(default_factory=dict)  # buffer_id → xrt.bo (inference)
+    kernel_instance: object | None = None  # top-level Kernel class instance (Composite or Simple)
     mode: str = "verification"  # "verification" or "inference"
 
     @property
@@ -262,6 +263,7 @@ class RuntimeEngine:
             tensor_data=tensor_data,
             iface_id_to_name=iface_id_to_name,
             probe_buffer_map=probe_buffer_map,
+            kernel_instance=self._get_primary_kernel().kernel_class_instance,
             mode="inference" if self._quiet else "verification",
         )
 
@@ -888,5 +890,6 @@ class RuntimeEngine:
             iface_id_to_name=all_iface_id_to_name,
             views=views,  # all views for multi-config verify
             view_buffer_ids=view_buffer_ids,
+            kernel_instance=engines[0]._get_primary_kernel().kernel_class_instance,
         )
 

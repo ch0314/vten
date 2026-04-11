@@ -52,6 +52,7 @@ class TestCpuBackendExecute:
     def test_empty_view_returns_ok(self):
         """No kernel instance → returns status=0 with empty buffers."""
         compiled = MagicMock()
+        compiled.kernel_instance = None
         compiled.flattened_view.sub_kernels = {}
 
         backend = CpuBackend()
@@ -61,18 +62,17 @@ class TestCpuBackendExecute:
         assert result.status == 0
 
     def test_forward_called_on_kernel(self):
-        """forward() is called via run_forward."""
+        """forward() is called via compiled.kernel_instance."""
         compiled = MagicMock()
-        ki = MagicMock()
-        ki.kernel_class_instance = MagicMock()
-        compiled.flattened_view.sub_kernels = {"main": ki}
+        kernel_inst = MagicMock()
+        compiled.kernel_instance = kernel_inst
         compiled.flattened_view.exposed_tensors = {}
 
         with patch("vten.runtime.golden.run_forward", return_value={}) as mock_fwd:
             backend = CpuBackend()
             result = backend.execute(compiled)
 
-            mock_fwd.assert_called_once_with(ki.kernel_class_instance)
+            mock_fwd.assert_called_once_with(kernel_inst)
             assert result.status == 0
 
     def test_output_buffers_populated(self):
@@ -94,12 +94,11 @@ class TestCpuBackendExecute:
         iface.packing = packing
 
         view = MagicMock()
-        view.sub_kernels = {"main": MagicMock()}
-        view.sub_kernels["main"].kernel_class_instance = MagicMock()
         view.exposed_tensors = {"output": exposed}
         view.top_spec.get_interface.return_value = iface
 
         compiled = MagicMock()
+        compiled.kernel_instance = MagicMock()
         compiled.flattened_view = view
         compiled.buffer_ids = {"output": 5}
 
