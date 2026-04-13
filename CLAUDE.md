@@ -51,51 +51,93 @@ RuntimeEngine.compile()  ← 8-stage pipeline
 | `specs/06_codegen_and_cli.md` | Jinja2 코드 생성, CLI 워크플로우 | Phase 4 |
 | `specs/07_e2e_examples.md` | E2E 예제, 구현 Phase 계획 | Phase 5 |
 | `specs/08_backend_abstraction.md` | Backend ABC, XRT 지원 설계 | Phase 4+ |
-| `specs/09_user_api.md` | 사용자 API 레벨 구조, 워크플로우 | **항상** — 사용법 참조 |
+| `specs/09_user_api.md` | 사용자 API 레벨 구조, 워크플로우 (일부 삭제된 API 포함) | **항상** — 사용법 참조 |
+| `specs/10_kernel_v2_design.md` | Kernel v2 설계 (kernel_view, ExposedTensor) | Phase 4+ |
+| `specs/11_inference_api.md` | InferenceSession, XRT eager execution | Phase 4+ |
+| `specs/12_xrt_hwemu_debug_log.md` | XRT hw_emu 디버그 기록 | 참조용 |
 
 ## Project Structure
 
 ```
 vten/
 ├── CLAUDE.md                  ← 이 파일
+├── README.md                  # 프로젝트 소개, Quick Start
 ├── pyproject.toml
 ├── vten.toml                  # 프로젝트 구성 (E2E 테스트용)
 ├── specs/                     # 스펙 문서 (읽기 전용 참조)
+├── docs/                      # 사용자 문서
+│   ├── kernel_guide.md        # Kernel 클래스 + DUT 작성법
+│   ├── composite_guide.md     # CompositeKernel 합성 가이드
+│   ├── testing_guide.md       # TestScenario 작성 및 검증
+│   ├── cli_reference.md       # CLI 명령어 레퍼런스
+│   └── architecture.md        # 시스템 아키텍처
 ├── vten/                      # Python 패키지
 │   ├── __init__.py
+│   ├── errors.py              # VTenError hierarchy
+│   ├── execution.py           # Execution orchestration
+│   ├── inference.py           # InferenceSession (FPGA deploy)
+│   ├── verifier.py            # Output verification
+│   ├── log.py                 # Logging setup
 │   ├── kernel/                # Phase 1: Kernel, Tensor, CompositeKernel
 │   │   ├── __init__.py
 │   │   ├── tensor.py
 │   │   ├── base.py
 │   │   ├── composite.py
 │   │   └── register.py
-│   ├── dsl/                   # Phase 1: DSL Operations, Dependency
+│   ├── dsl/                   # Phase 1: DSL Operations
 │   │   ├── __init__.py
-│   │   ├── operations.py
-│   │   └── dependency.py
+│   │   └── operations.py
 │   ├── spec/                  # Phase 1: kernel_spec.yaml parser
 │   │   ├── __init__.py
 │   │   ├── models.py
 │   │   └── parser.py
-│   ├── runtime/               # Phase 2: 8-stage compile pipeline
+│   ├── runtime/               # Phase 2: compile pipeline + runtime support
 │   │   ├── __init__.py
 │   │   ├── context.py         # ExecutionContext
 │   │   ├── engine.py          # RuntimeEngine (orchestrator)
-│   │   ├── flattener.py       # Stage 0
-│   │   ├── resolver.py        # Stage 1
-│   │   ├── serializer.py      # Stage 3
-│   │   ├── address.py         # Stage 4
-│   │   ├── binder.py          # Stage 5
-│   │   ├── ir.py              # Stage 6
-│   │   ├── shm.py             # Stage 7
-│   │   └── errors.py          # VTenError hierarchy
+│   │   ├── flatten.py         # Stage 0: Composite flattening
+│   │   ├── resolver.py        # Stage 1: Parameter resolution
+│   │   ├── serializer.py      # Stage 3: Tensor serialization
+│   │   ├── address.py         # Stage 4: Address allocation
+│   │   ├── binder.py          # Stage 5: auto_bind resolution
+│   │   ├── ir.py              # Stage 6: IR lowering
+│   │   ├── kernel_view.py     # ExposedTensor / KernelView API
+│   │   ├── command.py         # Command interpreter (XRT)
+│   │   ├── bfm_config.py      # BFM config synthesis
+│   │   ├── golden.py          # Golden reference comparison
+│   │   ├── output_reader.py   # SHM output tensor reader
+│   │   ├── reporting.py       # Test result reporting
+│   │   ├── probe_manager.py   # Probe signal collection
+│   │   └── layout.py          # Tensor layout/packing
 │   ├── backend/               # Phase 4: Backend adapters
 │   │   ├── __init__.py
-│   │   ├── base.py            # Backend ABC
-│   │   └── xsim.py            # xsim backend
+│   │   ├── base.py            # Backend ABC, RunContext, CmdStats
+│   │   ├── registry.py        # Backend auto-registration
+│   │   ├── xsim.py            # xsim backend
+│   │   ├── verilator.py       # Verilator backend
+│   │   ├── cpu.py             # CPU emulation backend
+│   │   ├── xrt/               # XRT (real FPGA) backend
+│   │   │   ├── __init__.py
+│   │   │   ├── backend.py
+│   │   │   └── interpreter.py
+│   │   └── sim/               # Shared SIM infrastructure
+│   │       ├── __init__.py
+│   │       ├── base.py        # SimBackend (SHM handshake)
+│   │       ├── shm_packer.py  # SHM binary packer
+│   │       ├── shm_constants.py # Magic, version, offsets
+│   │       └── semaphore.py   # POSIX semaphore wrapper
+│   ├── build/                 # Build pipeline orchestration
+│   │   ├── __init__.py
+│   │   ├── base.py            # Build orchestrator
+│   │   ├── common.py          # Shared build utilities
+│   │   ├── composite.py       # Composite kernel build
+│   │   ├── xsim_build.py      # Vivado xsim build stages
+│   │   ├── verilator_build.py # Verilator build stages
+│   │   └── xrt_build.py       # XRT/Vitis build stages
 │   ├── codegen/               # Phase 4: Jinja2 code generation
 │   │   ├── __init__.py
-│   │   └── sv_generator.py
+│   │   ├── sv_generator.py    # SV testbench codegen
+│   │   └── xrt_generator.py   # XRT build script codegen
 │   ├── sv/                    # Phase 3: SystemVerilog library (fixed)
 │   │   ├── vten_types.svh
 │   │   ├── vten_dpi_imports.svh
@@ -106,56 +148,49 @@ vten/
 │   │   ├── vten_bfm_axi4.sv
 │   │   ├── vten_bfm_axilite.sv
 │   │   ├── vten_bfm_probe.sv
+│   │   ├── vten_axis_if.sv
+│   │   ├── vten_aximm_if.sv
+│   │   ├── vten_axilite_if.sv
 │   │   ├── vten_shm_bridge.c
-│   │   └── vten_shm_bridge.h
+│   │   ├── vten_shm_bridge.h
+│   │   └── vten_shm_bridge_verilator.cpp
 │   ├── templates/             # Phase 4: Jinja2 templates
 │   │   ├── sim/               # xsim/verilator testbench templates
 │   │   └── xrt/               # XRT build templates
 │   └── cli/                   # Phase 4: CLI commands
 │       ├── __init__.py
-│       ├── main.py
-│       ├── init_cmd.py
-│       ├── build.py
-│       ├── run.py
-│       └── report.py
+│       ├── main.py            # Entry point, argparse
+│       ├── init_cmd.py        # vten init
+│       ├── build.py           # vten build
+│       ├── run.py             # vten run
+│       ├── list_cmd.py        # vten list
+│       ├── report.py          # vten report
+│       ├── config.py          # vten.toml loading
+│       ├── config_resolver.py # --config parsing (K=V, JSON, module:VAR)
+│       ├── discovery.py       # Kernel/test discovery
+│       ├── scenario.py        # TestScenario loading
+│       └── probe_report.py    # Probe result formatting
 ├── tests/                     # pytest 테스트
-│   ├── conftest.py
-│   ├── test_tensor.py
-│   ├── test_kernel.py
-│   ├── test_composite.py
-│   ├── test_spec_parser.py
-│   ├── test_dsl.py
-│   ├── test_runtime_resolver.py
-│   ├── test_runtime_serializer.py
-│   ├── test_runtime_address.py
-│   ├── test_runtime_ir.py
-│   ├── test_runtime_shm.py
-│   └── test_e2e_passthrough.py
-└── examples/                  # Phase 5: E2E examples
-    ├── passthrough/           # 단일 커널 예제 프로젝트
-    │   ├── vten.toml
-    │   ├── rtl/passthrough.sv
-    │   └── kernels/
-    │       └── passthrough/
-    │           ├── kernel_spec.yaml
-    │           ├── passthrough_kernel.py
-    │           └── tests/test_passthrough.py
-    └── conv3d/                # 멀티 커널 예제 프로젝트
-        ├── vten.toml
-        ├── rtl/
-        ├── ip/
-        └── kernels/
-            ├── conv3d/
-            │   ├── kernel_spec.yaml
-            │   └── tests/
-            └── npu_top/
-                ├── kernel_spec.yaml
-                └── tests/
+└── examples/                  # E2E 예제 프로젝트
+    ├── passthrough/           # AXI4-Stream 단일 커널 (+ 다양한 변형)
+    ├── mm_loopback/           # AXI4 memory-mapped 예제
+    └── scale_add/             # CompositeKernel 파이프라인 예제
 ```
 
 ## Workflow
 
 Implementer / Tester 분리 TDD 워크플로우: [`WORKFLOW.md`](WORKFLOW.md) 참조.
+
+## Documentation
+
+| 문서 | 내용 | 대상 |
+|------|------|------|
+| [`README.md`](README.md) | 프로젝트 소개, Quick Start | 처음 접하는 사용자 |
+| [`docs/kernel_guide.md`](docs/kernel_guide.md) | kernel_spec.yaml + Kernel 클래스 + DUT 작성법 | 커널 작성자 |
+| [`docs/composite_guide.md`](docs/composite_guide.md) | CompositeKernel 합성 및 run() 패턴 | 멀티 IP 검증 |
+| [`docs/testing_guide.md`](docs/testing_guide.md) | TestScenario, Config, 검증 워크플로우 | 테스트 작성자 |
+| [`docs/cli_reference.md`](docs/cli_reference.md) | CLI 명령어 전체 레퍼런스 | 모든 사용자 |
+| [`docs/architecture.md`](docs/architecture.md) | 시스템 아키텍처, 파이프라인 상세 | 내부 개발자 |
 
 ## Implementation Phases
 
@@ -180,6 +215,19 @@ Phase 5: Validation         ← specs: 07
    examples/, 통합 테스트
    완료 기준: Passthrough E2E pass, Conv3D golden match
 ```
+
+## Known Spec ↔ Code Divergences
+
+구현 과정에서 스펙과 달라진 부분. 코드가 현재 동작이며, 스펙 업데이트가 필요한 항목들:
+
+| Spec | 항목 | 스펙 기술 | 실제 코드 |
+|------|------|-----------|-----------|
+| `02` | Stage 7 위치 | RuntimeEngine 내부 | `backend/sim/` (SimBackend)으로 분리 |
+| `02` | `instantiate()` 시그니처 | `(kernel, config)` | `(kernel_cls, config, project_dir)` |
+| `02` | `run()` 반환 타입 | `BatchResult` | `ExecutionResult` |
+| `02` | IR lowering | engine 내부 메서드 | `ir.py`의 별도 `IRLowering` 클래스 |
+| `09` | `run_kernel()` / `KernelExecutor` | 존재 | 삭제됨 → `InferenceSession` 대체 |
+| `06` | `vten spec --detect` | CLI 명령 기술 | 미구현 |
 
 ## Implementation Rules
 
@@ -302,7 +350,7 @@ RTL 소스가 크기 때문에 vten/ 안으로 옮기지 않는다.
 - `VTEN_ROOT`: `import vten`으로 해결. SV 라이브러리, 템플릿 위치.
 - `PROJECT_ROOT`: `vten.toml` 위치. RTL, kernels, build, results.
 
-상세: `specs/path_resolution.md` 참조.
+상세: `docs/architecture.md` 참조.
 
 **구현 시 주의:**
 - 모든 파일 경로는 `PROJECT_ROOT` 또는 `VTEN_ROOT` 기준 상대 경로로 해결

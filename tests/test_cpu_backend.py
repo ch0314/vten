@@ -75,8 +75,8 @@ class TestCpuBackendExecute:
             mock_fwd.assert_called_once_with(kernel_inst)
             assert result.status == 0
 
-    def test_output_buffers_populated(self):
-        """DEV_TO_HOST tensor data appears in output_buffers."""
+    def test_output_tensors_populated(self):
+        """DEV_TO_HOST tensor data appears in _forward_tensors."""
         from vten.spec.models import Direction, PackingScheme
 
         # Set up a simple exposed tensor
@@ -86,21 +86,12 @@ class TestCpuBackendExecute:
         exposed.top_interface = "m_axis"
         exposed.origin_tensor.dtype = torch.int8
 
-        packing = PackingScheme(
-            element_width=8,
-            elements_per_beat=32,
-        )
-        iface = MagicMock()
-        iface.packing = packing
-
         view = MagicMock()
         view.exposed_tensors = {"output": exposed}
-        view.top_spec.get_interface.return_value = iface
 
         compiled = MagicMock()
         compiled.kernel_instance = MagicMock()
         compiled.flattened_view = view
-        compiled.buffer_ids = {"output": 5}
 
         # forward() returns a small tensor
         fwd_output = torch.tensor([1, 2, 3, 4], dtype=torch.int8)
@@ -109,5 +100,6 @@ class TestCpuBackendExecute:
             backend = CpuBackend()
             result = backend.execute(compiled)
 
-        assert 5 in result.output_buffers
-        assert len(result.output_buffers[5]) > 0
+        assert result._forward_tensors is not None
+        assert "output" in result._forward_tensors
+        assert torch.equal(result._forward_tensors["output"], fwd_output)

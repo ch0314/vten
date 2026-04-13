@@ -479,6 +479,10 @@ class ExecutionContext:
         if self._config_boundaries:
             compiled = self._compile_multi_config()
         else:
+            # CPU backend: skip serialize/deserialize for speed
+            from vten.backend.cpu import CpuBackend
+            skip_ser = isinstance(self._backend, CpuBackend)
+
             engine = RuntimeEngine(
                 kernels=self._kernels,
                 ops=self._pending_ops,
@@ -486,6 +490,7 @@ class ExecutionContext:
                 alias_registry=self._alias_registry,
                 quiet=(self._mode == "inference"),
                 project_dir=self._project_dir,
+                skip_serialize=skip_ser,
             )
             probe_golden_tensors = self._collect_probe_golden_tensors()
             compiled = engine.compile(

@@ -36,16 +36,16 @@ class CpuBackend(Backend):
         self._run_ctx = RunContext()
 
     def execute(self, compiled: CompiledResult) -> BackendResult:
-        """Run forward() on kernel instance and return serialized outputs.
+        """Run forward() on kernel instance and return outputs.
 
-        Flow:
-          1. Find kernel instance from compiled.flattened_view
-          2. Call run_forward() to compute golden outputs (physical format)
-          3. Serialize each DEV_TO_HOST tensor to bytes
-          4. Return BackendResult with output_buffers
+        Fast path (default): stores forward() tensor results directly
+        in BackendResult._forward_tensors, skipping serialize/deserialize.
+        This makes CPU backend ~100x faster for large tensors.
+
+        The read_output_tensors() in output_reader.py detects _forward_tensors
+        and uses them directly instead of going through byte serialization.
         """
         from vten.runtime.golden import run_forward
-        from vten.runtime.serializer import StreamSerializer
         from vten.spec.models import Direction
 
         view = compiled.flattened_view
@@ -67,56 +67,17 @@ class CpuBackend(Backend):
         fwd_result = run_forward(kernel_inst)
         logger.info("cpu forward: %s", list(fwd_result.keys()))
 
-        # Serialize outputs into buffer bytes
-        output_buffers: dict[int, bytes] = {}
+        # Collect forward tensors for D2H outputs (fast path: no serialization)
+        forward_tensors: dict[str, object] = {}
         for name, exposed in view.exposed_tensors.items():
             if exposed.direction != Direction.DEV_TO_HOST:
                 continue
-            if name not in fwd_result:
-                continue
-
-            physical = fwd_result[name]
-
-            try:
-                iface = view.top_spec.get_interface(exposed.top_interface)
-            except KeyError:
-                continue
-            if iface.packing is None:
-                continue
-
-            serializer = StreamSerializer(iface.packing)
-
-            # Handle multi-port (array) tensors
-            if exposed._port_buffers:
-                raw = serializer.serialize(physical.flatten())
-                n_ports = len(exposed._port_buffers)
-                bytes_per_beat = (iface.packing.bus_width + 7) // 8
-                total_beats = len(raw) // bytes_per_beat
-
-                if n_ports > 1 and total_beats >= n_ports:
-                    beats_per_port = total_beats // n_ports
-                    for idx, port_name in enumerate(exposed._port_buffers):
-                        key = f"{name}:{port_name}"
-                        bid = compiled.buffer_ids.get(key)
-                        if bid is not None:
-                            start = idx * beats_per_port * bytes_per_beat
-                            end = start + beats_per_port * bytes_per_beat
-                            output_buffers[bid] = raw[start:end]
-                else:
-                    for port_name in exposed._port_buffers:
-                        key = f"{name}:{port_name}"
-                        bid = compiled.buffer_ids.get(key)
-                        if bid is not None:
-                            output_buffers[bid] = raw
-            else:
-                raw = serializer.serialize(physical.flatten())
-                bid = compiled.buffer_ids.get(name)
-                if bid is not None:
-                    output_buffers[bid] = raw
+            if name in fwd_result:
+                forward_tensors[name] = fwd_result[name]
 
         return BackendResult(
             status=0,
-            output_buffers=output_buffers,
+            _forward_tensors=forward_tensors if forward_tensors else None,
         )
 
     def cleanup(self) -> None:

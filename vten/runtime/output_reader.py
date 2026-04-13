@@ -41,6 +41,9 @@ def read_output_tensors(
 
     view = compiled.flattened_view
 
+    # Fast path: CPU backend provides forward() tensors directly
+    forward_tensors = getattr(backend_result, '_forward_tensors', None)
+
     output_tensors: dict[str, TensorCls] = {}
     for name, exposed in view.exposed_tensors.items():
         if exposed.direction != Direction.DEV_TO_HOST:
@@ -64,16 +67,20 @@ def read_output_tensors(
         t._resolved_shape = origin._resolved_shape
         t._element_count = origin._element_count
 
-        raw_bytes = read_tensor_bytes(name, exposed, compiled, backend_result)
-        if raw_bytes:
-            serializer = StreamSerializer(iface.packing)
-            hw_tensor = serializer.deserialize(
-                raw_bytes,
-                origin._element_count,
-                origin._resolved_shape,
-                dtype=origin.dtype,
-            )
-            t.data = RuntimeEngine._apply_unlayout(view, exposed, hw_tensor)
+        if forward_tensors is not None and name in forward_tensors:
+            # CPU backend fast path: use forward() tensor directly (no serialize/deserialize)
+            t.data = RuntimeEngine._apply_unlayout(view, exposed, forward_tensors[name])
+        else:
+            raw_bytes = read_tensor_bytes(name, exposed, compiled, backend_result)
+            if raw_bytes:
+                serializer = StreamSerializer(iface.packing)
+                hw_tensor = serializer.deserialize(
+                    raw_bytes,
+                    origin._element_count,
+                    origin._resolved_shape,
+                    dtype=origin.dtype,
+                )
+                t.data = RuntimeEngine._apply_unlayout(view, exposed, hw_tensor)
 
         if is_hw and get_buffer_object is not None:
             buffer_id = compiled.buffer_ids.get(name)

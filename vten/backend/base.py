@@ -167,6 +167,10 @@ class BackendResult:
     _shm_reader: Callable[[int], bytes] | None = field(
         default=None, repr=False
     )
+    # CPU backend: forward() result tensors (skip serialize/deserialize)
+    _forward_tensors: dict[str, object] | None = field(
+        default=None, repr=False
+    )
 
     def read_buffer(self, buffer_id: int) -> bytes:
         """Read buffer data by buffer_id.

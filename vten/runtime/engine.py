@@ -103,6 +103,7 @@ class RuntimeEngine:
         alias_registry: AliasRegistry | None = None,
         quiet: bool = False,
         project_dir: Path | None = None,
+        skip_serialize: bool = False,
     ) -> None:
         self._kernels = kernels
         self._ops = ops
@@ -110,6 +111,7 @@ class RuntimeEngine:
         self._alias_registry = alias_registry
         self._quiet = quiet
         self._project_dir = project_dir
+        self._skip_serialize = skip_serialize
 
     # ── Internal: Stages 0–9 (IR generation, no SHM packing) ──
 
@@ -154,7 +156,7 @@ class RuntimeEngine:
 
         # Stage 4: Tensor serialization
         logger.log(5, "Stage 4: tensor serialization")
-        self._serialize_tensors(view)
+        self._serialize_tensors(view, skip_data=self._skip_serialize)
 
         # Stage 5: Probe golden serialization
         logger.log(5, "Stage 5: probe golden serialization")
@@ -471,7 +473,9 @@ class RuntimeEngine:
 
     # ── Stage 4: Tensor Serialization ──
 
-    def _serialize_tensors(self, view: FlattenedKernelView) -> None:
+    def _serialize_tensors(
+        self, view: FlattenedKernelView, *, skip_data: bool = False,
+    ) -> None:
         for name, exposed in view.exposed_tensors.items():
             try:
                 iface_spec = view.top_spec.get_interface(exposed.top_interface)
@@ -489,13 +493,23 @@ class RuntimeEngine:
                     exposed._serialized_size = 0
                     continue
 
+                # CPU backend fast path: compute size only, skip actual serialization
+                if skip_data:
+                    num_beats = math.ceil(
+                        exposed.origin_tensor._element_count
+                        / packing.elements_per_beat
+                    )
+                    exposed._serialized = None
+                    exposed._serialized_size = num_beats * (packing.bus_width // 8)
+                    continue
+
                 # Alias targets share buffer with source — skip serialization
                 is_alias = (
                     self._alias_registry
                     and self._alias_registry.is_alias_target(name)
                 )
                 # Check if this tensor's send op has _device_resident (inference: BO on device)
-                skip_data = any(
+                skip_op_data = any(
                     getattr(op, '_device_resident', False)
                     for op in self._ops
                     if op.tensor is not None and op.tensor.name == name
@@ -508,7 +522,7 @@ class RuntimeEngine:
                     )
                     exposed._serialized = None
                     exposed._serialized_size = num_beats * (packing.bus_width // 8)
-                elif skip_data and exposed.origin_tensor.data is None:
+                elif skip_op_data and exposed.origin_tensor.data is None:
                     # Inference: device tensor, skip serialization, compute size only
                     num_beats = math.ceil(
                         exposed.origin_tensor._element_count
