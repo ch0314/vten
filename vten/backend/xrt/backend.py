@@ -66,6 +66,7 @@ class XrtBackend(Backend):
         self._interpreter: Any = None
         self._emu_run_dir: Path | None = None  # hw_emu .run/<PID> to clean up
         self._xrt_ini_created: bool = False  # whether we auto-created xrt.ini
+        self._mem_topology: dict[str, int] | None = None  # lazy: bank name → index
 
     def set_run_context(self, ctx: RunContext) -> None:
         """Override to re-discover xclbin when RunContext provides kernel_build_dir."""
@@ -212,10 +213,31 @@ class XrtBackend(Backend):
 
         self._setup_emulation_env()
 
-        self._device = pyxrt.device(self._device_index)
-        self._xclbin = pyxrt.xclbin(self._xclbin_path)
-        self._device.load_xclbin(self._xclbin)
-        self._uuid = self._xclbin.get_uuid()
+        # Suppress hw_emu simulator stdout/stderr (periodic data transfer
+        # dumps from Vitis-EM).  The simulator process is forked during
+        # device/xclbin init and inherits our file descriptors — redirect
+        # fd 1,2 to /dev/null so the child writes there, then restore.
+        import os as _os
+        is_emu = _os.environ.get("XCL_EMULATION_MODE") == "hw_emu"
+        if is_emu:
+            _saved_out = _os.dup(1)
+            _saved_err = _os.dup(2)
+            _devnull = _os.open(_os.devnull, _os.O_WRONLY)
+            _os.dup2(_devnull, 1)
+            _os.dup2(_devnull, 2)
+            _os.close(_devnull)
+
+        try:
+            self._device = pyxrt.device(self._device_index)
+            self._xclbin = pyxrt.xclbin(self._xclbin_path)
+            self._device.load_xclbin(self._xclbin)
+            self._uuid = self._xclbin.get_uuid()
+        finally:
+            if is_emu:
+                _os.dup2(_saved_out, 1)
+                _os.dup2(_saved_err, 2)
+                _os.close(_saved_out)
+                _os.close(_saved_err)
 
         # Discover CU names from xclbin (for composite multi-IP routing)
         self._xclbin_cu_names: dict[str, str] = {}  # kernel_name → CU name
@@ -342,6 +364,87 @@ class XrtBackend(Backend):
             logger.warning("Failed to parse xclbin connectivity: %s", e)
 
         return result
+
+    def _get_mem_topology(self) -> dict[str, int]:
+        """Get memory bank tag → index mapping (cached, lazy-parsed from xclbin).
+
+        Returns: {"bank0": 0, "bank1": 1, "HBM[0]": 2, "HBM[1]": 3, ...}
+        Also creates DDR aliases: "DDR[0]" → index of first DDR bank, etc.
+        """
+        if self._mem_topology is not None:
+            return self._mem_topology
+        self._mem_topology = self._parse_mem_topology()
+        if self._mem_topology:
+            logger.debug("mem_topology: %s", self._mem_topology)
+        return self._mem_topology
+
+    def _parse_mem_topology(self) -> dict[str, int]:
+        """Parse xclbin MEM_TOPOLOGY to build bank name → index mapping.
+
+        MEM_TOPOLOGY contains the device's physical memory layout.
+        Each entry has m_tag (e.g. "bank0", "HBM[0]") and m_type.
+        The array index IS the mem_data_index used by XRT BO allocation.
+        """
+        import json
+        import subprocess
+        import tempfile
+
+        result: dict[str, int] = {}
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                mem_file = Path(tmpdir) / "mem.json"
+                subprocess.run(
+                    ["xclbinutil",
+                     "--dump-section", f"MEM_TOPOLOGY:JSON:{mem_file}",
+                     "--input", str(self._xclbin_path),
+                     "--force"],
+                    capture_output=True, check=True,
+                )
+                with open(mem_file) as f:
+                    mem_data = json.load(f)
+
+            ddr_idx = 0
+            for idx, mem in enumerate(
+                mem_data.get("mem_topology", {}).get("m_mem_data", [])
+            ):
+                tag = mem.get("m_tag", "").rstrip("\x00").strip()
+                if tag:
+                    result[tag] = idx
+                # Create "DDR[N]" aliases for DDR banks (tagged "bankN")
+                m_type = mem.get("m_type", "")
+                if "DDR" in m_type or (
+                    tag.startswith("bank") and "HBM" not in m_type
+                ):
+                    result[f"DDR[{ddr_idx}]"] = idx
+                    ddr_idx += 1
+
+        except FileNotFoundError:
+            logger.debug("xclbinutil not found — cannot parse MEM_TOPOLOGY")
+        except Exception as e:
+            logger.debug("Failed to parse MEM_TOPOLOGY: %s", e)
+
+        return result
+
+    def _resolve_memory_bank(self, memory_bank: str) -> int | None:
+        """Resolve memory_bank string (e.g. "DDR[0]", "HBM[3]") to bank index.
+
+        Tries exact match first, then DDR[N] → bankN alias.
+        """
+        import re
+
+        topo = self._get_mem_topology()
+        if not topo:
+            return None
+        # Exact match (handles "HBM[0]", "DDR[0]" alias, etc.)
+        if memory_bank in topo:
+            return topo[memory_bank]
+        # DDR alias fallback: "DDR[N]" → "bankN"
+        m = re.match(r"DDR\[(\d+)\]", memory_bank)
+        if m:
+            bank_tag = f"bank{m.group(1)}"
+            if bank_tag in topo:
+                return topo[bank_tag]
+        return None
 
     def _get_or_create_ip(self, ip_name: str) -> Any:
         """Get or lazily create an xrt.ip by name."""
@@ -484,12 +587,17 @@ class XrtBackend(Backend):
                         group_ids = per_cu_gids.get(kern_name, default_gids)
 
                 # Map logical buffer_id
+                # Priority: group_id(arg) > memory_bank_index > memory_bank string
                 buffer_id = compiled.buffer_ids.get(name)
                 if buffer_id is not None:
                     if iface.xrt.arg_index is not None and iface.xrt.arg_index in group_ids:
                         bank_map[buffer_id] = group_ids[iface.xrt.arg_index]
                     elif iface.xrt.memory_bank_index is not None:
                         bank_map[buffer_id] = iface.xrt.memory_bank_index
+                    elif iface.xrt.memory_bank is not None:
+                        resolved = self._resolve_memory_bank(iface.xrt.memory_bank)
+                        if resolved is not None:
+                            bank_map[buffer_id] = resolved
 
                 # Map per-port buffer_ids (array/split interfaces)
                 if exposed._port_buffers:
@@ -508,6 +616,12 @@ class XrtBackend(Backend):
                             bank_map[port_bid] = group_ids[base_arg] + port_idx
                         elif iface.xrt.memory_bank_index is not None:
                             bank_map[port_bid] = iface.xrt.memory_bank_index
+                        elif iface.xrt.memory_bank is not None:
+                            # Resolve template: "HBM[{i}]" → "HBM[0]", "HBM[1]", ...
+                            bank_name = iface.xrt.memory_bank.replace("{i}", str(port_idx))
+                            resolved = self._resolve_memory_bank(bank_name)
+                            if resolved is not None:
+                                bank_map[port_bid] = resolved
 
             except (KeyError, AttributeError):
                 pass
