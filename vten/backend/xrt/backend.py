@@ -23,6 +23,30 @@ if TYPE_CHECKING:
     from vten.runtime.engine import CompiledResult
 
 
+class _ProxyIP:
+    """Proxy for an xrt.ip that can't be opened directly.
+
+    Uses another CU's IP handle with offset adjustment to access
+    registers at a different base address in the shared PCIe BAR MMIO space.
+
+    This works because xrt::ip::write_register/read_register are raw MMIO
+    operations at (base_address + offset), and the CU register spaces share
+    the same BAR. By adjusting the offset, we can reach any CU's registers
+    through any other CU's IP handle.
+    """
+
+    def __init__(self, real_ip: Any, offset_delta: int, name: str = "") -> None:
+        self._ip = real_ip
+        self._delta = offset_delta
+        self._name = name
+
+    def write_register(self, offset: int, value: int) -> None:
+        self._ip.write_register(offset + self._delta, value)
+
+    def read_register(self, offset: int) -> int:
+        return self._ip.read_register(offset + self._delta)
+
+
 class XrtBackend(Backend):
     """XRT/pyxrt-based FPGA backend using xrt.ip for raw register access.
 
@@ -67,6 +91,7 @@ class XrtBackend(Backend):
         self._emu_run_dir: Path | None = None  # hw_emu .run/<PID> to clean up
         self._xrt_ini_created: bool = False  # whether we auto-created xrt.ini
         self._mem_topology: dict[str, int] | None = None  # lazy: bank name → index
+        self._cu_base_addresses: dict[str, int] = {}  # CU name → base address
 
     def set_run_context(self, ctx: RunContext) -> None:
         """Override to re-discover xclbin when RunContext provides kernel_build_dir."""
@@ -213,31 +238,19 @@ class XrtBackend(Backend):
 
         self._setup_emulation_env()
 
-        # Suppress hw_emu simulator stdout/stderr (periodic data transfer
-        # dumps from Vitis-EM).  The simulator process is forked during
-        # device/xclbin init and inherits our file descriptors — redirect
-        # fd 1,2 to /dev/null so the child writes there, then restore.
+        import time as _time
         import os as _os
         is_emu = _os.environ.get("XCL_EMULATION_MODE") == "hw_emu"
         if is_emu:
-            _saved_out = _os.dup(1)
-            _saved_err = _os.dup(2)
-            _devnull = _os.open(_os.devnull, _os.O_WRONLY)
-            _os.dup2(_devnull, 1)
-            _os.dup2(_devnull, 2)
-            _os.close(_devnull)
+            logger.info("starting hw_emu simulator (this may take minutes)...")
 
-        try:
-            self._device = pyxrt.device(self._device_index)
-            self._xclbin = pyxrt.xclbin(self._xclbin_path)
-            self._device.load_xclbin(self._xclbin)
-            self._uuid = self._xclbin.get_uuid()
-        finally:
-            if is_emu:
-                _os.dup2(_saved_out, 1)
-                _os.dup2(_saved_err, 2)
-                _os.close(_saved_out)
-                _os.close(_saved_err)
+        _t0 = _time.monotonic()
+        self._device = pyxrt.device(self._device_index)
+        self._xclbin = pyxrt.xclbin(self._xclbin_path)
+        self._device.load_xclbin(self._xclbin)
+        self._uuid = self._xclbin.get_uuid()
+        _elapsed = _time.monotonic() - _t0
+        logger.info("device ready (%.1fs)", _elapsed)
 
         # Discover CU names from xclbin (for composite multi-IP routing)
         self._xclbin_cu_names: dict[str, str] = {}  # kernel_name → CU name
@@ -251,14 +264,32 @@ class XrtBackend(Backend):
             if self._xclbin_cu_names:
                 log.debug("xclbin CUs: %s", list(self._xclbin_cu_names.values()))
 
+        # Parse CU base addresses for proxy IP fallback
+        self._cu_base_addresses = self._parse_cu_base_addresses()
+        if self._cu_base_addresses:
+            logger.debug("CU base addresses: %s",
+                         {k: f"0x{v:x}" for k, v in self._cu_base_addresses.items()})
+
         # Cache group_ids for ALL CUs (composite multi-kernel support).
-        # group_id() can only be queried via xrt.kernel, which has exclusive
-        # CU access — create, query, delete before creating xrt.ip.
+        # Prefer xclbin CONNECTIVITY parsing — it works for all CU types
+        # including AP_CTRL_NONE / user_managed IPs without creating
+        # xrt::kernel objects (which corrupt HW context on some XRT
+        # driver versions, causing BO allocation failures).
         self._per_cu_group_ids: dict[str, dict[int, int]] = {}
-        if hasattr(pyxrt, "kernel"):
+        if hasattr(self._xclbin, "get_kernels"):
+            self._per_cu_group_ids = self._parse_xclbin_connectivity()
+            if self._per_cu_group_ids:
+                logger.debug("per-CU group_ids (from xclbin connectivity): %s", {
+                    k: dict(v) for k, v in self._per_cu_group_ids.items()
+                })
+
+        # Fallback: xrt.kernel group_id() query — only used when xclbin
+        # connectivity parsing yields nothing (e.g. older xclbin format).
+        # WARNING: this creates temporary xrt::kernel objects which may
+        # invalidate HW context on newer XRT drivers with AP_CTRL_NONE CUs.
+        if not self._per_cu_group_ids and hasattr(pyxrt, "kernel"):
             for kern_name, cu_name in self._xclbin_cu_names.items():
                 try:
-                    # xrt.kernel uses kernel name (not CU instance name)
                     tmp_kernel = pyxrt.kernel(
                         self._device, self._uuid, kern_name,
                     )
@@ -277,15 +308,6 @@ class XrtBackend(Backend):
                     )
             if self._per_cu_group_ids:
                 logger.debug("per-CU group_ids: %s", {
-                    k: dict(v) for k, v in self._per_cu_group_ids.items()
-                })
-
-        # Fallback: parse xclbin CONNECTIVITY for arg→mem mapping when
-        # xrt.kernel group_id() fails (e.g. user_managed / AP_CTRL_NONE).
-        if not self._per_cu_group_ids and hasattr(self._xclbin, "get_kernels"):
-            self._per_cu_group_ids = self._parse_xclbin_connectivity()
-            if self._per_cu_group_ids:
-                logger.debug("per-CU group_ids (from xclbin connectivity): %s", {
                     k: dict(v) for k, v in self._per_cu_group_ids.items()
                 })
 
@@ -313,6 +335,9 @@ class XrtBackend(Backend):
         """Parse xclbin CONNECTIVITY + IP_LAYOUT to get arg→mem_index mapping.
 
         Fallback for user_managed kernels where xrt.kernel.group_id() fails.
+        Tries CONNECTIVITY first, then GROUP_CONNECTIVITY as fallback
+        (some xclbins have a corrupted CONNECTIVITY section).
+
         Returns: {kernel_name: {arg_index: mem_data_index}}.
         """
         import json
@@ -320,48 +345,103 @@ class XrtBackend(Backend):
         import tempfile
 
         xclbin_path = self._xclbin_path
-        result: dict[str, dict[int, int]] = {}
 
+        # Try both section names — GROUP_CONNECTIVITY is a superset that
+        # some xclbins use when regular CONNECTIVITY is malformed.
+        for section_name, json_key in [
+            ("CONNECTIVITY", "connectivity"),
+            ("GROUP_CONNECTIVITY", "group_connectivity"),
+        ]:
+            result: dict[str, dict[int, int]] = {}
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    ip_file = Path(tmpdir) / "ip.json"
+                    conn_file = Path(tmpdir) / "conn.json"
+
+                    subprocess.run(
+                        ["xclbinutil",
+                         "--dump-section", f"IP_LAYOUT:JSON:{ip_file}",
+                         "--dump-section", f"{section_name}:JSON:{conn_file}",
+                         "--input", str(xclbin_path),
+                         "--force"],
+                        capture_output=True, check=True,
+                    )
+
+                    with open(ip_file) as f:
+                        ip_data = json.load(f)
+                    with open(conn_file) as f:
+                        conn_data = json.load(f)
+
+                # Build IP index → kernel_name mapping
+                ip_names: dict[int, str] = {}
+                for i, ip in enumerate(ip_data["ip_layout"]["m_ip_data"]):
+                    name = ip["m_name"]
+                    kern = name.split(":")[0] if ":" in name else name
+                    ip_names[i] = kern
+
+                # Build kernel_name → {arg_index: mem_data_index}
+                connections = (
+                    conn_data.get(json_key, {}).get("m_connection", [])
+                    or conn_data.get("connectivity", {}).get("m_connection", [])
+                )
+                for conn in connections:
+                    ip_idx = int(conn["m_ip_layout_index"])
+                    arg_idx = int(conn["arg_index"])
+                    mem_idx = int(conn["mem_data_index"])
+                    kern = ip_names.get(ip_idx)
+                    if kern:
+                        if kern not in result:
+                            result[kern] = {}
+                        result[kern][arg_idx] = mem_idx
+
+                if result:
+                    logger.debug(
+                        "parsed %s: %s",
+                        section_name,
+                        {k: f"{len(v)} args" for k, v in result.items()},
+                    )
+                    return result
+
+            except Exception as e:
+                logger.debug("Failed to parse %s: %s", section_name, e)
+
+        return {}
+
+    def _parse_cu_base_addresses(self) -> dict[str, int]:
+        """Parse IP_LAYOUT from xclbin to get CU base addresses.
+
+        Returns: {"kernel_name:instance_name": base_address, ...}
+        E.g.: {"weight_loader:weight_loader_1": 0x802000, ...}
+        """
+        import json
+        import subprocess
+        import tempfile
+
+        result: dict[str, int] = {}
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 ip_file = Path(tmpdir) / "ip.json"
-                conn_file = Path(tmpdir) / "conn.json"
-
                 subprocess.run(
                     ["xclbinutil",
                      "--dump-section", f"IP_LAYOUT:JSON:{ip_file}",
-                     "--dump-section", f"CONNECTIVITY:JSON:{conn_file}",
-                     "--input", str(xclbin_path),
+                     "--input", str(self._xclbin_path),
                      "--force"],
                     capture_output=True, check=True,
                 )
-
                 with open(ip_file) as f:
                     ip_data = json.load(f)
-                with open(conn_file) as f:
-                    conn_data = json.load(f)
 
-            # Build IP index → kernel_name mapping
-            ip_names: dict[int, str] = {}
-            for i, ip in enumerate(ip_data["ip_layout"]["m_ip_data"]):
-                # m_name format: "kernel_name:instance_name"
-                name = ip["m_name"]
-                kern = name.split(":")[0] if ":" in name else name
-                ip_names[i] = kern
+            for ip in ip_data.get("ip_layout", {}).get("m_ip_data", []):
+                name = ip.get("m_name", "").rstrip("\x00").strip()
+                base = ip.get("m_base_address", "")
+                if name and base:
+                    addr = int(base, 16) if isinstance(base, str) else int(base)
+                    result[name] = addr
 
-            # Build kernel_name → {arg_index: mem_data_index}
-            for conn in conn_data["connectivity"]["m_connection"]:
-                ip_idx = int(conn["m_ip_layout_index"])
-                arg_idx = int(conn["arg_index"])
-                mem_idx = int(conn["mem_data_index"])
-                kern = ip_names.get(ip_idx)
-                if kern:
-                    if kern not in result:
-                        result[kern] = {}
-                    result[kern][arg_idx] = mem_idx
-
+        except FileNotFoundError:
+            logger.debug("xclbinutil not found — cannot parse CU base addresses")
         except Exception as e:
-            logger.warning("Failed to parse xclbin connectivity: %s", e)
+            logger.debug("Failed to parse CU base addresses: %s", e)
 
         return result
 
@@ -447,27 +527,91 @@ class XrtBackend(Backend):
         return None
 
     def _get_or_create_ip(self, ip_name: str) -> Any:
-        """Get or lazily create an xrt.ip by name."""
-        if ip_name not in self._ips:
-            try:
-                self._ips[ip_name] = self._xrt.ip(
-                    self._device, self._uuid, ip_name,
-                )
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "Failed to create xrt.ip for '%s': %s. "
-                    "Check xclbin IP_LAYOUT (may have 'not_used' base address). "
-                    "Run 'vten build --backend xrt --force' to rebuild.",
-                    ip_name, e,
-                )
+        """Get or lazily create an xrt.ip by name.
+
+        Falls back to _ProxyIP if direct xrt.ip creation fails (e.g., CUs
+        with many CONNECTIVITY entries that exceed XRT driver limits).
+        The proxy uses another CU's IP handle with offset adjustment to
+        access registers through the shared PCIe BAR MMIO space.
+        """
+        if ip_name in self._ips:
+            return self._ips[ip_name]
+
+        try:
+            self._ips[ip_name] = self._xrt.ip(
+                self._device, self._uuid, ip_name,
+            )
+        except Exception as e:
+            logger.warning(
+                "xrt.ip creation failed for '%s': %s — attempting proxy IP",
+                ip_name, e,
+            )
+            proxy = self._create_proxy_ip(ip_name)
+            if proxy is not None:
+                self._ips[ip_name] = proxy
+            else:
                 raise BackendError(
                     f"Cannot access CU '{ip_name}': {e}. "
-                    f"This usually means the xclbin IP_LAYOUT has "
-                    f"'not_used' base address for this CU. "
-                    f"Try rebuilding: vten build --backend xrt --force"
+                    f"Direct xrt.ip creation failed and no proxy donor available."
                 ) from e
+
         return self._ips[ip_name]
+
+    def _create_proxy_ip(self, ip_name: str) -> _ProxyIP | None:
+        """Create a ProxyIP using another CU's IP handle with offset delta.
+
+        Finds the target CU's base address from IP_LAYOUT, picks an existing
+        or newly-created donor IP, and creates a proxy that adjusts register
+        offsets by (target_base - donor_base).
+        """
+        if not self._cu_base_addresses:
+            return None
+
+        # ip_name format: "kernel:{instance}" — strip braces for IP_LAYOUT lookup
+        target_cu = ip_name.replace("{", "").replace("}", "")
+        target_base = self._cu_base_addresses.get(target_cu)
+        if target_base is None:
+            logger.debug("proxy IP: no base address for '%s'", target_cu)
+            return None
+
+        # Try existing IPs as donor
+        for donor_name, donor_ip in self._ips.items():
+            if isinstance(donor_ip, _ProxyIP):
+                continue
+            donor_cu = donor_name.replace("{", "").replace("}", "")
+            donor_base = self._cu_base_addresses.get(donor_cu)
+            if donor_base is not None:
+                delta = target_base - donor_base
+                logger.info(
+                    "proxy IP: '%s' (base=0x%x) via '%s' (base=0x%x, delta=0x%x)",
+                    ip_name, target_base, donor_name, donor_base, delta,
+                )
+                return _ProxyIP(donor_ip, delta, ip_name)
+
+        # No existing donor — try to create one from another CU
+        for cu_full_name, base in self._cu_base_addresses.items():
+            if cu_full_name == target_cu:
+                continue
+            if ":" in cu_full_name:
+                kern, inst = cu_full_name.split(":", 1)
+                donor_ip_name = f"{kern}:{{{inst}}}"
+            else:
+                donor_ip_name = cu_full_name
+            try:
+                donor_ip = self._xrt.ip(
+                    self._device, self._uuid, donor_ip_name,
+                )
+                self._ips[donor_ip_name] = donor_ip
+                delta = target_base - base
+                logger.info(
+                    "proxy IP: '%s' (base=0x%x) via new '%s' (base=0x%x, delta=0x%x)",
+                    ip_name, target_base, donor_ip_name, base, delta,
+                )
+                return _ProxyIP(donor_ip, delta, ip_name)
+            except Exception:
+                continue
+
+        return None
 
     def _build_ip_map(self, compiled: CompiledResult) -> dict[int, Any]:
         """Build interface_id → xrt.ip mapping from compiled result.
@@ -539,11 +683,16 @@ class XrtBackend(Backend):
         for attr_name, ki in view.sub_kernels.items():
             kernel_name = ki.spec.kernel_name
             if kernel_name in cu_names:
-                # Exact CU name from xclbin introspection
-                sub_to_ip[attr_name] = cu_names[kernel_name]
+                # CU name from xclbin is "kern:inst", xrt.ip needs "kern:{inst}"
+                cu_name = cu_names[kernel_name]
+                if ":" in cu_name:
+                    kern, inst = cu_name.split(":", 1)
+                    sub_to_ip[attr_name] = f"{kern}:{{{inst}}}"
+                else:
+                    sub_to_ip[attr_name] = cu_name
             else:
                 # Fallback: v++ single-instance convention
-                sub_to_ip[attr_name] = f"{kernel_name}:{kernel_name}_1"
+                sub_to_ip[attr_name] = f"{kernel_name}:{{{kernel_name}_1}}"
 
         return sub_to_ip
 
@@ -741,13 +890,28 @@ class XrtBackend(Backend):
         injected into the interpreter before execution.
         """
         if self._device is None:
+            logger.info("initializing XRT device (first execution)...")
             self._init_device()
 
         from vten.backend.xrt.interpreter import CommandInterpreter
 
+        # Diagnostic: dump flattened_view structure for debugging
+        if compiled.flattened_view is not None:
+            view = compiled.flattened_view
+            logger.debug(
+                "flattened_view: sub_kernels=%s, exposed=%s, iface_map=%s",
+                {k: v.spec.kernel_name for k, v in view.sub_kernels.items()},
+                list(view.exposed_tensors.keys()),
+                [(m.sub_kernel, m.sub_interface, m.top_interface)
+                 for m in view.interface_mappings],
+            )
+            logger.debug("iface_id_to_name: %s", compiled.iface_id_to_name)
+            logger.debug("buffer_ids: %s", compiled.buffer_ids)
+
         ip_map = self._build_ip_map(compiled)
         mem_bank_map = self._build_mem_bank_map(compiled)
         addr_bindings = self._build_addr_bindings(compiled)
+        logger.debug("ip_map: %s", {k: getattr(v, '_name', str(v)) for k, v in ip_map.items()})
 
         quiet = compiled.mode == "inference"
         if self._persistent and self._interpreter is not None:
@@ -773,6 +937,9 @@ class XrtBackend(Backend):
             for buffer_id, bo in compiled.prebound_buffers.items():
                 interpreter._buffers[buffer_id] = bo
                 interpreter._prebound.add(buffer_id)
+                # Record bank so _preallocate_bound_bos won't replace with wrong bank
+                if buffer_id in mem_bank_map:
+                    interpreter._buffer_banks[buffer_id] = mem_bank_map[buffer_id]
             logger.debug(
                 "prebound injected: %s (prebound_set=%s)",
                 list(compiled.prebound_buffers.keys()),

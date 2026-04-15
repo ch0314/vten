@@ -31,6 +31,11 @@ def build_project(
     project = Path(project_dir).resolve()
     config = load_project_config(project)
 
+    # Apply --target override to [backend.xrt].target
+    if config_overrides and "_xrt_target" in config_overrides:
+        xrt_target = config_overrides.pop("_xrt_target")
+        config.setdefault("backend", {}).setdefault("xrt", {})["target"] = xrt_target
+
     backend_name = resolve_backend_name(config, cli_backend=backend)
     pipeline = get_build_pipeline(backend_name, project, config)
     pipeline.build(

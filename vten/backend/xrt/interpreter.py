@@ -149,6 +149,7 @@ class CommandInterpreter:
         self._addr_bindings = addr_bindings or {}
         self._quiet = quiet
         self._buffers: dict[int, Any] = {}  # buffer_id → XRT BO
+        self._buffer_banks: dict[int, int] = {}  # buffer_id → memory bank
         self._output_buffers: dict[int, bytes] = {}
         self._completed: set[int] = set()  # completed cmd_ids
         self._prebound: set[int] = set()  # buffer_ids with pre-synced BOs
@@ -429,14 +430,27 @@ class CommandInterpreter:
 
         for buffer_id in sorted(bound_buffer_ids):
             size = buf_sizes.get(buffer_id, 4096)
-            existing = self._buffers.get(buffer_id)
-            if existing is not None and existing.size() >= size:
-                continue
             mem_bank = self._mem_bank_map.get(buffer_id, 0)
-            bo = self._xrt.bo(
-                self._device, size,
-                self._xrt.bo.flags.normal, mem_bank,
-            )
+            existing = self._buffers.get(buffer_id)
+            existing_bank = self._buffer_banks.get(buffer_id, -1)
+            if (existing is not None and existing.size() >= size
+                    and existing_bank == mem_bank):
+                continue
+            try:
+                bo = self._xrt.bo(
+                    self._device, size,
+                    self._xrt.bo.flags.normal, mem_bank,
+                )
+            except RuntimeError as e:
+                # Pre-allocation is best-effort: if it fails (e.g. during
+                # upload where address-bound BOs aren't actually needed),
+                # defer the error to when the BO is actually used by a
+                # WRITE_REG command.  Log details for diagnosis.
+                logger.warning(
+                    "pre-alloc BO failed (deferred): buf=%d size=%d bank=%d: %s",
+                    buffer_id, size, mem_bank, e,
+                )
+                continue
             if hasattr(bo, "map_init"):
                 bo.map_init()
             data = tensor_data.get(buffer_id, b"")
@@ -446,6 +460,7 @@ class CommandInterpreter:
                 bo.write(b"\x00" * size)
             bo.sync(self._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             self._buffers[buffer_id] = bo
+            self._buffer_banks[buffer_id] = mem_bank
             addr = bo.address() if hasattr(bo, "address") else 0
             op_name = buf_ops.get(buffer_id, "?")
             if hasattr(op_name, "name"):
@@ -506,17 +521,31 @@ class CommandInterpreter:
                 f"LOAD cmd_id={cmd.cmd_id}: no tensor data for "
                 f"buffer_id={cmd.buffer_id}"
             )
+        mem_bank = self._mem_bank_map.get(cmd.buffer_id, 0)
         bo = self._buffers.get(cmd.buffer_id)
-        if bo is not None and hasattr(bo, "size") and bo.size() >= len(data):
+        existing_bank = self._buffer_banks.get(cmd.buffer_id, -1)
+        # Reuse existing BO only if it's large enough AND on the correct bank.
+        # Persistent mode can leave stale BOs from prior uploads on different
+        # banks (e.g. weight upload buf=0 on HBM[0], then bias upload buf=0
+        # needs DDR[1]).
+        if (bo is not None and hasattr(bo, "size") and bo.size() >= len(data)
+                and existing_bank == mem_bank):
             bo.write(data)
         else:
-            mem_bank = self._mem_bank_map.get(cmd.buffer_id, 0)
-            bo = self._xrt.bo(
-                self._device, len(data),
-                self._xrt.bo.flags.normal, mem_bank,
-            )
+            try:
+                bo = self._xrt.bo(
+                    self._device, len(data),
+                    self._xrt.bo.flags.normal, mem_bank,
+                )
+            except RuntimeError as e:
+                raise BackendError(
+                    f"LOAD BO alloc failed: buf={cmd.buffer_id}, "
+                    f"size={len(data)}, bank={mem_bank}. {e}\n"
+                    f"  Hint: check 'ulimit -l' (locked memory limit)"
+                ) from e
             bo.write(data)
             self._buffers[cmd.buffer_id] = bo
+            self._buffer_banks[cmd.buffer_id] = mem_bank
 
     def _exec_push(self, cmd: Command) -> None:
         """PUSH: Sync BO to device."""
@@ -538,21 +567,30 @@ class CommandInterpreter:
     def _exec_pull(self, cmd: Command) -> None:
         """PULL: Allocate output BO (actual sync deferred to STORE)."""
         size = cmd.size or 4096
+        mem_bank = self._mem_bank_map.get(cmd.buffer_id, 0)
         bo = self._buffers.get(cmd.buffer_id)
-        # Reallocate if existing BO is too small (layer size changed)
-        if bo is not None and bo.size() < size:
+        existing_bank = self._buffer_banks.get(cmd.buffer_id, -1)
+        # Reallocate if existing BO is too small or on wrong bank
+        if bo is not None and (bo.size() < size or existing_bank != mem_bank):
             bo = None
         if bo is None:
-            mem_bank = self._mem_bank_map.get(cmd.buffer_id, 0)
-            bo = self._xrt.bo(
-                self._device, size,
-                self._xrt.bo.flags.normal, mem_bank,
-            )
+            try:
+                bo = self._xrt.bo(
+                    self._device, size,
+                    self._xrt.bo.flags.normal, mem_bank,
+                )
+            except RuntimeError as e:
+                raise BackendError(
+                    f"PULL BO alloc failed: buf={cmd.buffer_id}, "
+                    f"size={size}, bank={mem_bank}. {e}\n"
+                    f"  Hint: check 'ulimit -l' (locked memory limit)"
+                ) from e
             if hasattr(bo, "map_init"):
                 bo.map_init()
             bo.write(b"\x00" * size)
             bo.sync(self._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             self._buffers[cmd.buffer_id] = bo
+            self._buffer_banks[cmd.buffer_id] = mem_bank
 
     def _exec_store(self, cmd: Command) -> None:
         """STORE: Deferred until all commands complete."""

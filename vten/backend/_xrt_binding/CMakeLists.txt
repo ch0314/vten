@@ -9,7 +9,17 @@ set(XRT_ROOT "/opt/xilinx/xrt" CACHE PATH "XRT installation root")
 include_directories(${XRT_ROOT}/include)
 link_directories(${XRT_ROOT}/lib)
 
-# pybind11
+# pybind11 — auto-detect from Python environment
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} -m pybind11 --cmakedir
+  OUTPUT_VARIABLE _pybind11_cmake_dir
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE _pybind11_result
+)
+if(_pybind11_result EQUAL 0 AND _pybind11_cmake_dir)
+  set(pybind11_DIR "${_pybind11_cmake_dir}")
+endif()
 find_package(pybind11 REQUIRED)
 
 # Module

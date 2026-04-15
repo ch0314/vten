@@ -49,6 +49,9 @@ def main(argv: list[str] | None = None) -> None:
                               help="Run specific stage only")
     build_parser.add_argument("--upto", choices=_stages,
                               help="Run stages up to (inclusive)")
+    build_parser.add_argument("--target", default=None,
+                              choices=["hw", "hw_emu"],
+                              help="XRT build target (overrides vten.toml)")
     build_parser.add_argument("--force", action="store_true", help="Ignore cache, full rebuild")
     build_parser.add_argument("--clean", action="store_true",
                               help="Remove build artifacts before building")
@@ -159,6 +162,9 @@ def _dispatch(args: argparse.Namespace, log_level: str) -> None:
             for item in args.config:
                 k, v = item.split("=", 1)
                 overrides[k] = int(v) if v.isdigit() else v
+        # --target overrides [backend.xrt].target in vten.toml
+        if args.target:
+            overrides["_xrt_target"] = args.target
         build_project(
             project_dir=args.project,
             kernel_name=args.kernel,
