@@ -127,4 +127,4 @@ my_project/
 
 ## License
 
-Internal use only.
+This project is licensed under the MIT License — see [LICENSE](LICENSE).

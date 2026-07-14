@@ -41,9 +41,18 @@ xelab.pb
 xsim.pb
 *.so
 
-# Docs / papers
-docs/
-
 # Project build output
 build/
 !vten/build/
+
+# Example generated artifacts
+examples/*/results/
+examples/*/build/
+examples/*/kernels/*/build/
+
+# Xilinx / Vitis / XRT generated (nested)
+**/*.xclbin
+**/emconfig.json
+**/xrt.ini
+.run/
+**/xsim.dir/

@@ -54,6 +54,7 @@ version = "0.1.0"
 default_backend = "{backend}"
 
 [tools]
+# Set this to your own Vivado install path (e.g. /opt/Xilinx/Vivado/<version>).
 vivado_path = "/tools/Xilinx/Vivado/2023.2"
 
 [parameters]
