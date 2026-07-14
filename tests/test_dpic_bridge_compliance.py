@@ -444,7 +444,7 @@ class TestPosixApiUsage:
 
 # ═══════════════════════════════════════════════════════════════════
 # §8. Error handling
-#     (CLAUDE.md: all pointer access with null check)
+#     (requirement: all pointer access with null check)
 # ═══════════════════════════════════════════════════════════════════
 
 

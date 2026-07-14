@@ -1,6 +1,6 @@
 """NPU 3D accelerator fixtures — per-IP sub-kernel specs.
 
-All fixtures reflect NPU 3D accelerator patterns (specs/npu_3d_analysis.md).
+All fixtures reflect NPU 3D accelerator patterns.
 These are separated from generic fixtures to clarify which tests are
 NPU_3D-specific vs framework-general.
 """

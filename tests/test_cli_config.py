@@ -2,7 +2,7 @@
 
 Spec references:
 - 06_codegen_and_cli.md §6 (vten.toml Reference)
-- specs/npu_3d_analysis.md §11.4 (NPU 3D config)
+- NPU 3D config
 """
 
 from __future__ import annotations

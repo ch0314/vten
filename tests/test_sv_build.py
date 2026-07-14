@@ -47,7 +47,7 @@ def _has_verilator() -> bool:
 
 # ═══════════════════════════════════════════════════════════════════
 # §1. gcc compilation — Phase 3 completion criterion
-#     "gcc 컴파일 성공" (CLAUDE.md)
+#     "gcc 컴파일 성공"
 # ═══════════════════════════════════════════════════════════════════
 
 
@@ -101,7 +101,7 @@ class TestGccCompilation:
         )
 
     def test_compile_c99_standard(self, tmp_path):
-        """Must compile as C99 (CLAUDE.md: C99 표준)."""
+        """Must compile as C99 (C99 standard)."""
         c_file = VTEN_SV_DIR / "vten_shm_bridge.c"
         output = tmp_path / "libvten_shm.so"
         result = subprocess.run(
@@ -122,7 +122,7 @@ class TestGccCompilation:
 
 # ═══════════════════════════════════════════════════════════════════
 # §2. xvlog syntax check — Phase 3 completion criterion
-#     "xvlog 구문 통과" (CLAUDE.md)
+#     "xvlog 구문 통과"
 # ═══════════════════════════════════════════════════════════════════
 
 

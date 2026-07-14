@@ -815,7 +815,7 @@ class TestCrossFileConsistency:
         assert "vten_types.svh" in text
 
     def test_all_sv_files_exist(self):
-        """All 9 required SV files from CLAUDE.md project structure."""
+        """All 9 required SV files in the vten/sv/ library."""
         required = [
             "vten_types.svh",
             "vten_dpi_imports.svh",

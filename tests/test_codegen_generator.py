@@ -3,7 +3,7 @@
 Spec references:
 - 06_codegen_and_cli.md §1 (Template Architecture)
 - 06_codegen_and_cli.md §3 (Code Generator)
-- specs/npu_3d_analysis.md §11 (NPU 3D mapping)
+- NPU 3D accelerator mapping
 """
 
 from __future__ import annotations

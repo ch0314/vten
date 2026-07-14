@@ -1,7 +1,7 @@
 """Functional tests for vten_shm_controller via verilator simulation.
 
 Tests the 9-state FSM, DPI-C call sequences, and command feeding handshake.
-Spec reference: specs/04_backend_xsim.md §4
+Reference: vten/sv/vten_shm_controller.sv
 """
 
 from __future__ import annotations

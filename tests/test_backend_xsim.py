@@ -4,7 +4,7 @@ Spec references:
 - 04_backend_xsim.md §1-6 (Architecture, SHM, Semaphore, DPI-C)
 - 06_codegen_and_cli.md §4.4 (vten run)
 - 00_data_models.md §11 (SHM Constants)
-- specs/npu_3d_analysis.md §11.4 (NPU 3D scale)
+- NPU 3D scale
 """
 
 from __future__ import annotations

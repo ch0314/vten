@@ -3,7 +3,7 @@
 Spec references:
 - 06_codegen_and_cli.md §2 (Template Context Schema)
 - 06_codegen_and_cli.md §3 (Code Generator)
-- specs/npu_3d_analysis.md (NPU 3D realistic patterns)
+- NPU 3D realistic patterns
 """
 
 from __future__ import annotations

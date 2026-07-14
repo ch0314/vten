@@ -4,7 +4,7 @@ Spec references:
 - 06_codegen_and_cli.md §3.3 (_generate_bfm_index_mapping)
 - 06_codegen_and_cli.md §3.4 (_compute_scheduler_params)
 - 04_backend_xsim.md §10.0 (Parameter auto-determination)
-- specs/npu_3d_analysis.md §11.4 (NPU 3D Scheduler params)
+- NPU 3D scheduler params
 """
 
 from __future__ import annotations

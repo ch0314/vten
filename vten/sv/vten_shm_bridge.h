@@ -1,5 +1,5 @@
 /* vten_shm_bridge.h — DPI-C bridge header for vTen SHM communication
- * Reference: specs/04_backend_xsim.md §6
+ * Reference: docs/architecture.md
  * C99, POSIX API only.
  */
 
