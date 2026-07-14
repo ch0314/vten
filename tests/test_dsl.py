@@ -211,7 +211,7 @@ class TestNPU3DWorkflow:
     """NPU 3D host execution sequence as DSL operations."""
 
     def test_push_three_tensors(self):
-        """Phase 1: PUSH ifm, weight, bias (host → DUT)."""
+        """Step 1: PUSH ifm, weight, bias (host → DUT)."""
         push_ifm = Operation(kind=OpKind.PUSH_TENSOR)
         push_wgt = Operation(kind=OpKind.PUSH_TENSOR)
         push_bias = Operation(kind=OpKind.PUSH_TENSOR)
@@ -224,7 +224,7 @@ class TestNPU3DWorkflow:
         )
 
     def test_configure_depends_on_pushes(self):
-        """Phase 2: CONFIGURE depends on all 3 PUSHes."""
+        """Step 2: CONFIGURE depends on all 3 PUSHes."""
         h_ifm = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
         h_wgt = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
         h_bias = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
@@ -238,7 +238,7 @@ class TestNPU3DWorkflow:
         assert configure.kernel is k
 
     def test_vsync_trigger_order(self):
-        """Phase 3: VSYNC order — bias_loader → weight_loader → fmapIO.
+        """Step 3: VSYNC order — bias_loader → weight_loader → fmapIO.
 
         fmapIO vsync depends on bias/weight vsyncs being issued first.
         """
@@ -274,7 +274,7 @@ class TestNPU3DWorkflow:
         assert vsync_fmap.dep[1].op.register_interface == "ctrl_wgt"
 
     def test_poll_layer_done(self):
-        """Phase 4: POLL_REG layer_done on fmapIO ctrl."""
+        """Step 4: POLL_REG layer_done on fmapIO ctrl."""
         h_vsync = OperationHandle(op=Operation(kind=OpKind.WRITE_REGISTER))
 
         poll = Operation(
@@ -288,7 +288,7 @@ class TestNPU3DWorkflow:
         assert len(poll.dep) == 1
 
     def test_pull_ofm(self):
-        """Phase 5: PULL OFM from DUT."""
+        """Step 5: PULL OFM from DUT."""
         ofm = Tensor(
             shape=("${OUT_CH}", "${OUT_DEPTH}", "${OUT_HEIGHT}", "${OUT_WIDTH}"),
             dtype=torch.int8, interface="ddr",
@@ -306,21 +306,21 @@ class TestNPU3DWorkflow:
     def test_full_npu3d_chain(self):
         """Full NPU 3D workflow: push×3 → configure → vsync×3 → poll → pull.
 
-        Mirrors host code sequence from npu_3d_analysis.md §7.1.
+        Mirrors a representative multi-IP accelerator host code sequence.
         """
-        # Phase 1: Push tensors
+        # Step 1: Push tensors
         h_push_ifm = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
         h_push_wgt = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
         h_push_bias = OperationHandle(op=Operation(kind=OpKind.PUSH_TENSOR))
 
-        # Phase 2: Configure (auto_bind all registers)
+        # Step 2: Configure (auto_bind all registers)
         configure = Operation(
             kind=OpKind.CONFIGURE,
             dep=[h_push_ifm, h_push_wgt, h_push_bias],
         )
         h_configure = OperationHandle(op=configure)
 
-        # Phase 3: VSYNC triggers (bias → weight → fmapIO)
+        # Step 3: VSYNC triggers (bias → weight → fmapIO)
         h_vsync_bias = OperationHandle(op=Operation(
             kind=OpKind.WRITE_REGISTER,
             register_interface="ctrl_bias",
@@ -340,12 +340,12 @@ class TestNPU3DWorkflow:
             dep=[h_vsync_bias, h_vsync_wgt],
         ))
 
-        # Phase 3.5: Pull output tensors
+        # Step 3.5: Pull output tensors
         h_pull_ofm = OperationHandle(op=Operation(
             kind=OpKind.PULL_TENSOR, dep=[h_vsync_fmap],
         ))
 
-        # Phase 4: Poll layer_done
+        # Step 4: Poll layer_done
         h_poll = OperationHandle(op=Operation(
             kind=OpKind.POLL_REGISTER,
             register_interface="ctrl_fmapio",

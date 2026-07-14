@@ -1,4 +1,4 @@
-"""Phase 4 tests: Backend base — error codes, ABC, result types.
+"""Tests for Backend base — error codes, ABC, result types.
 
 Spec references:
 - 00_data_models.md §10.13 (BackendErrorCode)

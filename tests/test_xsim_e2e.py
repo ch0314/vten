@@ -33,10 +33,18 @@ def _add_kernel_path(kernel_dir: str | Path) -> None:
         sys.path.insert(0, kernel_dir)
 
 
-def _load_passthrough_env(kernel_name: str = "passthrough"):
-    """Load passthrough project environment with specified kernel build dir."""
+def _load_passthrough_env(kernel_name: str = "passthrough",
+                          project_name: str = "passthrough"):
+    """Load a passthrough-style project environment with the given kernel build dir.
+
+    ``project_name`` selects the example project under ``examples/``. The
+    default ``passthrough`` project holds the working kernel; the
+    ``broken_passthrough`` kernel lives in the ``passthrough_regression``
+    project.
+    """
     from vten.backend.base import RunContext
-    project = Path("examples/passthrough").resolve()
+    project = Path("examples") / project_name
+    project = project.resolve()
     config = load_project_config(project)
     backend_name = resolve_backend_name(config)
     backend = get_backend(backend_name, config)
@@ -265,7 +273,9 @@ class TestEdgeCases:
     @pytest.mark.xsim
     def test_broken_passthrough_verify_fail(self):
         """F1: broken_passthrough detects host-side verification failure."""
-        project, config, backend = _load_passthrough_env("broken_passthrough")
+        project, config, backend = _load_passthrough_env(
+            "broken_passthrough", project_name="passthrough_regression"
+        )
         spec = parse_kernel_spec(
             project / "kernels" / "broken_passthrough" / "kernel_spec.yaml"
         )
@@ -290,7 +300,9 @@ class TestEdgeCases:
     @pytest.mark.xsim
     def test_broken_passthrough_probe_fail(self):
         """F2: broken_passthrough with probe=True detects BFM-level mismatch."""
-        project, config, backend = _load_passthrough_env("broken_passthrough")
+        project, config, backend = _load_passthrough_env(
+            "broken_passthrough", project_name="passthrough_regression"
+        )
         spec = parse_kernel_spec(
             project / "kernels" / "broken_passthrough" / "kernel_spec.yaml"
         )

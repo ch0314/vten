@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.phase3.conftest import (
+from tests.hw_functional.conftest import (
     OP_WRITE_REG, OP_READ_REG, OP_POLL_REG,
     requires_verilator,
 )
@@ -355,7 +355,7 @@ class TestNPU3DPatterns:
         """Full NPU sequence: configure regs, trigger, poll done."""
         _setup(axilite_sim)
 
-        # Phase 1: Configure registers
+        # Step 1: Configure registers
         configs = [
             (0x010, 32), (0x018, 32), (0x020, 3),
         ]
@@ -365,13 +365,13 @@ class TestNPU3DPatterns:
             r = _run_until_done(axilite_sim)
             assert r["done"] == 1 and r["done_error"] == 0
 
-        # Phase 2: Trigger
+        # Step 2: Trigger
         _issue_cmd(axilite_sim, OP_WRITE_REG, cmd_id=10,
                    reg_offset=0x060, reg_value=1)
         r = _run_until_done(axilite_sim)
         assert r["done"] == 1
 
-        # Phase 3: Pre-set done flag and poll
+        # Step 3: Pre-set done flag and poll
         _set_reg(axilite_sim, 0x068, 0x01)
         _issue_cmd(axilite_sim, OP_POLL_REG, cmd_id=11,
                    reg_offset=0x068, reg_mask=0x01, reg_expected=0x01)

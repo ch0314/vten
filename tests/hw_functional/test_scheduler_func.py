@@ -10,7 +10,7 @@ Default iface_to_bfm mapping: iface 0→BFM 0, iface 1→BFM 1, etc.
 
 from __future__ import annotations
 
-from tests.phase3.conftest import (
+from tests.hw_functional.conftest import (
     OP_BARRIER,
     OP_LOAD,
     OP_PUSH,

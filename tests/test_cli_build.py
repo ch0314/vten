@@ -1,4 +1,4 @@
-"""Phase 4 tests: vten build — Multi-Kernel 5-Stage Pipeline.
+"""Tests for vten build — Multi-Kernel 5-Stage Pipeline.
 
 Spec references:
 - 06_codegen_and_cli.md §4.3 (vten build)
@@ -363,8 +363,13 @@ class TestVtenBuildStageControl:
         # Stage 1 output (vivado_proj) should NOT exist when only codegen requested
         assert not (project / "build" / "vivado_proj").exists()
 
+    @pytest.mark.xsim
     def test_build_upto_codegen(self, tmp_path: Path):
-        """--upto codegen runs Stages 1-3 but NOT 4-5."""
+        """--upto codegen runs Stages 1-3 but NOT 4-5.
+
+        Stages 1-2 invoke Vivado, so this is marked ``xsim`` and skipped
+        when no simulator is available.
+        """
         from vten.cli.build import build_project
 
         project = _setup_project(tmp_path)
@@ -380,8 +385,13 @@ class TestVtenBuildStageControl:
             project / "kernels" / "passthrough" / "build" / "compile.prj"
         ).exists()
 
+    @pytest.mark.xsim
     def test_build_upto_dpi_c(self, tmp_path: Path):
-        """--upto dpi_c runs Stages 1-2 only (no kernel codegen)."""
+        """--upto dpi_c runs Stages 1-2 only (no kernel codegen).
+
+        Stages 1-2 invoke Vivado, so this is marked ``xsim`` and skipped
+        when no simulator is available.
+        """
         from vten.cli.build import build_project
 
         project = _setup_project(tmp_path)

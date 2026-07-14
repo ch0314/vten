@@ -1,4 +1,4 @@
-"""Phase 4 tests: vten CLI entry point (main.py).
+"""Tests for the vten CLI entry point (main.py).
 
 Spec references:
 - 06_codegen_and_cli.md §4 (CLI Commands)

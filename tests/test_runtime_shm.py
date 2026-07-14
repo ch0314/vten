@@ -1,4 +1,4 @@
-"""Phase 2 tests — Stage 7: SHM Packing.
+"""Runtime pipeline tests — Stage 7: SHM Packing.
 
 Spec reference: 02_runtime_engine.md §14, 00_data_models.md §11
 NPU 3D patterns: npu_3d_analysis.md

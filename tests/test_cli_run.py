@@ -1,4 +1,4 @@
-"""Phase 4 tests: vten run, TestScenario, test discovery, execution pipeline.
+"""Tests for vten run, TestScenario, test discovery, execution pipeline.
 
 Spec references:
 - 00_data_models.md §14 (TestScenario, Test Discovery, Execution Flow)

@@ -1,4 +1,4 @@
-"""Phase 2 tests — Stage 6: IR Lowering.
+"""Runtime pipeline tests — Stage 6: IR Lowering.
 
 Spec reference: 02_runtime_engine.md §12, 00_data_models.md §9
 NPU 3D patterns: npu_3d_analysis.md §7

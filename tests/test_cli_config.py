@@ -1,4 +1,4 @@
-"""Phase 4 tests: vten.toml parsing and validation.
+"""Tests for vten.toml parsing and validation.
 
 Spec references:
 - 06_codegen_and_cli.md §6 (vten.toml Reference)

@@ -1,4 +1,4 @@
-"""Phase 2 tests — Stage 1: Parameter Resolution.
+"""Runtime pipeline tests — Stage 1: Parameter Resolution.
 
 Spec reference: 02_runtime_engine.md §6, 00_data_models.md §7.4
 NPU 3D patterns: npu_3d_analysis.md §3

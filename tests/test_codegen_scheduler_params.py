@@ -1,4 +1,4 @@
-"""Phase 4 tests: Scheduler parameter computation and BFM index mapping.
+"""Tests for scheduler parameter computation and BFM index mapping.
 
 Spec references:
 - 06_codegen_and_cli.md §3.3 (_generate_bfm_index_mapping)

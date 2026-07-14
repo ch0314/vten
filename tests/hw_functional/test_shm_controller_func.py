@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.phase3.conftest import (
+from tests.hw_functional.conftest import (
     BACKEND_DONE,
     BACKEND_ERROR,
     BACKEND_RUNNING,

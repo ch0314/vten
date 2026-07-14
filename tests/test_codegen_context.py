@@ -1,4 +1,4 @@
-"""Phase 4 tests: Codegen context — dataclasses and _build_context().
+"""Tests for the codegen context — dataclasses and _build_context().
 
 Spec references:
 - 06_codegen_and_cli.md §2 (Template Context Schema)

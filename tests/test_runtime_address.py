@@ -1,4 +1,4 @@
-"""Phase 2 tests — Stage 4: Address Allocation.
+"""Runtime pipeline tests — Stage 4: Address Allocation.
 
 Spec reference: 02_runtime_engine.md §10, 00_data_models.md §6.5
 NPU 3D patterns: npu_3d_analysis.md §6

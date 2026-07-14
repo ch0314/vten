@@ -1,4 +1,4 @@
-"""Phase 4 tests: vten init command.
+"""Tests for the vten init command.
 
 Spec references:
 - 06_codegen_and_cli.md §4.1 (vten init)

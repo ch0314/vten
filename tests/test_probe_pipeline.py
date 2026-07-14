@@ -1,4 +1,4 @@
-"""Tests for probe verification pipeline (Phase 2-5).
+"""Tests for the probe verification pipeline.
 
 Covers:
   §1 Probe golden serialization (engine._serialize_probe_golden)

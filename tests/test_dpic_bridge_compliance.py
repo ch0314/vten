@@ -1,4 +1,4 @@
-"""Phase 3 tests: DPI-C bridge (vten_shm_bridge.c/h) spec compliance.
+"""Tests for the DPI-C bridge (vten_shm_bridge.c/h) spec compliance.
 
 Parse C source files and verify:
 - All required function signatures (04_backend_xsim.md §6.1)

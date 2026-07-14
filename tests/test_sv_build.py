@@ -1,14 +1,14 @@
-"""Phase 3 tests: SV/C build verification and ctypes SHM round-trip.
+"""Tests for SV/C build verification and ctypes SHM round-trip.
 
 Three levels of testing:
 1. gcc compilation of vten_shm_bridge.c → libvten_shm.so
 2. xvlog syntax check of all SV files
 3. ctypes: load compiled .so, write Python SHM image, verify C reads correctly
 
-Level 3 is the most powerful: it validates that Phase 2 SHM packing
-and Phase 3 C unpacking are byte-compatible end-to-end.
+Level 3 is the most powerful: it validates that the Python SHM packing
+and the C bridge unpacking are byte-compatible end-to-end.
 
-NPU 3D patterns used for realistic command/buffer layouts.
+Multi-IP accelerator patterns are used for realistic command/buffer layouts.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def _has_verilator() -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §1. gcc compilation — Phase 3 completion criterion
+# §1. gcc compilation of the C bridge
 #     "gcc 컴파일 성공"
 # ═══════════════════════════════════════════════════════════════════
 
@@ -121,7 +121,7 @@ class TestGccCompilation:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §2. xvlog syntax check — Phase 3 completion criterion
+# §2. xvlog syntax check of the SystemVerilog sources
 #     "xvlog 구문 통과"
 # ═══════════════════════════════════════════════════════════════════
 
@@ -248,7 +248,7 @@ class TestVerilatorLint:
 
 # ═══════════════════════════════════════════════════════════════════
 # §4. ctypes round-trip: Python SHM image ↔ C bridge unpacking
-#     Most powerful test: validates Phase 2 ↔ Phase 3 compatibility
+#     Most powerful test: validates Python packing ↔ C bridge compatibility
 # ═══════════════════════════════════════════════════════════════════
 
 
@@ -282,7 +282,7 @@ class TestCtypesRoundTrip:
     """Load compiled .so via ctypes and verify SHM binary compatibility.
 
     This tests that the C bridge correctly reads what Python writes:
-    Phase 2 (shm.py pack_*) → SHM image → Phase 3 (C bridge unpack).
+    Python (shm.py pack_*) → SHM image → C bridge unpack.
     """
 
     @pytest.fixture()
@@ -296,7 +296,7 @@ class TestCtypesRoundTrip:
 
     @pytest.fixture()
     def shm_image(self):
-        """Create a minimal SHM image using Phase 2 packing functions."""
+        """Create a minimal SHM image using the Python packing functions."""
         from vten.runtime.ir import Command
         from vten.backend.sim.shm_constants import (
             BUF_DESC_SIZE,

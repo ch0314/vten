@@ -1,4 +1,4 @@
-"""Phase 4 tests: XsimBackend — lifecycle, SHM management, process control.
+"""Tests for XsimBackend — lifecycle, SHM management, process control.
 
 Spec references:
 - 04_backend_xsim.md §1-6 (Architecture, SHM, Semaphore, DPI-C)

@@ -1,4 +1,4 @@
-"""Verilator simulation harness for Phase 3 functional testing.
+"""Verilator simulation harness for hardware functional testing.
 
 Communicates with compiled verilator drivers via subprocess stdin/stdout
 using a simple JSON line protocol. Each module has its own driver executable.

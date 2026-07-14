@@ -1,15 +1,12 @@
 """Tests for vten.spec — kernel_spec.yaml parser and data models.
 
-Spec reference: 03_kernel_spec_schema.md, 00_data_models.md §5.8
-NPU 3D patterns: npu_3d_analysis.md §14 (test_spec_parser.py)
-
-NPU 3D spec parsing patterns:
-  - 6 AXI4-Lite interfaces (per-IP control registers)
+Multi-IP accelerator spec parsing patterns:
+  - AXI4-Lite interfaces (per-IP control registers)
   - AXI4 DDR: data_width=256, addr_width=64, tensors=[ifm,ofm,concat]
   - AXI4 HBM: split.mode=channel_interleave, 32 ports
   - auto_bind: address split, size_bytes, param binding
   - packing.bus_width: 8×32=256 exact match
-  - register offset ranges: bias_loader 0x010~0x01C, weight_loader 0x010~0x128
+  - register offset ranges: bias_loader 0x000~0x00C, weight_loader 0x000~0x118
 """
 
 from __future__ import annotations
@@ -413,13 +410,13 @@ class TestAXI4LiteInterface:
         assert len(iface.registers) == 17  # fmapIO has 17 regs in fixture
 
     def test_fmapio_register_offsets(self, fmapio_spec_yaml):
-        """fmapIO: in_depth@0x014, vsync@0x050, layer_done@0x054."""
+        """fmapIO: in_depth@0x000, vsync@0x03C, layer_done@0x040."""
         spec = parse_kernel_spec(str(fmapio_spec_yaml))
         regs = spec.get_registers("ctrl")
         reg_map = {r.name: r for r in regs}
-        assert reg_map["in_depth"].offset == 0x014
-        assert reg_map["vsync"].offset == 0x050
-        assert reg_map["layer_done"].offset == 0x054
+        assert reg_map["in_depth"].offset == 0x000
+        assert reg_map["vsync"].offset == 0x03C
+        assert reg_map["layer_done"].offset == 0x040
 
     def test_fmapio_vsync_field(self, fmapio_spec_yaml):
         """fmapIO vsync: fields = {trigger: '0:0'}."""
@@ -450,13 +447,13 @@ class TestAXI4LiteInterface:
         assert in_ch.auto_bind.param == "${IN_CH}"
 
     def test_bias_loader_register_range(self, bias_loader_spec_yaml):
-        """bias_loader: 4 registers, offset 0x010~0x01C."""
+        """bias_loader: 4 registers, offset 0x000~0x00C."""
         spec = parse_kernel_spec(str(bias_loader_spec_yaml))
         regs = spec.get_registers("ctrl")
         assert len(regs) == 4
         offsets = sorted(r.offset for r in regs)
-        assert offsets[0] == 0x010
-        assert offsets[-1] == 0x01C
+        assert offsets[0] == 0x000
+        assert offsets[-1] == 0x00C
 
     def test_weight_loader_register_count(self, weight_loader_spec_yaml):
         """weight_loader: 71 registers (3 params + 64 bank addrs + vsync + 3 params)."""
@@ -465,12 +462,12 @@ class TestAXI4LiteInterface:
         assert len(regs) == 71  # 3 + 64 + 1 + 3
 
     def test_weight_loader_register_range(self, weight_loader_spec_yaml):
-        """weight_loader: offset range 0x010~0x128."""
+        """weight_loader: offset range 0x000~0x118."""
         spec = parse_kernel_spec(str(weight_loader_spec_yaml))
         regs = spec.get_registers("ctrl")
         offsets = sorted(r.offset for r in regs)
-        assert offsets[0] == 0x010
-        assert offsets[-1] == 0x128  # out_ch at 0x128
+        assert offsets[0] == 0x000
+        assert offsets[-1] == 0x118  # out_ch at 0x118
 
     def test_mac_atu_auto_bind_only(self, mac_atu_spec_yaml):
         """mac_atu ctrl: 8 registers, 모두 auto_bind (param)."""

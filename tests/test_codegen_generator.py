@@ -1,4 +1,4 @@
-"""Phase 4 tests: SVGenerator.generate() — Jinja2 template rendering.
+"""Tests for SVGenerator.generate() — Jinja2 template rendering.
 
 Spec references:
 - 06_codegen_and_cli.md §1 (Template Architecture)

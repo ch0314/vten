@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import struct
 
-from tests.phase3.conftest import (
+from tests.hw_functional.conftest import (
     OP_PUSH,
     OP_PULL,
     PROTO_AXI4,

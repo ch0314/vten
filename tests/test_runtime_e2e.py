@@ -1,4 +1,4 @@
-"""Phase 2 tests — End-to-End Pipeline Integration.
+"""Runtime pipeline tests — End-to-End Pipeline Integration.
 
 Spec reference: 02_runtime_engine.md §3-§14
 NPU 3D patterns: npu_3d_analysis.md

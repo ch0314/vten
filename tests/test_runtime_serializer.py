@@ -1,4 +1,4 @@
-"""Phase 2 tests — Stage 3: Tensor Serialization.
+"""Runtime pipeline tests — Stage 3: Tensor Serialization.
 
 Spec reference: 02_runtime_engine.md §8, 00_data_models.md §6.1
 NPU 3D patterns: npu_3d_analysis.md §5

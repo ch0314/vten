@@ -1,4 +1,4 @@
-"""Phase 4 tests: Integration seams between Phase 2→4 modules.
+"""Tests for integration seams between the runtime and codegen modules.
 
 Tests the compatibility boundaries:
 - CompiledResult → SVGenerator (shm_image, bfm_configs flow into codegen)

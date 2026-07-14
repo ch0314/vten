@@ -1,8 +1,15 @@
-"""NPU 3D accelerator fixtures — per-IP sub-kernel specs.
+"""Multi-IP accelerator fixtures — per-IP sub-kernel specs.
 
-All fixtures reflect NPU 3D accelerator patterns.
-These are separated from generic fixtures to clarify which tests are
-NPU_3D-specific vs framework-general.
+These fixtures model a representative multi-IP tensor accelerator with
+several sub-kernels (feature-map I/O, bias/weight loaders, a MAC unit)
+that share an AXI4-Lite control interface and drive AXI4/AXI4-Stream data
+paths. The register offsets, memory layouts, and HBM port counts here are
+neutral synthetic values chosen to exercise the framework's parsing and
+code-generation paths (address splitting, HBM channel interleave, register
+banks, packing). They do not correspond to any real hardware design.
+
+They are separated from the generic fixtures to clarify which tests exercise
+these richer multi-interface layouts vs. the framework-general cases.
 """
 
 from __future__ import annotations
@@ -20,7 +27,11 @@ def _write_yaml(directory: Path, filename: str, data: dict) -> Path:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# NPU 3D sub-kernel specs — per-IP (npu_3d_analysis.md §4)
+# Per-IP sub-kernel specs
+#
+# Offsets use a neutral, regular stride-4 layout within each IP. The
+# structure (register counts, 64-bit address lsb/msb splits, HBM port
+# counts, packing) is preserved so the same code paths are exercised.
 # ═══════════════════════════════════════════════════════════════════
 
 
@@ -45,29 +56,29 @@ def fmapio_spec_yaml(tmp_path: Path) -> Path:
                 "protocol": "axi4_lite",
                 "addr_width": 16,
                 "registers": [
-                    {"name": "in_depth", "offset": 0x014, "auto_bind": {"param": "${IN_DEPTH}"}},
-                    {"name": "in_height", "offset": 0x018, "auto_bind": {"param": "${IN_HEIGHT}"}},
-                    {"name": "in_width", "offset": 0x01C, "auto_bind": {"param": "${IN_WIDTH}"}},
-                    {"name": "in_ch", "offset": 0x020, "auto_bind": {"param": "${IN_CH}"}},
-                    {"name": "out_ch", "offset": 0x024, "auto_bind": {"param": "${OUT_CH}"}},
-                    {"name": "ifm_stride", "offset": 0x028, "auto_bind": {"param": "${IFM_STRIDE}"}},
-                    {"name": "ofm_stride", "offset": 0x02C, "auto_bind": {"param": "${OFM_STRIDE}"}},
-                    {"name": "is_concat", "offset": 0x030, "auto_bind": {"param": "${IS_CONCAT}"}},
-                    {"name": "concat_ch", "offset": 0x034, "auto_bind": {"param": "${CONCAT_CH}"}},
-                    {"name": "ifm_addr_lsb", "offset": 0x038,
+                    {"name": "in_depth", "offset": 0x000, "auto_bind": {"param": "${IN_DEPTH}"}},
+                    {"name": "in_height", "offset": 0x004, "auto_bind": {"param": "${IN_HEIGHT}"}},
+                    {"name": "in_width", "offset": 0x008, "auto_bind": {"param": "${IN_WIDTH}"}},
+                    {"name": "in_ch", "offset": 0x00C, "auto_bind": {"param": "${IN_CH}"}},
+                    {"name": "out_ch", "offset": 0x010, "auto_bind": {"param": "${OUT_CH}"}},
+                    {"name": "ifm_stride", "offset": 0x014, "auto_bind": {"param": "${IFM_STRIDE}"}},
+                    {"name": "ofm_stride", "offset": 0x018, "auto_bind": {"param": "${OFM_STRIDE}"}},
+                    {"name": "is_concat", "offset": 0x01C, "auto_bind": {"param": "${IS_CONCAT}"}},
+                    {"name": "concat_ch", "offset": 0x020, "auto_bind": {"param": "${CONCAT_CH}"}},
+                    {"name": "ifm_addr_lsb", "offset": 0x024,
                      "auto_bind": {"tensor": "ifm", "value": "address", "bits": "31:0"}},
-                    {"name": "ifm_addr_msb", "offset": 0x03C,
+                    {"name": "ifm_addr_msb", "offset": 0x028,
                      "auto_bind": {"tensor": "ifm", "value": "address", "bits": "63:32"}},
-                    {"name": "ofm_addr_lsb", "offset": 0x040,
+                    {"name": "ofm_addr_lsb", "offset": 0x02C,
                      "auto_bind": {"tensor": "ofm", "value": "address", "bits": "31:0"}},
-                    {"name": "ofm_addr_msb", "offset": 0x044,
+                    {"name": "ofm_addr_msb", "offset": 0x030,
                      "auto_bind": {"tensor": "ofm", "value": "address", "bits": "63:32"}},
-                    {"name": "concat_addr_lsb", "offset": 0x048,
+                    {"name": "concat_addr_lsb", "offset": 0x034,
                      "auto_bind": {"tensor": "concat", "value": "address", "bits": "31:0"}},
-                    {"name": "concat_addr_msb", "offset": 0x04C,
+                    {"name": "concat_addr_msb", "offset": 0x038,
                      "auto_bind": {"tensor": "concat", "value": "address", "bits": "63:32"}},
-                    {"name": "vsync", "offset": 0x050, "fields": {"trigger": "0:0"}},
-                    {"name": "layer_done", "offset": 0x054, "fields": {"done": "0:0"}},
+                    {"name": "vsync", "offset": 0x03C, "fields": {"trigger": "0:0"}},
+                    {"name": "layer_done", "offset": 0x040, "fields": {"done": "0:0"}},
                 ],
             },
             "ddr": {
@@ -116,13 +127,13 @@ def bias_loader_spec_yaml(tmp_path: Path) -> Path:
                 "protocol": "axi4_lite",
                 "addr_width": 16,
                 "registers": [
-                    {"name": "bias_addr_lsb", "offset": 0x010,
+                    {"name": "bias_addr_lsb", "offset": 0x000,
                      "auto_bind": {"tensor": "bias", "value": "address", "bits": "31:0"}},
-                    {"name": "bias_addr_msb", "offset": 0x014,
+                    {"name": "bias_addr_msb", "offset": 0x004,
                      "auto_bind": {"tensor": "bias", "value": "address", "bits": "63:32"}},
-                    {"name": "out_ch", "offset": 0x018,
+                    {"name": "out_ch", "offset": 0x008,
                      "auto_bind": {"param": "${OUT_CH}"}},
-                    {"name": "vsync", "offset": 0x01C, "fields": {"trigger": "0:0"}},
+                    {"name": "vsync", "offset": 0x00C, "fields": {"trigger": "0:0"}},
                 ],
             },
             "ddr": {
@@ -150,23 +161,30 @@ def bias_loader_spec_yaml(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def weight_loader_spec_yaml(tmp_path: Path) -> Path:
-    """weight_loader: 71 registers + HBM 32-port split."""
+    """weight_loader: 71 registers + HBM 32-port split.
+
+    Layout (synthetic, stride 4): 3 dimension params, then 32 pairs of
+    64-bit address registers (64 total), then vsync + 3 more params.
+    """
     regs = [
-        {"name": "in_width", "offset": 0x010, "auto_bind": {"param": "${IN_WIDTH}"}},
-        {"name": "in_height", "offset": 0x014, "auto_bind": {"param": "${IN_HEIGHT}"}},
-        {"name": "in_depth", "offset": 0x018, "auto_bind": {"param": "${IN_DEPTH}"}},
+        {"name": "in_width", "offset": 0x000, "auto_bind": {"param": "${IN_WIDTH}"}},
+        {"name": "in_height", "offset": 0x004, "auto_bind": {"param": "${IN_HEIGHT}"}},
+        {"name": "in_depth", "offset": 0x008, "auto_bind": {"param": "${IN_DEPTH}"}},
     ]
+    # 32 address channels, each a 64-bit lsb/msb pair, starting at 0x00C.
+    addr_base = 0x00C
     for i in range(32):
-        regs.append({"name": f"wgt_addr_{i:02d}_lsb", "offset": 0x01C + 8 * i})
-        regs.append({"name": f"wgt_addr_{i:02d}_msb", "offset": 0x020 + 8 * i})
+        regs.append({"name": f"wgt_addr_{i:02d}_lsb", "offset": addr_base + 8 * i})
+        regs.append({"name": f"wgt_addr_{i:02d}_msb", "offset": addr_base + 8 * i + 4})
+    tail_base = addr_base + 8 * 32  # 0x10C
     regs.extend([
-        {"name": "vsync", "offset": 0x11C, "fields": {"trigger": "0:0"}},
-        {"name": "kernel_size", "offset": 0x120, "auto_bind": {"param": "${KERNEL_SIZE}"}},
-        {"name": "in_ch", "offset": 0x124, "auto_bind": {"param": "${IN_CH}"}},
-        {"name": "out_ch", "offset": 0x128, "auto_bind": {"param": "${OUT_CH}"}},
+        {"name": "vsync", "offset": tail_base, "fields": {"trigger": "0:0"}},
+        {"name": "kernel_size", "offset": tail_base + 0x04, "auto_bind": {"param": "${KERNEL_SIZE}"}},
+        {"name": "in_ch", "offset": tail_base + 0x08, "auto_bind": {"param": "${IN_CH}"}},
+        {"name": "out_ch", "offset": tail_base + 0x0C, "auto_bind": {"param": "${OUT_CH}"}},
     ])
 
-    hbm_ports = [{"name": f"hbm_m{i:02d}_axi", "base_addr": 0} for i in range(32)]
+    hbm_ports = [{"name": f"hbm_ch{i:02d}", "base_addr": 0} for i in range(32)]
 
     data = {
         "kernel": "weight_loader",
@@ -224,14 +242,14 @@ def mac_atu_spec_yaml(tmp_path: Path) -> Path:
                 "protocol": "axi4_lite",
                 "addr_width": 16,
                 "registers": [
-                    {"name": "ifm_is_signed", "offset": 0x010, "auto_bind": {"param": "${IFM_DTYPE}"}},
-                    {"name": "in_ch", "offset": 0x014, "auto_bind": {"param": "${IN_CH}"}},
-                    {"name": "out_ch", "offset": 0x018, "auto_bind": {"param": "${OUT_CH}"}},
-                    {"name": "is_concat", "offset": 0x01C, "auto_bind": {"param": "${IS_CONCAT}"}},
-                    {"name": "concat_is_signed", "offset": 0x020, "auto_bind": {"param": "${IFM_DTYPE}"}},
-                    {"name": "concat_ch", "offset": 0x024, "auto_bind": {"param": "${CONCAT_CH}"}},
-                    {"name": "in_width", "offset": 0x028, "auto_bind": {"param": "${IN_WIDTH}"}},
-                    {"name": "in_height", "offset": 0x02C, "auto_bind": {"param": "${IN_HEIGHT}"}},
+                    {"name": "ifm_is_signed", "offset": 0x000, "auto_bind": {"param": "${IFM_DTYPE}"}},
+                    {"name": "in_ch", "offset": 0x004, "auto_bind": {"param": "${IN_CH}"}},
+                    {"name": "out_ch", "offset": 0x008, "auto_bind": {"param": "${OUT_CH}"}},
+                    {"name": "is_concat", "offset": 0x00C, "auto_bind": {"param": "${IS_CONCAT}"}},
+                    {"name": "concat_is_signed", "offset": 0x010, "auto_bind": {"param": "${IFM_DTYPE}"}},
+                    {"name": "concat_ch", "offset": 0x014, "auto_bind": {"param": "${CONCAT_CH}"}},
+                    {"name": "in_width", "offset": 0x018, "auto_bind": {"param": "${IN_WIDTH}"}},
+                    {"name": "in_height", "offset": 0x01C, "auto_bind": {"param": "${IN_HEIGHT}"}},
                 ],
             },
             "ifm_in": {
@@ -289,13 +307,13 @@ def conv3d_composite_spec_yamls(tmp_path: Path) -> dict[str, Path]:
                     "fmapio": {"base_offset": 0x000},
                 },
                 "registers": [
-                    {"name": "in_depth", "offset": 0x014, "auto_bind": {"param": "${IN_DEPTH}"}},
-                    {"name": "ifm_addr_lsb", "offset": 0x038,
+                    {"name": "in_depth", "offset": 0x000, "auto_bind": {"param": "${IN_DEPTH}"}},
+                    {"name": "ifm_addr_lsb", "offset": 0x024,
                      "auto_bind": {"tensor": "ifm", "value": "address", "bits": "31:0"}},
-                    {"name": "ifm_addr_msb", "offset": 0x03C,
+                    {"name": "ifm_addr_msb", "offset": 0x028,
                      "auto_bind": {"tensor": "ifm", "value": "address", "bits": "63:32"}},
-                    {"name": "vsync", "offset": 0x050, "fields": {"trigger": "0:0"}},
-                    {"name": "layer_done", "offset": 0x054, "fields": {"done": "0:0"}},
+                    {"name": "vsync", "offset": 0x03C, "fields": {"trigger": "0:0"}},
+                    {"name": "layer_done", "offset": 0x040, "fields": {"done": "0:0"}},
                 ],
             },
             "ddr": {
@@ -312,14 +330,14 @@ def conv3d_composite_spec_yamls(tmp_path: Path) -> dict[str, Path]:
 
     # ── weight_loader sub-kernel (with HBM split) ──
     wgt_regs = [
-        {"name": "in_width", "offset": 0x010, "auto_bind": {"param": "${IN_WIDTH}"}},
+        {"name": "in_width", "offset": 0x000, "auto_bind": {"param": "${IN_WIDTH}"}},
     ]
     for i in range(4):  # Simplified: 4 HBM ports instead of 32
-        wgt_regs.append({"name": f"wgt_addr_{i:02d}_lsb", "offset": 0x01C + 8 * i})
-        wgt_regs.append({"name": f"wgt_addr_{i:02d}_msb", "offset": 0x020 + 8 * i})
-    wgt_regs.append({"name": "vsync", "offset": 0x05C, "fields": {"trigger": "0:0"}})
+        wgt_regs.append({"name": f"wgt_addr_{i:02d}_lsb", "offset": 0x004 + 8 * i})
+        wgt_regs.append({"name": f"wgt_addr_{i:02d}_msb", "offset": 0x008 + 8 * i})
+    wgt_regs.append({"name": "vsync", "offset": 0x024, "fields": {"trigger": "0:0"}})
 
-    hbm_ports = [{"name": f"hbm_m{i:02d}_axi", "base_addr": 0} for i in range(4)]
+    hbm_ports = [{"name": f"hbm_ch{i:02d}", "base_addr": 0} for i in range(4)]
 
     weight_loader = {
         "kernel": "weight_loader",
@@ -369,8 +387,8 @@ def conv3d_composite_spec_yamls(tmp_path: Path) -> dict[str, Path]:
                     "mac": {"base_offset": 0x2000},
                 },
                 "registers": [
-                    {"name": "in_ch", "offset": 0x014, "auto_bind": {"param": "${IN_CH}"}},
-                    {"name": "out_ch", "offset": 0x018, "auto_bind": {"param": "${OUT_CH}"}},
+                    {"name": "in_ch", "offset": 0x004, "auto_bind": {"param": "${IN_CH}"}},
+                    {"name": "out_ch", "offset": 0x008, "auto_bind": {"param": "${OUT_CH}"}},
                 ],
             },
             "ifm_in": {
@@ -407,11 +425,11 @@ def conv3d_composite_spec_yamls(tmp_path: Path) -> dict[str, Path]:
                     "bias": {"base_offset": 0x3000},
                 },
                 "registers": [
-                    {"name": "bias_addr_lsb", "offset": 0x010,
+                    {"name": "bias_addr_lsb", "offset": 0x000,
                      "auto_bind": {"tensor": "bias", "value": "address", "bits": "31:0"}},
-                    {"name": "bias_addr_msb", "offset": 0x014,
+                    {"name": "bias_addr_msb", "offset": 0x004,
                      "auto_bind": {"tensor": "bias", "value": "address", "bits": "63:32"}},
-                    {"name": "out_ch", "offset": 0x018, "auto_bind": {"param": "${OUT_CH}"}},
+                    {"name": "out_ch", "offset": 0x008, "auto_bind": {"param": "${OUT_CH}"}},
                 ],
             },
             "ddr": {

@@ -1,6 +1,8 @@
-"""Phase 3 functional test fixtures.
+"""Hardware functional test fixtures.
 
 Session-scoped compilation of verilator modules + test-scoped simulator instances.
+These tests exercise the generated BFMs, the SHM controller, and the command
+scheduler against a Verilator-compiled model of the vTen SystemVerilog.
 """
 
 from __future__ import annotations
@@ -16,8 +18,8 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 VTEN_SV = PROJECT_ROOT / "vten" / "sv"
-STUBS_DIR = PROJECT_ROOT / "tests" / "phase3" / "stubs"
-WRAPPERS_DIR = PROJECT_ROOT / "tests" / "phase3" / "wrappers"
+STUBS_DIR = PROJECT_ROOT / "tests" / "hw_functional" / "stubs"
+WRAPPERS_DIR = PROJECT_ROOT / "tests" / "hw_functional" / "wrappers"
 BUILD_DIR = PROJECT_ROOT / "build" / "verilator"
 
 
@@ -84,7 +86,7 @@ def _verilate(
     """Run verilator --cc on a SystemVerilog file. Returns Mdir path.
 
     If sv_dir is given, module_sv is resolved relative to that directory
-    (useful for wrapper modules in tests/phase3/wrappers/).
+    (useful for wrapper modules in tests/hw_functional/wrappers/).
     """
     mdir = BUILD_DIR / build_name
     mdir.mkdir(parents=True, exist_ok=True)
@@ -238,7 +240,7 @@ def scheduler_driver() -> Path:
 @pytest.fixture
 def shm_ctrl_sim(shm_ctrl_driver):
     """Create a VerilatorSim instance for shm_controller."""
-    from tests.phase3.sim_harness import VerilatorSim
+    from tests.hw_functional.sim_harness import VerilatorSim
 
     with VerilatorSim(shm_ctrl_driver) as sim:
         yield sim
@@ -247,7 +249,7 @@ def shm_ctrl_sim(shm_ctrl_driver):
 @pytest.fixture
 def axilite_sim(axilite_driver):
     """Create a VerilatorSim instance for axilite BFM."""
-    from tests.phase3.sim_harness import VerilatorSim
+    from tests.hw_functional.sim_harness import VerilatorSim
 
     with VerilatorSim(axilite_driver) as sim:
         yield sim
@@ -256,7 +258,7 @@ def axilite_sim(axilite_driver):
 @pytest.fixture
 def axi4s_sim(axi4s_driver):
     """Create a VerilatorSim instance for axi4s BFM (MASTER mode)."""
-    from tests.phase3.sim_harness import VerilatorSim
+    from tests.hw_functional.sim_harness import VerilatorSim
 
     with VerilatorSim(axi4s_driver) as sim:
         yield sim
@@ -265,7 +267,7 @@ def axi4s_sim(axi4s_driver):
 @pytest.fixture
 def axi4_sim(axi4_driver):
     """Create a VerilatorSim instance for axi4 BFM."""
-    from tests.phase3.sim_harness import VerilatorSim
+    from tests.hw_functional.sim_harness import VerilatorSim
 
     with VerilatorSim(axi4_driver) as sim:
         yield sim
@@ -274,7 +276,7 @@ def axi4_sim(axi4_driver):
 @pytest.fixture
 def scheduler_sim(scheduler_driver):
     """Create a VerilatorSim instance for scheduler."""
-    from tests.phase3.sim_harness import VerilatorSim
+    from tests.hw_functional.sim_harness import VerilatorSim
 
     with VerilatorSim(scheduler_driver) as sim:
         yield sim

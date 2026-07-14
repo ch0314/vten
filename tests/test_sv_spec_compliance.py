@@ -1,4 +1,4 @@
-"""Phase 3 tests: SystemVerilog source spec compliance.
+"""Tests for SystemVerilog source spec compliance.
 
 Parse vten_sv/ source files and verify they match the authoritative spec
 (00_data_models.md, 04_backend_xsim.md, 05_bfm_library.md).

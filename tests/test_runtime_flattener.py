@@ -1,4 +1,4 @@
-"""Phase 2 tests — Stage 0: Composite Flattening.
+"""Runtime pipeline tests — Stage 0: Composite Flattening.
 
 Spec reference: 02_runtime_engine.md §5, 00_data_models.md §7
 NPU 3D patterns: npu_3d_analysis.md §4

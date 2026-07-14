@@ -1,4 +1,4 @@
-"""Phase 2 tests — Stage 5: auto_bind Resolution.
+"""Runtime pipeline tests — Stage 5: auto_bind Resolution.
 
 Spec reference: 02_runtime_engine.md §11, 00_data_models.md §5.3
 NPU 3D patterns: npu_3d_analysis.md §4

@@ -1,4 +1,4 @@
-"""Phase 4 tests: vten report command.
+"""Tests for the vten report command.
 
 Spec references:
 - 06_codegen_and_cli.md §4.5 (vten report)
