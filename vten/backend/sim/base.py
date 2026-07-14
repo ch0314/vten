@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from vten.backend.base import Backend, BackendResult, CmdStats, raise_backend_error
 from vten.backend.sim.semaphore import PosixSemaphore
+from vten.backend.sim import shm_constants
 from vten.backend.sim.shm_constants import (
     BACKEND_STATUS_DONE,
     BACKEND_STATUS_ERROR,
@@ -74,16 +75,19 @@ class SimBackend(Backend):
             └── VerilatorBackend — Verilator binary
     """
 
-    SHM_MAGIC = 0x5654454E  # "VTEN"
+    # SHM protocol constants — single source of truth is shm_constants.py.
+    # Re-exposed as class attributes so existing self.* references keep working
+    # while the authoritative values live in one module.
+    SHM_MAGIC = shm_constants.SHM_MAGIC  # "VTEN"
 
-    # Control region offsets (00_data_models.md §10.2)
-    HOST_STATUS_OFFSET = 0x08
-    BACKEND_STATUS_OFFSET = 0x0C
-    ERROR_CODE_OFFSET = 0x40
-    ERROR_CMD_ID_OFFSET = 0x44
-    ERROR_MSG_OFFSET = 0x48
-    ERROR_MSG_SIZE = 64
-    STATS_ENABLED_OFFSET = 0x88
+    # Control region offsets (00_data_models.md §11.3)
+    HOST_STATUS_OFFSET = shm_constants.HOST_STATUS_OFFSET
+    BACKEND_STATUS_OFFSET = shm_constants.BACKEND_STATUS_OFFSET
+    ERROR_CODE_OFFSET = shm_constants.ERROR_CODE_OFFSET
+    ERROR_CMD_ID_OFFSET = shm_constants.ERROR_CMD_ID_OFFSET
+    ERROR_MSG_OFFSET = shm_constants.ERROR_MSG_OFFSET
+    ERROR_MSG_SIZE = shm_constants.ERROR_MSG_SIZE
+    STATS_ENABLED_OFFSET = shm_constants.FLAGS_OFFSET
 
     def __init__(self, project_config: dict, backend_section: str) -> None:
         from vten.backend.base import RunContext

@@ -25,6 +25,43 @@ CACHE_LINE = 64
 SHM_MAGIC = 0x5654454E  # "VTEN"
 PROTOCOL_VERSION = 0x00000003
 
+# ── Control Header field byte offsets (00_data_models.md §11.3) ──
+#
+# Single source of truth for the control-region layout.  The C bridge
+# (vten_shm_bridge.h ControlHeader struct) and SV controller must agree
+# byte-for-byte; test_dpic_bridge_compliance.py asserts these against the
+# parsed C struct.
+MAGIC_OFFSET = 0x00
+VERSION_OFFSET = 0x04
+HOST_STATUS_OFFSET = 0x08
+BACKEND_STATUS_OFFSET = 0x0C
+NUM_COMMANDS_OFFSET = 0x10
+NUM_BUFFERS_OFFSET = 0x14
+CMD_REGION_OFFSET = 0x18
+STATS_REGION_OFFSET = 0x20
+BUF_DESC_OFFSET = 0x28
+DATA_REGION_OFFSET = 0x30
+TOTAL_SHM_SIZE_OFFSET = 0x38
+ERROR_CODE_OFFSET = 0x40
+ERROR_CMD_ID_OFFSET = 0x44
+ERROR_MSG_OFFSET = 0x48
+ERROR_MSG_SIZE = 64
+FLAGS_OFFSET = 0x88
+TIMEOUT_MS_OFFSET = 0x8C
+
+# ── Backend error codes (00_data_models.md §11.13) ──
+
+ERR_OK = 0
+ERR_ADDR_UNMATCH = 1
+ERR_POLL_TIMEOUT = 2
+ERR_BFM_QUEUE_ERROR = 3
+ERR_SCHEDULER_ERROR = 4
+ERR_SHM_ACCESS_ERROR = 5
+ERR_UNKNOWN_OPCODE = 6
+ERR_BFM_MAP_ERROR = 7
+ERR_PROBE_MISMATCH = 8
+ERR_TIMEOUT_CODE = 9
+
 # ── Protocol encoding for SHM ──
 
 PROTOCOL_ENCODING = {
@@ -146,19 +183,19 @@ def pack_control_header(
     flags: int = FLAG_STATS_ENABLED,
 ) -> None:
     """Pack the 256-byte control header."""
-    struct.pack_into("<I", image, 0x00, SHM_MAGIC)
-    struct.pack_into("<I", image, 0x04, PROTOCOL_VERSION)
-    struct.pack_into("<I", image, 0x08, 0)  # host_status = IDLE
-    struct.pack_into("<I", image, 0x0C, 0)  # backend_status = IDLE
-    struct.pack_into("<I", image, 0x10, num_commands)
-    struct.pack_into("<I", image, 0x14, num_buffers)
-    struct.pack_into("<Q", image, 0x18, cmd_region_offset)
-    struct.pack_into("<Q", image, 0x20, stats_region_offset)
-    struct.pack_into("<Q", image, 0x28, buf_desc_offset)
-    struct.pack_into("<Q", image, 0x30, data_region_offset)
-    struct.pack_into("<Q", image, 0x38, total_shm_size)
+    struct.pack_into("<I", image, MAGIC_OFFSET, SHM_MAGIC)
+    struct.pack_into("<I", image, VERSION_OFFSET, PROTOCOL_VERSION)
+    struct.pack_into("<I", image, HOST_STATUS_OFFSET, 0)  # host_status = IDLE
+    struct.pack_into("<I", image, BACKEND_STATUS_OFFSET, 0)  # backend_status = IDLE
+    struct.pack_into("<I", image, NUM_COMMANDS_OFFSET, num_commands)
+    struct.pack_into("<I", image, NUM_BUFFERS_OFFSET, num_buffers)
+    struct.pack_into("<Q", image, CMD_REGION_OFFSET, cmd_region_offset)
+    struct.pack_into("<Q", image, STATS_REGION_OFFSET, stats_region_offset)
+    struct.pack_into("<Q", image, BUF_DESC_OFFSET, buf_desc_offset)
+    struct.pack_into("<Q", image, DATA_REGION_OFFSET, data_region_offset)
+    struct.pack_into("<Q", image, TOTAL_SHM_SIZE_OFFSET, total_shm_size)
     # error_code, error_cmd_id, error_message, flags, timeout, freq, seq = 0
-    struct.pack_into("<I", image, 0x88, flags)
+    struct.pack_into("<I", image, FLAGS_OFFSET, flags)
 
 
 def pack_command_slot(

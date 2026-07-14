@@ -835,3 +835,163 @@ class TestCrossFileConsistency:
         """DPI-C bridge C files."""
         assert (VTEN_SV_DIR / "vten_shm_bridge.c").exists()
         assert (VTEN_SV_DIR / "vten_shm_bridge.h").exists()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §11. Single-source-of-truth drift guard
+#     Python (vten.backend.sim.shm_constants + vten.spec.models) is
+#     authoritative.  Every SHM constant, status value, error code, and
+#     enum encoding in vten_types.svh must equal the Python value.  Any
+#     future edit that desyncs SV from Python fails here.
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestPythonSvhDriftGuard:
+    """Assert vten_types.svh == Python authoritative constants, field by field."""
+
+    @pytest.fixture(autouse=True)
+    def _load(self):
+        self.text = _read_sv("vten_types.svh")
+
+    def test_scalar_constants_match_python(self):
+        from vten.backend.sim import shm_constants as sc
+
+        assert _extract_localparam_int(self.text, "SHM_MAGIC") == sc.SHM_MAGIC
+        assert _extract_localparam_int(self.text, "SHM_VERSION") == sc.PROTOCOL_VERSION
+        assert _extract_localparam_int(self.text, "CONTROL_SIZE") == sc.CONTROL_SIZE
+        assert _extract_localparam_int(self.text, "CMD_SLOT_SIZE") == sc.CMD_SLOT_SIZE
+        assert _extract_localparam_int(self.text, "STATS_SLOT_SIZE") == sc.STATS_SLOT_SIZE
+        assert _extract_localparam_int(self.text, "BUF_DESC_SIZE") == sc.BUF_DESC_SIZE
+        assert _extract_localparam_int(self.text, "CACHE_LINE") == sc.CACHE_LINE
+
+    def test_host_status_match_python(self):
+        from vten.backend.sim import shm_constants as sc
+
+        assert _extract_localparam_int(self.text, "HOST_IDLE") == sc.HOST_STATUS_IDLE
+        assert _extract_localparam_int(self.text, "HOST_CMD_READY") == sc.HOST_STATUS_CMD_READY
+        assert _extract_localparam_int(self.text, "HOST_ACK") == sc.HOST_STATUS_ACK
+        assert _extract_localparam_int(self.text, "HOST_SHUTDOWN") == sc.HOST_STATUS_SHUTDOWN
+
+    def test_backend_status_match_python(self):
+        from vten.backend.sim import shm_constants as sc
+
+        assert _extract_localparam_int(self.text, "BACKEND_IDLE") == sc.BACKEND_STATUS_IDLE
+        assert _extract_localparam_int(self.text, "BACKEND_RUNNING") == sc.BACKEND_STATUS_RUNNING
+        assert _extract_localparam_int(self.text, "BACKEND_DONE") == sc.BACKEND_STATUS_DONE
+        assert _extract_localparam_int(self.text, "BACKEND_ERROR") == sc.BACKEND_STATUS_ERROR
+
+    def test_error_codes_match_python(self):
+        """SV error-code localparams == Python shm_constants error codes.
+
+        (Names differ slightly — SV drops the _ERROR/_CODE suffix — but the
+        integer encoding is the cross-process contract and must match.)
+        """
+        from vten.backend.sim import shm_constants as sc
+
+        pairs = {
+            "ERR_OK": sc.ERR_OK,
+            "ERR_ADDR_UNMATCH": sc.ERR_ADDR_UNMATCH,
+            "ERR_POLL_TIMEOUT": sc.ERR_POLL_TIMEOUT,
+            "ERR_BFM_QUEUE": sc.ERR_BFM_QUEUE_ERROR,
+            "ERR_SCHEDULER": sc.ERR_SCHEDULER_ERROR,
+            "ERR_SHM_ACCESS": sc.ERR_SHM_ACCESS_ERROR,
+            "ERR_UNKNOWN_OPCODE": sc.ERR_UNKNOWN_OPCODE,
+            "ERR_BFM_MAP": sc.ERR_BFM_MAP_ERROR,
+            "ERR_PROBE_MISMATCH": sc.ERR_PROBE_MISMATCH,
+            "ERR_TIMEOUT": sc.ERR_TIMEOUT_CODE,
+        }
+        for name, py_val in pairs.items():
+            assert _extract_localparam_int(self.text, name) == py_val, name
+
+    def test_opcode_enum_matches_python(self):
+        """opcode_t encoding == OpCode enum."""
+        from vten.spec.models import OpCode
+
+        sv = _extract_enum_values(self.text, "opcode_t")
+        for member in OpCode:
+            assert sv.get(f"OP_{member.name}") == member.value, member.name
+
+    def test_command_status_enum_matches_python(self):
+        """cmd_status_t encoding == CommandStatus enum."""
+        from vten.spec.models import CommandStatus
+
+        sv = _extract_enum_values(self.text, "cmd_status_t")
+        for member in CommandStatus:
+            assert sv.get(f"CMD_{member.name}") == member.value, member.name
+
+    def test_protocol_enum_matches_python(self):
+        """protocol_t encoding == PROTOCOL_ENCODING map."""
+        from vten.backend.sim.shm_constants import PROTOCOL_ENCODING
+        from vten.spec.models import Protocol
+
+        sv = _extract_enum_values(self.text, "protocol_t")
+        assert sv.get("PROTO_AXI4S") == PROTOCOL_ENCODING[Protocol.AXI4S]
+        assert sv.get("PROTO_AXI4") == PROTOCOL_ENCODING[Protocol.AXI4]
+        assert sv.get("PROTO_AXI4L") == PROTOCOL_ENCODING[Protocol.AXI4L]
+
+    def test_role_encoding_matches_python(self):
+        """ROLE_MASTER/SLAVE == ROLE_ENCODING map."""
+        from vten.backend.sim.shm_constants import ROLE_ENCODING
+        from vten.spec.models import Role
+
+        assert re.search(
+            rf"ROLE_MASTER\s*=\s*1'b{ROLE_ENCODING[Role.MASTER]}", self.text
+        )
+        assert re.search(
+            rf"ROLE_SLAVE\s*=\s*1'b{ROLE_ENCODING[Role.SLAVE]}", self.text
+        )
+
+    def test_dep_none_sentinel_matches_packer(self):
+        """DEP_NONE (0xFFFF) == the unused-dep sentinel written by the packer."""
+        assert re.search(r"DEP_NONE\s*=\s*16'hFFFF", self.text)
+
+
+class TestCSvScalarConsistency:
+    """The scalar constants shared by all three languages must agree C == SV.
+
+    Python-vs-C is covered in test_dpic_bridge_compliance; Python-vs-SV above.
+    This closes the triangle directly so a C/SV-only edit can't slip through.
+    """
+
+    def test_shared_scalars_c_equals_sv(self):
+        h_path = VTEN_SV_DIR / "vten_shm_bridge.h"
+        if not h_path.exists():
+            pytest.skip("vten_shm_bridge.h not present")
+        h_text = h_path.read_text()
+        sv_text = _read_sv("vten_types.svh")
+
+        def c_int(name):
+            m = re.search(
+                rf"#define\s+{re.escape(name)}\s+(0x[0-9a-fA-F_]+|\d+)", h_text
+            )
+            return int(m.group(1).replace("_", ""), 0) if m else None
+
+        # (C name, SV name)
+        pairs = [
+            ("SHM_MAGIC", "SHM_MAGIC"),
+            ("PROTOCOL_VERSION", "SHM_VERSION"),
+            ("CONTROL_SIZE", "CONTROL_SIZE"),
+            ("CMD_SLOT_SIZE", "CMD_SLOT_SIZE"),
+            ("STATS_SLOT_SIZE", "STATS_SLOT_SIZE"),
+            ("BUF_DESC_SIZE", "BUF_DESC_SIZE"),
+            ("CACHE_LINE", "CACHE_LINE"),
+            ("HOST_IDLE", "HOST_IDLE"),
+            ("HOST_CMD_READY", "HOST_CMD_READY"),
+            ("HOST_ACK", "HOST_ACK"),
+            ("HOST_SHUTDOWN", "HOST_SHUTDOWN"),
+            ("BACKEND_IDLE", "BACKEND_IDLE"),
+            ("BACKEND_RUNNING", "BACKEND_RUNNING"),
+            ("BACKEND_DONE", "BACKEND_DONE"),
+            ("BACKEND_ERROR", "BACKEND_ERROR"),
+            ("ERR_OK", "ERR_OK"),
+            ("ERR_ADDR_UNMATCH", "ERR_ADDR_UNMATCH"),
+            ("ERR_POLL_TIMEOUT", "ERR_POLL_TIMEOUT"),
+            ("ERR_UNKNOWN_OPCODE", "ERR_UNKNOWN_OPCODE"),
+            ("ERR_PROBE_MISMATCH", "ERR_PROBE_MISMATCH"),
+        ]
+        for c_name, sv_name in pairs:
+            cv = c_int(c_name)
+            sv = _extract_localparam_int(sv_text, sv_name)
+            assert cv is not None, f"C {c_name} not found"
+            assert sv is not None, f"SV {sv_name} not found"
+            assert cv == sv, f"{c_name}(C)={cv} != {sv_name}(SV)={sv}"

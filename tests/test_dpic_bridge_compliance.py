@@ -52,6 +52,32 @@ def _extract_define_int(text: str, name: str) -> int | None:
     return int(m.group(1))
 
 
+def _extract_struct_offsets(text: str, struct_name: str) -> dict[str, int]:
+    """Parse ``field; /* 0xNN */`` byte offsets from a C struct definition.
+
+    The ControlHeader/BufferDescriptor/StatsEntry structs annotate each field
+    with its byte offset in a trailing comment; this is the authoritative C
+    view of the binary layout.
+    """
+    m = re.search(
+        rf"typedef\s+struct\s*\{{(.*?)\}}\s*{re.escape(struct_name)}\s*;",
+        text,
+        re.DOTALL,
+    )
+    if not m:
+        return {}
+    body = m.group(1)
+    offsets: dict[str, int] = {}
+    for line in body.splitlines():
+        fm = re.search(
+            r"\b(\w+)\s*(?:\[\s*\d+\s*\])?\s*;\s*/\*\s*(0x[0-9a-fA-F]+)\s*\*/",
+            line,
+        )
+        if fm:
+            offsets[fm.group(1)] = int(fm.group(2), 16)
+    return offsets
+
+
 # ═══════════════════════════════════════════════════════════════════
 # §1. Header file: function declarations
 #     (04_backend_xsim.md §6.1)
@@ -525,3 +551,145 @@ class TestBufferDescriptorCache:
         """Bulk read uses data_offset to locate buffer."""
         # The function should compute: data_base + desc.data_offset + offset
         assert "data_offset" in self.c_text or "offset" in self.c_text
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §11. Single-source-of-truth drift guard
+#     Python (vten.backend.sim.shm_constants) is authoritative.  Every
+#     constant, error code, and byte offset it declares must equal the
+#     value parsed from the C header vten_shm_bridge.h.  Any future edit
+#     that desyncs the two languages fails here.
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestPythonCHeaderDriftGuard:
+    """Assert vten_shm_bridge.h == vten.backend.sim.shm_constants, field by field."""
+
+    @pytest.fixture(autouse=True)
+    def _load(self):
+        self.h_text = _read_c("vten_shm_bridge.h")
+
+    def test_scalar_constants_match_python(self):
+        """Region sizes, magic, and version match the C #defines exactly."""
+        from vten.backend.sim import shm_constants as sc
+
+        int_defines = {
+            "CONTROL_SIZE": sc.CONTROL_SIZE,
+            "CMD_SLOT_SIZE": sc.CMD_SLOT_SIZE,
+            "STATS_SLOT_SIZE": sc.STATS_SLOT_SIZE,
+            "BUF_DESC_SIZE": sc.BUF_DESC_SIZE,
+            "CACHE_LINE": sc.CACHE_LINE,
+        }
+        for name, py_val in int_defines.items():
+            c_val = _extract_define_int(self.h_text, name)
+            assert c_val == py_val, f"{name}: C={c_val} Python={py_val}"
+
+        assert _extract_define_hex(self.h_text, "SHM_MAGIC") == sc.SHM_MAGIC
+        assert (
+            _extract_define_hex(self.h_text, "PROTOCOL_VERSION")
+            == sc.PROTOCOL_VERSION
+        )
+
+    def test_host_status_defines_match_python(self):
+        from vten.backend.sim import shm_constants as sc
+
+        pairs = {
+            "HOST_IDLE": sc.HOST_STATUS_IDLE,
+            "HOST_CMD_READY": sc.HOST_STATUS_CMD_READY,
+            "HOST_ACK": sc.HOST_STATUS_ACK,
+            "HOST_SHUTDOWN": sc.HOST_STATUS_SHUTDOWN,
+        }
+        for name, py_val in pairs.items():
+            assert _extract_define_int(self.h_text, name) == py_val, name
+
+    def test_backend_status_defines_match_python(self):
+        from vten.backend.sim import shm_constants as sc
+
+        pairs = {
+            "BACKEND_IDLE": sc.BACKEND_STATUS_IDLE,
+            "BACKEND_RUNNING": sc.BACKEND_STATUS_RUNNING,
+            "BACKEND_DONE": sc.BACKEND_STATUS_DONE,
+            "BACKEND_ERROR": sc.BACKEND_STATUS_ERROR,
+        }
+        for name, py_val in pairs.items():
+            assert _extract_define_int(self.h_text, name) == py_val, name
+
+    def test_error_code_defines_match_python(self):
+        from vten.backend.sim import shm_constants as sc
+
+        pairs = {
+            "ERR_OK": sc.ERR_OK,
+            "ERR_ADDR_UNMATCH": sc.ERR_ADDR_UNMATCH,
+            "ERR_POLL_TIMEOUT": sc.ERR_POLL_TIMEOUT,
+            "ERR_BFM_QUEUE_ERROR": sc.ERR_BFM_QUEUE_ERROR,
+            "ERR_SCHEDULER_ERROR": sc.ERR_SCHEDULER_ERROR,
+            "ERR_SHM_ACCESS_ERROR": sc.ERR_SHM_ACCESS_ERROR,
+            "ERR_UNKNOWN_OPCODE": sc.ERR_UNKNOWN_OPCODE,
+            "ERR_BFM_MAP_ERROR": sc.ERR_BFM_MAP_ERROR,
+            "ERR_PROBE_MISMATCH": sc.ERR_PROBE_MISMATCH,
+            "ERR_TIMEOUT_CODE": sc.ERR_TIMEOUT_CODE,
+        }
+        for name, py_val in pairs.items():
+            assert _extract_define_int(self.h_text, name) == py_val, name
+
+    def test_control_header_offsets_match_python(self):
+        """ControlHeader struct byte offsets == Python offset constants."""
+        from vten.backend.sim import shm_constants as sc
+
+        offsets = _extract_struct_offsets(self.h_text, "ControlHeader")
+        assert offsets, "could not parse ControlHeader offsets from C header"
+        expected = {
+            "magic": sc.MAGIC_OFFSET,
+            "version": sc.VERSION_OFFSET,
+            "host_status": sc.HOST_STATUS_OFFSET,
+            "backend_status": sc.BACKEND_STATUS_OFFSET,
+            "num_commands": sc.NUM_COMMANDS_OFFSET,
+            "num_buffers": sc.NUM_BUFFERS_OFFSET,
+            "cmd_region_offset": sc.CMD_REGION_OFFSET,
+            "stats_region_offset": sc.STATS_REGION_OFFSET,
+            "buf_desc_offset": sc.BUF_DESC_OFFSET,
+            "data_region_offset": sc.DATA_REGION_OFFSET,
+            "total_shm_size": sc.TOTAL_SHM_SIZE_OFFSET,
+            "error_code": sc.ERROR_CODE_OFFSET,
+            "error_cmd_id": sc.ERROR_CMD_ID_OFFSET,
+            "error_message": sc.ERROR_MSG_OFFSET,
+            "flags": sc.FLAGS_OFFSET,
+            "timeout_ms": sc.TIMEOUT_MS_OFFSET,
+        }
+        for field, py_off in expected.items():
+            assert offsets.get(field) == py_off, (
+                f"ControlHeader.{field}: C={offsets.get(field)} Python={py_off}"
+            )
+
+    def test_error_message_size_matches_python(self):
+        """error_message[64] in the C struct == ERROR_MSG_SIZE and MAX_ERROR_MSG_LEN."""
+        from vten.backend.sim import shm_constants as sc
+
+        assert _extract_define_int(self.h_text, "MAX_ERROR_MSG_LEN") == sc.ERROR_MSG_SIZE
+        m = re.search(r"char\s+error_message\s*\[\s*(\d+)\s*\]", self.h_text)
+        assert m and int(m.group(1)) == sc.ERROR_MSG_SIZE
+
+    def test_stats_entry_offsets_match_python_packer(self):
+        """StatsEntry struct offsets match the layout base.py reads.
+
+        base.py reads status at +0x00 and 7 int32 stats starting at +0x04.
+        """
+        offsets = _extract_struct_offsets(self.h_text, "StatsEntry")
+        assert offsets.get("status") == 0x00
+        assert offsets.get("issue_cycle") == 0x04
+        assert offsets.get("commit_cycle") == 0x08
+        assert offsets.get("first_active_cycle") == 0x0C
+        assert offsets.get("last_active_cycle") == 0x10
+        assert offsets.get("active_cycles") == 0x14
+        assert offsets.get("total_beats") == 0x18
+        assert offsets.get("stall_cycles") == 0x1C
+
+    def test_buffer_descriptor_offsets_match_python_packer(self):
+        """BufferDescriptor struct offsets match pack_buffer_descriptor()."""
+        offsets = _extract_struct_offsets(self.h_text, "BufferDescriptor")
+        assert offsets.get("buffer_id") == 0x00
+        assert offsets.get("direction") == 0x02
+        assert offsets.get("flags") == 0x03
+        assert offsets.get("size") == 0x04
+        assert offsets.get("data_offset") == 0x08
+        assert offsets.get("reserved") == 0x10
