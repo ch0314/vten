@@ -314,7 +314,7 @@ class FlattenedKernelView:
         seen: set[str] = set()
         result: list[str] = []
         for m in self.interface_mappings:
-            if m.mapping_type in (MappingType.EXTERNAL, MappingType.EXTERNAL_BANK):
+            if m.mapping_type == MappingType.EXTERNAL:
                 if m.top_interface not in seen:
                     seen.add(m.top_interface)
                     result.append(m.top_interface)
@@ -335,7 +335,7 @@ class FlattenedKernelView:
         for m in self.interface_mappings:
             if m.top_interface != top_iface:
                 continue
-            if m.mapping_type not in (MappingType.EXTERNAL, MappingType.EXTERNAL_BANK):
+            if m.mapping_type != MappingType.EXTERNAL:
                 continue
             sub = self.sub_kernels[m.sub_kernel]
             for reg in sub.spec.get_registers(m.sub_interface):

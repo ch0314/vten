@@ -402,18 +402,19 @@ class TestInterfaceMapping:
         assert m.bank_offset == 0
 
     def test_external_bank_mapping(self):
-        """EXTERNAL_BANK with non-zero bank_offset (NPU composite)."""
+        """EXTERNAL mapping carrying a bank_name/bank_offset (NPU composite)."""
         from vten.runtime.kernel_view import InterfaceMapping
 
         m = InterfaceMapping(
             sub_kernel="fmapio",
             sub_interface="ctrl",
-            mapping_type=MappingType.EXTERNAL_BANK,
+            mapping_type=MappingType.EXTERNAL,
             top_interface="ctrl",
             bank_name="fmapio",
             bank_offset=0x0000,
         )
-        assert m.mapping_type == MappingType.EXTERNAL_BANK
+        assert m.mapping_type == MappingType.EXTERNAL
+        assert m.bank_name == "fmapio"
 
     def test_internal_mapping(self):
         from vten.runtime.kernel_view import InterfaceMapping
@@ -554,7 +555,7 @@ class TestFlattenedKernelView:
             InterfaceMapping(
                 sub_kernel="_self",
                 sub_interface="ctrl",
-                mapping_type=MappingType.EXTERNAL_BANK,
+                mapping_type=MappingType.EXTERNAL,
                 top_interface="ctrl",
                 bank_name="fmapio",
                 bank_offset=0x1000,
@@ -711,7 +712,7 @@ class TestNPU3DFlattenedView:
             InterfaceMapping(
                 sub_kernel="fmapio",
                 sub_interface="ctrl",
-                mapping_type=MappingType.EXTERNAL_BANK,
+                mapping_type=MappingType.EXTERNAL,
                 top_interface="ctrl",
                 bank_name="fmapio",
                 bank_offset=0x0000,

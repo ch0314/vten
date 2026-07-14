@@ -509,7 +509,6 @@ class TestMappingType:
         from vten.spec.models import MappingType
 
         assert MappingType.EXTERNAL.value == "external"
-        assert MappingType.EXTERNAL_BANK.value == "external_bank"
         assert MappingType.INTERNAL.value == "internal"
         assert MappingType.INTERNAL_PROBE.value == "internal_probe"
 

@@ -1069,7 +1069,7 @@ class TestNPU3DFullIR:
             InterfaceMapping(
                 sub_kernel="_self",
                 sub_interface="ctrl",
-                mapping_type=MappingType.EXTERNAL_BANK,
+                mapping_type=MappingType.EXTERNAL,
                 top_interface="ctrl",
                 bank_name="sub_a",
                 bank_offset=0x2000,

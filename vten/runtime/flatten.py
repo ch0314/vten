@@ -322,7 +322,7 @@ def validate_flattened(
     external_ifaces = {
         m.top_interface
         for m in mappings
-        if m.mapping_type in (MappingType.EXTERNAL, MappingType.EXTERNAL_BANK)
+        if m.mapping_type == MappingType.EXTERNAL
         and m.top_interface is not None
     }
     for name, exp in exposed.items():

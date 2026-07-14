@@ -75,7 +75,6 @@ class MappingType(Enum):
     """How a sub-kernel interface maps to the top-level composite."""
 
     EXTERNAL = "external"
-    EXTERNAL_BANK = "external_bank"
     INTERNAL = "internal"
     INTERNAL_PROBE = "internal_probe"
 
