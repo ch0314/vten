@@ -1,5 +1,5 @@
 // vten_bfm_axi4.sv — AXI4 Memory-Mapped BFM (slave)
-// Reference: specs/05_bfm_library.md §2
+// Reference: docs/architecture.md
 //
 // BFM is slave — DUT is master.
 // Supports simultaneous AR/AW processing with fully independent

@@ -1,5 +1,5 @@
 // vten_shm_controller.sv — Backend state machine (9 states)
-// Reference: specs/04_backend_xsim.md §4
+// Reference: docs/architecture.md
 //
 // Design: Single always_ff block ensures DPI-C calls execute exactly once
 // per posedge. All DPI-C calls in S_LOAD_BATCH happen in one cycle;

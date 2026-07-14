@@ -1,5 +1,5 @@
 // vten_bfm_axi4s.sv — AXI4-Stream BFM (MASTER/SLAVE via parameter)
-// Reference: specs/05_bfm_library.md §1
+// Reference: docs/architecture.md
 //
 // Diagnostics: +VTEN_VERBOSE (xsim) or +define+VTEN_VERBOSE (verilator)
 

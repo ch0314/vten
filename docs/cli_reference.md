@@ -71,7 +71,7 @@ vten init <project_dir> [--kernel NAME] [--backend {xsim,verilator,xrt,cpu}] [--
 | Argument | Description |
 |----------|-------------|
 | `project_dir` | Directory to create (works on new or existing dirs). |
-| `--backend B` | Target backend for a **new** project. Default: `xsim`. Chooses the `[backend.<B>]` section and backend-specific dirs written into `vten.toml`. |
+| `--backend B` | Backend for a **new** project. Default: `xsim`. Writes that backend's config template. |
 | `--kernel NAME` | Add a kernel subdirectory to an existing project instead of initializing. |
 | `--add-backend NAME` | Append a `[backend.<NAME>]` section (and its dirs) to an existing project's `vten.toml`. |
 
@@ -97,9 +97,9 @@ vten init my_project --add-backend verilator
 
 ## `vten build`
 
-Codegen + compile for a project or a single kernel. `build` is a thin wrapper
-([vten/cli/build.py](../vten/cli/build.py)) that resolves the backend and
-delegates to that backend's `BuildPipeline`.
+Codegen + compile for a project or a single kernel. `build`
+([vten/cli/build.py](../vten/cli/build.py)) resolves the selected backend and
+then runs that backend's `BuildPipeline`.
 
 ```
 vten build [--project DIR] [--kernel NAME] [--backend B]
@@ -183,7 +183,7 @@ vten run --kernel NAME [--test SCENARIO] [--project DIR] [--backend B]
 | `--waveform` | Always dump a waveform (saved to `results/.../waveform.wdb`). |
 | `--waveform-on-fail` | Dump a waveform, but delete it again if the test passes. |
 | `--gui` | xsim GUI mode. |
-| `-v`, `--sim-verbose` | Enable simulator verbose output (`+VTEN_VERBOSE`). A subcommand-level `-v` **also** raises Python logging to DEBUG. |
+| `-v`, `--sim-verbose` | Enable simulator verbose output and raise Python logging to DEBUG. |
 | `--verify` | Auto-verify RTL output against the `forward()` golden. |
 | `--config SPEC ...` | Config overrides / ad-hoc configs (see grammar below). |
 
@@ -200,7 +200,7 @@ Behavior notes:
 vten run --kernel passthrough                          # run all scenarios
 vten run --kernel passthrough --test TestPassthrough --verify
 vten run --kernel conv3d --backend verilator --waveform-on-fail
-vten run --kernel conv3d --config in_ch=64 out_ch=32   # ad-hoc single config
+vten run --kernel conv3d --config in_ch=64 out_ch=32   # override scenario configs
 ```
 
 ---
@@ -291,9 +291,10 @@ The module is imported from `kernels/` (added to `sys.path`), so
 `model_configs.py` living alongside your kernels is importable. A `module:VAR`
 token is recognized as a module ref only when it contains `:` and no `=`.
 
-**Single dict vs. list** matters for run semantics: a single dict is treated as
-`config_overrides` merged onto scenario configs; a **list** switches `run` into
-ad-hoc mode (see [testing_guide.md](testing_guide.md)).
+**Single dict vs. list** matters for run semantics. A single dict is treated as
+`config_overrides` and is merged onto the discovered scenario configs. A **list**
+of config dicts switches `run` into ad-hoc mode, which bypasses `TestScenario`
+discovery and runs those configs directly (see [testing_guide.md](testing_guide.md)).
 
 ### `build --config` (simple grammar)
 
@@ -523,6 +524,6 @@ vten list tests --kernel conv3d                    # what scenarios exist?
 vten list params --kernel conv3d                   # what params/interfaces?
 ```
 
-> `vten spec --detect` is **not** a real command — it is documented in the
-> stale `specs/06`, but is unimplemented. See
+> `vten spec --detect` is **not** a real command — it was described in an
+> earlier design note but never implemented; there is no `spec` subcommand. See
 > [paper_vs_code.md](paper_vs_code.md).

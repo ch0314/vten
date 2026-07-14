@@ -1,5 +1,5 @@
 // vten_bfm_axilite.sv — AXI4-Lite BFM (master)
-// Reference: specs/05_bfm_library.md §3
+// Reference: docs/architecture.md
 //
 // BFM is master — drives AXI-Lite transactions.
 // Supports WRITE_REG, READ_REG, POLL_REG.

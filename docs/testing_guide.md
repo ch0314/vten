@@ -76,9 +76,9 @@ class TestPassthrough(TestScenario):
 
 ## Configs & the merge order
 
-`configs` drives **kernel-granular batch** runs: one `configs` list produces a
-batch where every dict is compiled and executed independently, in one backend
-session. Aggregated pass/fail across the batch is reported in `summary.json`.
+`configs` drives **per-kernel batch** runs: one `configs` list produces a batch
+where every dict is compiled and executed independently, in one backend session.
+Aggregated pass/fail across the batch is reported in `summary.json`.
 
 ```python
 class TestScaleAdd(TestScenario):
@@ -112,11 +112,11 @@ Concretely:
    `{**base_params, **c}` — **the scenario entry wins** over base + CLI.
 
 If `scenario.configs is None`, a single run uses `base_params` (plus any
-`--config` overrides). `build_params` from the project config are threaded into
+`--config` overrides). `build_params` from the project config are also added to
 each run config so the parameter resolver can reach them.
 
 ```bash
-# base N=1024 from vten.toml, overridden to N=2048 for every scenario config:
+# base N=1024 from vten.toml; CLI sets N=2048 unless a scenario entry overrides it:
 vten run --kernel scale_add --config N=2048
 ```
 
@@ -181,20 +181,24 @@ vten run --kernel conv3d --verify
 ## Probes
 
 Probes capture intermediate values for beat-level comparison, in addition to
-final output verification. Declarative probe specs are annotated onto the
-recorded ops by
+final output verification. Declarative probe specs are applied to the recorded
+operations by
 [vten/runtime/probe_manager.py](../vten/runtime/probe_manager.py).
 
-Two kinds, distinguished by whether the spec contains a `.`:
+There are two kinds, distinguished by whether the spec contains a `.`:
 
-| Spec form | Kind | Meaning |
-|-----------|------|---------|
-| `"data_out"` (simple name) | **output probe** | Marks the matching `PULL_TENSOR` op `probe=True` → the BFM compares each output beat against the golden buffer in hardware. |
-| `"scale.data_out"` (dotted) | **composite internal probe** | `sub.tensor` — probes an internal sub-kernel tensor; golden is auto-extracted from the CompositeKernel's `forward()` golden pool. |
+- **Output probe**: `"data_out"` marks the matching `PULL_TENSOR` op as
+  `probe=True`. The BFM then compares each output beat against the golden buffer
+  during simulation.
+- **Composite internal probe**: `"scale.data_out"` uses the dotted
+  `<sub_kernel>.<tensor>` form. It probes an internal sub-kernel tensor, and the
+  expected values come from the `CompositeKernel`'s chained `forward()`.
 
 Output probes can also be requested directly in a kernel's `run(ctx)` via
-`ctx.pull_tensor(..., probe=True)` (see
-[examples/passthrough/kernels/passthrough/tests/test_passthrough.py](../examples/passthrough/kernels/passthrough/tests/test_passthrough.py)).
+`ctx.pull_tensor(..., probe=True)`; see the
+[passthrough probe scenario][passthrough-probe].
+
+[passthrough-probe]: ../examples/passthrough/kernels/passthrough/tests/test_passthrough.py
 
 ### Beat-level golden comparison in hardware
 

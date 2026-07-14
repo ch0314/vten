@@ -3,7 +3,7 @@
 How to compose multiple IPs into one verification unit with **CompositeKernel**.
 
 A `CompositeKernel` wires several single kernels together into a pipeline,
-verifies the whole thing end-to-end against an auto-chained golden reference,
+verifies the entire pipeline end-to-end against an auto-chained golden reference,
 and lets you drive every sub-kernel's control from one `run(ctx)`. If you
 haven't written a single kernel yet, read [kernel_guide.md](kernel_guide.md)
 first — a composite is built entirely out of ordinary `Kernel`s.
@@ -276,7 +276,7 @@ Notes on the four-stage pattern:
 - **Start all, then poll all.** Each `write_register(..., {"start": 1})` uses the
   auto-created `{ref}_ctrl` handle. The final pull gains a commit dependency on
   *every* stage's `done`, so the read-back is only valid once the whole chain has
-  drained.
+  finished producing output.
 - **Topological order is derived from `connections`.** You list connections in
   any order; vTen computes the dependency order
   (`ReadDMA → Scale → Offset → WriteDMA`) itself for the golden chain.
@@ -320,9 +320,9 @@ the golden updates automatically per config. With `--verify`, each config's
 
 ## Probing internal connections
 
-Because internal `>>` wires carry no host traffic, you can't read them with
-`pull_tensor`. Instead, vTen supports **probes** that passively snoop a wire and
-compare it beat-by-beat against golden during simulation.
+Because internal `>>` wires carry no host traffic, you cannot read them with
+`pull_tensor`. Instead, vTen supports **probes** that passively observe a wire and
+compare it beat-by-beat against golden data during simulation.
 
 There are two flavors, distinguished by whether the probe name is dotted
 ([vten/runtime/probe_manager.py](../vten/runtime/probe_manager.py)):
@@ -345,7 +345,7 @@ Declarative probes are listed on the `TestScenario` via the `probes` attribute:
 ```python
 class TestScaleAddProbe(TestScenario):
     kernel = "scale_add"
-    probes = ["scale.data_out"]   # snoop the internal wire between scale and offset
+    probes = ["scale.data_out"]   # observe the internal wire between scale and offset
 ```
 
 At `run()` time the framework applies each probe: plain names flip `probe=True`
@@ -370,7 +370,7 @@ to a specific stage instead of just the final output.
 | Control handles | `register("ctrl")`. | Auto-created `{ref}_ctrl` per sub-kernel (declare optionally). |
 | `forward()` | You write it. | Auto-chained across sub-kernels; override only for cross-stage golden. |
 | `generate_inputs()` | You write it. | Only for exposed inputs; downstream filled by the chain. |
-| Probing internals | N/A | Dotted probe names (`"scale.data_out"`) snoop `>>` wires. |
+| Probing internals | N/A | Dotted probe names (`"scale.data_out"`) observe `>>` wires. |
 
 The mental model: a `CompositeKernel` is a thin orchestration layer. All the
 protocol detail (packing, registers, `auto_bind`, `memory_regions`) lives in the

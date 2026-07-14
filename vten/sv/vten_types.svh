@@ -1,5 +1,5 @@
 // vten_types.svh — Shared type definitions for vTen SV library
-// Reference: specs/00_data_models.md §1, §11
+// Reference: docs/architecture.md
 
 `ifndef VTEN_TYPES_SVH
 `define VTEN_TYPES_SVH

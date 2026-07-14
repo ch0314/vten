@@ -1,5 +1,5 @@
 // vten_dpi_imports.svh — DPI-C function import declarations
-// Reference: specs/04_backend_xsim.md §6
+// Reference: docs/architecture.md
 // Include this file in tb_top.sv. All BFM/Controller/Scheduler modules reference these.
 
 `ifndef VTEN_DPI_IMPORTS_SVH

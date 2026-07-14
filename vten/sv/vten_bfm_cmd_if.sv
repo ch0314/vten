@@ -1,5 +1,5 @@
 // vten_bfm_cmd_if.sv — Scheduler ↔ BFM command interface
-// Reference: specs/04_backend_xsim.md §9
+// Reference: docs/architecture.md
 
 `include "vten_types.svh"
 

@@ -1,5 +1,5 @@
 // vten_command_scheduler.sv — Dependency-aware command dispatch
-// Reference: specs/04_backend_xsim.md §10
+// Reference: docs/architecture.md
 //
 // Diagnostics: +VTEN_VERBOSE (xsim) or +define+VTEN_VERBOSE (verilator)
 

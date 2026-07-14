@@ -17,9 +17,9 @@ the underlying mechanics.
 Hardware accelerators are designed against a *tensor-level* mental model — "a `(N, C, H, W)`
 feature map streams in, a `(N, K, H, W)` feature map streams out" — but they are *verified*
 against a *signal-level* testbench: AXI handshakes, byte-packed bus beats, control-register
-pokes, ready/valid backpressure, and cycle timing. Every project re-crosses this **semantic gap**
-by hand, writing bespoke SystemVerilog drivers that translate tensors into wiggles and back.
-That glue is where verification time goes, and where bugs hide.
+writes, ready/valid backpressure, and cycle timing. Every project re-crosses this **semantic
+gap** by hand, writing custom SystemVerilog drivers that translate tensors into signal-level
+transactions and back. That translation layer is where verification time goes, and where bugs hide.
 
 vTen closes the gap with a **data-centric** approach. You describe *what data crosses which
 interface in which direction* — as PyTorch tensors bound to named interfaces — and vTen owns
@@ -88,8 +88,8 @@ executes that IR against a concrete target.
 The pivot is the **Command[] IR**: a flat, serializable list of low-level operations produced
 by the Runtime and consumed by every backend. A simulation backend packs it into a shared-memory
 image that a SystemVerilog scheduler reads; a hardware backend interprets it directly into XRT
-calls. The Frontend never knows which backend it is running against, and the same DSL program is
-bit-for-bit valid on all of them.
+calls. The Frontend never needs backend-specific logic, and the same DSL program keeps the same
+semantics across simulation, hardware, and CPU reference execution.
 
 ---
 
@@ -100,7 +100,7 @@ vTen uses a **two-pass** model: your `run(self, ctx)` method does not execute an
 
 **Pass 1 — Record.** Each DSL method on the [`ExecutionContext`](../vten/runtime/context.py)
 (`ctx`) appends an `Operation` to a pending list and returns an `OperationHandle` you can pass as
-a `dep=` to a later call. Nothing touches a bus. The DSL surface is:
+a `dep=` to a later call. Nothing touches a bus during recording. The available DSL calls are:
 
 | `ctx` method       | Records            | Notes                                              |
 |--------------------|--------------------|----------------------------------------------------|
@@ -245,12 +245,12 @@ The IR describes *operations*; the **Binding Table** describes the *identifiers*
 reference and what each resolves to on a concrete target. It is not a single object but a set of
 maps produced across the pipeline, all carried on the `CompiledResult`:
 
-| Component            | Produced by                                          | Maps                                            |
-|----------------------|------------------------------------------------------|-------------------------------------------------|
-| **Buffer IDs**       | [`ir.py`](../vten/runtime/ir.py) (`_allocate_buffer_ids`) | tensor / port name → integer buffer ID      |
-| **Physical addresses** | [`address.py`](../vten/runtime/address.py)         | buffer → physical/device address                |
-| **Register values**  | [`binder.py`](../vten/runtime/binder.py)             | `auto_bind` register → resolved value           |
-| **Interface ID map** | [`ir.py`](../vten/runtime/ir.py) (`_iface_id_map`)   | interface name → integer interface ID           |
+| Component | Produced by | Maps |
+|---|---|---|
+| **Buffer IDs** | [`ir.py`](../vten/runtime/ir.py) | tensor / port name → integer buffer ID |
+| **Physical addresses** | [`address.py`](../vten/runtime/address.py) | buffer → physical/device address |
+| **Register values** | [`binder.py`](../vten/runtime/binder.py) | `auto_bind` register → resolved value |
+| **Interface ID map** | [`ir.py`](../vten/runtime/ir.py) | interface name → integer interface ID |
 
 Commands reference buffers and interfaces by these integer IDs, keeping each 64-byte slot compact
 and name-free. The interface ID map is aligned with the spec's declaration order so that it matches
@@ -334,12 +334,16 @@ All backends implement the same [`Backend`](../vten/backend/base.py) ABC (`execu
 `BackendResult`, plus `cleanup()`) and consume the same `CompiledResult`. They split into two
 compile targets: `SIM` (xsim, verilator, cpu) and `HW` (xrt).
 
-| Backend       | Target | Transport            | Fidelity                    | Use it when…                                                        |
-|---------------|--------|----------------------|-----------------------------|---------------------------------------------------------------------|
-| **xsim**      | SIM    | SV-DPI (C bridge)    | Cycle-accurate RTL (Vivado) | You need Vivado-grade simulation and have a Vivado install.         |
-| **verilator** | SIM    | Pure C++ bridge      | Cycle-accurate RTL (OSS)    | You want fast, open-source cycle-accurate sim with no Vivado.       |
-| **cpu**       | SIM    | none (in-process)    | Functional only             | You want a ~100× faster smoke test of the config/pipeline & golden. |
-| **xrt**       | HW     | PCIe DMA + MMIO      | Real silicon                | You are running verified kernels on an actual FPGA (or `hw_emu`).   |
+At a glance:
+
+- **xsim** (`SIM`) — cycle-accurate RTL simulation through Vivado `xsim` and the SV-DPI bridge.
+  Use it when you want Vivado-grade simulation and have a Vivado install.
+- **verilator** (`SIM`) — cycle-accurate RTL simulation through an open-source C++ simulator.
+  Use it when you want a fast simulator path without Vivado.
+- **cpu** (`SIM`) — functional reference execution in the Python process. Use it for a fast check
+  of the config, compile pipeline, and golden model without RTL.
+- **xrt** (`HW`) — real FPGA or `hw_emu` execution through PCIe DMA and MMIO. Use it after a kernel
+  has been verified and packaged for XRT.
 
 **xsim** ([`vten/backend/xsim.py`](../vten/backend/xsim.py)) — launches Vivado `xsim` against a
 pre-elaborated snapshot, linking the DPI-C shared-memory bridge during elaboration. Supports batch
@@ -365,7 +369,7 @@ XRT: `LOAD` → `bo.write`, `PUSH` → `bo.sync(TO_DEVICE)` (DMA), `PULL` → `b
 guide.
 
 The [Inference API](../vten/inference.py) (`InferenceSession`, `InferenceModule`) sits on top of the
-xrt backend for eager, kernel-granular deployment of already-verified kernels.
+xrt backend for eager deployment of already-verified kernels, one kernel at a time.
 
 ---
 
@@ -403,8 +407,8 @@ $PROJECT_ROOT/                  ← where vten.toml lives
 
 All paths in `kernel_spec.yaml` (`rtl_top`) and `vten.toml` (`[rtl].sources`) are resolved relative
 to `PROJECT_ROOT`; the SV library and templates are resolved relative to `VTEN_ROOT`. Nothing is
-hardcoded to an absolute path. This is the "Multi-Directory Setup" model described in the project's
-`CLAUDE.md`, and it is what lets several kernels share one large RTL tree while keeping each kernel's
+hardcoded to an absolute path. This multi-directory model is what lets several kernels share one
+large RTL tree while keeping each kernel's
 generated build output isolated under `kernels/<name>/build/`.
 
 ---
@@ -412,17 +416,21 @@ generated build output isolated under `kernels/<name>/build/`.
 ## 10. How This Maps to the Paper
 
 The DAC paper and this codebase describe the same system; a few names and counts differ. The code
-is authoritative.
+is the authoritative reference for the current implementation.
 
-| Paper                                   | Code                                                                 |
-|-----------------------------------------|----------------------------------------------------------------------|
-| `write_tensor` / `read_tensor` DSL ops  | `push_tensor` / `pull_tensor` ([`context.py`](../vten/runtime/context.py)) |
-| "8-stage compile pipeline"              | The same pipeline, split into ~10 internally-numbered stages (Stage 0–9) in [`engine.py`](../vten/runtime/engine.py); the paper's eight conceptual stages ≈ §4's seven steps here, with a few code sub-stages. |
-| Tensor-centric, data-centric framing    | Exactly as implemented — the tensor is the unit of intent; the wire-level testbench is generated. |
-| One program, sim and hardware           | The single `Command[]` IR (§5) driving both the SHM/SV path and the XRT interpreter; `auto_bind` address substitution (§7) reconciles the two. |
+- The paper's `write_tensor` / `read_tensor` DSL names correspond to the implemented
+  `push_tensor` / `pull_tensor` calls ([`context.py`](../vten/runtime/context.py)).
+- The paper describes an "8-stage compile pipeline." In code, the same ideas are split into
+  internally numbered Stage 0–9 log entries in [`engine.py`](../vten/runtime/engine.py). Section 4
+  of this document groups those implementation stages into seven reader-facing steps.
+- The paper's tensor-centric framing is implemented directly: tensors are the unit of intent, and
+  vTen generates the wire-level testbench.
+- The "one program for simulation and hardware" claim is implemented through the single
+  `Command[]` IR (§5), the SHM/SV simulation path, the XRT interpreter, and `auto_bind` address
+  substitution (§7).
 
-If you are reading the paper alongside the source, treat the paper for *intent* and this document
-(plus the code it links) for *ground truth*.
+If you are reading the paper alongside the source, use the paper for the design intent and this
+document (plus the code it links) for the current behavior.
 
 ---
 

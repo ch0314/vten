@@ -1,5 +1,5 @@
 // vten_bfm_probe.sv — Passive probe BFM for golden comparison
-// Reference: specs/05_bfm_library.md §4
+// Reference: docs/architecture.md
 //
 // Passive monitor: observes AXI4-Stream signals without driving them.
 // Compares each beat against golden data via DPI-C.

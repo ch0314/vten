@@ -234,7 +234,7 @@ recorded graph is compiled and dispatched to a backend.
 | `ctx.push_tensor(tensor, dep=)` | Host → device transfer. Feeds `tensor.data` into the DUT (LOAD + PUSH). |
 | `ctx.pull_tensor(tensor, dep=, chunks=)` | Device → host read. Captures DUT output into `tensor` (PULL + STORE). |
 | `ctx.configure(kernel, dep=)` | Emit a WRITE_REG for **every** `auto_bind` register of the kernel. |
-| `ctx.write_register(reg, fields, dep=)` | Write field values, e.g. `{"start": 1}`. `reg` is a `register(...)` handle. |
+| `ctx.write_register(reg, fields, dep=)` | Write register fields, e.g. `{"start": 1}`. |
 | `ctx.read_register(reg, field_name, dep=)` | Read one register field. |
 | `ctx.poll_register(reg, field_name, expected=, dep=)` | Poll a field until it equals `expected` (default `1`). |
 | `ctx.barrier()` | Global fence: everything before must complete before anything after. |
@@ -373,7 +373,7 @@ write DMA addresses by hand. Fields:
 - `value` — `address` (the tensor's allocated device address) or `size_beats`
   (its length in AXI beats).
 - `bits` — which slice of the value goes into this register, e.g. `"31:0"` /
-  `"63:32"` to split a 64-bit address across two 32-bit registers (the classic
+  `"63:32"` to split a 64-bit address across two 32-bit registers (the common
   `_lo`/`_hi` split).
 - `param` / `expr` — bind to a parameter or a computed expression instead.
 - `offset` — a byte offset added to the address.
@@ -417,6 +417,9 @@ class MmLoopbackKernel(Kernel):
 
     def run(self, ctx) -> None:
         h_push = ctx.push_tensor(self.data_in)
+
+        # Issue the read-back early so the backend is ready to capture output.
+        # The commit dependency below keeps it from finishing before done=1.
         h_pull = ctx.pull_tensor(self.data_out, dep=h_push)
 
         h_cfg = ctx.configure(self, dep=h_push)
@@ -596,7 +599,7 @@ the diverging elements.
 **Shape mismatch.** The resolved tensor shape doesn't match what the DUT
 produced/consumed. Check that every `${PARAM}` in a shape has a value (in
 `default_params`, `compute_derived_params()`, or the config), and that the
-element count squares with `length`/`size_beats` registers. `Tensor` raises
+element count matches `length`/`size_beats` registers. `Tensor` raises
 `"shape not resolved"` if a param is missing at instantiation.
 
 **Missing interface.** A tensor's `interface="..."` names an interface not in

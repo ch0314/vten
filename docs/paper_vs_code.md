@@ -1,11 +1,11 @@
 # Paper ↔ Code Reconciliation
 
-A maintainer-facing note mapping the DAC paper's terminology and claims onto the
-actual vTen implementation, and flagging documentation drift to fix later.
+A maintainer-facing note that maps the DAC paper's terminology and claims onto the
+current vTen implementation, and notes documentation that still needs follow-up.
 
-> **Ground truth is the code.** Where the paper, `README.md`, `CLAUDE.md`, or the
-> `specs/` disagree with the source, the source wins. This note exists so future
-> doc edits don't re-introduce stale terminology.
+> **The source code is authoritative.** Where the paper, `README.md`, or any
+> earlier design note disagrees with the source, follow the source. This note
+> exists so future doc edits do not re-introduce outdated terminology.
 
 See also: [architecture.md](architecture.md) ·
 [cli_reference.md](cli_reference.md) ·
@@ -20,7 +20,7 @@ See also: [architecture.md](architecture.md) ·
 - [2. "8-stage" vs. ~10 internal stages](#2-8-stage-vs-10-internal-stages)
 - [3. Kernel Template / Kernel Object / Binding Table](#3-kernel-template--kernel-object--binding-table)
 - [4. Transport mechanisms vs. shipped backends](#4-transport-mechanisms-vs-shipped-backends)
-- [5. Stale specs to fix later](#5-stale-specs-to-fix-later)
+- [5. Known paper ↔ code drift](#5-known-paper--code-drift)
 - [6. Evaluation gap](#6-evaluation-gap)
 
 ---
@@ -30,9 +30,8 @@ See also: [architecture.md](architecture.md) ·
 The paper names the tensor-transfer operations `write_tensor` / `read_tensor`.
 The implementation renamed these to `push_tensor` / `pull_tensor` — the
 memory-mapped case made "write/read" ambiguous (host↔memory vs.
-accelerator↔memory), so a two-level Data/Control classification was adopted
-(rationale in `specs/01_kernel_and_dsl.md` §3.1). The control-plane ops kept
-their names.
+accelerator↔memory), so a two-level Data/Control classification was adopted.
+The control-plane ops kept their names.
 
 | Paper op | Code op | Location |
 |----------|---------|----------|
@@ -53,8 +52,8 @@ does not list.
 
 ## 2. "8-stage" vs. ~10 internal stages
 
-The paper, `README.md`, and `CLAUDE.md` all describe an **"8-stage compile
-pipeline."** That is a *conceptual* summary. The real orchestrator,
+The paper, `README.md`, and earlier design notes all describe an **"8-stage
+compile pipeline."** That is a *conceptual* summary. The real orchestrator,
 [vten/runtime/engine.py](../vten/runtime/engine.py), enumerates **Stages 0–9**
 (ten numbered stages, though not all are heavyweight, and Stage 7's
 SHM-packing/backend split moved out to `backend/sim/`).
@@ -74,9 +73,9 @@ Correspondence (conceptual 8 → implementation 0–9):
 | Stage 8 — IR lowering → Command[] | IR lowering |
 | Stage 9 — BFM config synthesis | BFM config synthesis |
 
-The old `CLAUDE.md` diagram places SHM packing as an in-engine "Stage 7"; in the
+An older design diagram placed SHM packing as an in-engine "Stage 7"; in the
 code the SHM packing + backend handshake lives in `vten/backend/sim/`
-(`SimBackend`), not inside `RuntimeEngine`. Treat "8-stage" as marketing
+(`SimBackend`), not inside `RuntimeEngine`. Treat "8-stage" as a high-level
 shorthand for "the ~10-stage `RuntimeEngine.compile()` pipeline."
 
 **Action:** when rewriting user docs, either say "10-stage" and match
@@ -89,11 +88,16 @@ shorthand for "the ~10-stage `RuntimeEngine.compile()` pipeline."
 
 Paper §3.3 concepts and where they live in code:
 
-| Paper concept | Code location |
-|---------------|---------------|
-| **Kernel Template** — the declarative class with `Tensor` descriptors | [vten/kernel/base.py](../vten/kernel/base.py) — `class Kernel` (uses `__init_subclass__` to collect tensor descriptors). |
-| **Kernel Object** — an instantiated, parameter-resolved kernel | `KernelInstance` in [vten/runtime/kernel_view.py](../vten/runtime/kernel_view.py); produced by `ExecutionContext.instantiate(...)`. |
-| **Binding Table** — the resolved register↔value mapping | `RegisterBindingEntry` + `resolve_registers()` in [vten/runtime/binder.py](../vten/runtime/binder.py) (auto_bind values and param-name matching). |
+- **Kernel Template**: the declarative class with `Tensor` descriptors. In code,
+  this is `class Kernel` in [vten/kernel/base.py](../vten/kernel/base.py), which
+  uses `__init_subclass__` to collect tensor descriptors.
+- **Kernel Object**: an instantiated, parameter-resolved kernel. In code, this is
+  `KernelInstance` in [vten/runtime/kernel_view.py](../vten/runtime/kernel_view.py),
+  produced by `ExecutionContext.instantiate(...)`.
+- **Binding Table**: the resolved register↔value mapping. In code, this is
+  `RegisterBindingEntry` plus `resolve_registers()` in
+  [vten/runtime/binder.py](../vten/runtime/binder.py), covering `auto_bind` values
+  and param-name matching.
 
 Related supporting types: `ExposedTensor` / flattened kernel views also in
 [vten/runtime/kernel_view.py](../vten/runtime/kernel_view.py).
@@ -106,20 +110,25 @@ Paper §4.2 discusses **five transport mechanisms**. Only some are *shipped
 backends*; the rest are comparison points in the evaluation, not code paths in
 this repo.
 
-| Paper transport | Shipped in repo? | Backend / notes |
-|-----------------|------------------|-----------------|
-| Native C++ | No | Comparison baseline only — no backend. |
-| vTen Pure C++ | **Yes** | `verilator` backend ([vten/backend/verilator.py](../vten/backend/verilator.py)); DPI resolved via `verilated_dpi.h` in [vten/sv/vten_shm_bridge_verilator.cpp](../vten/sv/vten_shm_bridge_verilator.cpp). |
-| vTen SV-DPI | **Yes** | `xsim` backend ([vten/backend/xsim.py](../vten/backend/xsim.py)); DPI-C bridge in [vten/sv/vten_shm_bridge.c](../vten/sv/vten_shm_bridge.c). |
-| File I/O | No | Comparison point only — no backend. |
-| VPI / Cocotb | No | Comparison baseline only — no backend. |
+Status by transport:
+
+- **Native C++**: comparison baseline only; no backend is shipped.
+- **vTen Pure C++**: shipped as the `verilator` backend
+  ([vten/backend/verilator.py](../vten/backend/verilator.py)). DPI is resolved via
+  `verilated_dpi.h` in
+  [vten/sv/vten_shm_bridge_verilator.cpp](../vten/sv/vten_shm_bridge_verilator.cpp).
+- **vTen SV-DPI**: shipped as the `xsim` backend
+  ([vten/backend/xsim.py](../vten/backend/xsim.py)), with the DPI-C bridge in
+  [vten/sv/vten_shm_bridge.c](../vten/sv/vten_shm_bridge.c).
+- **File I/O**: comparison point only; no backend is shipped.
+- **VPI / Cocotb**: comparison baseline only; no backend is shipped.
 
 Backends that exist in the registry but are **not** paper §4.2 transports:
 
-| Backend | Location | Purpose |
-|---------|----------|---------|
-| `xrt` | [vten/backend/xrt/](../vten/backend/xrt) | Real-FPGA / `hw_emu` execution via XRT (IR interpreted directly, not SHM). |
-| `cpu` | [vten/backend/cpu.py](../vten/backend/cpu.py) | Runs the kernel's `forward()` as a reference model — no RTL, no FPGA. |
+- **`xrt`** ([vten/backend/xrt/](../vten/backend/xrt)): real-FPGA / `hw_emu`
+  execution via XRT. It interprets the IR directly rather than using SHM.
+- **`cpu`** ([vten/backend/cpu.py](../vten/backend/cpu.py)): reference-model
+  execution. It runs the kernel's `forward()` with no RTL or FPGA.
 
 The authoritative backend list is `_BACKEND_MAP` in
 [vten/backend/registry.py](../vten/backend/registry.py): `xsim`, `verilator`,
@@ -127,20 +136,40 @@ The authoritative backend list is `_BACKEND_MAP` in
 
 ---
 
-## 5. Stale specs to fix later
+## 5. Known paper ↔ code drift
 
-The `specs/` are partially stale. Known drift (code is ground truth):
+A few APIs and workflows described by the paper (and by earlier, unshipped
+design notes) diverged from what the code actually does. The code is
+authoritative in every case below.
 
-| Spec | Stale content | Current reality |
-|------|---------------|-----------------|
-| `specs/07_e2e_examples.md` | `forward(self)` signature; `TestScenario.run(self, ctx, cfg)` with inline `ctx.instantiate(...)` / `ctx.run(verify=True)`. | Code uses `forward(self, **inputs) -> dict[str, torch.Tensor]` ([vten/kernel/base.py](../vten/kernel/base.py)). `TestScenario` is declarative (`kernel`/`configs`/`probes`/`seed`); the DSL protocol lives in the **kernel's** `run(ctx)`, invoked by [`execute_batch`](../vten/execution.py). The scenario `run(self, ctx, cfg)` shown in old examples is **not** called by the CLI run path. |
-| `specs/09_user_api.md` | Documents `run_kernel()` and `KernelExecutor`. | Both **removed**. Replaced by `InferenceSession` / `InferenceModule` in [vten/inference.py](../vten/inference.py). |
-| `specs/06_codegen_and_cli.md` §4.2 | Documents `vten spec --detect rtl/....sv`. | **Unimplemented** — there is no `spec` subcommand in [vten/cli/main.py](../vten/cli/main.py). Do not document it. |
+The main differences are:
 
-These are already partially captured in `CLAUDE.md` under "Known Spec ↔ Code
-Divergences"; keep that table and this section in sync. When user-facing docs
-are the target, prefer [cli_reference.md](cli_reference.md) and
-[testing_guide.md](testing_guide.md), which are derived from source.
+- Kernel entry point: scenarios are declarative; the executable DSL lives in the
+  kernel's `run(ctx)`.
+- Batch/run API: `InferenceSession` / `InferenceModule` replaced earlier
+  `run_kernel()` / `KernelExecutor` sketches.
+- RTL detection CLI: `vten spec --detect` was never implemented.
+
+- **Kernel entry point.** Earlier design notes showed `forward(self)` and a
+  `TestScenario.run(self, ctx, cfg)` method with inline `ctx.instantiate(...)` /
+  `ctx.run(verify=True)`. Current code uses
+  `forward(self, **inputs) -> dict[str, torch.Tensor]`
+  ([vten/kernel/base.py](../vten/kernel/base.py)). `TestScenario` is declarative
+  (`kernel` / `configs` / `probes` / `seed`); the DSL protocol lives in the
+  **kernel's** `run(ctx)` and is invoked by
+  [`execute_batch`](../vten/execution.py). The scenario-level `run(self, ctx, cfg)`
+  shown in the older examples is **not** called by the CLI run path.
+- **Batch/run API.** Earlier (unshipped) design notes documented `run_kernel()`
+  and `KernelExecutor`. Both were removed; the code replaced them with
+  `InferenceSession` / `InferenceModule` in
+  [vten/inference.py](../vten/inference.py).
+- **RTL detection CLI.** Earlier design notes described
+  `vten spec --detect rtl/....sv`. That command was never implemented; there is
+  no `spec` subcommand in [vten/cli/main.py](../vten/cli/main.py). Do not
+  document it as a supported command.
+
+When user-facing docs are the target, prefer [cli_reference.md](cli_reference.md)
+and [testing_guide.md](testing_guide.md), which are derived from source.
 
 ---
 
@@ -148,8 +177,7 @@ are the target, prefer [cli_reference.md](cli_reference.md) and
 
 The paper's headline evaluation is **not reproducible in-repo**:
 
-- The **3D U-Net NPU** design-under-test is analyzed in
-  `specs/npu_3d_analysis.md` and modeled in test fixtures
+- The **3D U-Net NPU** design-under-test is modeled in test fixtures
   ([tests/fixtures/npu_3d.py](../tests/fixtures/npu_3d.py)), but the full NPU RTL
   and the end-to-end U-Net run are not shipped as a runnable example.
 - The **Cocotb baseline** used for comparison is not present — there is no
