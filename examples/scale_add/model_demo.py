@@ -162,6 +162,27 @@ def main() -> None:
     print("\n── full graph (JSON) ──")
     print(json.dumps(graph, indent=2))
 
+    # ── (1) End-to-end + per-node verification (Slice C) ──
+    # net(x, verify=True, reference=<torch fn>) runs every node with verify=True
+    # (each kernel output checked against its forward() golden, fail-fast) AND
+    # checks the model's final output(s) end-to-end against a torch reference.
+    print("\n── verify: net(x, verify=True, reference=torch_reference) ──")
+    net(x, verify=True, reference=torch_reference)
+    report = net.verify_report()
+    for row in report["nodes"]:
+        mark = "ok" if row["passed"] else "FAIL"
+        print(f"  node {row['node']:>6} [{row['kernel']}]: verified={row['verified']} ({mark})")
+    e2e = report["e2e"]
+    print(f"  E2E vs torch reference: passed={e2e['passed']} "
+          f"({len(e2e['outputs'])} output(s) checked)")
+    print(f"  overall verify passed: {report['passed']}")
+
+    # ── (2) Per-node + model perf rollup (Slice D) ──
+    # perf_report() rolls up each node's CmdStats into a per-node table. The cpu
+    # backend emits no CmdStats, so this degrades gracefully to a clear note.
+    print("\n── perf: print(net.perf_report()) ──")
+    print(net.perf_report())
+
     session.cleanup()
     print("\nDone.")
 

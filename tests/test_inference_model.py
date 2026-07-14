@@ -16,6 +16,7 @@ chdir is required (each kernel's spec is parsed explicitly and passed via
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -260,15 +261,258 @@ class TestApiSurface:
         assert seen["before"] == ["scale", "off1", "off2"]
         assert seen["after"] == ["scale", "off1", "off2"]
 
-    def test_graphnode_has_empty_hook_slots(self, session, specs):
-        """verification/stats slots exist and start empty for later agents."""
+    def test_graphnode_hook_slots_on_plain_run(self, session, specs):
+        """Plain (non-verify) run: verification empty; stats None on cpu.
+
+        The post-node hook fires on every run. Without verify=True there is no
+        verification outcome to record (slot stays empty). The cpu backend
+        emits no CmdStats, so the perf slot is set to None (graceful degrade),
+        never a crash.
+        """
         net = FanOutNet(session, specs)
         net(torch.zeros(N, dtype=torch.int8))
         for rec in net._graph:
             assert rec.verification == {}
-            assert rec.stats == {}
+            assert rec.stats is None
 
     def test_forward_not_implemented_by_base(self, session):
         net = InferenceModel(session)
         with pytest.raises(NotImplementedError):
             net(torch.zeros(N, dtype=torch.int8))
+
+
+# ── Slice C: per-node + end-to-end verification ──
+
+
+class TestPerNodeVerification:
+
+    def test_graphnode_verification_populated_on_verify(self, session, specs):
+        """net(x, verify=True) populates GraphNode.verification per node."""
+        net = FanOutNet(session, specs)
+        x = torch.arange(-16, 16, dtype=torch.int8)
+        net(x, verify=True)
+        assert len(net._graph) == 3
+        for rec in net._graph:
+            v = rec.verification
+            assert v != {}
+            assert v["passed"] is True
+            assert v["max_diff"] == 0.0
+            # Each node's declared output tensor is what got verified.
+            assert rec.output_name in v["tensors"]
+
+    def test_verification_empty_without_verify(self, session, specs):
+        """No verify → no per-node verification recorded."""
+        net = FanOutNet(session, specs)
+        net(torch.arange(-16, 16, dtype=torch.int8))
+        for rec in net._graph:
+            assert rec.verification == {}
+
+    def test_verify_report_structure(self, session, specs):
+        net = FanOutNet(session, specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True)
+        report = net.verify_report()
+        assert report["all_nodes_passed"] is True
+        assert report["passed"] is True
+        assert report["e2e"] is None  # no reference supplied
+        node_names = [row["node"] for row in report["nodes"]]
+        assert node_names == ["scale", "off1", "off2"]
+        assert all(row["verified"] and row["passed"] for row in report["nodes"])
+
+
+class TestEndToEndVerification:
+
+    def test_e2e_passes_vs_correct_reference(self, session, specs):
+        """Correct torch reference → E2E verify passes, no raise."""
+        net = FanOutNet(session, specs)
+        x = torch.arange(-16, 16, dtype=torch.int8)
+        net(x, verify=True, reference=_reference)  # must not raise
+        report = net.verify_report()
+        assert report["e2e"]["passed"] is True
+        assert report["passed"] is True
+        assert len(report["e2e"]["outputs"]) == 2
+
+    def test_e2e_raises_vs_wrong_reference(self, session, specs):
+        """Wrong reference → VerificationError with clear message."""
+        from vten.errors import VerificationError
+
+        def wrong_reference(x):
+            return (
+                torch.zeros(N, dtype=torch.int8),
+                torch.zeros(N, dtype=torch.int8),
+            )
+
+        net = FanOutNet(session, specs)
+        x = torch.arange(-16, 16, dtype=torch.int8)
+        with pytest.raises(VerificationError, match="E2E"):
+            net(x, verify=True, reference=wrong_reference)
+
+    def test_e2e_accepts_tensor_reference(self, session, specs):
+        """A precomputed reference tensor (not callable) also works."""
+        class OneOut(InferenceModel):
+            def __init__(self, session, specs):
+                super().__init__(session)
+                self._specs = specs
+
+            def build(self):
+                self.scale = self.stage(
+                    ScaleKernel, scale_factor=SCALE_FACTOR, N=N,
+                    input_name="data_in", output_name="data_out",
+                    name="scale", _spec=self._specs["scale"],
+                )
+
+            def forward(self, x):
+                return self.scale(x)
+
+        net = OneOut(session, specs)
+        x = torch.arange(-16, 16, dtype=torch.int8)
+        golden = (x.to(torch.int16) * SCALE_FACTOR).clamp(-128, 127).to(torch.int8)
+        net(x, verify=True, reference=golden)  # must not raise
+        assert net.verify_report()["e2e"]["passed"] is True
+
+    def test_e2e_output_count_mismatch_raises(self, session, specs):
+        """Reference producing wrong number of outputs → error."""
+        from vten.errors import VerificationError
+
+        def one_output_ref(x):
+            return torch.zeros(N, dtype=torch.int8)  # model returns 2
+
+        net = FanOutNet(session, specs)
+        x = torch.arange(-16, 16, dtype=torch.int8)
+        with pytest.raises(VerificationError):
+            net(x, verify=True, reference=one_output_ref)
+
+
+# ── Slice D: per-node perf rollup (synthetic CmdStats fixtures) ──
+
+
+@dataclass
+class _StubCmdStats:
+    """Minimal CmdStats stub (mirrors tests/test_reporting.py)."""
+
+    cmd_id: int
+    status: int = 3
+    issue_cycle: int = 0
+    commit_cycle: int = 0
+    first_active_cycle: int = 0
+    last_active_cycle: int = 0
+    active_cycles: int = 0
+    total_beats: int = 0
+    stall_cycles: int = 0
+
+    @property
+    def latency_cycles(self) -> int:
+        return self.commit_cycle - self.issue_cycle
+
+
+def _push_cmd_stats(active, window_start, window_end, latency, beats, stall=0):
+    """A single data-moving command's synthetic stats."""
+    return _StubCmdStats(
+        cmd_id=0, status=3, issue_cycle=window_start,
+        commit_cycle=window_start + latency,
+        first_active_cycle=window_start, last_active_cycle=window_end,
+        active_cycles=active, total_beats=beats, stall_cycles=stall,
+    )
+
+
+class TestPerNodePerf:
+    """perf_report() rollup — driven by synthetic CmdStats (cpu has none)."""
+
+    def _model_with_stats(self, session, specs, per_node_stats):
+        """Build a FanOutNet and stamp synthetic PerfSummary onto each node.
+
+        We can't get real cycles from cpu, so we mirror test_reporting.py and
+        inject stats directly, then exercise the real perf_report() rollup.
+        """
+        from vten.runtime.reporting import build_perf_summary
+
+        net = FanOutNet(session, specs)
+        net(torch.arange(-16, 16, dtype=torch.int8))
+        for rec, cmds in zip(net._graph, per_node_stats):
+            # Build enriched command dicts the way the model does, then roll up.
+            enriched = [
+                {
+                    "op": "PUSH", "interface": "s_axis",
+                    "protocol": "axi4_stream",
+                    "total_beats": c.total_beats,
+                    "active_cycles": c.active_cycles,
+                    "stall_cycles": c.stall_cycles,
+                    "latency_cycles": c.latency_cycles,
+                    "first_active_cycle": c.first_active_cycle,
+                    "last_active_cycle": c.last_active_cycle,
+                    "size": 1024,
+                }
+                for c in cmds
+            ]
+            rec.stats = build_perf_summary(enriched)
+        return net
+
+    def test_perf_report_builds_per_node_table(self, session, specs):
+        net = self._model_with_stats(
+            session, specs,
+            per_node_stats=[
+                [_push_cmd_stats(40, 0, 49, 100, 10)],   # scale
+                [_push_cmd_stats(20, 0, 29, 50, 8)],     # off1
+                [_push_cmd_stats(30, 0, 39, 60, 12)],    # off2
+            ],
+        )
+        report = net.perf_report()
+        assert report.has_data
+        d = report.to_dict()
+        names = [row["node"] for row in d["nodes"]]
+        assert names == ["scale", "off1", "off2"]
+        scale_row = d["nodes"][0]
+        assert scale_row["kernel"] == "ScaleKernel"
+        assert scale_row["active_cycles"] == 40
+        assert scale_row["active_window"] == 50  # 49 - 0 + 1
+        assert scale_row["total_beats"] == 10
+        assert scale_row["bytes_moved"] == 1024
+        # Totals roll up across nodes.
+        assert d["totals"]["active_cycles"] == 90
+        assert d["totals"]["total_beats"] == 30
+
+    def test_bottleneck_node_is_highest_active_cycles(self, session, specs):
+        net = self._model_with_stats(
+            session, specs,
+            per_node_stats=[
+                [_push_cmd_stats(40, 0, 49, 100, 10)],   # scale — most cycles
+                [_push_cmd_stats(20, 0, 29, 50, 8)],     # off1
+                [_push_cmd_stats(30, 0, 39, 60, 12)],    # off2
+            ],
+        )
+        report = net.perf_report()
+        assert report.bottleneck_node().node == "scale"
+        assert report.to_dict()["bottleneck_node"] == "scale"
+
+    def test_perf_report_terminal_string(self, session, specs):
+        net = self._model_with_stats(
+            session, specs,
+            per_node_stats=[
+                [_push_cmd_stats(40, 0, 49, 100, 10)],
+                [_push_cmd_stats(20, 0, 29, 50, 8)],
+                [_push_cmd_stats(30, 0, 39, 60, 12)],
+            ],
+        )
+        text = str(net.perf_report())
+        assert "per-node performance" in text
+        assert "scale" in text and "off1" in text and "off2" in text
+        assert "bottleneck node: scale" in text
+        assert "TOTAL" in text
+
+    def test_perf_report_graceful_without_stats(self, session, specs):
+        """cpu backend: no CmdStats → empty report, clear note, no crash."""
+        net = FanOutNet(session, specs)
+        net(torch.arange(-16, 16, dtype=torch.int8))
+        report = net.perf_report()
+        assert not report.has_data
+        assert report.bottleneck_node() is None
+        assert "no per-node performance data" in str(report)
+        d = report.to_dict()
+        assert d["nodes"] == []
+        assert d["bottleneck_node"] is None
+
+    def test_node_stats_is_none_on_cpu(self, session, specs):
+        """Each GraphNode.stats is None on the cpu backend (no CmdStats)."""
+        net = FanOutNet(session, specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True)
+        for rec in net._graph:
+            assert rec.stats is None
