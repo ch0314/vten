@@ -60,6 +60,52 @@ def _load_test_result(test_dir: Path, display_name: str) -> dict:
     return entry
 
 
+def _read_clock_freq_hz(project_dir: Path) -> int | None:
+    """Read backend clock frequency from vten.toml, or None if absent.
+
+    Looks under ``[backend.<name>].clock_freq_hz`` for any backend section.
+    Never fabricates a value — returns None so bandwidth is reported per-cycle.
+    """
+    toml_path = project_dir / "vten.toml"
+    if not toml_path.exists():
+        return None
+    try:
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # pragma: no cover - py<3.11 fallback
+            import tomli as tomllib  # type: ignore[no-redef]
+        config = tomllib.loads(toml_path.read_text())
+    except Exception:
+        return None
+    backends = config.get("backend", {})
+    if not isinstance(backends, dict):
+        return None
+    for section in backends.values():
+        if isinstance(section, dict) and section.get("clock_freq_hz"):
+            try:
+                return int(section["clock_freq_hz"])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _attach_perf(report_data: list[dict], clock_freq_hz: int | None) -> None:
+    """Compute and attach a perf summary dict to each test entry, in place."""
+    from vten.runtime.reporting import build_perf_summary
+
+    for entry in report_data:
+        cmd_stats = entry.get("command_stats", {})
+        commands = (
+            cmd_stats.get("commands", [])
+            if isinstance(cmd_stats, dict) else []
+        )
+        if not commands:
+            continue
+        summary = build_perf_summary(commands, clock_freq_hz=clock_freq_hz)
+        if summary is not None:
+            entry["perf_summary"] = summary.to_dict()
+
+
 def generate_report(project_dir: str, format: str = "terminal") -> str:
     """Generate a report from test results.
 
@@ -70,7 +116,8 @@ def generate_report(project_dir: str, format: str = "terminal") -> str:
     Returns:
         Formatted report string.
     """
-    results_dir = Path(project_dir) / "results"
+    project_path = Path(project_dir)
+    results_dir = project_path / "results"
 
     if format not in ("terminal", "html", "json"):
         raise VTenError(f"Unsupported report format: {format}")
@@ -82,6 +129,9 @@ def generate_report(project_dir: str, format: str = "terminal") -> str:
 
     if not report_data:
         raise VTenError(f"No test results in {results_dir}")
+
+    clock_freq_hz = _read_clock_freq_hz(project_path)
+    _attach_perf(report_data, clock_freq_hz)
 
     if format == "json":
         return json.dumps(report_data, indent=2)
@@ -113,10 +163,15 @@ def _format_terminal(report_data: list[dict]) -> str:
 
         # Command table
         cmd_stats = entry.get("command_stats", {})
+        commands = []
         if isinstance(cmd_stats, dict) and "commands" in cmd_stats:
             commands = cmd_stats["commands"]
             if commands:
                 lines.extend(_format_command_table(commands))
+
+        # Performance summary (roofline / utilization)
+        if commands:
+            lines.extend(_format_perf_summary(entry.get("perf_summary")))
 
         # Verification results
         verifications = summary.get("verification_results", [])
@@ -157,6 +212,93 @@ def _format_command_table(commands: list[dict]) -> list[str]:
     if has_sub_kernel:
         return _format_grouped_table(commands)
     return _format_flat_table(commands)
+
+
+def _format_perf_summary(perf: dict | None) -> list[str]:
+    """Render the Performance Summary section (roofline / utilization).
+
+    ``perf`` is the dict from ``PerfSummary.to_dict()`` or None. None means
+    the run carried no per-command CmdStats (e.g. the cpu backend) — we emit a
+    short graceful note instead of an empty table.
+    """
+    lines: list[str] = ["", "Performance Summary:"]
+
+    if not perf or not perf.get("interfaces"):
+        lines.append(
+            "  no per-command performance data (backend emits no CmdStats)"
+        )
+        return lines
+
+    header = (
+        "  Interface", "Proto", "Beats", "Active", "Stall",
+        "Util%", "Eff%", "Beats/cyc", "Bytes/cyc",
+    )
+    rows: list[tuple[str, ...]] = []
+    for iface in perf["interfaces"]:
+        rows.append((
+            "  " + str(iface.get("interface", "")),
+            _proto_short(iface.get("protocol", "")),
+            str(iface.get("total_beats", 0)),
+            str(iface.get("active_cycles", 0)),
+            str(iface.get("stall_cycles", 0)),
+            f"{iface.get('utilization', 0.0) * 100:.1f}",
+            f"{iface.get('bus_efficiency', 0.0) * 100:.1f}",
+            f"{iface.get('beats_per_cycle', 0.0):.3f}",
+            f"{iface.get('bytes_per_cycle', 0.0):.2f}",
+        ))
+
+    widths = _calc_widths(header, rows)
+    lines.append(_align_row(header, rows))
+    lines.append("  " + "  ".join("-" * w for w in widths))
+    for row in rows:
+        lines.append(_align_row_data(row, widths))
+
+    overall = perf.get("overall", {})
+    util = overall.get("utilization", 0.0) * 100
+    eff = overall.get("bus_efficiency", 0.0) * 100
+    lines.append(
+        f"  Overall: {overall.get('total_beats', 0)} beats, "
+        f"util {util:.1f}%, bus efficiency {eff:.1f}%, "
+        f"window {overall.get('active_window', 0)} cycles"
+    )
+
+    bw = overall.get("achieved_bandwidth_bps")
+    if bw is not None:
+        lines.append(f"  Achieved bandwidth: {_human_bytes(bw)}/s")
+    else:
+        lines.append(
+            f"  Achieved bandwidth: {overall.get('beats_per_cycle', 0.0):.3f} "
+            f"beats/cycle, {overall.get('bytes_per_cycle', 0.0):.2f} bytes/cycle "
+            f"(no clock_freq_hz in vten.toml)"
+        )
+
+    bottleneck = overall.get("bottleneck_interface")
+    if bottleneck:
+        reason = overall.get("bottleneck_reason")
+        detail = f" ({reason})" if reason else ""
+        lines.append(f"  Bottleneck: {bottleneck}{detail}")
+
+    return lines
+
+
+def _proto_short(protocol: str) -> str:
+    """Shorten a protocol name for compact display."""
+    return {
+        "axi4_stream": "AXI4S",
+        "axi4": "AXI4",
+        "axi4_lite": "AXI4L",
+    }.get(protocol, protocol or "-")
+
+
+def _human_bytes(n: float) -> str:
+    """Format a byte count with binary unit suffix."""
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    val = float(n)
+    for unit in units:
+        if val < 1024.0 or unit == units[-1]:
+            return f"{val:.2f} {unit}"
+        val /= 1024.0
+    return f"{val:.2f} {units[-1]}"
 
 
 def _format_flat_table(commands: list[dict]) -> list[str]:

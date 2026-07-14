@@ -468,6 +468,190 @@ class TestVerificationResult:
         assert vr.shape == (32, 32)
 
 
+class TestBuildPerfSummary:
+    """§ build_perf_summary — per-interface roofline / utilization aggregation."""
+
+    def _cmd(self, **kw) -> dict:
+        """Build an enriched-command dict with sensible zero defaults."""
+        base = {
+            "op": "PUSH", "interface": "s_axis", "protocol": "axi4_stream",
+            "total_beats": 0, "active_cycles": 0, "stall_cycles": 0,
+            "latency_cycles": 0, "first_active_cycle": 0,
+            "last_active_cycle": 0, "size": 0,
+        }
+        base.update(kw)
+        return base
+
+    def test_empty_stats_returns_none(self):
+        """No data-moving stats → None (graceful degrade, e.g. cpu backend)."""
+        from vten.runtime.reporting import build_perf_summary
+        assert build_perf_summary([]) is None
+
+    def test_only_register_ops_returns_none(self):
+        """Register/barrier ops carry no beats/active cycles → None."""
+        from vten.runtime.reporting import build_perf_summary
+        cmds = [
+            self._cmd(op="WRITE_REG", interface="ctrl", protocol="axi4_lite",
+                      latency_cycles=2),
+            self._cmd(op="BARRIER", interface="", latency_cycles=0),
+        ]
+        assert build_perf_summary(cmds) is None
+
+    def test_single_interface_math(self):
+        """utilization = active/window, bus_efficiency = active/latency."""
+        from vten.runtime.reporting import build_perf_summary
+        cmds = [
+            self._cmd(total_beats=10, active_cycles=40, stall_cycles=10,
+                      latency_cycles=100, first_active_cycle=10,
+                      last_active_cycle=59, size=1024),
+        ]
+        s = build_perf_summary(cmds)
+        assert s is not None
+        assert len(s.interfaces) == 1
+        iface = s.interfaces[0]
+        # window = 59 - 10 + 1 = 50; util = 40/50 = 0.8
+        assert iface.active_window == 50
+        assert iface.utilization == pytest.approx(0.8)
+        # bus_efficiency = 40/100 = 0.4
+        assert iface.bus_efficiency == pytest.approx(0.4)
+        assert iface.total_beats == 10
+        assert iface.bytes_moved == 1024
+        # beats/cycle = 10/50 = 0.2
+        assert iface.beats_per_cycle == pytest.approx(0.2)
+        # bytes/beat = 1024/10
+        assert iface.bytes_per_beat == pytest.approx(102.4)
+
+    def test_multi_interface_aggregation(self):
+        """Two interfaces aggregate independently; overall spans both."""
+        from vten.runtime.reporting import build_perf_summary
+        cmds = [
+            self._cmd(interface="s_axis", total_beats=8, active_cycles=20,
+                      stall_cycles=5, latency_cycles=40,
+                      first_active_cycle=15, last_active_cycle=45, size=1024),
+            self._cmd(interface="s_axis", op="PUSH", total_beats=8,
+                      active_cycles=18, stall_cycles=7, latency_cycles=40,
+                      first_active_cycle=60, last_active_cycle=95, size=1024),
+            self._cmd(interface="m_axis", op="PULL", total_beats=16,
+                      active_cycles=40, stall_cycles=2, latency_cycles=50,
+                      first_active_cycle=50, last_active_cycle=100, size=4096),
+        ]
+        s = build_perf_summary(cmds)
+        assert s is not None
+        by_name = {i.interface: i for i in s.interfaces}
+        assert set(by_name) == {"s_axis", "m_axis"}
+        # s_axis: 2 commands, beats 16, active 38, stall 12
+        assert by_name["s_axis"].commands == 2
+        assert by_name["s_axis"].total_beats == 16
+        assert by_name["s_axis"].active_cycles == 38
+        assert by_name["s_axis"].stall_cycles == 12
+        # s_axis window: min first 15 .. max last 95 → 81
+        assert by_name["s_axis"].active_window == 81
+        # overall totals
+        assert s.total_beats == 32
+        assert s.active_cycles == 78
+        assert s.stall_cycles == 14
+        assert s.bytes_moved == 6144
+        # overall window: min(15,50)=15 .. max(95,100)=100 → 86
+        assert s.active_window == 86
+
+    def test_bottleneck_is_highest_stall(self):
+        """Bottleneck = interface with the most stall cycles."""
+        from vten.runtime.reporting import build_perf_summary
+        cmds = [
+            self._cmd(interface="s_axis", total_beats=8, active_cycles=20,
+                      stall_cycles=12, latency_cycles=40,
+                      first_active_cycle=0, last_active_cycle=40),
+            self._cmd(interface="m_axis", op="PULL", total_beats=16,
+                      active_cycles=40, stall_cycles=2, latency_cycles=50,
+                      first_active_cycle=0, last_active_cycle=50),
+        ]
+        s = build_perf_summary(cmds)
+        assert s.bottleneck_interface == "s_axis"
+        assert "stall" in (s.bottleneck_reason or "")
+
+    def test_bottleneck_tiebreak_lowest_efficiency(self):
+        """No stalls anywhere → bottleneck is the least efficient interface."""
+        from vten.runtime.reporting import build_perf_summary
+        cmds = [
+            # eff = 20/40 = 0.5
+            self._cmd(interface="s_axis", total_beats=8, active_cycles=20,
+                      stall_cycles=0, latency_cycles=40,
+                      first_active_cycle=0, last_active_cycle=40),
+            # eff = 45/50 = 0.9
+            self._cmd(interface="m_axis", op="PULL", total_beats=16,
+                      active_cycles=45, stall_cycles=0, latency_cycles=50,
+                      first_active_cycle=0, last_active_cycle=50),
+        ]
+        s = build_perf_summary(cmds)
+        assert s.bottleneck_interface == "s_axis"
+        assert "efficiency" in (s.bottleneck_reason or "")
+
+    def test_clock_freq_bandwidth(self):
+        """clock_freq_hz present → achieved bytes/s bandwidth computed."""
+        from vten.runtime.reporting import build_perf_summary
+        cmds = [
+            self._cmd(total_beats=10, active_cycles=40, stall_cycles=0,
+                      latency_cycles=100, first_active_cycle=0,
+                      last_active_cycle=99, size=1000),
+        ]
+        s = build_perf_summary(cmds, clock_freq_hz=100)
+        assert s.clock_freq_hz == 100
+        # window = 100, bytes/cycle = 1000/100 = 10, ×100 Hz = 1000 B/s
+        assert s.achieved_bandwidth_bps == pytest.approx(1000.0)
+
+    def test_no_clock_freq_no_bandwidth(self):
+        """No clock → no fabricated Hz; bandwidth reported per-cycle only."""
+        from vten.runtime.reporting import build_perf_summary
+        cmds = [
+            self._cmd(total_beats=10, active_cycles=40, latency_cycles=100,
+                      first_active_cycle=0, last_active_cycle=99, size=1000),
+        ]
+        s = build_perf_summary(cmds)
+        assert s.achieved_bandwidth_bps is None
+        assert s.clock_freq_hz is None
+        assert s.bytes_per_cycle == pytest.approx(10.0)
+
+    def test_accepts_enriched_objects(self):
+        """Works on EnrichedCmdStats objects, not just dicts."""
+        from vten.runtime.reporting import (
+            EnrichedCmdStats,
+            build_perf_summary,
+        )
+        e = EnrichedCmdStats(
+            cmd_id=0, op_name="PUSH", interface_name="s_axis",
+            protocol="axi4_stream", tensor_name="x", size=512,
+            dep=[], commit_dep=[], sub_kernel=None, origin_path=None,
+            port="", probe=False, reg_offset=0, reg_value=0,
+            status_code=3, status_name="COMMITTED",
+            issue_cycle=0, commit_cycle=100,
+            active_cycles=40, stall_cycles=10, total_beats=8,
+            latency_cycles=100, utilization=0.8, bus_efficiency=0.4,
+        )
+        # EnrichedCmdStats has no first/last_active fields → falls back to
+        # summed active cycles for the window.
+        s = build_perf_summary([e])
+        assert s is not None
+        assert s.interfaces[0].interface == "s_axis"
+        assert s.interfaces[0].total_beats == 8
+        assert s.interfaces[0].bytes_moved == 512
+        # window falls back to active_cycles=40 → util 40/40 = 1.0
+        assert s.interfaces[0].active_window == 40
+
+    def test_to_dict_roundtrip(self):
+        """to_dict emits interfaces + overall with bottleneck info."""
+        from vten.runtime.reporting import build_perf_summary
+        cmds = [
+            self._cmd(interface="s_axis", total_beats=8, active_cycles=20,
+                      stall_cycles=5, latency_cycles=40,
+                      first_active_cycle=0, last_active_cycle=40, size=256),
+        ]
+        d = build_perf_summary(cmds).to_dict()
+        assert "interfaces" in d
+        assert "overall" in d
+        assert d["overall"]["bottleneck_interface"] == "s_axis"
+        assert d["interfaces"][0]["interface"] == "s_axis"
+
+
 class TestProbeResult:
 
     def test_probe_match(self):

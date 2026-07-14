@@ -216,6 +216,116 @@ class TestVtenReportCommandMetrics:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# §2b  vten report — performance summary
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _setup_perf_result(tmp_path: Path) -> Path:
+    """Result with multi-interface data-moving commands for perf summary."""
+    results = tmp_path / "results" / "passthrough" / "TestPerf"
+    results.mkdir(parents=True)
+    (results / "summary.json").write_text(json.dumps({
+        "test_name": "TestPerf", "kernel": "passthrough", "status": "PASS",
+        "total_cycles": 200, "configs_run": 1, "configs_passed": 1,
+    }))
+    cmds = [
+        {"cmd_id": 0, "op": "PUSH", "interface": "s_axis",
+         "protocol": "axi4_stream", "tensor": "data_in", "size": 1024,
+         "status": 3, "status_name": "COMMITTED",
+         "issue_cycle": 10, "commit_cycle": 50, "latency_cycles": 40,
+         "active_cycles": 20, "stall_cycles": 8, "total_beats": 8,
+         "first_active_cycle": 15, "last_active_cycle": 45},
+        {"cmd_id": 1, "op": "PULL", "interface": "m_axis",
+         "protocol": "axi4_stream", "tensor": "data_out", "size": 4096,
+         "status": 3, "status_name": "COMMITTED",
+         "issue_cycle": 60, "commit_cycle": 120, "latency_cycles": 60,
+         "active_cycles": 40, "stall_cycles": 2, "total_beats": 16,
+         "first_active_cycle": 65, "last_active_cycle": 115},
+        {"cmd_id": 2, "op": "WRITE_REG", "interface": "ctrl",
+         "protocol": "axi4_lite", "status": 3, "status_name": "COMMITTED",
+         "issue_cycle": 0, "commit_cycle": 2, "latency_cycles": 2,
+         "active_cycles": 0, "stall_cycles": 0, "total_beats": 0},
+    ]
+    (results / "stats.json").write_text(json.dumps({"commands": cmds}))
+    return tmp_path
+
+
+class TestVtenReportPerfSummary:
+    """Performance Summary section (roofline / utilization)."""
+
+    def test_terminal_has_perf_section(self, tmp_path: Path):
+        from vten.cli.report import generate_report
+        project = _setup_perf_result(tmp_path)
+        report = generate_report(str(project), format="terminal")
+        assert "Performance Summary:" in report
+        assert "s_axis" in report and "m_axis" in report
+
+    def test_terminal_shows_bottleneck(self, tmp_path: Path):
+        """s_axis has the most stall cycles → flagged as bottleneck."""
+        from vten.cli.report import generate_report
+        project = _setup_perf_result(tmp_path)
+        report = generate_report(str(project), format="terminal")
+        assert "Bottleneck: s_axis" in report
+
+    def test_terminal_reg_ops_excluded(self, tmp_path: Path):
+        """Register interface (ctrl) is not a data mover → absent from perf."""
+        from vten.cli.report import generate_report
+        project = _setup_perf_result(tmp_path)
+        report = generate_report(str(project), format="terminal")
+        perf_section = report.split("Performance Summary:")[1]
+        assert "ctrl" not in perf_section
+
+    def test_json_includes_perf_summary(self, tmp_path: Path):
+        from vten.cli.report import generate_report
+        project = _setup_perf_result(tmp_path)
+        parsed = json.loads(generate_report(str(project), format="json"))
+        entry = next(e for e in parsed if "perf_summary" in e)
+        perf = entry["perf_summary"]
+        assert "interfaces" in perf and "overall" in perf
+        assert perf["overall"]["bottleneck_interface"] == "s_axis"
+
+    def test_no_clock_reports_per_cycle(self, tmp_path: Path):
+        """No vten.toml clock → bandwidth shown in beats/cycle, not Hz."""
+        from vten.cli.report import generate_report
+        project = _setup_perf_result(tmp_path)
+        report = generate_report(str(project), format="terminal")
+        assert "beats/cycle" in report
+
+    def test_clock_freq_reports_bandwidth(self, tmp_path: Path):
+        """clock_freq_hz in vten.toml → achieved bytes/s bandwidth."""
+        from vten.cli.report import generate_report
+        project = _setup_perf_result(tmp_path)
+        (project / "vten.toml").write_text(
+            "[project]\nname = \"p\"\n\n"
+            "[backend.xrt]\nclock_freq_hz = 300000000\n"
+        )
+        report = generate_report(str(project), format="terminal")
+        assert "Achieved bandwidth" in report
+        assert "/s" in report
+
+    def test_no_cmd_stats_graceful_note(self, tmp_path: Path):
+        """Commands present but all zero-stat (cpu backend) → graceful note."""
+        from vten.cli.report import generate_report
+        results = tmp_path / "results" / "cpu_run" / "TestCpu"
+        results.mkdir(parents=True)
+        (results / "summary.json").write_text(json.dumps({
+            "test_name": "TestCpu", "kernel": "cpu_run", "status": "PASS",
+            "total_cycles": 0, "configs_run": 1, "configs_passed": 1,
+        }))
+        # cpu backend emits commands with no cycle stats at all.
+        (results / "stats.json").write_text(json.dumps({"commands": [
+            {"cmd_id": 0, "op": "WRITE_REG", "interface": "ctrl",
+             "status": 3, "status_name": "COMMITTED",
+             "issue_cycle": 0, "commit_cycle": 0, "latency_cycles": 0,
+             "active_cycles": 0, "stall_cycles": 0, "total_beats": 0},
+        ]}))
+        report = generate_report(str(tmp_path), format="terminal")
+        assert "no per-command performance data" in report
+        # Must not crash / must not emit an empty table
+        assert "Performance Summary:" in report
+
+
+# ═══════════════════════════════════════════════════════════════════
 # §3  vten report — multi-result aggregation
 # ═══════════════════════════════════════════════════════════════════
 

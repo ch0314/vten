@@ -881,3 +881,67 @@ class TestOK(TestScenario):
         assert len(summary_files) >= 1
         content = json.loads(summary_files[0].read_text())
         assert content["status"] == "PASS"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# §  _write_results — perf summary persisted into stats.json
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestWriteResultsPerfSummary:
+    """_write_results embeds a perf_summary built from CmdStats."""
+
+    def _batch_with_stats(self, stats):
+        from vten.backend.base import RunContext
+        from vten.execution import BatchResult, ConfigResult
+
+        result = MagicMock(
+            total_cycles=200, verification_count=0,
+            verification_results=[], per_command_stats=stats,
+            compiled_result=None,  # → enrich_stats metadata-free fallback
+        )
+        batch = BatchResult(configs=[
+            ConfigResult(config_index=0, result=result),
+        ])
+        backend = MagicMock()
+        backend._run_ctx = RunContext(waveform=False)
+        return batch, backend
+
+    def test_perf_summary_written(self, tmp_path: Path):
+        from vten.backend.base import CmdStats
+        from vten.cli.run import _write_results
+
+        stats = [
+            CmdStats(cmd_id=0, status=3, issue_cycle=10, commit_cycle=50,
+                     first_active_cycle=15, last_active_cycle=45,
+                     active_cycles=20, total_beats=8, stall_cycles=8),
+            CmdStats(cmd_id=1, status=3, issue_cycle=60, commit_cycle=120,
+                     first_active_cycle=65, last_active_cycle=115,
+                     active_cycles=40, total_beats=16, stall_cycles=2),
+        ]
+        batch, backend = self._batch_with_stats(stats)
+        results_dir = tmp_path / "results" / "k" / "t"
+        results_dir.mkdir(parents=True)
+
+        _write_results(batch, [{}], "k", "t", results_dir, backend)
+
+        stats_json = json.loads((results_dir / "stats.json").read_text())
+        assert "perf_summary" in stats_json
+        perf = stats_json["perf_summary"]
+        assert "interfaces" in perf and "overall" in perf
+        # Two commands moved 24 beats total.
+        assert perf["overall"]["total_beats"] == 24
+
+    def test_no_stats_omits_perf_summary(self, tmp_path: Path):
+        from vten.cli.run import _write_results
+
+        batch, backend = self._batch_with_stats([])
+        results_dir = tmp_path / "results" / "k" / "t"
+        results_dir.mkdir(parents=True)
+
+        _write_results(batch, [{}], "k", "t", results_dir, backend)
+
+        stats_json = json.loads((results_dir / "stats.json").read_text())
+        # No CmdStats → no perf_summary key, still valid stats.json.
+        assert "perf_summary" not in stats_json
+        assert stats_json["commands"] == []

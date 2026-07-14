@@ -305,8 +305,21 @@ def _write_results(
 
     (results_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
+    stats_payload: dict = {"commands": all_cmd_stats}
+    # Attach a per-interface performance summary (roofline/utilization view)
+    # built from the per-command stats. None when the backend emits no
+    # CmdStats (e.g. cpu backend) — omit the section rather than store nulls.
+    if all_cmd_stats:
+        try:
+            from vten.runtime.reporting import build_perf_summary
+            perf = build_perf_summary(all_cmd_stats)
+            if perf is not None:
+                stats_payload["perf_summary"] = perf.to_dict()
+        except Exception:
+            logger.debug("perf summary build failed", exc_info=True)
+
     (results_dir / "stats.json").write_text(json.dumps(
-        {"commands": all_cmd_stats}, indent=2,
+        stats_payload, indent=2,
     ))
 
     # Waveform file management

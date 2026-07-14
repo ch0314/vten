@@ -233,6 +233,312 @@ def build_command_metadata(compiled: CompiledResult) -> list[CommandMetadata]:
     return result
 
 
+# ── Performance summary — roofline / utilization aggregation ──
+
+
+@dataclass
+class InterfacePerf:
+    """Aggregated performance for a single interface."""
+
+    interface: str
+    protocol: str
+    commands: int
+    total_beats: int
+    active_cycles: int
+    stall_cycles: int
+    latency_cycles: int
+    active_window: int  # last_active - first_active + 1 across the interface
+    bytes_moved: int  # from Command.size, 0 when unknown
+    utilization: float  # active_cycles / active_window
+    bus_efficiency: float  # active_cycles / latency_cycles
+    beats_per_cycle: float  # total_beats / active_window
+    bytes_per_cycle: float  # bytes_moved / active_window (0 when bytes unknown)
+    bytes_per_beat: float  # bytes_moved / total_beats (0 when unknown)
+
+    def to_dict(self) -> dict:
+        return {
+            "interface": self.interface,
+            "protocol": self.protocol,
+            "commands": self.commands,
+            "total_beats": self.total_beats,
+            "active_cycles": self.active_cycles,
+            "stall_cycles": self.stall_cycles,
+            "latency_cycles": self.latency_cycles,
+            "active_window": self.active_window,
+            "bytes_moved": self.bytes_moved,
+            "utilization": round(self.utilization, 4),
+            "bus_efficiency": round(self.bus_efficiency, 4),
+            "beats_per_cycle": round(self.beats_per_cycle, 4),
+            "bytes_per_cycle": round(self.bytes_per_cycle, 4),
+            "bytes_per_beat": round(self.bytes_per_beat, 4),
+        }
+
+
+@dataclass
+class PerfSummary:
+    """Per-run performance summary: per-interface + overall roofline view."""
+
+    interfaces: list[InterfacePerf]
+    total_beats: int
+    active_cycles: int
+    stall_cycles: int
+    active_window: int  # span from earliest first_active to latest last_active
+    bytes_moved: int
+    utilization: float  # aggregate active / window
+    bus_efficiency: float  # aggregate active / total latency
+    beats_per_cycle: float
+    bytes_per_cycle: float
+    bottleneck_interface: str | None  # highest stall / lowest efficiency
+    bottleneck_reason: str | None  # human-readable why
+    clock_freq_hz: int | None = None  # None → report per-cycle, not per-second
+    achieved_bandwidth_bps: float | None = None  # bytes/s when clock known
+
+    def to_dict(self) -> dict:
+        d: dict = {
+            "interfaces": [i.to_dict() for i in self.interfaces],
+            "overall": {
+                "total_beats": self.total_beats,
+                "active_cycles": self.active_cycles,
+                "stall_cycles": self.stall_cycles,
+                "active_window": self.active_window,
+                "bytes_moved": self.bytes_moved,
+                "utilization": round(self.utilization, 4),
+                "bus_efficiency": round(self.bus_efficiency, 4),
+                "beats_per_cycle": round(self.beats_per_cycle, 4),
+                "bytes_per_cycle": round(self.bytes_per_cycle, 4),
+                "bottleneck_interface": self.bottleneck_interface,
+                "bottleneck_reason": self.bottleneck_reason,
+            },
+        }
+        if self.clock_freq_hz is not None:
+            d["overall"]["clock_freq_hz"] = self.clock_freq_hz
+        if self.achieved_bandwidth_bps is not None:
+            d["overall"]["achieved_bandwidth_bps"] = round(
+                self.achieved_bandwidth_bps, 2
+            )
+        return d
+
+
+# Ops that move data over a bus (contribute to bandwidth/utilization).
+_DATA_OPS = frozenset({"PUSH", "PULL", "LOAD", "STORE"})
+
+
+def _cmd_field(cmd: object, name: str, default: int = 0) -> int:
+    """Read a numeric field from either a dict (report schema) or an object."""
+    if isinstance(cmd, dict):
+        val = cmd.get(name, default)
+    else:
+        val = getattr(cmd, name, default)
+    return val if val is not None else default
+
+
+def _cmd_str(cmd: object, *names: str) -> str:
+    """Read the first non-empty string field from a dict/object."""
+    for name in names:
+        if isinstance(cmd, dict):
+            val = cmd.get(name)
+        else:
+            val = getattr(cmd, name, None)
+        if val:
+            return str(val)
+    return ""
+
+
+def build_perf_summary(
+    commands: list,
+    clock_freq_hz: int | None = None,
+) -> PerfSummary | None:
+    """Aggregate per-command stats into a per-interface performance summary.
+
+    Accepts either enriched command dicts (the stats.json ``commands`` schema
+    produced by :meth:`EnrichedCmdStats.to_dict`) or ``EnrichedCmdStats``
+    objects. Only data-moving ops (PUSH/PULL/LOAD/STORE) with cycle timing
+    contribute; register/barrier/sync ops are ignored.
+
+    Per interface it reports beats, active/stall cycles, utilization,
+    bus efficiency, bytes moved and achieved bandwidth (beats/cycle and, when
+    ``size`` bytes are present, bytes/cycle). The overall section adds the
+    bottleneck interface — the one with the highest stall cycles, breaking
+    ties by lowest bus efficiency.
+
+    Reuses the same math as ``CmdStats.utilization`` / ``bus_efficiency``:
+    utilization = active_cycles / active_window,
+    bus_efficiency = active_cycles / latency_cycles.
+
+    Returns ``None`` when no command carries per-command cycle stats (e.g.
+    the cpu backend, which emits no CmdStats) so callers can degrade
+    gracefully rather than rendering an empty table.
+    """
+    # Accumulators keyed by interface name.
+    agg: dict[str, dict] = {}
+    any_stats = False
+
+    for cmd in commands:
+        op = _cmd_str(cmd, "op", "op_name")
+        if op and op not in _DATA_OPS:
+            continue
+
+        beats = _cmd_field(cmd, "total_beats")
+        active = _cmd_field(cmd, "active_cycles")
+        latency = _cmd_field(cmd, "latency_cycles")
+        stall = _cmd_field(cmd, "stall_cycles")
+        first_active = _cmd_field(cmd, "first_active_cycle", -1)
+        last_active = _cmd_field(cmd, "last_active_cycle", -1)
+
+        # A command counts as "having stats" if it moved beats or spent
+        # active/latency cycles. Pure metadata rows (all zero) don't.
+        if not (beats or active or latency or stall):
+            continue
+        any_stats = True
+
+        iface = _cmd_str(cmd, "interface", "interface_name") or "(none)"
+        proto = _cmd_str(cmd, "protocol")
+
+        a = agg.setdefault(iface, {
+            "protocol": proto,
+            "commands": 0,
+            "total_beats": 0,
+            "active_cycles": 0,
+            "stall_cycles": 0,
+            "latency_cycles": 0,
+            "bytes_moved": 0,
+            "first_active": None,
+            "last_active": None,
+        })
+        if not a["protocol"] and proto:
+            a["protocol"] = proto
+        a["commands"] += 1
+        a["total_beats"] += beats
+        a["active_cycles"] += active
+        a["stall_cycles"] += stall
+        a["latency_cycles"] += latency
+        a["bytes_moved"] += _cmd_field(cmd, "size")
+
+        if first_active >= 0:
+            a["first_active"] = (
+                first_active if a["first_active"] is None
+                else min(a["first_active"], first_active)
+            )
+        if last_active >= 0:
+            a["last_active"] = (
+                last_active if a["last_active"] is None
+                else max(a["last_active"], last_active)
+            )
+
+    if not any_stats:
+        return None
+
+    interfaces: list[InterfacePerf] = []
+    for name in sorted(agg):
+        a = agg[name]
+        # Active window: prefer measured first/last active span; fall back to
+        # summed active cycles when per-command first/last are unavailable.
+        if a["first_active"] is not None and a["last_active"] is not None:
+            window = a["last_active"] - a["first_active"] + 1
+        else:
+            window = a["active_cycles"]
+        window = max(window, 0)
+
+        util = a["active_cycles"] / window if window else 0.0
+        eff = (
+            a["active_cycles"] / a["latency_cycles"]
+            if a["latency_cycles"] else 0.0
+        )
+        bpc = a["total_beats"] / window if window else 0.0
+        bytes_pc = a["bytes_moved"] / window if window else 0.0
+        bytes_pb = (
+            a["bytes_moved"] / a["total_beats"] if a["total_beats"] else 0.0
+        )
+
+        interfaces.append(InterfacePerf(
+            interface=name,
+            protocol=a["protocol"],
+            commands=a["commands"],
+            total_beats=a["total_beats"],
+            active_cycles=a["active_cycles"],
+            stall_cycles=a["stall_cycles"],
+            latency_cycles=a["latency_cycles"],
+            active_window=window,
+            bytes_moved=a["bytes_moved"],
+            utilization=util,
+            bus_efficiency=eff,
+            beats_per_cycle=bpc,
+            bytes_per_cycle=bytes_pc,
+            bytes_per_beat=bytes_pb,
+        ))
+
+    # ── Overall aggregate ──
+    total_beats = sum(i.total_beats for i in interfaces)
+    total_active = sum(i.active_cycles for i in interfaces)
+    total_stall = sum(i.stall_cycles for i in interfaces)
+    total_latency = sum(i.latency_cycles for i in interfaces)
+    total_bytes = sum(i.bytes_moved for i in interfaces)
+
+    first_actives = [
+        agg[n]["first_active"] for n in agg
+        if agg[n]["first_active"] is not None
+    ]
+    last_actives = [
+        agg[n]["last_active"] for n in agg
+        if agg[n]["last_active"] is not None
+    ]
+    if first_actives and last_actives:
+        overall_window = max(last_actives) - min(first_actives) + 1
+    else:
+        overall_window = total_active
+    overall_window = max(overall_window, 0)
+
+    overall_util = total_active / overall_window if overall_window else 0.0
+    overall_eff = total_active / total_latency if total_latency else 0.0
+    overall_bpc = total_beats / overall_window if overall_window else 0.0
+    overall_bytes_pc = total_bytes / overall_window if overall_window else 0.0
+
+    # ── Bottleneck: highest stall cycles; tie-break on lowest efficiency ──
+    bottleneck = None
+    reason = None
+    if interfaces:
+        bottleneck_if = max(
+            interfaces,
+            key=lambda i: (i.stall_cycles, -i.bus_efficiency),
+        )
+        bottleneck = bottleneck_if.interface
+        if bottleneck_if.stall_cycles > 0:
+            reason = (
+                f"{bottleneck_if.stall_cycles} stall cycles, "
+                f"{bottleneck_if.bus_efficiency * 100:.1f}% bus efficiency"
+            )
+        else:
+            # No stalls anywhere → flag the least efficient interface instead.
+            least_eff = min(interfaces, key=lambda i: i.bus_efficiency)
+            bottleneck = least_eff.interface
+            reason = (
+                f"lowest bus efficiency "
+                f"({least_eff.bus_efficiency * 100:.1f}%)"
+            )
+
+    achieved_bw = None
+    if clock_freq_hz and overall_window and total_bytes:
+        # bytes/cycle × cycles/s = bytes/s
+        achieved_bw = overall_bytes_pc * clock_freq_hz
+
+    return PerfSummary(
+        interfaces=interfaces,
+        total_beats=total_beats,
+        active_cycles=total_active,
+        stall_cycles=total_stall,
+        active_window=overall_window,
+        bytes_moved=total_bytes,
+        utilization=overall_util,
+        bus_efficiency=overall_eff,
+        beats_per_cycle=overall_bpc,
+        bytes_per_cycle=overall_bytes_pc,
+        bottleneck_interface=bottleneck,
+        bottleneck_reason=reason,
+        clock_freq_hz=clock_freq_hz,
+        achieved_bandwidth_bps=achieved_bw,
+    )
+
+
 def merge_stats_with_metadata(
     stats: list[CmdStats],
     metadata: list[CommandMetadata],
