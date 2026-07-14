@@ -1,10 +1,16 @@
-# E2E Test Results — passthrough project
+# E2E Test Results — passthrough_regression project
+
+These results were originally recorded for the `passthrough` example before the
+edge-case / regression fixtures were split out into this sibling project. The
+`passthrough` kernel itself now lives in [`../passthrough/`](../passthrough/README.md);
+its results are kept here for historical reference alongside the fixtures they
+were validated with.
 
 ## Test Environment
 
 - **Backend**: xsim (Vivado 2023.2)
 - **Default parameters**: N=1024
-- **Project directory**: `examples/passthrough/`
+- **Project directory**: `examples/passthrough_regression/`
 
 ---
 

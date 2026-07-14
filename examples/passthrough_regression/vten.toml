@@ -1,0 +1,26 @@
+[project]
+name = "passthrough_regression"
+version = "0.1.0"
+
+[parameters]
+N = 1024
+
+[backend.xsim]
+vivado_path = "/tools/Xilinx/Vivado/2023.2"
+timeout_ms = 10000
+submit_timeout_s = 300
+
+[backend.verilator]
+threads = 4
+trace = false
+
+[rtl]
+sources = ["rtl/**/*.sv", "rtl/**/*.v"]
+tb_module = "tb_top"
+
+[[ip]]
+source = "ip/**/*.xci"
+
+[test]
+default_seed = 42
+waveform = false
