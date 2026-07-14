@@ -13,7 +13,7 @@ from vten.cli.scenario import TestScenario
 from vten.execution import BatchResult, ConfigResult, execute_batch
 
 # Level 3: Inference
-from vten.inference import InferenceModule, InferenceSession
+from vten.inference import InferenceModel, InferenceModule, InferenceSession
 
 __all__ = [
     # Kernel definition
@@ -31,4 +31,5 @@ __all__ = [
     # Inference
     "InferenceSession",
     "InferenceModule",
+    "InferenceModel",
 ]

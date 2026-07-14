@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time as _time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -497,3 +498,378 @@ class InferenceModule(torch.nn.Module):
             self.kernel_cls, inputs=inputs, verify=verify, **self._params,
         )
         return result[self.output_name]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# InferenceModel — whole-network orchestration with graph capture
+# ═══════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class GraphEdge:
+    """One input binding of a node invocation.
+
+    ``source`` is the ``node_name`` of the producing node, or the sentinel
+    ``"input"`` when the tensor entered the graph from outside (a graph input
+    such as the ``x`` passed to ``forward()`` or an uploaded weight/bias).
+    ``tensor_name`` is the kernel-side input slot the tensor was bound to
+    (e.g. ``"data_in"``, or ``"concat_mem"`` for a skip connection).
+    """
+
+    tensor_name: str
+    source: str  # producing node_name, or "input"
+    source_tensor_id: int
+
+
+@dataclass
+class GraphNode:
+    """A single node invocation recorded during eager ``forward()``.
+
+    One record is appended per ``node(...)`` call.  Because capture happens as
+    a *side effect of execution*, calling the same node twice (e.g. in a loop)
+    produces two records — the graph is an execution trace, not a static DAG.
+    """
+
+    node_name: str
+    kernel: str  # kernel class __name__
+    inputs: list[GraphEdge] = field(default_factory=list)
+    params: dict[str, Any] = field(default_factory=dict)
+    output_tensor_id: int | None = None
+    output_name: str | None = None
+    # Hook slots for the later verify/perf agent (Slice C/D). Left empty here;
+    # never read by capture/execution so filling them cannot break the trace.
+    verification: dict[str, Any] = field(default_factory=dict)
+    stats: dict[str, Any] = field(default_factory=dict)
+
+
+class _Node:
+    """A tracked stage in an :class:`InferenceModel`.
+
+    Created via :meth:`InferenceModel.stage`. Calling the node runs its kernel
+    eagerly through the shared :class:`InferenceSession` (mirroring
+    :class:`InferenceModule`) *and* records the invocation into the owning
+    model's dataflow graph. Do not construct directly.
+    """
+
+    def __init__(
+        self,
+        model: InferenceModel,
+        kernel_cls: type[Kernel],
+        *,
+        name: str,
+        input_name: str,
+        output_name: str,
+        extra_inputs: dict[str, Tensor],
+        params: dict[str, Any],
+    ) -> None:
+        self._model = model
+        self.kernel_cls = kernel_cls
+        self.name = name
+        self.input_name = input_name
+        self.output_name = output_name
+        self._extra_inputs = extra_inputs  # uploaded weights/biases (graph inputs)
+        self._params = params
+
+    def __call__(
+        self,
+        x: torch.Tensor | Tensor,
+        *,
+        verify: bool = False,
+        **extra_inputs: torch.Tensor | Tensor,
+    ) -> Tensor:
+        """Run this node eagerly and capture the invocation into the graph.
+
+        Args:
+            x: Primary input, bound to ``self.input_name``. May be a raw
+                ``torch.Tensor`` (a graph input) or an on-device / host
+                ``vten.Tensor`` produced by an upstream node (a graph edge).
+            verify: Forwarded to ``session.run`` (per-node verify hook).
+            **extra_inputs: Additional per-call inputs, e.g. a skip connection
+                passed as ``concat_mem=<upstream tensor>``. Each is bound by
+                keyword name and captured as an edge — this is how fan-in /
+                skip-joins show up in the graph.
+
+        Returns:
+            The on-device (HW) or host (SIM/CPU) output ``Tensor``, also
+            registered as this node's output in the model's id→node map so a
+            downstream node consuming it records the correct edge.
+        """
+        inputs: dict[str, torch.Tensor | Tensor] = {self.input_name: x}
+        inputs.update(self._extra_inputs)
+        inputs.update(extra_inputs)
+
+        # ── Graph capture (BEFORE run): resolve each input tensor's producer ──
+        edges: list[GraphEdge] = []
+        for tensor_name, value in inputs.items():
+            edges.append(self._model._resolve_edge(tensor_name, value))
+
+        self._model._on_before_node(self, inputs)  # no-op hook (verify agent)
+
+        result = self._model._session.run(
+            self.kernel_cls, inputs=inputs, verify=verify, **self._params,
+        )
+        out = result[self.output_name]
+
+        # ── Graph capture (AFTER run): register this node as out's producer ──
+        # Drop private/plumbing keys (e.g. "_spec", a KernelSpec object) from the
+        # captured params so graph() stays plain-data / JSON-serializable.
+        captured_params = {
+            k: v for k, v in self._params.items() if not k.startswith("_")
+        }
+        record = GraphNode(
+            node_name=self.name,
+            kernel=self.kernel_cls.__name__,
+            inputs=edges,
+            params=captured_params,
+            output_tensor_id=id(out),
+            output_name=self.output_name,
+        )
+        self._model._register_output(out, self, record)
+        self._model._on_after_node(self, record, out)  # no-op hook (perf agent)
+        return out
+
+
+class InferenceModel:
+    """Whole-network orchestration container with internal graph capture.
+
+    A hybrid **imperative + graph-capturing** model. You compose multiple vTen
+    kernels into one model; ``forward()`` runs them *eagerly on device* through a
+    shared :class:`InferenceSession` (the same zero-copy device chaining as
+    :class:`InferenceModule`), while the model records the dataflow graph as a
+    *side effect* of that execution. Execution **is** the capture — there is no
+    deferred/lazy graph build and no second execution path.
+
+    Subclass and override two methods::
+
+        class MyNet(InferenceModel):
+            def build(self):
+                # declare stages once (uploads weights/biases here)
+                self.scale  = self.stage(ScaleKernel,  scale_factor=2, N=32)
+                self.off1   = self.stage(OffsetKernel, offset_value=1, N=32,
+                                         name="off1")
+                self.off2   = self.stage(OffsetKernel, offset_value=2, N=32,
+                                         name="off2")
+
+            def forward(self, x):
+                h = self.scale(x)      # h fans out to two consumers below
+                a = self.off1(h)
+                b = self.off2(h)
+                return a               # (b is still captured as a node)
+
+        net = MyNet(session)
+        y = net(x)              # runs build() once, resets graph, runs forward()
+        graph = net.graph()     # {"nodes": [...], "edges": [...]}
+
+    Graph capture (the id-map mechanism)
+    ------------------------------------
+    The model keeps an **external identity map** ``id(tensor) -> (node, record)``
+    — it never mutates the core :class:`~vten.kernel.tensor.Tensor` to carry
+    provenance. On every node call, for each bound input tensor it looks up
+    ``id(tensor)`` in that map: a hit records an edge from the producing node; a
+    miss records a graph input (sentinel source ``"input"``, e.g. the ``x`` arg
+    or an uploaded weight). After the kernel runs, the output tensor's ``id`` is
+    registered → this node. Because the same physical output object is passed to
+    every consumer, one tensor consumed by two nodes yields **fan-out** in the
+    graph, and a tensor threaded through as ``concat_mem=`` yields a **skip**
+    edge — both fall out of the id-map automatically.
+
+    Hook points ``_on_before_node`` / ``_on_after_node`` are intentional no-ops
+    here; the later verification (Slice C) and perf/memory rollup (Slice D)
+    agents attach per-node behavior there and populate ``GraphNode.verification``
+    / ``GraphNode.stats`` without restructuring this class.
+    """
+
+    def __init__(self, session: InferenceSession) -> None:
+        self._session = session
+        self._built = False
+        self._nodes: dict[str, _Node] = {}
+        self._auto_name_counts: dict[str, int] = {}
+        # Graph state (reset per forward): trace of node invocations …
+        self._graph: list[GraphNode] = []
+        # … and the external identity map: id(tensor) -> (producing node, record).
+        self._producers: dict[int, tuple[_Node, GraphNode]] = {}
+
+    # ── Declaration ──
+
+    def stage(
+        self,
+        kernel_cls: type[Kernel],
+        *,
+        weight: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+        weight_name: str = "wgt_mem",
+        bias_name: str = "bias_mem",
+        input_name: str = "data_in",
+        output_name: str = "data_out",
+        name: str | None = None,
+        **params: Any,
+    ) -> _Node:
+        """Declare a tracked stage (a graph node factory).
+
+        Mirrors :class:`InferenceModule`: weights/biases are uploaded to the
+        device **once** here (not per call) and become fixed graph inputs on
+        every invocation. Call the returned node inside ``forward()`` to run it.
+
+        Args:
+            kernel_cls: Kernel subclass to execute for this stage.
+            weight, bias: Optional constants uploaded once via
+                ``session.upload`` and bound to every call under
+                ``weight_name`` / ``bias_name``.
+            input_name, output_name: Kernel tensor slot names for the primary
+                input/output (default ``"data_in"``/``"data_out"``).
+            name: Node name in the captured graph. Auto-derived from the kernel
+                class (deduplicated, e.g. ``offset#1``) when omitted.
+            **params: Kernel parameters merged into each ``session.run`` (e.g.
+                ``scale_factor``, ``offset_value``, ``N``, ``_spec``).
+
+        Returns:
+            A callable :class:`_Node`.
+        """
+        if name is None:
+            name = self._auto_name(kernel_cls.__name__)
+        elif name in self._nodes:
+            raise ValueError(f"duplicate stage name: {name!r}")
+
+        extra_inputs: dict[str, Tensor] = {}
+        if weight is not None:
+            extra_inputs[weight_name] = self._session.upload(
+                weight, weight_name, kernel_cls, params,
+            )
+        if bias is not None:
+            extra_inputs[bias_name] = self._session.upload(
+                bias, bias_name, kernel_cls, params,
+            )
+
+        node = _Node(
+            self,
+            kernel_cls,
+            name=name,
+            input_name=input_name,
+            output_name=output_name,
+            extra_inputs=extra_inputs,
+            params=params,
+        )
+        self._nodes[name] = node
+        return node
+
+    def _auto_name(self, kernel_name: str) -> str:
+        """Derive a unique, stable node name from a kernel class name."""
+        base = kernel_name.lower()
+        if base.endswith("kernel"):
+            base = base[: -len("kernel")] or kernel_name.lower()
+        count = self._auto_name_counts.get(base, 0)
+        self._auto_name_counts[base] = count + 1
+        return base if count == 0 else f"{base}#{count}"
+
+    def build(self) -> None:
+        """Declare the model's stages. Override in subclasses.
+
+        Called exactly once, lazily, on the first ``net(x)``. Use
+        :meth:`stage` here to create nodes and upload any weights/biases.
+        """
+
+    def forward(self, x: torch.Tensor | Tensor) -> Tensor:
+        """Imperative dataflow. Override in subclasses.
+
+        Call the nodes declared in :meth:`build`, wiring outputs to inputs in
+        plain Python. Executes eagerly; the graph is captured as a side effect.
+        """
+        raise NotImplementedError("InferenceModel subclasses must implement forward()")
+
+    # ── Execution + capture ──
+
+    def __call__(self, x: torch.Tensor | Tensor) -> Tensor:
+        """Run the model: lazily ``build()``, reset the graph, then ``forward()``.
+
+        Returns the output ``Tensor`` of ``forward()``. Inspect the captured
+        dataflow with :meth:`graph`.
+        """
+        if not self._built:
+            self.build()
+            self._built = True
+        # Fresh trace per forward — execution IS the capture.
+        self._graph = []
+        self._producers = {}
+        return self.forward(x)
+
+    def _resolve_edge(
+        self, tensor_name: str, value: torch.Tensor | Tensor,
+    ) -> GraphEdge:
+        """Look up a bound input's producer in the id-map → build an edge.
+
+        A hit means the tensor was produced by an upstream node (a real graph
+        edge, incl. fan-out and skips); a miss means it entered from outside
+        (the ``forward`` argument, or an uploaded weight/bias) → source
+        ``"input"``.
+        """
+        producer = self._producers.get(id(value))
+        source = producer[0].name if producer is not None else "input"
+        return GraphEdge(
+            tensor_name=tensor_name,
+            source=source,
+            source_tensor_id=id(value),
+        )
+
+    def _register_output(
+        self, out: Tensor, node: _Node, record: GraphNode,
+    ) -> None:
+        """Append the node record and mark ``out`` as produced by ``node``."""
+        self._graph.append(record)
+        self._producers[id(out)] = (node, record)
+
+    # ── Graph accessor ──
+
+    def graph(self) -> dict[str, Any]:
+        """Return the captured dataflow graph from the last ``forward()``.
+
+        Structure (plain dicts/lists, safe to serialize)::
+
+            {
+              "nodes": [
+                {"name", "kernel", "params", "output_name",
+                 "inputs": [{"tensor_name", "source"}, ...]},
+                ...
+              ],
+              "edges": [{"src", "dst", "tensor_name"}, ...],  # producer→consumer
+            }
+
+        ``src == "input"`` marks a graph input (forward arg / uploaded weight).
+        Node order is execution order; fan-out shows up as one ``src`` node
+        appearing in multiple edges. Intended for the later verify/perf agent.
+        """
+        nodes: list[dict[str, Any]] = []
+        edges: list[dict[str, Any]] = []
+        for rec in self._graph:
+            nodes.append(
+                {
+                    "name": rec.node_name,
+                    "kernel": rec.kernel,
+                    "params": dict(rec.params),
+                    "output_name": rec.output_name,
+                    "inputs": [
+                        {"tensor_name": e.tensor_name, "source": e.source}
+                        for e in rec.inputs
+                    ],
+                }
+            )
+            for e in rec.inputs:
+                edges.append(
+                    {
+                        "src": e.source,
+                        "dst": rec.node_name,
+                        "tensor_name": e.tensor_name,
+                    }
+                )
+        return {"nodes": nodes, "edges": edges}
+
+    # ── Hook points (no-ops now; filled by verify/perf agent later) ──
+
+    def _on_before_node(
+        self, node: _Node, inputs: dict[str, torch.Tensor | Tensor],
+    ) -> None:
+        """Hook fired just before a node runs. No-op (verification agent)."""
+
+    def _on_after_node(
+        self, node: _Node, record: GraphNode, output: Tensor,
+    ) -> None:
+        """Hook fired just after a node runs. No-op (perf/memory agent)."""
