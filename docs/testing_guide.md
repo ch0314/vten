@@ -76,7 +76,7 @@ class TestPassthrough(TestScenario):
 
 ## Configs & the merge order
 
-`configs` drives **per-kernel batch** runs: one `configs` list produces a batch
+`configs` drives **kernel-granular batch** runs: one `configs` list produces a batch
 where every dict is compiled and executed independently, in one backend session.
 Aggregated pass/fail across the batch is reported in `summary.json`.
 
