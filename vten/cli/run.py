@@ -224,8 +224,20 @@ def _write_results(
                     default=0,
                 )
                 total_cycles = max(total_cycles, max_cycle)
-                # enrich_stats needs compiled context — skip if unavailable
-                # (stats enrichment is secondary to correctness)
+                # Join runtime CmdStats with compiled IR command metadata.
+                # compiled_result is threaded from ctx.run(); when absent
+                # (e.g. pre-built SHM path) enrich_stats falls back to a
+                # metadata-free stats dict.
+                compiled = getattr(r, "compiled_result", None)
+                try:
+                    all_cmd_stats.extend(
+                        enrich_stats(r.per_command_stats, compiled)
+                    )
+                except Exception:
+                    logger.debug(
+                        "stats enrichment failed (config %d/%d)",
+                        cfg_idx + 1, len(run_cfgs), exc_info=True,
+                    )
 
             verification_count += r.verification_count
             verification_passed += r.verification_count

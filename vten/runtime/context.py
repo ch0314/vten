@@ -71,6 +71,7 @@ class ExecutionResult:
     output_tensors: dict = field(default_factory=dict)  # dict[str, Tensor]
     verification_count: int = 0
     verification_results: list = field(default_factory=list)  # list[VerificationResult]
+    compiled_result: object = None  # CompiledResult — carries IR command metadata
 
 
 
@@ -564,6 +565,7 @@ class ExecutionContext:
                 total_cycles=total_cycles,
                 per_command_stats=per_cmd_stats,
                 output_tensors=output_tensors,
+                compiled_result=compiled,
             )
 
         return ExecutionResult(status="DONE")
