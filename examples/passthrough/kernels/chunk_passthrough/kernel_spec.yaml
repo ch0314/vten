@@ -1,0 +1,27 @@
+# chunk_passthrough — reuses the SAME physical DUT as `passthrough`
+# (rtl/passthrough.sv, a byte-verbatim AXI4-Stream copy).
+#
+# The only difference from the base `passthrough` kernel is the Python run():
+# it drains data_out with chunks=, a HOST-side read-splitting feature. The RTL
+# is unchanged and already passing, so verification still holds.
+kernel: chunk_passthrough
+rtl_top: rtl/passthrough.sv
+
+interfaces:
+  input_stream:
+    rtl_port: s_axis
+    protocol: axi4_stream
+    tensor: data_in
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first
+
+  output_stream:
+    rtl_port: m_axis
+    protocol: axi4_stream
+    tensor: data_out
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first

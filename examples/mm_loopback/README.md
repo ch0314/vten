@@ -43,6 +43,67 @@ This is also the home of vTen's **Level-3 Inference API demo**
   AXI4-Lite, runs the loopback, pulls `data_out`, and (with `--verify`) checks it
   is bit-identical to the input.
 
+## Array interfaces — one tensor fanned across many ports
+
+Beyond the single-port `mm_loopback` kernel, this project ships three
+**already-passing** kernels that demonstrate vTen's **`array:` interface**: one
+logical tensor is block-split across an `array` of identical RTL ports. In the
+`kernel_spec.yaml`, an interface gains an `array:` block:
+
+```yaml
+interfaces:
+  din:
+    rtl_port: s_axis_din
+    protocol: axi4_stream
+    tensor: data_in
+    array:
+      dimensions: [4]      # 4 parallel ports
+    packing: { element_width: 8, elements_per_beat: 32 }
+```
+
+At flatten time the logical interface name expands into one physical port per
+array element, following the flattened naming convention
+`<iface>_<idx...>` — e.g. `dimensions: [4]` → `din_0, din_1, din_2, din_3`, and
+`dimensions: [2, 2]` → `din_0_0, din_0_1, din_1_0, din_1_1`. The tensor is
+**block-split** (`vten/runtime/serializer.py::block_split_data`) so each port carries
+a contiguous slice of the serialized stream; on the way back the per-port
+buffers are concatenated in order (`output_reader.py::read_tensor_bytes`). The
+kernel's Python `run()` / `forward()` are identical to the single-port case — the
+port expansion is entirely spec-driven.
+
+| Kernel | Interface | `array: dimensions` | Expanded ports (per side) | Protocol | Test class names |
+|--------|-----------|---------------------|---------------------------|----------|------------------|
+| `stream_array_pt` | `din` / `dout` | `[4]` | `din_0..din_3` / `dout_0..dout_3` | AXI4-Stream | `TestStreamArrayPt`, `TestStreamArrayPtProbe` |
+| `stream_array_2d` | `din` / `dout` | `[2, 2]` | `din_0_0, din_0_1, din_1_0, din_1_1` (and `dout_*`) | AXI4-Stream | `TestStreamArray2d` |
+| `mm_array_lb` | `mem_in` / `mem_out` | `[4]` | `m_axi_in` × 4 / `m_axi_out` × 4 | AXI4 mem-mapped + AXI4-Lite | `TestMmArrayLb` |
+
+- **`stream_array_pt`** — 4-channel AXI4-Stream passthrough. Each of the four
+  channels independently passes through its block of the tensor. Its probe
+  variant (`TestStreamArrayPtProbe`, in `tests/test_stream_array_pt_probe.py`)
+  sets `probe=True` on the PULL so **each of the four array-element BFMs**
+  compares its received beats against golden independently.
+- **`stream_array_2d`** — the same idea with a **2-D** `[2, 2]` array, showing how
+  multi-dimensional `dimensions:` expand to nested flat names.
+- **`mm_array_lb`** — the memory-mapped analogue: the `mem_in` / `mem_out` AXI4
+  masters are each an `array: dimensions: [4]`, so the loopback runs across four
+  parallel AXI4 channels while a single `ctrl` AXI4-Lite block (with `auto_bind`
+  address/length splits, exactly like `mm_loopback`) drives the whole transfer.
+
+> **Split vs. array.** An `array:` interface fans a tensor over a *homogeneous*
+> set of identical ports declared by `dimensions:`. A **`split:`** interface
+> (see [`../passthrough_regression/`](../passthrough_regression/README.md)'s
+> `multi_port_scatter`) instead lists *named* ports explicitly under `split:
+> ports:` — use `split:` when the ports are individually named/heterogeneous, and
+> `array:` when they are a regular vector of identical ports.
+
+Each of these kernels is a standalone, passing DUT — build and run them exactly
+like `mm_loopback`:
+
+```bash
+vten build --kernel stream_array_pt --backend verilator
+vten run   --kernel stream_array_pt --test TestStreamArrayPt --backend verilator --verify
+```
+
 ## Build & run (open-source path)
 
 The **verilator** and **cpu** backends need no Vivado. Run from inside this
@@ -119,7 +180,8 @@ you have built the xclbin. See the docstring at the top of
 
 ## See also
 
-- [`../../docs/kernel_guide.md`](../../docs/kernel_guide.md) — `kernel_spec.yaml`, memory regions, `auto_bind`, and the DUT.
+- [`../README.md`](../README.md) — the examples index & feature→example map.
+- [`../../docs/kernel_guide.md`](../../docs/kernel_guide.md) — `kernel_spec.yaml`, memory regions, `auto_bind`, array interfaces, and the DUT.
 - [`../../docs/testing_guide.md`](../../docs/testing_guide.md) — `TestScenario` and the verification workflow.
 - [`../../docs/cli_reference.md`](../../docs/cli_reference.md) — full CLI reference.
 - [`../../docs/composite_guide.md`](../../docs/composite_guide.md) — composing multiple IPs (see also [`../scale_add`](../scale_add/README.md)).

@@ -54,7 +54,7 @@ DUTs with an AXI4 DMA master plus AXI4-Lite control.
 | Kernel | Exercises | Test class names |
 |--------|-----------|------------------|
 | `stream_scatter` | Stream fan-out into dual AXI4 memory regions under AXI4-Lite control | `TestStreamScatter` |
-| `multi_port_scatter` | Multiple AXI4-Stream ports fanned out from one input | `TestMultiPortScatter` |
+| `multi_port_scatter` | **Split interface** (`split: ports:`): one tensor block-split across two explicitly-named AXI4-Stream ports (`din_0`/`din_1`, `dout_0`/`dout_1`). Contrast with `mm_loopback`'s `array:` interfaces, which fan a tensor over a homogeneous vector of ports declared by `dimensions:`. | `TestMultiPortScatter` |
 
 ### Compute
 
@@ -103,6 +103,7 @@ vten run --kernel broken_passthrough --test TestBrokenPassthrough --backend veri
 
 ## See also
 
+- [`../README.md`](../README.md) — the examples index & feature→example map.
 - [`../passthrough/`](../passthrough/README.md) — the canonical single-kernel tutorial these fixtures were split out of.
 - [`E2E_TEST_RESULTS.md`](E2E_TEST_RESULTS.md) — recorded pass/fail status for several of these kernels.
 - [`../../docs/kernel_guide.md`](../../docs/kernel_guide.md) — writing `kernel_spec.yaml`, the `Kernel` class, and the DUT.

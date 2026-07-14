@@ -37,6 +37,13 @@ class ScaleAddKernel(CompositeKernel):
     #   offset.data_out → data_out
     #   scale.ctrl, offset.ctrl → ctrl registers
 
+    # Composite-level params used by the golden forward() below (and propagated
+    # to each sub-kernel's control register: scale_factor → scale, offset_value
+    # → offset). Any config may override these; when a config omits them these
+    # defaults apply, so every sweep entry resolves self.scale_factor /
+    # self.offset_value.
+    default_params = {"N": 1024, "scale_factor": 1, "offset_value": 0}
+
     def generate_inputs(self, seed=None):
         rng = torch.Generator()
         if seed is not None:
@@ -55,6 +62,19 @@ class ScaleAddKernel(CompositeKernel):
         return {"data_out": x.clamp(-128, 127).to(torch.int8)}
 
     def run(self, ctx) -> None:
+        # Internal (dotted) probe support: if a TestScenario declared
+        # probes=["scale.data_out"], seed the golden for that internal wire.
+        # This is a no-op unless the probe was requested. It is required because
+        # this composite defines a *custom* forward() (no auto-chained
+        # _golden_pool), so the framework cannot auto-extract the internal-wire
+        # golden — see vten/runtime/probe_manager.py::resolve_internal_probe_golden.
+        # The scale→offset wire carries the scale stage output (saturating int8
+        # multiply), i.e. the data BEFORE offset is applied.
+        if "scale.data_out" in getattr(ctx, "_declarative_probes", []):
+            scaled = (self.data_in.data.to(torch.int16) * self.scale_factor)
+            scaled = scaled.clamp(-128, 127).to(torch.int8)
+            ctx.set_internal_probe_golden("scale", "data_out", scaled)
+
         h_push = ctx.push_tensor(self.data_in)
 
         # ctx.configure auto-writes runtime_params with register mappings

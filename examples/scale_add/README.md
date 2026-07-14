@@ -35,12 +35,14 @@ pair to the user, hiding the internal `scale → offset` wiring.
 | `kernels/scale/scale_kernel.py` | `ScaleKernel` — multiplies each `int8` element by `scale_factor` (saturating). AXI4-Stream in/out + AXI4-Lite `ctrl`. |
 | `kernels/offset/offset_kernel.py` | `OffsetKernel` — adds `offset_value` to each `int8` element (saturating, with uint8→signed wrap). AXI4-Stream in/out + AXI4-Lite `ctrl`. |
 | `kernels/scale/kernel_spec.yaml`, `kernels/offset/kernel_spec.yaml` | Per-stage interface/packing/register maps. (The composite has no spec of its own — it flattens its sub-kernels.) |
-| `kernels/scale_add/tests/test_scale_add.py` | `TestScaleAdd` (parameter sweep) and `TestScaleAddProbe` (beat-level probe). |
+| `kernels/scale_add/tests/test_scale_add.py` | `TestScaleAdd` (parameter sweep), `TestScaleAddProbe` (output probe), and `TestScaleAddInternalProbe` (internal/dotted probe). |
+| `kernels/dma_pipeline/dma_pipeline_kernel.py` | `DmaPipelineKernel(CompositeKernel)` — 4-stage `ReadDMA → Scale → Offset → WriteDMA` memory-mapped pipeline (documented below). |
 | `vten.toml` | Project config. `[parameters] N = 1024`. Backend: `xsim`. |
 
-> The `dma_pipeline`, `read_dma`, `write_dma`, and standalone `scale` / `offset`
-> directories under `kernels/` are additional fixtures for the individual stages
-> and DMA variants — the canonical composite tutorial kernel is `scale_add`.
+> The standalone `scale` / `offset`, and `read_dma` / `write_dma` directories
+> under `kernels/` are the individual-stage fixtures. The canonical composite
+> tutorial kernel is `scale_add`; the larger **4-stage `dma_pipeline`** composite
+> is documented in its own section below.
 
 ### Test scenarios
 
@@ -49,7 +51,97 @@ pair to the user, hiding the internal `scale → offset` wiring.
   `big_scale` (scale=5, offset=3), `small_n` (`N=32`, one beat), `large_n`
   (`N=4096`, 128 beats), and `negative_off` (offset=251 → `-5` as signed int8).
 - **`TestScaleAddProbe`** — like `default` but with `probe=True` on the PULL, so
-  the BFM checks each output beat against the composed golden during simulation.
+  the BFM checks each **output** beat against the composed golden during simulation.
+- **`TestScaleAddInternalProbe`** — an **internal (dotted) probe**. See the
+  [Output probe vs. internal probe](#output-probe-vs-internal-probe) section.
+
+## Output probe vs. internal probe
+
+vTen can compare DUT data against golden at two different taps:
+
+| | `TestScaleAddProbe` (output probe) | `TestScaleAddInternalProbe` (internal probe) |
+|--|--|--|
+| Declared as | `probe=True` on `ctx.pull_tensor(data_out, ...)` | `probes = ["scale.data_out"]` (dotted name) |
+| Where it taps | the **exposed output** `data_out` (offset stage result) | the **hidden internal wire** `scale.data_out` consumed by the `scale.data_out >> offset.data_in` connection |
+| Golden it checks against | full `scale → offset` composed golden | mid-pipeline: the scale stage's output **before** offset is applied |
+| RTL | reuses the same scale + offset DUTs — **no new RTL** | reuses the same scale + offset DUTs — **no new RTL** |
+
+The dotted `probes=["scale.data_out"]` form asks a **passive probe BFM** to tap
+the internal `scale → offset` connection and compare each beat against golden
+scale-stage data. Because the `scale_add` composite defines a *custom* `forward()`
+(it does not auto-chain), it exposes no `_golden_pool` for automatic internal
+golden extraction — so `TestScaleAddInternalProbe.run()` supplies the wire golden
+explicitly with `ctx.set_internal_probe_golden("scale", "data_out", scaled)`
+(the saturating int8 multiply). This is the reliable pattern for internal probes
+on custom-`forward()` composites; verified by reading
+`vten/runtime/context.py`, `vten/runtime/probe_manager.py`, and the tensor names
+in `kernels/scale_add/scale_add_kernel.py` (`scale.data_out`).
+
+```bash
+vten run --kernel scale_add --test TestScaleAddInternalProbe --backend verilator --verify
+```
+
+## `dma_pipeline` — a 4-stage memory-mapped composite
+
+`kernels/dma_pipeline/` composes **four** IPs into a full DDR→compute→DDR
+dataflow, the way a Vitis multi-IP kernel would. It reads a buffer from DDR over
+AXI4, scales and offsets the stream, and writes the result back to DDR:
+
+```
+             ┌──────────┐   ┌───────┐   ┌────────┐   ┌───────────┐
+  DDR ─AXI4─▶│ ReadDMA  │──▶│ Scale │──▶│ Offset │──▶│ WriteDMA  │─AXI4─▶ DDR
+ (data_in)   │ read_dma │ s │ scale │ s │ offset │ s │ write_dma │      (data_out)
+             └──────────┘   └───────┘   └────────┘   └───────────┘
+                  ▲ AXI4-Lite ctrl on every stage (start / done) ▲
+   ── s ── = internal AXI4-Stream wire created by a `>>` connection ──
+```
+
+Defined in `kernels/dma_pipeline/dma_pipeline_kernel.py` as
+`DmaPipelineKernel(CompositeKernel)`:
+
+```python
+class DmaPipelineKernel(CompositeKernel):
+    read_dma  = ReadDMAKernel()
+    scale     = ScaleKernel()
+    offset    = OffsetKernel()
+    write_dma = WriteDMAKernel()
+
+    connections = [
+        read_dma.data_out >> scale.data_in,    # ReadDMA  → Scale
+        scale.data_out    >> offset.data_in,   # Scale    → Offset
+        offset.data_out   >> write_dma.data_in,# Offset   → WriteDMA
+    ]
+    # Auto-exposed: read_dma.data_in → data_in, write_dma.data_out → data_out
+```
+
+Walkthrough of `run()`:
+
+1. **push** `data_in` to the AXI4 BFM that `ReadDMA` reads from.
+2. **pull** `data_out` (dispatched early so the AXI4 BFM has a PULL entry ready).
+3. **`configure(self)`** — one call writes every stage's `auto_bind` (DMA
+   src/dst addresses + length) and `runtime_params` (scale_factor, offset_value)
+   registers.
+4. **start** all four stages (`write_register(..., {"start": 1})`).
+5. **poll** all four `done` flags, and make the PULL commit only after every
+   stage has finished (`h_pull.add_commit_dependency(...)`).
+
+`forward()` is the composed golden: read (identity) → int8-saturating multiply →
+saturating add → write (identity). `--verify` checks the DUT's DDR output against
+it end-to-end.
+
+Test scenarios (`kernels/dma_pipeline/tests/test_dma_pipeline.py`):
+
+- **`TestDmaPipeline`** — parameter sweep over four configs: `default`
+  (`N=1024`, scale=2, offset=1), `identity` (scale=1, offset=0, a pure DMA
+  round-trip), `small_n` (`N=32`, minimal DMA), and `overflow`
+  (scale=10, offset=50, exercising int8 saturation).
+- **`TestDmaPipelineStore`** — same pipeline but drives `store_tensor()` readback
+  after the PULL.
+
+```bash
+vten build --kernel dma_pipeline --backend verilator
+vten run   --kernel dma_pipeline --test TestDmaPipeline --backend verilator --verify
+```
 
 ## Build & run (open-source path)
 
@@ -96,6 +188,7 @@ passed` and the summary reports `status: PASS` (`6/6 configs passed` for
 
 ## See also
 
+- [`../README.md`](../README.md) — the examples index & feature→example map.
 - [`../../docs/composite_guide.md`](../../docs/composite_guide.md) — `CompositeKernel`, the `>>` operator, auto-expose, and multi-IP `run()` patterns.
 - [`../../docs/kernel_guide.md`](../../docs/kernel_guide.md) — writing the individual `Scale` / `Offset` kernels and their DUTs.
 - [`../../docs/testing_guide.md`](../../docs/testing_guide.md) — `TestScenario`, config sweeps, and the verification workflow.
