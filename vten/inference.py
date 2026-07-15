@@ -238,6 +238,15 @@ class InferenceSession:
             self._run_count, label, input_desc,
         )
 
+        # Point the backend's run context at THIS kernel's build dir. A single
+        # InferenceSession drives many kernels (e.g. an InferenceModel graph),
+        # but SIM backends resolve their per-kernel artifact (xsim snapshot /
+        # verilator ``Vtb_top``) from ``RunContext.kernel_build_dir``. Without
+        # this, every node would look under the session's project dir and only
+        # the first (or no) kernel would be found. Derived from ``kernel.spec``
+        # ("kernels/<name>/kernel_spec.yaml" → "kernels/<name>/build").
+        self._point_run_context_at_kernel(kernel_class)
+
         from vten.execution import execute_batch
 
         batch = execute_batch(
@@ -269,6 +278,26 @@ class InferenceSession:
         logger.info("  total: %s", format_elapsed(run_elapsed))
 
         return outputs
+
+    def _point_run_context_at_kernel(self, kernel_class: type[Kernel]) -> None:
+        """Retarget the backend's ``RunContext.kernel_build_dir`` at ``kernel``.
+
+        No-op for backends without a run context (e.g. cpu) or kernels without a
+        ``spec`` path. Resolves ``kernels/<name>/build`` relative to the session
+        project dir so SIM backends find the right per-kernel testbench binary.
+        """
+        run_ctx = getattr(self._backend, "_run_ctx", None)
+        if run_ctx is None:
+            return
+        spec = getattr(kernel_class, "spec", "") or ""
+        if not spec:
+            return
+        spec_path = Path(spec)
+        if not spec_path.is_absolute():
+            spec_path = self._project_dir / spec_path
+        # spec = kernels/<name>/kernel_spec.yaml → build dir = kernels/<name>/build
+        kernel_dir = spec_path.parent
+        run_ctx.kernel_build_dir = kernel_dir / "build"
 
     # ── Last-run accessors (for InferenceModel verify/perf hooks) ──
 
