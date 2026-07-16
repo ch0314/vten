@@ -28,5 +28,11 @@ class PassthroughKernel(Kernel):
         return {"data_out": self.data_in.data.clone()}
 
     def run(self, ctx) -> None:
-        h_push = ctx.push_tensor(self.data_in)
-        ctx.pull_tensor(self.data_out, dep=h_push)
+        # Combinational DUT (s_axis_tready = m_axis_tready): the core cannot
+        # accept a single beat until the output side is drained, and the slave
+        # BFM only asserts tready while a PULL command is active. PUSH and PULL
+        # must therefore be issued CONCURRENTLY — sequencing pull after push (an
+        # issue-dep waits for the dep to COMMIT) deadlocks on a real simulator.
+        # Previously masked by cpu-only testing.
+        ctx.push_tensor(self.data_in)
+        ctx.pull_tensor(self.data_out)

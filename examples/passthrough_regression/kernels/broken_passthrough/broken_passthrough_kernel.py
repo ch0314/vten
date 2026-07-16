@@ -37,5 +37,9 @@ class BrokenPassthroughKernel(Kernel):
         return {"data_out": self.data_in.data.clone()}
 
     def run(self, ctx) -> None:
-        h_push = ctx.push_tensor(self.data_in)
-        h_pull = ctx.pull_tensor(self.data_out, dep=h_push)
+        # Combinational DUT (s_axis_tready = m_axis_tready): PUSH and PULL must
+        # be issued CONCURRENTLY — sequencing pull after push (an issue-dep
+        # waits for the dep to COMMIT) deadlocks on a real simulator, and the
+        # intended verify/probe mismatch is never reached.
+        ctx.push_tensor(self.data_in)
+        ctx.pull_tensor(self.data_out)

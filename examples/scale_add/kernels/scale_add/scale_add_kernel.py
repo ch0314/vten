@@ -75,16 +75,21 @@ class ScaleAddKernel(CompositeKernel):
             scaled = scaled.clamp(-128, 127).to(torch.int8)
             ctx.set_internal_probe_golden("scale", "data_out", scaled)
 
-        h_push = ctx.push_tensor(self.data_in)
-
+        # Streaming DUTs: each sub-core only accepts input once STARTED and
+        # while its output is being drained (input tready gated on state==S_RUN
+        # and downstream ready). Configure + start FIRST, then push (input) and
+        # pull (output) run CONCURRENTLY, then poll done — same ordering fix as
+        # the scale/offset single kernels. (Pushing before start deadlocks on a
+        # real simulator; previously masked by cpu-only testing.)
         # ctx.configure auto-writes runtime_params with register mappings
-        h_cfg = ctx.configure(self, dep=h_push)
-
-        h_pull = ctx.pull_tensor(self.data_out, dep=h_cfg)
+        h_cfg = ctx.configure(self)
 
         # Start both sub-kernels
         h_start_s = ctx.write_register(self.scale_ctrl, {"start": 1}, dep=h_cfg)
         h_start_o = ctx.write_register(self.offset_ctrl, {"start": 1}, dep=h_cfg)
+
+        h_push = ctx.push_tensor(self.data_in, dep=h_start_s)
+        h_pull = ctx.pull_tensor(self.data_out, dep=h_start_o)
 
         # Poll both done flags
         h_poll_s = ctx.poll_register(self.scale_ctrl, "done", dep=h_start_s)
