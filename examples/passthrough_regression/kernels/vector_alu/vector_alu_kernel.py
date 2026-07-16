@@ -53,12 +53,17 @@ class VectorAluKernel(Kernel):
         return {"result": raw.clamp(-128, 127).to(torch.int8)}
 
     def run(self, ctx) -> None:
+        # Memory-mapped DUT: PUSH/PULL only register the DDR buffers with the
+        # passive AXI4 slave BFM — they complete when the DUT (the AXI master) has
+        # read/written every byte, which happens only after start. Register both
+        # operands and the result buffer FIRST (no deps), then configure + start.
+        # (Gating configure/pull on PUSH completion deadlocks on a real simulator;
+        # masked previously by cpu-only testing.)
         h_push_a = ctx.push_tensor(self.operand_a)
         h_push_b = ctx.push_tensor(self.operand_b)
+        h_pull = ctx.pull_tensor(self.result)
 
-        h_cfg = ctx.configure(self, dep=[h_push_a, h_push_b])
-
-        h_pull = ctx.pull_tensor(self.result, dep=h_cfg)
+        h_cfg = ctx.configure(self)
 
         h_start = ctx.write_register(self.ctrl, {"start": 1}, dep=h_cfg)
 

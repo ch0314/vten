@@ -71,14 +71,18 @@ class DmaPipelineKernel(CompositeKernel):
         return {"data_out": x.clamp(-128, 127).to(torch.int8)}
 
     def run(self, ctx) -> None:
-        # Push input to AXI4 BFM (ReadDMA reads from here)
+        # Memory-mapped pipeline: PUSH registers the DDR source buffer and PULL the
+        # DDR destination buffer with the passive AXI4 slave BFM — both complete
+        # only after the DUT masters move the bytes (post-start). Register both
+        # buffers FIRST (no deps), then configure + start. (Gating pull/configure on
+        # PUSH completion deadlocks on a real simulator; masked by cpu-only testing.)
         h_push = ctx.push_tensor(self.data_in)
 
         # Pull output — dispatch early so AXI4 BFM has PULL entry
-        h_pull = ctx.pull_tensor(self.data_out, dep=h_push)
+        h_pull = ctx.pull_tensor(self.data_out)
 
         # Configure all sub-kernels (auto_bind + runtime_params registers)
-        h_cfg = ctx.configure(self, dep=h_push)
+        h_cfg = ctx.configure(self)
 
         # Start all sub-kernels
         h_start_rdma = ctx.write_register(self.rdma_ctrl, {"start": 1}, dep=h_cfg)

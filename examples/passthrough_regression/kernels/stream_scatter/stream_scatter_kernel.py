@@ -35,8 +35,14 @@ class StreamScatterKernel(Kernel):
         self.data_in.fill_random(generator=rng)
 
     def run(self, ctx) -> None:
+        # Memory-mapped scatter (stream in -> two HBM ports via AXI masters): PUSH
+        # only arms the input-stream source and completes after the DUT drains it
+        # (post-start), so configure must NOT gate on PUSH completion or the graph
+        # deadlocks on a real simulator (masked previously by cpu-only testing).
+        # The per-port pulls stay barrier-gated before start with commit-deps on
+        # done, preserving the two-port scatter ordering.
         h_push = ctx.push_tensor(self.data_in)
-        h_cfg = ctx.configure(self, dep=h_push)
+        h_cfg = ctx.configure(self)
 
         total_beats = self.N // 32
         h_len = ctx.write_register(self.ctrl, {"length": total_beats}, dep=h_cfg)
