@@ -26,3 +26,36 @@ jobs:
 
       - name: Run tests (no simulator required)
         run: pytest -m "not xsim" -q
+
+  verilator:
+    # Runs the hardware-functional suite against a real Verilator simulator.
+    # Assumption: Verilator >= 5.0 is required (the vTen build pipeline uses
+    # --timing, which Verilator 4.x does not properly support). ubuntu-22.04
+    # ships Verilator 4.x from apt; ubuntu-24.04 ships 5.020, so the runner is
+    # pinned to ubuntu-24.04 rather than ubuntu-latest.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Verilator (>= 5.0 with --timing required)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends verilator
+          verilator --version
+
+      - name: Install dependencies
+        run: pip install -e .[dev]
+
+      # Module-level verilations only — fast. A full kernel build + E2E run
+      # takes ~5 minutes of g++ time per kernel; do not add an E2E smoke test
+      # here unless the verilator build directory is cached.
+      # TODO: add a cached E2E smoke run (e.g. examples/scale_add).
+      - name: Run hardware-functional tests under Verilator
+        run: pytest tests/hw_functional -q
