@@ -58,7 +58,11 @@ class ChunkPassthroughKernel(Kernel):
         return {"data_out": self.data_in.data.clone()}
 
     def run(self, ctx) -> None:
-        h_push = ctx.push_tensor(self.data_in)
+        # Combinational DUT (s_axis_tready = m_axis_tready): issue PUSH and PULL
+        # CONCURRENTLY — sequencing pull after push (an issue-dep waits for the dep
+        # to COMMIT while the slave BFM only asserts tready during a PULL) deadlocks
+        # on a real simulator. Previously masked by cpu-only testing.
+        ctx.push_tensor(self.data_in)
         # chunks=4: drain data_out in 4 host-side chunk groups. Returns a list of
         # OperationHandles (one per chunk); reassembled on host. No RTL change.
-        ctx.pull_tensor(self.data_out, dep=h_push, chunks=4)
+        ctx.pull_tensor(self.data_out, chunks=4)

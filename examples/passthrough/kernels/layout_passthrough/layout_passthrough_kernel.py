@@ -84,5 +84,10 @@ class LayoutPassthroughKernel(Kernel):
         return {"data_out": data.clone()}
 
     def run(self, ctx) -> None:
-        h_push = ctx.push_tensor(self.data_in)
-        ctx.pull_tensor(self.data_out, dep=h_push)
+        # Combinational DUT (s_axis_tready = m_axis_tready): issue PUSH and PULL
+        # CONCURRENTLY — sequencing pull after push (an issue-dep waits for the dep
+        # to COMMIT while the slave BFM only asserts tready during a PULL) deadlocks
+        # on a real simulator. The host-side layout_data_in / unlayout_data_out
+        # hooks are unaffected. Previously masked by cpu-only testing.
+        ctx.push_tensor(self.data_in)
+        ctx.pull_tensor(self.data_out)

@@ -27,8 +27,13 @@ class MultiPortScatterKernel(Kernel):
         self.data_in.fill_random(generator=rng)
 
     def run(self, ctx) -> None:
-        h_push = ctx.push_tensor(self.data_in)
-        h_pull = ctx.pull_tensor(self.data_out, dep=h_push)
+        # Combinational multi-port DUT: each split port wires s_axis_tready =
+        # m_axis_tready. PUSH and PULL must be issued CONCURRENTLY (the framework
+        # fans them out per block_split port) — sequencing pull after push (an
+        # issue-dep waits for the dep to COMMIT while the slave BFM only asserts
+        # tready during a PULL) deadlocks on a real simulator. Masked by cpu-only.
+        ctx.push_tensor(self.data_in)
+        ctx.pull_tensor(self.data_out)
 
     def forward(self, **inputs) -> dict[str, torch.Tensor]:
         """Golden: passthrough (output == input)."""

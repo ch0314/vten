@@ -34,8 +34,12 @@ class StreamArrayPtKernel(Kernel):
         self.data_in.fill_random(generator=rng)
 
     def run(self, ctx) -> None:
-        h_push = ctx.push_tensor(self.data_in)
-        h_pull = ctx.pull_tensor(self.data_out, dep=h_push)
+        # Combinational DUT (s_axis_tready = m_axis_tready): PUSH and PULL must be
+        # issued CONCURRENTLY — sequencing pull after push (an issue-dep waits for
+        # the dep to COMMIT, and the slave BFM only asserts tready while a PULL is
+        # active) deadlocks on a real simulator. Previously masked by cpu-only testing.
+        ctx.push_tensor(self.data_in)
+        ctx.pull_tensor(self.data_out)
 
     def forward(self, **inputs) -> dict[str, torch.Tensor]:
         """Golden reference: passthrough is identity."""
