@@ -115,8 +115,11 @@ class TestMultiConfigE2E:
             for i in range(3):
                 ki = ctx.instantiate(KernelClass, spec=spec, N=1024)
                 ki.generate_inputs(seed=42 + i)
-                h_push = ctx.push_tensor(ki.data_in)
-                ctx.pull_tensor(ki.data_out, dep=h_push)
+                # Combinational DUT (s_axis_tready = m_axis_tready): PUSH and
+                # PULL must run concurrently — an issue-dep waits for the dep
+                # to COMMIT, so pull-after-push deadlocks on a real simulator.
+                ctx.push_tensor(ki.data_in)
+                ctx.pull_tensor(ki.data_out)
                 goldens.append(ki.forward()["data_out"])
                 ctx.config_boundary()
 
@@ -142,8 +145,9 @@ class TestMultiConfigE2E:
                 ctx._project_params = {"N": n_val}
                 ki = ctx.instantiate(KernelClass, spec=spec, N=n_val)
                 ki.generate_inputs(seed=42)
-                h_push = ctx.push_tensor(ki.data_in)
-                ctx.pull_tensor(ki.data_out, dep=h_push)
+                # Concurrent PUSH/PULL — see test_multi_config_passthrough_3x.
+                ctx.push_tensor(ki.data_in)
+                ctx.pull_tensor(ki.data_out)
                 ctx.config_boundary()
 
             result = ctx.run(verify=True)
@@ -180,12 +184,12 @@ class TestMultiConfigE2E:
                 )
                 ki.generate_inputs(seed=42)
 
-                h_push = ctx.push_tensor(ki.data_in)
-
+                # Streaming DUTs only accept input once STARTED: configure +
+                # start FIRST, then push/pull run CONCURRENTLY, then poll done
+                # (same ordering as ScaleAddKernel.run — push-before-start
+                # deadlocks on a real simulator).
                 # ctx.configure auto-writes runtime_params with register mappings
-                h_cfg = ctx.configure(ki, dep=h_push)
-
-                h_pull = ctx.pull_tensor(ki.data_out, dep=h_cfg)
+                h_cfg = ctx.configure(ki)
 
                 h_start_s = ctx.write_register(
                     ki.scale_ctrl, {"start": 1}, dep=h_cfg,
@@ -193,6 +197,9 @@ class TestMultiConfigE2E:
                 h_start_o = ctx.write_register(
                     ki.offset_ctrl, {"start": 1}, dep=h_cfg,
                 )
+
+                ctx.push_tensor(ki.data_in, dep=h_start_s)
+                h_pull = ctx.pull_tensor(ki.data_out, dep=h_start_o)
 
                 h_poll_s = ctx.poll_register(ki.scale_ctrl, "done", dep=h_start_s)
                 h_poll_o = ctx.poll_register(ki.offset_ctrl, "done", dep=h_start_o)
@@ -226,8 +233,9 @@ class TestMultiBatchSessionE2E:
                     ctx = ExecutionContext(backend=backend, project_params={"N": 1024})
                     ki = ctx.instantiate(KernelClass, spec=spec, N=1024)
                     ki.generate_inputs(seed=42 + i)
-                    h_push = ctx.push_tensor(ki.data_in)
-                    ctx.pull_tensor(ki.data_out, dep=h_push)
+                    # Concurrent PUSH/PULL — see test_multi_config_passthrough_3x.
+                    ctx.push_tensor(ki.data_in)
+                    ctx.pull_tensor(ki.data_out)
                     result = ctx.run(verify=True)
                     assert result.status == "DONE"
         finally:
@@ -253,8 +261,9 @@ class TestMultiBatchSessionE2E:
                     ctx = ExecutionContext(backend=backend, project_params={"N": N})
                     ki = ctx.instantiate(KernelClass, spec=spec, N=N)
                     ki.generate_inputs(seed=N)
-                    h_push = ctx.push_tensor(ki.data_in)
-                    ctx.pull_tensor(ki.data_out, dep=h_push)
+                    # Concurrent PUSH/PULL — see test_multi_config_passthrough_3x.
+                    ctx.push_tensor(ki.data_in)
+                    ctx.pull_tensor(ki.data_out)
                     result = ctx.run(verify=True)
                     assert result.status == "DONE", f"Failed at N={N}"
         finally:
@@ -287,8 +296,9 @@ class TestEdgeCases:
             ctx = ExecutionContext(backend=backend, project_params={"N": 1024})
             ki = ctx.instantiate(KernelClass, spec=spec, N=1024)
             ki.generate_inputs(seed=42)
-            h_push = ctx.push_tensor(ki.data_in)
-            ctx.pull_tensor(ki.data_out, dep=h_push)
+            # Concurrent PUSH/PULL — see test_multi_config_passthrough_3x.
+            ctx.push_tensor(ki.data_in)
+            ctx.pull_tensor(ki.data_out)
 
             with pytest.raises(VerificationError):
                 # forward() returns correct data, but RTL XORs with 0x01
@@ -314,9 +324,10 @@ class TestEdgeCases:
             ctx = ExecutionContext(backend=backend, project_params={"N": 1024})
             ki = ctx.instantiate(KernelClass, spec=spec, N=1024)
             ki.generate_inputs(seed=42)
-            h_push = ctx.push_tensor(ki.data_in)
+            # Concurrent PUSH/PULL — see test_multi_config_passthrough_3x.
+            ctx.push_tensor(ki.data_in)
             # probe=True triggers golden comparison in BFM
-            ctx.pull_tensor(ki.data_out, dep=h_push, probe=True)
+            ctx.pull_tensor(ki.data_out, probe=True)
 
             with pytest.raises(Exception):
                 # Either VerificationError from host or BackendError
