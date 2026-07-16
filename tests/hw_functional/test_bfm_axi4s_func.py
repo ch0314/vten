@@ -233,9 +233,10 @@ class TestStatsAccuracy:
     def test_total_beats_matches(self, axi4s_sim):
         """total_beats in stats should match expected beat count.
 
-        NOTE: Due to NBA ordering in the BFM (total_beats += 1 and
-        finish_command both in same always_ff), the final beat's increment
-        may not be visible in stats. Stats report N-1 instead of N.
+        finish_command() runs in the same cycle as the final beat's handshake,
+        where total_beats is bumped by NBA (not yet visible); the BFM
+        compensates by writing total_beats + 1 to stats (commit 28cafc1), so
+        the reported count is exactly N.
         """
         for num_beats in [2, 4, 8]:
             image = _build_push_image(num_beats=num_beats)
@@ -244,9 +245,8 @@ class TestStatsAccuracy:
             _run_until_done(axi4s_sim)
 
             stats = self._read_stats(axi4s_sim, cmd_id=0)
-            # BFM NBA timing: total_beats is N-1 (last increment not yet resolved)
-            assert stats["total_beats"] == num_beats - 1, (
-                f"Expected {num_beats - 1} (NBA lag), got {stats['total_beats']}")
+            assert stats["total_beats"] == num_beats, (
+                f"Expected {num_beats}, got {stats['total_beats']}")
 
     def test_active_cycles_nonzero(self, axi4s_sim):
         """active_cycles should be > 0 after transfer."""

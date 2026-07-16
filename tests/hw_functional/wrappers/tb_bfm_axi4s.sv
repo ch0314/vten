@@ -6,7 +6,11 @@
 
 module tb_bfm_axi4s #(
     parameter int DATA_W = 256,
-    parameter string MODE = "MASTER"
+    // NOTE: untyped on purpose. Verilator 5.020 const-folds the BFM's
+    // `MODE == "MASTER"` comparison to FALSE when the override comes from a
+    // `parameter string` (the MASTER path gets elided entirely); an untyped
+    // string-literal parameter (as vten_bfm_axi4s itself declares) works.
+    parameter MODE = "MASTER"
 )(
     input  logic clk,
     input  logic rst_n,
