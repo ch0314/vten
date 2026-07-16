@@ -219,11 +219,16 @@ module vten_bfm_axi4s #(
         cmd_if.done_cmd_id <= current_cmd.cmd_id;
         cmd_if.done_error  <= 1'b0;
         cmd_if.done_error_code <= 16'd0;
+        // finish_command() runs in the SAME cycle as the final beat's
+        // handshake, where active_cycles/total_beats are bumped by non-blocking
+        // assignment and are therefore not yet visible here. Add the in-flight
+        // final beat (+1) so it isn't undercounted — this is why a 1-beat
+        // transfer previously reported 0 beats / 0 active cycles.
         vten_write_cmd_stats(current_cmd.cmd_id,
             CMD_COMMITTED, issue_cycle, cycle_count,
             (first_active == 0) ? cycle_count : first_active,
             cycle_count,
-            active_cycles, total_beats, stall_cycles);
+            active_cycles + 1, total_beats + 1, stall_cycles);
         if (verbose)
             $display("[AXI4S    %t] %s %s iface=%0d cmd#%0d done: %0d beats, %0d stall cyc, %0d active cyc",
                      $time, MODE, current_cmd.opcode.name(),
