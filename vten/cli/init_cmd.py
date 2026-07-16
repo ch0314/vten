@@ -17,7 +17,7 @@ _BACKEND_TOML_TEMPLATES: dict[str, str] = {
 [backend.xsim]
 part = "xcu250-figd2104-2L-e"
 compile_options = ["-timescale", "1ns/1ps"]
-timeout_ms = 0
+timeout_ms = 30000
 submit_timeout_s = 300
 """,
     "xrt": """\
