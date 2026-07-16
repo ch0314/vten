@@ -195,6 +195,22 @@ class VerilatorBuildPipeline(BuildPipeline):
             "-Wno-WIDTHEXPAND", "-Wno-WIDTHTRUNC", "-Wno-WIDTHCONCAT",
             "-Wno-CASEINCOMPLETE", "-Wno-IGNOREDRETURN", "-Wno-MULTIDRIVEN",
             "-Wno-TIMESCALEMOD",
+            # The shm controller reads host status via an idempotent DPI call
+            # inside a `case` expression; Verilator's conservative side-effect
+            # warning is safe to silence for the framework SV.
+            "-Wno-SIDEEFFECT",
+            # The command scheduler / shm controller loop over the static
+            # MAX_CMDS bound (default 256) with NBA writes to per-command
+            # state arrays. Verilator must FULLY unroll these loops so every
+            # NBA target resolves to a constant index — otherwise BLKLOOPINIT
+            # coalesces the per-i writes and keeps only the last. That needs
+            # --unroll-count >= MAX_CMDS and an --unroll-stmts budget large
+            # enough for the biggest loop body (the controller's bulk command
+            # copy needs ~80k at MAX_CMDS=256; 200k gives headroom). Projects
+            # can override via [backend.verilator] extra_args (appended after
+            # these, and for Verilator the last occurrence of a flag wins).
+            "--unroll-count", "256",
+            "--unroll-stmts", "200000",
         ]
 
         # RTL include directories from project config

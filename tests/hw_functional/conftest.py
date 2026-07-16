@@ -101,7 +101,12 @@ def _verilate(
         "-Wno-WIDTHEXPAND", "-Wno-CASEINCOMPLETE",
         "-Wno-IGNOREDRETURN", "-Wno-WIDTHTRUNC",
         "-Wno-DEPRECATED", "-Wno-WIDTHCONCAT",
-        "-Wno-MULTIDRIVEN",
+        "-Wno-MULTIDRIVEN", "-Wno-SIDEEFFECT",
+        # Scheduler/controller MAX_CMDS loops must fully unroll so NBA array
+        # writes get constant indices (avoids BLKLOOPINIT miscompilation).
+        # Same defaults as vten/build/verilator_build.py _stage_verilate().
+        "--unroll-count", "256",
+        "--unroll-stmts", "200000",
         "--threads", "1",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
