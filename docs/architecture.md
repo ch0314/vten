@@ -351,8 +351,13 @@ waveform dumps and an interactive `--gui` mode that keeps the session alive acro
 restarts.
 
 **verilator** ([`vten/backend/verilator.py`](../vten/backend/verilator.py)) — launches a standalone
-`Vtb_top` C++ binary produced by the Verilator build pipeline. Same SHM handshake, no proprietary
-tools.
+`Vtb_top` C++ binary produced by the Verilator build pipeline
+([`vten/build/verilator_build.py`](../vten/build/verilator_build.py):
+`dpi_c → codegen → verilate → make`). Same SHM handshake, no proprietary tools: Verilator >= 5.0
+with `--timing` support is the only simulator dependency (`apt install verilator` on Ubuntu 24.04).
+A fresh build takes ~5 minutes per kernel — dominated by g++ compiling the verilated model — and is
+cached afterwards. Current limitation: composite kernels have no `kernel_spec.yaml` of their own and
+build only under the xsim pipeline; the verilator pipeline supports unit kernels.
 
 **cpu** ([`vten/backend/cpu.py`](../vten/backend/cpu.py)) — runs no RTL at all. It executes the
 kernel's `forward()` and returns those tensors directly as the "DUT" output, skipping serialization

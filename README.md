@@ -123,7 +123,10 @@ my_project/
 
 - Python >= 3.10
 - PyTorch >= 2.0
-- Vivado (for xsim backend) or Verilator (open-source alternative)
+- A simulator for real-RTL runs (either one; the same tests run on both):
+  - **Verilator >= 5.0** with `--timing` support — fully open source, no Vivado
+    required. On Ubuntu 24.04, `apt install verilator` is enough.
+  - **Vivado** (for the `xsim` backend).
 
 ## License
 

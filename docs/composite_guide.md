@@ -148,6 +148,10 @@ own `kernel_spec.yaml`; the composite is pure Python that references them. Its
 interfaces are the *union* of the sub-kernels' auto-exposed interfaces, computed
 at flatten time.
 
+One consequence: the **verilator build pipeline requires a `kernel_spec.yaml`
+per kernel and therefore cannot build composites yet** — build composite
+kernels with the xsim backend (unit kernels build on either).
+
 ---
 
 ## The auto-chained `forward()`

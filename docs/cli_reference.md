@@ -123,13 +123,13 @@ vten build [--project DIR] [--kernel NAME] [--backend B]
 
 ### Build stages
 
-The stage names (choices for `--stage` / `--upto`) are, in order:
+Each backend's `BuildPipeline` defines its own ordered stage list.
+
+xsim pipeline ([vten/build/xsim_build.py](../vten/build/xsim_build.py)):
 
 ```
 project_setup → dpi_c → codegen → compile_order → compile
 ```
-
-Meaning (xsim pipeline, [vten/build/xsim_build.py](../vten/build/xsim_build.py)):
 
 | Stage | Granularity | What it does |
 |-------|-------------|--------------|
@@ -138,6 +138,29 @@ Meaning (xsim pipeline, [vten/build/xsim_build.py](../vten/build/xsim_build.py))
 | `codegen` | per-kernel | Jinja2 → generated SystemVerilog testbench (cached). |
 | `compile_order` | per-kernel | Vivado `get_compile_order` (cached). |
 | `compile` | per-kernel | `xvlog`/`xelab` compile of the testbench. |
+
+verilator pipeline ([vten/build/verilator_build.py](../vten/build/verilator_build.py)):
+
+```
+dpi_c → codegen → verilate → make
+```
+
+| Stage | Granularity | What it does |
+|-------|-------------|--------------|
+| `dpi_c` | project | Build the SHM-bridge shared library via gcc (cached; no Vivado includes). |
+| `codegen` | per-kernel | Jinja2 → generated SystemVerilog testbench (same as xsim). |
+| `verilate` | per-kernel | `verilator --cc --exe --main --timing` → C++ model in `build/obj_dir/`. |
+| `make` | per-kernel | `make -C obj_dir` → the standalone `Vtb_top` simulator binary. |
+
+Expect a fresh verilator build to take on the order of **~5 minutes per
+kernel**, dominated by the g++ compile of the verilated model in the `make`
+stage; unchanged stages are cached on rebuild. Note that the verilator
+`codegen` stage requires a `kernels/<name>/kernel_spec.yaml`, so **composite
+kernels (which have no spec of their own) currently build only under the xsim
+pipeline** — unit kernels only under verilator.
+
+`--stage` / `--upto` argparse choices are the xsim stage names above
+([vten/cli/main.py](../vten/cli/main.py)).
 
 `--skip-compile` runs codegen but not `compile`.
 
@@ -372,14 +395,40 @@ submit_timeout_s = 300
 
 ### `[backend.verilator]`
 
+Requires Verilator **>= 5.0** (the build uses `--timing`, which 4.x does not
+properly support). No Vivado install is needed.
+
 ```toml
 [backend.verilator]
 verilator_path = ""     # empty = use PATH
 threads = 4
 trace = false           # enable VCD/FST tracing
 opt_level = 3
-# extra_args = [...]    # extra verilator flags
+timeout_ms = 10000           # sim TIMEOUT_MS (+plusarg); 0 = no timeout
+submit_timeout_s = 300
+# extra_args = [...]         # extra verilator flags (appended after defaults)
+# sim_models = "sim_models"  # project dir of IP behavioral models
 ```
+
+| Key | Meaning |
+|-----|---------|
+| `verilator_path` | Verilator binary; empty = `verilator` from `PATH`. |
+| `threads` | Verilation parallelism (`-j`). |
+| `trace` | Waveform tracing (`--trace` at build, `+trace` at run). |
+| `opt_level` | Verilator `-O<n>` optimization level. |
+| `timeout_ms` | Simulator watchdog in ms (`0` disables — not recommended, a hung sim then runs forever). |
+| `submit_timeout_s` | Python-side submit timeout. |
+| `extra_args` | Extra `verilator` flags. |
+| `sim_models` | Directory of `.v`/`.sv` behavioral models for Vivado IP (default `sim_models/`). Project models override the framework models in `vten/sv/verilator/` when module names collide. |
+
+The pipeline always passes `--unroll-count 256 --unroll-stmts 200000` and
+`-Wno-SIDEEFFECT` (plus other warning suppressions): the generated command
+scheduler/controller loops over the static `MAX_CMDS` bound and must be fully
+unrolled (see the comment in
+[vten/build/verilator_build.py](../vten/build/verilator_build.py)).
+`extra_args` is appended **after** these defaults, and for Verilator the last
+occurrence of a flag wins — so a project can override them, e.g.
+`extra_args = ["--unroll-count", "512"]` when raising `max_cmds`.
 
 ### `[backend.xrt]`
 
