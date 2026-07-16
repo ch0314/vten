@@ -116,8 +116,11 @@ module mm_array_lb_core #(
                     end
 
                     S_AR: begin
+                        // Block split: channel gi owns beats
+                        // [gi*beats_per_ch, (gi+1)*beats_per_ch) of the
+                        // tensor, so address its own slice of the buffer.
                         mem_in[gi].araddr  <= src_addr +
-                            (ch_beat[gi] * BYTES_PER_BEAT);
+                            ((gi * beats_per_ch + ch_beat[gi]) * BYTES_PER_BEAT);
                         mem_in[gi].arlen   <= 8'd0;
                         mem_in[gi].arsize  <= $clog2(BYTES_PER_BEAT);
                         mem_in[gi].arburst <= 2'b01;
@@ -139,7 +142,7 @@ module mm_array_lb_core #(
 
                     S_AW: begin
                         mem_out[gi].awaddr  <= dst_addr +
-                            (ch_beat[gi] * BYTES_PER_BEAT);
+                            ((gi * beats_per_ch + ch_beat[gi]) * BYTES_PER_BEAT);
                         mem_out[gi].awlen   <= 8'd0;
                         mem_out[gi].awsize  <= $clog2(BYTES_PER_BEAT);
                         mem_out[gi].awburst <= 2'b01;
