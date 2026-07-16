@@ -38,10 +38,16 @@ class MmArrayLbKernel(Kernel):
         self.data_in.fill_random(generator=rng)
 
     def run(self, ctx) -> None:
+        # Memory-mapped DUT: PUSH/PULL only *register* the DDR buffers with
+        # the AXI4 slave BFMs — they complete when the DUT (the AXI master)
+        # has read/written every byte, which happens only after start.
+        # Register both buffers FIRST (no deps), then configure + start.
+        # (Gating configure on PUSH completion deadlocks on a real
+        # simulator; it was previously masked by cpu-only testing.)
         h_push = ctx.push_tensor(self.data_in)
-        h_pull = ctx.pull_tensor(self.data_out, dep=h_push)
+        h_pull = ctx.pull_tensor(self.data_out)
 
-        h_cfg = ctx.configure(self, dep=h_push)
+        h_cfg = ctx.configure(self)
         h_start = ctx.write_register(self.ctrl, {"start": 1}, dep=h_cfg)
         h_poll = ctx.poll_register(self.ctrl, "done", dep=h_start)
         h_pull.add_commit_dependency(h_poll)
