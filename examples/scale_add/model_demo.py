@@ -56,6 +56,7 @@ InferenceModel / InferenceSession call mirrors the exact signatures in
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -124,9 +125,32 @@ def torch_reference(x: torch.Tensor):
     return a, b
 
 
-def main() -> None:
-    print("Creating InferenceSession(backend='cpu')  — no build/FPGA required")
-    session = InferenceSession("cpu", project_dir=".", log_level="WARNING")
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="scale_add InferenceModel demo (fan-out capture + verify + perf).",
+    )
+    p.add_argument(
+        "--backend", default="cpu",
+        help="Backend to run on: 'cpu' (default, no build) or a simulator such "
+             "as 'verilator'/'xsim' (requires the kernels to be built for it). "
+             "Only a simulator backend emits CmdStats, so perf_report() shows "
+             "real per-node cycles only there.",
+    )
+    p.add_argument(
+        "--target", default="hw",
+        help="Backend target passed to InferenceSession (default: 'hw'; only "
+             "meaningful for the xrt backend).",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+    print(f"Creating InferenceSession(backend={args.backend!r})"
+          + ("  — no build/FPGA required" if args.backend == "cpu" else ""))
+    session = InferenceSession(
+        args.backend, target=args.target, project_dir=".", log_level="WARNING",
+    )
 
     net = FanOutNet(session)
 

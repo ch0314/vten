@@ -106,6 +106,10 @@ class SimBackend(Backend):
         self._sem_h2b: PosixSemaphore | None = None
         self._sem_b2h: PosixSemaphore | None = None
         self._session_active: bool = False
+        # Build dir (kernel identity) driving the live session's simulator. A
+        # session runs ONE simulator; a later batch for a different kernel
+        # (InferenceModel driving many kernels) triggers a relaunch.
+        self._active_build_dir = None
         self._batch_count: int = 0
         self._last_backend_result: BackendResult | None = None
 
@@ -158,11 +162,26 @@ class SimBackend(Backend):
         self._probe_buffer_map = getattr(compiled, "probe_buffer_map", {})
         shm_image, shm_layout = self._pack_shm_image(compiled)
 
+        # A persistent session drives ONE simulator (one kernel's Vtb_top /
+        # xsim snapshot). InferenceModel drives many *different* kernels through
+        # one session, so when the kernel build dir changes, tear down the live
+        # simulator and start the new one — otherwise the old sim is fed a
+        # foreign kernel's batch and deadlocks. Same-kernel reuse (vten run
+        # multi-config, run_pipeline) is unaffected.
+        current_build_dir = self._run_ctx.kernel_build_dir
+        if self._session_active and current_build_dir != self._active_build_dir:
+            logger.debug("kernel build dir changed (%s → %s): relaunching simulator",
+                         self._active_build_dir, current_build_dir)
+            self._shutdown_sim()
+            self._release_posix_resources()
+            self._session_active = False
+
         self._batch_count += 1
         if not self._session_active:
             logger.debug("──── batch #%d (new session) ────", self._batch_count)
             self._submit_shm(shm_image, compiled.bfm_configs)
             self._session_active = True
+            self._active_build_dir = current_build_dir
         else:
             logger.debug("──── batch #%d (session reuse) ────", self._batch_count)
             self._submit_batch_internal_raw(shm_image, shm_layout)

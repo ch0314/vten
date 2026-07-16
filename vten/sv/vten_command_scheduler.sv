@@ -148,24 +148,33 @@ module vten_command_scheduler #(
     // Preprocessing: executed once at batch start
     // ════════════════════════════════════════════════════════════════
     task automatic preprocess_batch(int n);
-        // 1. Load dependencies from SHM via DPI-C
-        for (int i = 0; i < n; i++) begin
-            int nd, ncd;
-            int d [0:3], cd [0:3];
-            vten_read_command_deps(i, nd, d, ncd, cd);
-            cmd_num_dep[i]        <= nd[1:0];
-            cmd_num_commit_dep[i] <= ncd[1:0];
-            for (int j = 0; j < 4; j++) begin
-                cmd_dep[i][j]        <= d[j];
-                cmd_commit_dep[i][j] <= cd[j];
+        // 1. Load dependencies from SHM via DPI-C.
+        // Loops are bounded by the static MAX_CMDS and guarded with `if (i < n)`
+        // (instead of `i < n` directly) so a full-unrolling simulator can resolve
+        // each NBA array target to a constant index (avoids BLKLOOPINIT, which
+        // otherwise coalesces the per-i writes and drops all but the last).
+        // Iterations i >= n are guarded no-ops — identical behaviour to `i < n`.
+        for (int i = 0; i < MAX_CMDS; i++) begin
+            if (i < n) begin
+                int nd, ncd;
+                int d [0:3], cd [0:3];
+                vten_read_command_deps(i, nd, d, ncd, cd);
+                cmd_num_dep[i]        <= nd[1:0];
+                cmd_num_commit_dep[i] <= ncd[1:0];
+                for (int j = 0; j < 4; j++) begin
+                    cmd_dep[i][j]        <= d[j];
+                    cmd_commit_dep[i][j] <= cd[j];
+                end
             end
         end
 
         // 2. Bitmap init (LOAD = pre-committed, others = 0)
-        for (int i = 0; i < n; i++) begin
-            issued[i]    <= 1'b0;
-            bfm_done[i]  <= 1'b0;
-            committed[i] <= (cmd_store[i].opcode == OP_LOAD) ? 1'b1 : 1'b0;
+        for (int i = 0; i < MAX_CMDS; i++) begin
+            if (i < n) begin
+                issued[i]    <= 1'b0;
+                bfm_done[i]  <= 1'b0;
+                committed[i] <= (cmd_store[i].opcode == OP_LOAD) ? 1'b1 : 1'b0;
+            end
         end
 
         // 3. Sync chain & Barrier fence
@@ -177,35 +186,46 @@ module vten_command_scheduler #(
     endtask
 
     task automatic build_sync_chain(int n);
+        // Static bound + `if (i < n)` guard → full-unrollable, constant-index
+        // NBA (see preprocess_batch note). `last_sync` is a blocking accumulator
+        // so the guarded skip of trailing iterations leaves it unchanged.
         logic [15:0] last_sync;
         last_sync = DEP_NONE;
-        for (int i = 0; i < n; i++) begin
-            prev_sync_cmd[i] <= last_sync;
-            if (cmd_store[i].sync) last_sync = i[15:0];
+        for (int i = 0; i < MAX_CMDS; i++) begin
+            if (i < n) begin
+                prev_sync_cmd[i] <= last_sync;
+                if (cmd_store[i].sync) last_sync = i[15:0];
+            end
         end
     endtask
 
     task automatic build_barrier_fences(int n);
+        // Static bound + `if (i < n)` guard → full-unrollable (see note above).
         logic [15:0] last_barrier;
         last_barrier = DEP_NONE;
-        for (int i = 0; i < n; i++) begin
-            if (cmd_store[i].opcode == OP_BARRIER) begin
-                barrier_fence[i] <= last_barrier;
-                last_barrier = i[15:0];
-            end else begin
-                barrier_fence[i] <= last_barrier;
+        for (int i = 0; i < MAX_CMDS; i++) begin
+            if (i < n) begin
+                if (cmd_store[i].opcode == OP_BARRIER) begin
+                    barrier_fence[i] <= last_barrier;
+                    last_barrier = i[15:0];
+                end else begin
+                    barrier_fence[i] <= last_barrier;
+                end
             end
         end
     endtask
 
     task automatic build_bfm_map(int n);
-        for (int i = 0; i < n; i++) begin
-            case (cmd_store[i].opcode)
-                OP_LOAD, OP_STORE, OP_BARRIER:
-                    cmd_bfm_map[i] <= -1;  // No BFM needed
-                default:
-                    cmd_bfm_map[i] <= iface_to_bfm[cmd_store[i].interface_id];
-            endcase
+        // Static bound + `if (i < n)` guard → full-unrollable (see note above).
+        for (int i = 0; i < MAX_CMDS; i++) begin
+            if (i < n) begin
+                case (cmd_store[i].opcode)
+                    OP_LOAD, OP_STORE, OP_BARRIER:
+                        cmd_bfm_map[i] <= -1;  // No BFM needed
+                    default:
+                        cmd_bfm_map[i] <= iface_to_bfm[cmd_store[i].interface_id];
+                endcase
+            end
         end
     endtask
 
@@ -255,29 +275,35 @@ module vten_command_scheduler #(
                 bfm_used_this_cycle[b] = 1'b0;
             end
 
-            for (int i = 0; i < num_commands; i++) begin
-                if (!ready[i]) continue;
-                case (cmd_store[i].opcode)
-                    OP_STORE, OP_BARRIER: begin
-                        // Internal commit — no BFM dispatch
-                        issued[i]    <= 1'b1;
-                        bfm_done[i]  <= 1'b1;
-                        committed[i] <= 1'b1;
-                        if (stats_enabled)
-                            vten_write_cmd_status(i, CMD_COMMITTED);
-                    end
-                    default: begin
-                        if (cmd_bfm_map[i] < 0) begin
-                            report_error(i, ERR_UNKNOWN_OPCODE);
-                        end else if (!bfm_used_this_cycle[cmd_bfm_map[i]]) begin
-                            dispatch_to_bfm(cmd_bfm_map[i], cmd_store[i]);
-                            issued[i] <= 1'b1;
-                            bfm_used_this_cycle[cmd_bfm_map[i]] = 1'b1;
+            // Static loop bound (MAX_CMDS) + if-guarded body (no early
+            // `continue`) lets the simulator fully unroll this loop and resolve
+            // each NBA array target to a constant index (avoids BLKLOOPINIT).
+            // Requires --unroll-count >= MAX_CMDS. Iterations i >= num_commands
+            // and !ready[i] are no-ops, exactly as with the prior `continue`s.
+            for (int i = 0; i < MAX_CMDS; i++) begin
+                if (i < num_commands && ready[i]) begin
+                    case (cmd_store[i].opcode)
+                        OP_STORE, OP_BARRIER: begin
+                            // Internal commit — no BFM dispatch
+                            issued[i]    <= 1'b1;
+                            bfm_done[i]  <= 1'b1;
+                            committed[i] <= 1'b1;
                             if (stats_enabled)
-                                vten_write_cmd_status(i, CMD_ISSUED);
+                                vten_write_cmd_status(i, CMD_COMMITTED);
                         end
-                    end
-                endcase
+                        default: begin
+                            if (cmd_bfm_map[i] < 0) begin
+                                report_error(i, ERR_UNKNOWN_OPCODE);
+                            end else if (!bfm_used_this_cycle[cmd_bfm_map[i]]) begin
+                                dispatch_to_bfm(cmd_bfm_map[i], cmd_store[i]);
+                                issued[i] <= 1'b1;
+                                bfm_used_this_cycle[cmd_bfm_map[i]] = 1'b1;
+                                if (stats_enabled)
+                                    vten_write_cmd_status(i, CMD_ISSUED);
+                            end
+                        end
+                    endcase
+                end
             end
         end
     end
@@ -322,9 +348,12 @@ module vten_command_scheduler #(
                 end
             end
 
-            // bfm_done → committed promotion (check commit deps)
-            for (int i = 0; i < num_commands; i++) begin
-                if ((bfm_done[i] || cur_done[i]) && !committed[i]) begin
+            // bfm_done → committed promotion (check commit deps).
+            // Static loop bound + if-guarded body (no early `continue`) lets the
+            // simulator fully unroll and resolve the committed[i] NBA target to a
+            // constant index (avoids BLKLOOPINIT). Needs --unroll-count>=MAX_CMDS.
+            for (int i = 0; i < MAX_CMDS; i++) begin
+                if (i < num_commands && (bfm_done[i] || cur_done[i]) && !committed[i]) begin
                     all_commit_deps = 1'b1;
                     for (int d = 0; d < cmd_num_commit_dep[i]; d++) begin
                         if (!committed[cmd_commit_dep[i][d]])

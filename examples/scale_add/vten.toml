@@ -13,6 +13,29 @@ compile_options = ["-timescale", "1ns/1ps"]
 timeout_ms = 0
 submit_timeout_s = 300
 
+# Verilator needs no Xilinx part. Point verilator_path at the installed binary
+# (an empty string is used verbatim as argv[0], so give the real path here).
+[backend.verilator]
+verilator_path = "/usr/bin/verilator"
+threads = 4
+trace = false
+opt_level = 3
+timeout_ms = 0
+# Verilator-specific flags for this project:
+#  --unroll-count/--unroll-stmts: the command scheduler and shm controller have
+#    MAX_CMDS=256 loops with non-blocking writes to per-command state arrays;
+#    Verilator must FULLY unroll them (constant-index NBA) to avoid BLKLOOPINIT,
+#    which otherwise coalesces the per-i writes and keeps only the last. Budgets
+#    are set generously so the dispatch loop unrolls in the full-design context.
+#  -Wno-SIDEEFFECT: the controller reads host status via a DPI call inside a
+#    `case` expression (idempotent); Verilator's conservative side-effect warning
+#    is safe to silence here.
+extra_args = [
+    "--unroll-count", "2048",
+    "--unroll-stmts", "10000000",
+    "-Wno-SIDEEFFECT",
+]
+
 [rtl]
 sources = ["rtl/**/*.sv", "rtl/**/*.v"]
 include_dirs = ["rtl/include"]

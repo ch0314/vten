@@ -45,6 +45,7 @@ module vten_shm_controller #(
     int num_commands;
     int feed_idx;
     int timeout_ms;
+    int nc;  // cached DPI command count for the static-bound cache-load loop
 
     // Command local cache (bulk read from SHM)
     bfm_cmd_t cmd_cache [0:MAX_CMDS-1];
@@ -139,32 +140,41 @@ module vten_shm_controller #(
                         batch_number <= batch_number + 1;
                         vten_set_backend_status(BACKEND_RUNNING);
 
-                        // Bulk copy all commands to local cache in one cycle
-                        for (int i = 0; i < vten_read_num_commands(); i++) begin
-                            int op, iface, proto, rl, bufid, prb, flg, sz;
-                            longint pa;
-                            int ro, rv, rm, re, gbid;
-                            int nd, ncd;
-                            int d [0:3], cd [0:3];
-                            vten_read_command(i, op, iface, proto, rl,
-                                              bufid, prb, flg, sz, pa,
-                                              ro, rv, rm, re, gbid,
-                                              nd, ncd, d, cd);
-                            cmd_cache[i].opcode       <= opcode_t'(op[3:0]);
-                            cmd_cache[i].cmd_id       <= i[15:0];
-                            cmd_cache[i].interface_id <= iface[15:0];
-                            cmd_cache[i].protocol     <= protocol_t'(proto[7:0]);
-                            cmd_cache[i].role         <= rl[0];
-                            cmd_cache[i].buffer_id    <= bufid[15:0];
-                            cmd_cache[i].probe        <= prb[0];
-                            cmd_cache[i].sync         <= flg[0];
-                            cmd_cache[i].size         <= sz;
-                            cmd_cache[i].phys_addr    <= pa;
-                            cmd_cache[i].reg_offset   <= ro;
-                            cmd_cache[i].reg_value    <= rv;
-                            cmd_cache[i].reg_mask     <= rm;
-                            cmd_cache[i].reg_expected <= re;
-                            cmd_cache[i].golden_buf_id <= gbid[15:0];
+                        // Bulk copy all commands to local cache in one cycle.
+                        // Loop over the static MAX_CMDS with an `if (i < nc)`
+                        // guard (nc cached from the DPI count) so a full-unrolling
+                        // simulator resolves every cmd_cache[i] NBA target to a
+                        // constant index — avoids Verilator BLKLOOPINIT, which
+                        // would otherwise coalesce the per-i struct writes and
+                        // keep only the last. Iterations i >= nc are no-ops.
+                        nc = vten_read_num_commands();
+                        for (int i = 0; i < MAX_CMDS; i++) begin
+                            if (i < nc) begin
+                                int op, iface, proto, rl, bufid, prb, flg, sz;
+                                longint pa;
+                                int ro, rv, rm, re, gbid;
+                                int nd, ncd;
+                                int d [0:3], cd [0:3];
+                                vten_read_command(i, op, iface, proto, rl,
+                                                  bufid, prb, flg, sz, pa,
+                                                  ro, rv, rm, re, gbid,
+                                                  nd, ncd, d, cd);
+                                cmd_cache[i].opcode       <= opcode_t'(op[3:0]);
+                                cmd_cache[i].cmd_id       <= i[15:0];
+                                cmd_cache[i].interface_id <= iface[15:0];
+                                cmd_cache[i].protocol     <= protocol_t'(proto[7:0]);
+                                cmd_cache[i].role         <= rl[0];
+                                cmd_cache[i].buffer_id    <= bufid[15:0];
+                                cmd_cache[i].probe        <= prb[0];
+                                cmd_cache[i].sync         <= flg[0];
+                                cmd_cache[i].size         <= sz;
+                                cmd_cache[i].phys_addr    <= pa;
+                                cmd_cache[i].reg_offset   <= ro;
+                                cmd_cache[i].reg_value    <= rv;
+                                cmd_cache[i].reg_mask     <= rm;
+                                cmd_cache[i].reg_expected <= re;
+                                cmd_cache[i].golden_buf_id <= gbid[15:0];
+                            end
                         end
 
                         feed_idx <= 0;
