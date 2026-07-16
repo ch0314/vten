@@ -34,7 +34,10 @@ def list_tests(project_dir: str, kernel_name: str) -> None:
 
     print(f"\n  {kernel_name}: {len(scenarios)} test(s)\n")
     for name, instance in scenarios:
-        n_configs = len(instance.configs) if hasattr(instance, "configs") else 0
+        # configs defaults to None, meaning one run with the base
+        # parameters (see run.py) — count that as a single config.
+        configs = getattr(instance, "configs", None)
+        n_configs = len(configs) if configs is not None else 1
         doc = (instance.__class__.__doc__ or "").strip().split("\n")[0]
         print(f"  {name:<30s}  ({n_configs} config)  {doc}")
     print()
