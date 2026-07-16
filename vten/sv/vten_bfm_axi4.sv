@@ -221,14 +221,14 @@ module vten_bfm_axi4 #(
                     s_rresp  <= 2'b11;
                     s_rlast  <= 1;
                     s_rdata  <= '0;
-                    if (s_rvalid && s_rready) begin
+                    if (s_rvalid && s_rready) begin : blk_r_decerr_done
+                        done_event_t ev;
                         r_active <= 0;
                         s_rvalid <= 0;
-                        done_queue.push_back('{
-                            cmd_id:     DEP_NONE,
-                            error:      1'b1,
-                            error_code: ERR_ADDR_UNMATCH
-                        });
+                        ev.cmd_id     = DEP_NONE;
+                        ev.error      = 1'b1;
+                        ev.error_code = ERR_ADDR_UNMATCH;
+                        done_queue.push_back(ev);
                     end
                 end else begin : blk_r_serve
                     int idx;
@@ -389,16 +389,18 @@ module vten_bfm_axi4 #(
                     // B channel response
                     begin : blk_b_resp
                         logic [1:0] resp_val;
+                        b_entry_t   b_ent;
                         resp_val = (current_write.entry_idx >= 0) ? 2'b00 : 2'b11;
-                        b_queue.push_back('{resp: resp_val});
+                        b_ent.resp = resp_val;
+                        b_queue.push_back(b_ent);
                     end
                     // DECERR for unmatched write
-                    if (current_write.entry_idx < 0) begin
-                        done_queue.push_back('{
-                            cmd_id:     DEP_NONE,
-                            error:      1'b1,
-                            error_code: ERR_ADDR_UNMATCH
-                        });
+                    if (current_write.entry_idx < 0) begin : blk_w_decerr_done
+                        done_event_t ev;
+                        ev.cmd_id     = DEP_NONE;
+                        ev.error      = 1'b1;
+                        ev.error_code = ERR_ADDR_UNMATCH;
+                        done_queue.push_back(ev);
                     end
                 end
             end
@@ -432,8 +434,12 @@ module vten_bfm_axi4 #(
             automatic int          act_cycles  = active_table[idx].active_cycles;
             automatic int          tot_beats   = active_table[idx].total_beats;
             automatic int          stl_cycles  = active_table[idx].stall_cycles;
+            automatic done_event_t ev;
             active_table[idx].active = 0;
-            done_queue.push_back('{cmd_id: cid, error: 1'b0, error_code: 16'd0});
+            ev.cmd_id     = cid;
+            ev.error      = 1'b0;
+            ev.error_code = 16'd0;
+            done_queue.push_back(ev);
             vten_write_cmd_stats(cid, CMD_COMMITTED, iss_cycle, cycle_count,
                 first_act, last_act, act_cycles, tot_beats, stl_cycles);
             if (verbose)
