@@ -90,22 +90,24 @@ R=3 repeats; both frameworks run the identical DUT/simulator/tensor.
 
 | N | beats | vTen T_exec [s] | Cocotb T_exec [s] | T_exec ratio | vTen T_total [s] | Cocotb T_total [s] |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1,024 | 32 | 0.0038 | 0.0049 | 1.3× | 0.008 | 0.56 |
-| 4,096 | 128 | 0.0100 | 0.0233 | 2.3× | 0.021 | 0.65 |
-| 16,384 | 512 | 0.0196 | 0.0768 | 3.9× | 0.056 | 0.71 |
-| 65,536 | 2,048 | 0.0663 | 0.3382 | 5.1× | 0.211 | 0.95 |
-| 262,144 | 8,192 | 0.2259 | 1.3805 | 6.1× | 0.703 | 2.02 |
-| 1,048,576 | 32,768 | 1.0402 | 4.8228 | 4.6× | 3.28 | 5.46 |
-| 4,194,304 | 131,072 | 3.6554 | 19.2427 | 5.3× | 11.32 | 19.95 |
+| 1,024 | 32 | 0.0036 | 0.0047 | 1.3× | 0.0067 | 0.54 |
+| 4,096 | 128 | 0.0072 | 0.0187 | 2.6× | 0.0102 | 0.55 |
+| 16,384 | 512 | 0.0146 | 0.0706 | 4.8× | 0.0193 | 0.61 |
+| 65,536 | 2,048 | 0.0553 | 0.2897 | 5.2× | 0.0600 | 0.81 |
+| 262,144 | 8,192 | 0.2140 | 1.1401 | 5.3× | 0.2242 | 1.68 |
+| 1,048,576 | 32,768 | 0.8441 | 4.4813 | 5.3× | 0.8747 | 5.06 |
+| 4,194,304 | 131,072 | 3.5372 | 20.6768 | 5.8× | 3.6742 | 21.38 |
 
 Notes:
 
 - **Sweep bound.** The published sweep was run with `--max-n 4194304` so
-  every subprocess stays far below the 145 s kill timeout. An earlier,
-  identically configured run additionally recorded **one vTen point at
-  N = 16,777,216: T_exec = 15.13 s, warm T_total = 50.70 s** — quoted here
+  every subprocess stays far below the 145 s kill timeout. An earlier run
+  (predating the serializer vectorization of commit `e06650e`) additionally
+  recorded **one vTen point at N = 16,777,216: T_exec = 15.13 s** — quoted
   for scale only (single run, not a median; the matching Cocotb 16M runs
-  did not complete within that session's wall-clock budget).
+  did not complete within that session's wall-clock budget). That run's
+  warm T_total (50.70 s) is not quoted: it was dominated by the pre-fix
+  serializer and is no longer representative.
 - **T_total semantics differ** (see the stage table above): vTen's is the
   warm in-session batch (serialize + load + exec + readback + verify),
   Cocotb's includes its per-run simulator launch + Python bring-up
@@ -118,22 +120,27 @@ Notes:
 
 ### Observed trends vs the paper
 
-- **Per-beat transport cost is linear on both sides, with a ~5× constant
-  gap.** In steady state Cocotb spends ≈147 µs per 256-bit beat (each beat
-  crosses the VPI boundary into Python twice — drive and monitor), vTen
-  ≈28–32 µs per beat of simulator work. Once fixed costs are amortized
-  (N ≥ 65,536) the T_exec ratio settles at ≈5× (4.6–6.1×).
+- **Per-beat transport cost is linear on both sides, with a ~5–6× constant
+  gap.** In steady state Cocotb spends ≈140–160 µs per 256-bit beat (each
+  beat crosses the VPI boundary into Python twice — drive and monitor),
+  vTen ≈26–27 µs per beat of simulator work. Once fixed costs are
+  amortized (N ≥ 65,536) the T_exec ratio settles at ≈5–6× (5.2–5.8×).
 - **The gap exceeds the paper's ~2× (Fig. 8) — as predicted** in the
   framing section: the passthrough DUT has zero compute, so there is no
   kernel execution time to amortize the transport overhead against. The
   qualitative claim (per-beat VPI overhead vs batched SHM) reproduces; the
   magnitude is DUT-dependent.
-- **End-to-end the gap is smaller** (T_total ≈1.8× at N = 4M): vTen's warm
-  total is dominated by its host-side `StreamSerializer` (5.98 s at N = 4M,
-  vs 0.05 s for Cocotb's raw numpy beat packing), i.e. on this
-  zero-compute DUT vTen's wire-format serializer — not the transport — is
-  its large-N bottleneck. At small N the picture inverts: Cocotb's fixed
-  ~0.55 s launch cost makes vTen's total up to 70× lower.
+- **End-to-end the gap now matches the transport gap.** An earlier revision
+  of this benchmark found vTen's host-side `StreamSerializer` to be the
+  large-N bottleneck (5.98 s at N = 4M, capping the T_total gap at ~1.8×).
+  Commit `e06650e` vectorized the serializer (~186× on this path:
+  5.98 s → 0.032 s at N = 4M), so serialization is now negligible at every
+  measured N (≤ 1.3% of the warm total) and the T_total ratio tracks the
+  T_exec ratio (~5.8× at N = 4M). vTen's total non-exec overhead
+  (serialize + load + readback/verify) is ~3.7% of the warm total at
+  N = 4M — consistent with the paper's "< 10% at large N" claim. At small
+  N the fixed costs dominate instead: Cocotb's ~0.55 s per-run launch cost
+  makes vTen's total up to ~80× lower at N = 1,024.
 
 ## Verification-LOC comparison (paper §4.4 analog)
 
