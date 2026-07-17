@@ -50,6 +50,9 @@ examples/*/results/
 examples/*/build/
 examples/*/kernels/*/build/
 
+# Benchmark generated artifacts
+benchmarks/*/results/
+
 # Xilinx / Vitis / XRT generated (nested)
 **/*.xclbin
 **/emconfig.json

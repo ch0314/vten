@@ -1,0 +1,7 @@
+# Benchmark-only dependencies — NOT vten core dependencies.
+# cocotb is pinned to the 1.9.x line: cocotb 2.x requires Verilator >= 5.026
+# (VerilatedVpi::evalNeeded API); this benchmark was validated with
+# cocotb 1.9.2 on Verilator 5.020.
+cocotb==1.9.2
+matplotlib>=3.8
+numpy>=1.24
