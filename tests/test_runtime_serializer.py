@@ -584,3 +584,140 @@ class TestCustomFieldSerializer:
         """bus_width computed from custom fields' max bit position."""
         packing = self._custom_packing()
         assert packing.bus_width == 64  # bits 0-63
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Differential: vectorized fast path == reference slow path
+# ═══════════════════════════════════════════════════════════════════
+
+import itertools  # noqa: E402
+
+
+# Width-matched signed dtype + a bounded, negatives-included value range.
+_EW_DTYPE = {
+    8: (torch.int8, -128, 128),
+    16: (torch.int16, -(2**15), 2**15),
+    32: (torch.int32, -(2**31), 2**31),
+    64: (torch.int64, -(2**62), 2**62),
+}
+
+# Grid: element width × elements/beat × bit order × byte order × padding.
+_DIFF_GRID = list(itertools.product(
+    (8, 16, 32, 64),          # element_width (byte-aligned fast widths)
+    (1, 3, 7, 32),            # elements_per_beat (incl. odd, narrow, wide)
+    ("lsb_first", "msb_first"),
+    ("little", "big"),
+    (0, 8, 16),               # extra padding bits on the bus (>0 → padded beat)
+))
+
+
+def _make_diff_packing(packing_cls, ew, epb, bit_order, byte_order, pad_bits):
+    p = packing_cls(
+        element_width=ew,
+        elements_per_beat=epb,
+        bit_order=bit_order,
+        byte_order=byte_order,
+    )
+    if pad_bits:
+        # Widen the bus beyond epb*ew → each beat gets trailing zero padding.
+        p._explicit_bus_width = ew * epb + pad_bits
+    return p
+
+
+class TestFastVsSlowDifferential:
+    """Fast (numpy) and slow (reference loop) paths must agree exactly.
+
+    Sweeps a grid of PackingSchemes with randomized data and asserts, for
+    both serialize and deserialize, that the vectorized fast path is (a)
+    actually taken and (b) byte/element-identical to the reference loop.
+    Also confirms round-trip fidelity for the width-matched signed dtype.
+    """
+
+    @pytest.mark.parametrize("ew,epb,bit_order,byte_order,pad_bits", _DIFF_GRID)
+    def test_serialize_deserialize_match(
+        self, serializer_cls, packing_cls,
+        ew, epb, bit_order, byte_order, pad_bits,
+    ):
+        packing = _make_diff_packing(
+            packing_cls, ew, epb, bit_order, byte_order, pad_bits
+        )
+        s = serializer_cls(packing)
+        dtype, lo, hi = _EW_DTYPE[ew]
+
+        gen = torch.Generator().manual_seed(1234 + ew * 131 + epb)
+        # Exact multiple of epb, and a partial final beat (remainder < epb).
+        n_values = [5 * epb]
+        if epb > 1:
+            n_values.append(5 * epb + max(1, epb // 2))
+
+        for n in n_values:
+            data = torch.randint(
+                lo, hi, (n,), dtype=dtype, generator=gen
+            )
+
+            # ---- serialize: fast path taken and == slow ----
+            fast_bytes = s._serialize_fast(data)
+            slow_bytes = s._serialize_slow(data)
+            assert fast_bytes is not None, (
+                f"fast serialize unexpectedly declined for ew={ew} epb={epb}"
+            )
+            assert fast_bytes == slow_bytes, (
+                f"serialize mismatch ew={ew} epb={epb} {bit_order} "
+                f"{byte_order} pad={pad_bits} n={n}"
+            )
+            assert s.serialize(data) == slow_bytes
+
+            # ---- deserialize (signed): fast path taken and == slow ----
+            f_signed = s._deserialize_fast(fast_bytes, n, (n,), dtype)
+            sl_signed = s._deserialize_slow(fast_bytes, n, (n,), dtype)
+            assert f_signed is not None
+            assert torch.equal(f_signed, sl_signed), (
+                f"deserialize(signed) mismatch ew={ew} epb={epb} n={n}"
+            )
+            # Round-trip fidelity (width-matched signed dtype).
+            assert torch.equal(f_signed, data)
+
+            # ---- deserialize (unsigned interpretation): fast == slow ----
+            u_dtype = torch.uint8 if ew == 8 else getattr(
+                torch, f"uint{ew}", None
+            )
+            if u_dtype is not None:
+                f_uns = s._deserialize_fast(fast_bytes, n, (n,), u_dtype)
+                sl_uns = s._deserialize_slow(fast_bytes, n, (n,), u_dtype)
+                if f_uns is not None:  # ew==64 unsigned falls back by design
+                    assert torch.equal(f_uns, sl_uns)
+                # Public entry point agrees with the reference regardless.
+                assert torch.equal(
+                    s.deserialize(fast_bytes, n, (n,), u_dtype), sl_uns
+                )
+
+    @pytest.mark.parametrize("ew", (8, 16, 32))
+    @pytest.mark.parametrize("bit_order", ("lsb_first", "msb_first"))
+    @pytest.mark.parametrize("byte_order", ("little", "big"))
+    def test_wide_data_narrow_ew_masking(
+        self, serializer_cls, packing_cls, ew, bit_order, byte_order,
+    ):
+        """int32 data packed into a narrower element width → masking path."""
+        packing = _make_diff_packing(
+            packing_cls, ew, 5, bit_order, byte_order, pad_bits=0
+        )
+        s = serializer_cls(packing)
+        gen = torch.Generator().manual_seed(99)
+        data = torch.randint(
+            -(2**31), 2**31, (23,), dtype=torch.int32, generator=gen
+        )
+        fast_bytes = s._serialize_fast(data)
+        slow_bytes = s._serialize_slow(data)
+        assert fast_bytes is not None
+        assert fast_bytes == slow_bytes
+
+    def test_fallback_for_non_byte_aligned_width(
+        self, serializer_cls, packing_cls
+    ):
+        """Odd (non-byte) element widths must decline the fast path."""
+        packing = packing_cls(element_width=12, elements_per_beat=4)
+        s = serializer_cls(packing)
+        data = torch.tensor([1, 2, 3, 4], dtype=torch.int16)
+        assert s._serialize_fast(data) is None
+        # Public path still works via the reference loop.
+        assert s.serialize(data) == s._serialize_slow(data)

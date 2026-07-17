@@ -10,9 +10,15 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from vten.spec.models import PackingScheme
+
+# Element widths (bits) with a whole-byte, native-numpy representation. The
+# vectorized fast paths only engage for these; everything else falls back to
+# the exact per-element reference implementation.
+_FAST_ELEMENT_WIDTHS = (8, 16, 32, 64)
 
 if TYPE_CHECKING:
     from vten.spec.models import SplitSpec
@@ -34,7 +40,19 @@ class StreamSerializer:
         self.packing = packing
 
     def serialize(self, tensor_data: torch.Tensor) -> bytes:
-        """Tensor → byte stream. Element order: C-contiguous (row-major)."""
+        """Tensor → byte stream. Element order: C-contiguous (row-major).
+
+        Uses a vectorized numpy path for byte-aligned element widths; falls
+        back to the exact per-element reference implementation
+        (:meth:`_serialize_slow`) for anything not provably handled.
+        """
+        fast = self._serialize_fast(tensor_data)
+        if fast is not None:
+            return fast
+        return self._serialize_slow(tensor_data)
+
+    def _serialize_slow(self, tensor_data: torch.Tensor) -> bytes:
+        """Reference serialize: pure-Python per-beat packing loop."""
         flat = tensor_data.flatten()
         beats: list[bytes] = []
         for i in range(0, len(flat), self.packing.elements_per_beat):
@@ -42,6 +60,77 @@ class StreamSerializer:
             beat = self._pack_beat(chunk)
             beats.append(beat)
         return b"".join(beats)
+
+    def _serialize_fast(self, tensor_data: torch.Tensor) -> bytes | None:
+        """Vectorized serialize for byte-aligned element widths.
+
+        Returns ``None`` (signalling the caller to use the slow path) unless
+        the PackingScheme is standard-mode with an element width in
+        {8,16,32,64} bits, a recognized bit/byte order, and a bus wide enough
+        to hold ``elements_per_beat`` packed elements. Semantics match
+        :meth:`_serialize_slow` byte-for-byte (including per-beat padding and
+        a zero-padded final partial beat).
+        """
+        p = self.packing
+        ew = p.element_width
+        epb = p.elements_per_beat
+        if p.mode != "standard":
+            return None
+        if ew not in _FAST_ELEMENT_WIDTHS or epb <= 0:
+            return None
+        if p.bit_order not in ("lsb_first", "msb_first"):
+            return None
+        if p.byte_order not in ("little", "big"):
+            return None
+
+        ew_bytes = ew // 8
+        num_bytes = (p.bus_width + 7) // 8
+        packed_bytes = epb * ew_bytes
+        if num_bytes < packed_bytes:
+            # Bus narrower than the packed elements: reference loop truncates
+            # via int.to_bytes/overflow semantics — not modelled here.
+            return None
+        pad_bytes = num_bytes - packed_bytes
+
+        try:
+            arr = tensor_data.detach().cpu().flatten().numpy()
+        except (RuntimeError, TypeError):
+            return None
+        if not np.issubdtype(arr.dtype, np.integer):
+            return None
+
+        n = int(arr.shape[0])
+        rem = n % epb
+        if rem != 0:
+            # Zero-pad the flat data up to a whole beat; the padding elements
+            # emit zero bytes, matching the reference's short-final-beat.
+            arr = np.concatenate(
+                [arr, np.zeros(epb - rem, dtype=arr.dtype)]
+            )
+        total = int(arr.shape[0])
+        num_beats = total // epb
+
+        # Mask each element to `ew` bits and lay it out little-endian in
+        # `ew_bytes` bytes. astype(uint64) applies two's-complement wraparound
+        # for negatives (== int(v) & mask); the &mask then trims to `ew` bits.
+        mask = (1 << ew) - 1
+        u64 = arr.astype(np.uint64) & np.uint64(mask)
+        le = u64.astype(np.dtype(f"<u{ew_bytes}"))
+        byte_view = le.view(np.uint8).reshape(num_beats, epb, ew_bytes)
+        if p.bit_order == "msb_first":
+            # element 0 occupies the top slot → reverse element order within
+            # each beat when emitting little-endian bytes.
+            byte_view = byte_view[:, ::-1, :]
+        beats = byte_view.reshape(num_beats, packed_bytes)
+        if pad_bytes:
+            beats = np.concatenate(
+                [beats, np.zeros((num_beats, pad_bytes), dtype=np.uint8)],
+                axis=1,
+            )
+        if p.byte_order == "big":
+            # to_bytes(num_bytes, 'big') reverses the whole beat's bytes.
+            beats = beats[:, ::-1]
+        return beats.tobytes()
 
     def _pack_beat(self, elements: torch.Tensor) -> bytes:
         beat_val = 0
@@ -57,6 +146,16 @@ class StreamSerializer:
         num_bytes = (self.packing.bus_width + 7) // 8
         return beat_val.to_bytes(num_bytes, byteorder=self.packing.byte_order)
 
+    @staticmethod
+    def _is_signed(dtype: torch.dtype | None) -> bool:
+        """True if sign-extension applies (unsigned torch dtypes → False)."""
+        _unsigned_dtypes = {torch.uint8}
+        # torch.uint16/uint32/uint64 may not exist in older PyTorch versions
+        for _name in ("uint16", "uint32", "uint64"):
+            if hasattr(torch, _name):
+                _unsigned_dtypes.add(getattr(torch, _name))
+        return dtype not in _unsigned_dtypes if dtype is not None else True
+
     def deserialize(
         self,
         raw_bytes: bytes,
@@ -64,19 +163,95 @@ class StreamSerializer:
         shape: tuple[int, ...] | None = None,
         dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        """Byte stream → Tensor. Element order: C-contiguous."""
+        """Byte stream → Tensor. Element order: C-contiguous.
+
+        Uses a vectorized numpy path for byte-aligned element widths; falls
+        back to :meth:`_deserialize_slow` for anything not provably handled.
+        """
+        fast = self._deserialize_fast(raw_bytes, num_elements, shape, dtype)
+        if fast is not None:
+            return fast
+        return self._deserialize_slow(raw_bytes, num_elements, shape, dtype)
+
+    def _deserialize_fast(
+        self,
+        raw_bytes: bytes,
+        num_elements: int,
+        shape: tuple[int, ...] | None,
+        dtype: torch.dtype | None,
+    ) -> torch.Tensor | None:
+        """Vectorized deserialize for byte-aligned element widths.
+
+        Returns ``None`` to fall back to the reference loop unless the scheme
+        is standard-mode, ew ∈ {8,16,32,64}, recognized bit/byte order, the
+        bus holds the packed elements, and ``raw_bytes`` is a whole number of
+        beats. Matches :meth:`_deserialize_slow` (incl. sign-extension for
+        signed dtypes and ``num_elements`` truncation).
+        """
+        p = self.packing
+        ew = p.element_width
+        epb = p.elements_per_beat
+        if p.mode != "standard":
+            return None
+        if ew not in _FAST_ELEMENT_WIDTHS or epb <= 0:
+            return None
+        if p.bit_order not in ("lsb_first", "msb_first"):
+            return None
+        if p.byte_order not in ("little", "big"):
+            return None
+
+        ew_bytes = ew // 8
+        num_bytes = (p.bus_width + 7) // 8
+        packed_bytes = epb * ew_bytes
+        if num_bytes < packed_bytes:
+            return None
+        if num_bytes == 0 or len(raw_bytes) % num_bytes != 0:
+            return None
+
+        signed = self._is_signed(dtype)
+        if ew == 64 and not signed:
+            # uint64 values may exceed int64; slow path is exact here.
+            return None
+
+        buf = np.frombuffer(raw_bytes, dtype=np.uint8)
+        num_beats = len(raw_bytes) // num_bytes
+        beats = buf.reshape(num_beats, num_bytes)
+        if p.byte_order == "big":
+            beats = beats[:, ::-1]
+        # Drop per-beat padding, split into per-element byte groups.
+        elem_bytes = beats[:, :packed_bytes].reshape(num_beats, epb, ew_bytes)
+        if p.bit_order == "msb_first":
+            elem_bytes = elem_bytes[:, ::-1, :]
+        flat = np.ascontiguousarray(elem_bytes).reshape(-1)
+        if signed:
+            vals = flat.view(np.dtype(f"<i{ew_bytes}"))
+        else:
+            vals = flat.view(np.dtype(f"<u{ew_bytes}"))
+        vals = vals[:num_elements]
+        # Widen to int64 so torch.from_numpy always has a supported dtype;
+        # ew<=32 unsigned fits, ew==64 is signed-only here.
+        vals = vals.astype(np.int64)
+        tensor = torch.from_numpy(vals)
+        out_dtype = dtype if dtype is not None else torch.int32
+        tensor = tensor.to(out_dtype)
+        if shape is not None:
+            tensor = tensor.reshape(shape)
+        return tensor
+
+    def _deserialize_slow(
+        self,
+        raw_bytes: bytes,
+        num_elements: int,
+        shape: tuple[int, ...] | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """Reference deserialize: pure-Python per-element unpacking loop."""
         ew = self.packing.element_width
         epb = self.packing.elements_per_beat
         mask = (1 << ew) - 1
         bytes_per_beat = (self.packing.bus_width + 7) // 8
 
-        # Determine if sign-extension is needed
-        _unsigned_dtypes = {torch.uint8}
-        # torch.uint16/uint32/uint64 may not exist in older PyTorch versions
-        for _name in ("uint16", "uint32", "uint64"):
-            if hasattr(torch, _name):
-                _unsigned_dtypes.add(getattr(torch, _name))
-        signed = dtype not in _unsigned_dtypes if dtype is not None else True
+        signed = self._is_signed(dtype)
 
         elements: list[int] = []
         for beat_idx in range(0, len(raw_bytes), bytes_per_beat):
@@ -167,7 +342,14 @@ class CustomFieldSerializer:
 
 
 class MultiPortSerializer:
-    """Split serialized data across multiple ports."""
+    """Split serialized data across multiple ports.
+
+    Note: ``_interleave_split`` / ``reassemble`` remain byte-wise Python loops.
+    They are left unvectorized on purpose — the round-robin distribution with
+    a partial trailing unit and uneven per-port counts does not reduce to a
+    clean numpy reshape, and these paths are not on the large-N hot path that
+    ``StreamSerializer`` is. Out of scope for this change.
+    """
 
     def split_tensor(
         self, serialized: bytes, split_spec: SplitSpec
