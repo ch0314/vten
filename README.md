@@ -128,6 +128,12 @@ my_project/
     required. On Ubuntu 24.04, `apt install verilator` is enough.
   - **Vivado** (for the `xsim` backend).
 
+## Contributing
+
+Bug reports, fixes, and new examples are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, test
+instructions, and PR guidelines.
+
 ## License
 
 This project is licensed under the MIT License — see [LICENSE](LICENSE).
