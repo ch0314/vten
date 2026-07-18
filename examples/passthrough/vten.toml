@@ -6,6 +6,8 @@ version = "0.1.0"
 N = 1024
 
 [backend.xsim]
+# Set this to your own Vivado install path (e.g. /opt/Xilinx/Vivado/<version>).
+# No Vivado? The verilator backend needs none: `vten run --backend verilator` (Verilator >= 5.0).
 vivado_path = "/tools/Xilinx/Vivado/2023.2"
 timeout_ms = 10000
 submit_timeout_s = 300
