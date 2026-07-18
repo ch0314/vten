@@ -23,6 +23,10 @@ backends need no Vivado, so you can run everything here open-source.
    **split interfaces**, multi-port scatter, compute, and an intentionally-broken
    DUT used to confirm vTen actually *detects* mismatches.
 
+> Also runnable, but living under `benchmarks/` rather than `examples/`:
+> [`../benchmarks/cocotb_comparison/`](../benchmarks/cocotb_comparison/README.md)
+> — a cocotb-vs-vTen benchmark on the `passthrough` DUT.
+
 ## Feature → example map
 
 Each feature points to the example (and the specific kernel / test) that teaches

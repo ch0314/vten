@@ -119,6 +119,15 @@ my_project/
 | [CLI Reference](docs/cli_reference.md) | All commands, options, and usage examples |
 | [Architecture](docs/architecture.md) | System architecture and compile pipeline |
 
+## Benchmarks
+
+[`benchmarks/cocotb_comparison/`](benchmarks/cocotb_comparison/README.md) pits a
+hand-written cocotb testbench against vTen on the same DUT and the same
+Verilator 5.020, reproducing the DAC'26 paper's evaluation methodology.
+Headline numbers: ~5.8× lower test-execution time at N = 4M elements and a
+46.0% verification-LOC reduction (47 vs 87 lines) — measured on the open
+`passthrough` DUT, i.e. a methodology reproduction, not the paper's internal-NPU numbers.
+
 ## Requirements
 
 - Python >= 3.10
