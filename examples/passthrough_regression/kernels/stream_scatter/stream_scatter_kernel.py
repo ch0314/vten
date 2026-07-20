@@ -36,23 +36,24 @@ class StreamScatterKernel(Kernel):
 
     def run(self, ctx) -> None:
         # Memory-mapped scatter (stream in -> two HBM ports via AXI masters): PUSH
-        # only arms the input-stream source and completes after the DUT drains it
-        # (post-start), so configure must NOT gate on PUSH completion or the graph
-        # deadlocks on a real simulator (masked previously by cpu-only testing).
-        # The per-port pulls stay barrier-gated before start with commit-deps on
-        # done, preserving the two-port scatter ordering.
+        # arms the input-stream source and both PULLs register the HBM destination
+        # buffers with the passive AXI4 slave BFMs — all complete only after the DUT
+        # masters move the bytes (post-start). Register push + both pulls FIRST with
+        # NO deps, then configure -> length -> start -> poll. A barrier before start
+        # would gate start behind the PUSH's commit while the combinational core
+        # cannot drain until start — a deadlock on a real simulator (masked by
+        # cpu-only testing). Ordering is preserved via the per-port commit-deps on
+        # poll(done).
         h_push = ctx.push_tensor(self.data_in)
+        h_pull_0 = ctx.pull_tensor(self.result_0)
+        h_pull_1 = ctx.pull_tensor(self.result_1)
+
         h_cfg = ctx.configure(self)
 
         total_beats = self.N // 32
         h_len = ctx.write_register(self.ctrl, {"length": total_beats}, dep=h_cfg)
 
-        h_barrier = ctx.barrier()
-
-        h_pull_0 = ctx.pull_tensor(self.result_0, dep=h_barrier)
-        h_pull_1 = ctx.pull_tensor(self.result_1, dep=h_barrier)
-
-        h_start = ctx.write_register(self.ctrl, {"start": 1}, dep=h_barrier)
+        h_start = ctx.write_register(self.ctrl, {"start": 1}, dep=h_len)
         h_read = ctx.read_register(self.ctrl, "count", dep=h_start)
 
         h_poll = ctx.poll_register(self.ctrl, "done", dep=h_start)
