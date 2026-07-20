@@ -6,6 +6,17 @@ class TestVectorAluAdd(TestScenario):
 
     kernel = "vector_alu"
 
+    # Two configs run back-to-back in ONE sim session. The "replay" config
+    # re-runs the same N=1024 ADD after "default" has already latched done —
+    # this exercises the ALU FSM's re-arm path (S_DONE returns to S_IDLE; the
+    # next start pulse re-latches src/dst addrs, length and op_mode and clears
+    # done). Fresh DDR buffers are allocated per config, so the second run
+    # also verifies the operand/result addresses are re-latched.
+    configs = [
+        {"name": "default"},  # N=1024 (project default), op_mode=0
+        {"name": "replay"},   # same N — re-run in-session to exercise re-arm
+    ]
+
 
 class TestVectorAluSub(TestScenario):
     """Vector ALU: element-wise SUB (op_mode=1)."""
