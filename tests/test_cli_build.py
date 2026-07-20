@@ -13,6 +13,7 @@ build_project() signature:
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -434,6 +435,68 @@ class TestVtenBuildStageControl:
         project = _setup_project(tmp_path)
         with pytest.raises(Exception, match="(?i)stage|invalid|unknown"):
             build_project(str(project), stage="nonexistent_stage")
+
+
+class TestBackendStageValidation:
+    """--stage/--upto are validated against the ACTIVE backend's pipeline,
+    not a hardcoded xsim stage list."""
+
+    def test_verilator_stage_accepted(self, tmp_path: Path):
+        """'verilate' (a verilator-only stage) passes validation for --stage."""
+        from vten.build.verilator_build import VerilatorBuildPipeline
+        from vten.cli.build import build_project
+
+        project = _setup_project(tmp_path)
+        with patch.object(VerilatorBuildPipeline, "run_stage") as mock_stage:
+            build_project(str(project), backend="verilator", stage="verilate")
+        assert mock_stage.call_count == 1
+        assert "verilate" in mock_stage.call_args.args
+
+    def test_verilator_upto_accepted(self, tmp_path: Path):
+        """'verilate' passes validation for --upto (runs dpi_c → verilate)."""
+        from vten.build.verilator_build import VerilatorBuildPipeline
+        from vten.cli.build import build_project
+
+        project = _setup_project(tmp_path)
+        with patch.object(VerilatorBuildPipeline, "run_stage") as mock_stage:
+            build_project(str(project), backend="verilator", upto="verilate")
+        stages_run = [c.args[0] for c in mock_stage.call_args_list]
+        assert stages_run == ["dpi_c", "codegen", "verilate"]
+
+    def test_verilator_stage_invalid_on_xsim(self, tmp_path: Path):
+        """'verilate' on the (default) xsim backend errors, listing xsim stages."""
+        from vten.cli.build import build_project
+        from vten.errors import BuildError
+
+        project = _setup_project(tmp_path)
+        with pytest.raises(
+            BuildError,
+            match=r"--stage: invalid stage 'verilate' for backend 'xsim'\. "
+                  r"Valid stages: project_setup, dpi_c, codegen, compile_order, compile",
+        ):
+            build_project(str(project), stage="verilate")
+
+    def test_xsim_stage_invalid_on_verilator(self, tmp_path: Path):
+        """'project_setup' on verilator errors, listing verilator stages."""
+        from vten.cli.build import build_project
+        from vten.errors import BuildError
+
+        project = _setup_project(tmp_path)
+        with pytest.raises(
+            BuildError,
+            match=r"--stage: invalid stage 'project_setup' for backend "
+                  r"'verilator'\. Valid stages: dpi_c, codegen, verilate, make",
+        ):
+            build_project(str(project), backend="verilator", stage="project_setup")
+
+    def test_upto_invalid_stage_error(self, tmp_path: Path):
+        """--upto is validated the same way as --stage."""
+        from vten.cli.build import build_project
+        from vten.errors import BuildError
+
+        project = _setup_project(tmp_path)
+        with pytest.raises(BuildError, match=r"--upto: invalid stage 'bogus'"):
+            build_project(str(project), upto="bogus")
 
 
 # ═══════════════════════════════════════════════════════════════════

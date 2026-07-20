@@ -44,11 +44,12 @@ def main(argv: list[str] | None = None) -> None:
     build_parser.add_argument("--backend", default=None,
         choices=_backends,
         help="Target backend (default: from vten.toml or xsim)")
-    _stages = ["project_setup", "dpi_c", "codegen", "compile_order", "compile"]
-    build_parser.add_argument("--stage", choices=_stages,
-                              help="Run specific stage only")
-    build_parser.add_argument("--upto", choices=_stages,
-                              help="Run stages up to (inclusive)")
+    build_parser.add_argument("--stage",
+                              help="Run specific stage only (stage names are "
+                                   "backend-specific; see docs/cli_reference.md)")
+    build_parser.add_argument("--upto",
+                              help="Run stages up to (inclusive; stage names are "
+                                   "backend-specific; see docs/cli_reference.md)")
     build_parser.add_argument("--target", default=None,
                               choices=["hw", "hw_emu"],
                               help="XRT build target (overrides vten.toml)")

@@ -112,8 +112,8 @@ vten build [--project DIR] [--kernel NAME] [--backend B]
 | `--project DIR` | Project directory (contains `vten.toml`). Default: `.`. |
 | `--kernel NAME` | Build only this kernel (default: build all). |
 | `--backend B` | Override backend. Priority: `--backend` > `[project].default_backend` > `xsim`. |
-| `--stage S` | Run exactly one stage. |
-| `--upto S` | Run all stages up to and including `S`. |
+| `--stage S` | Run exactly one stage (stage names are backend-specific; see [Build stages](#build-stages)). |
+| `--upto S` | Run all stages up to and including `S` (backend-specific; see [Build stages](#build-stages)). |
 | `--target {hw,hw_emu}` | XRT build target; overrides `[backend.xrt].target` in `vten.toml`. |
 | `--force` | Ignore the build cache — full rebuild. |
 | `--clean` | Remove build artifacts before building. |
@@ -159,8 +159,11 @@ stage; unchanged stages are cached on rebuild. Note that the verilator
 kernels (which have no spec of their own) currently build only under the xsim
 pipeline** — unit kernels only under verilator.
 
-`--stage` / `--upto` argparse choices are the xsim stage names above
-([vten/cli/main.py](../vten/cli/main.py)).
+`--stage` / `--upto` accept any stage name from the **active backend's**
+pipeline (tables above; the xrt pipeline has its own stage list in
+[vten/build/xrt_build.py](../vten/build/xrt_build.py)). An unknown stage
+name fails with an error listing the valid stages for that backend
+([vten/cli/build.py](../vten/cli/build.py)).
 
 `--skip-compile` runs codegen but not `compile`.
 

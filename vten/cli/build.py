@@ -14,6 +14,7 @@ from vten.build.xsim_build import (  # noqa: F401
     _expand_split_interfaces,
 )
 from vten.cli.config import load_project_config
+from vten.errors import BuildError
 
 
 def build_project(
@@ -38,6 +39,17 @@ def build_project(
 
     backend_name = resolve_backend_name(config, cli_backend=backend)
     pipeline = get_build_pipeline(backend_name, project, config)
+
+    # --stage/--upto names are backend-specific, so they are validated here
+    # against the active pipeline rather than as static argparse choices.
+    valid_stages = pipeline.stages()
+    for flag, value in (("--stage", stage), ("--upto", upto)):
+        if value is not None and value not in valid_stages:
+            raise BuildError(
+                f"{flag}: invalid stage '{value}' for backend "
+                f"'{backend_name}'. Valid stages: {', '.join(valid_stages)}"
+            )
+
     pipeline.build(
         kernel_name=kernel_name,
         stage=stage,
