@@ -46,6 +46,7 @@ it. `Test*` names are `TestScenario` class names — pass them to `--test`.
 | **Output probes** (`probe=True` on PULL) | [`passthrough/`](passthrough/README.md), [`scale_add/`](scale_add/README.md) | `TestPassthroughProbe`, `TestScaleAddProbe` |
 | **Internal (dotted) probes** (`probes=["scale.data_out"]`) | [`scale_add/`](scale_add/README.md#output-probe-vs-internal-probe) | `scale_add` — `TestScaleAddInternalProbe` |
 | **Multi-config sweeps** (`configs = [...]`) | [`scale_add/`](scale_add/README.md) | `scale_add` — `TestScaleAdd` (6 configs); `dma_pipeline` — `TestDmaPipeline` |
+| **QuantSpec fixed-point goldens** (`quant:` blocks + [`vten/runtime/quant`](../vten/runtime/quant.py) helpers) | [`scale_add/`](scale_add/README.md) | `fixed_scale` — `TestFixedScale` (Q1.7 × Q8.8, round-half-up + saturate); also `scale`, `offset`, `vector_alu` |
 | **`chunks=`** on `pull_tensor` (host-side read split) | [`passthrough/`](passthrough/README.md#chunked-pull--chunk_passthrough-kernel-chunks-on-pull_tensor) | `chunk_passthrough` — `TestChunkPassthrough` |
 | **Layout hooks** (`layout_{name}()` / `unlayout_{name}()`) | [`passthrough/`](passthrough/README.md#layout-hook--layout_passthrough-kernel) | `layout_passthrough` — `TestLayoutPassthrough` |
 | **Inference API** (`InferenceSession` / `InferenceModule`) | [`mm_loopback/`](mm_loopback/README.md#inference-api-demo--inferpy) | `mm_loopback/infer.py` |

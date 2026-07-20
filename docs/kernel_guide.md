@@ -199,19 +199,49 @@ Rules:
 
   Reading from `inputs` first matters for composites, where an upstream kernel
   feeds this one (see [composite_guide.md](composite_guide.md)).
-- Model the RTL's **exact** arithmetic, including width and saturation. The
-  `scale` kernel multiplies int8 by a factor with signed saturation — note it
-  widens to `int16` first, then clamps back:
+- Model the RTL's **exact** arithmetic — width, overflow *and* rounding — but
+  don't hand-roll it. Declare the number format of each data interface as a
+  `quant:` block in `kernel_spec.yaml` (a [`QuantSpec`](../vten/spec/models.py):
+  `bits`/`signed`, Q-format `frac_bits`, `overflow: saturate|wrap`,
+  `rounding: trunc|half_up|half_even`), then build the golden from the helpers
+  in [`vten/runtime/quant.py`](../vten/runtime/quant.py) — `qmul`, `qadd`,
+  `requantize`, `apply_overflow` — parameterized by the same QuantSpecs. The
+  `fixed_scale` kernel ([examples/scale_add](../examples/scale_add/README.md))
+  is the reference: its RTL computes `(x8 * coeff16 + 128) >>> 8` with
+  saturation per lane (Q1.7 × Q8.8 → Q1.7, round-half-up), and its entire
+  golden is ONE helper call:
 
   ```python
+  from vten.runtime.quant import qmul
+  from vten.spec.models import QuantSpec
+
+  # Mirrors the quant: blocks in kernel_spec.yaml
+  _DATA_QS = QuantSpec(bits=8, signed=True, frac_bits=7,
+                       rounding="half_up", overflow="saturate")   # Q1.7
+  _COEFF_QS = QuantSpec(bits=16, signed=True, frac_bits=8)        # Q8.8
+
   def forward(self, **inputs):
       data = inputs.get("data_in", self.data_in.data)
-      x = data.to(torch.int16) * self.scale_factor
-      return {"data_out": x.clamp(-128, 127).to(torch.int8)}
+      out = qmul(data, _DATA_QS, self.coeff, _COEFF_QS, _DATA_QS)
+      return {"data_out": out.to(torch.int8)}
   ```
 
-  If your golden doesn't saturate identically to the hardware, you'll get a
-  *verification mismatch* even though the RTL is correct.
+  The int64 widening, the fractional-bit alignment shift (7 + 8 − 7 = 8), the
+  half-up rounding constant and the clamp to `[-128, 127]` all derive from the
+  declared formats — nothing to get subtly wrong. The `scale`, `offset` and
+  `vector_alu` example kernels are written the same way; `vector_alu` shows the
+  pattern for **per-op semantics** (ADD/SUB saturate but MUL keeps the raw low
+  8 bits): declare the tensor-level format in the spec and pick the op-specific
+  overflow in `forward()` with local QuantSpecs.
+
+  If your golden's overflow or rounding doesn't match the hardware
+  bit-for-bit, you'll get a *verification mismatch* even though the RTL is
+  correct. When a small rounding gap is *legitimate* (e.g. a reference model
+  that can't reproduce the RTL's rounding exactly), a scenario can opt in to
+  `lsb_tolerance` instead of loosening the golden — and a declared `quant:`
+  block upgrades mismatch reports to dequantized real-domain values with
+  per-element LSB errors. See
+  [testing_guide.md](testing_guide.md#integer-lsb-tolerance-lsb_tolerance).
 
 `generate_inputs()` is the companion: it fills input tensors before `forward()`
 and `run()` execute. Use `fill_random(generator=rng)` with a seeded
