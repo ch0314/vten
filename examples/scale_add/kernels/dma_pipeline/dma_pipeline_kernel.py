@@ -35,11 +35,21 @@ class DmaPipelineKernel(CompositeKernel):
     offset = OffsetKernel()
     write_dma = WriteDMAKernel()
 
-    # Register proxies
-    rdma_ctrl = register("rdma_ctrl")
+    # Register proxies — names must match the auto-inferred {ref_name}_{iface}
+    # convention (read_dma/write_dma, not rdma/wdma), else the interface has no
+    # register map and write_register/poll_register fail to resolve fields.
+    read_dma_ctrl = register("read_dma_ctrl")
     scale_ctrl = register("scale_ctrl")
     offset_ctrl = register("offset_ctrl")
-    wdma_ctrl = register("wdma_ctrl")
+    write_dma_ctrl = register("write_dma_ctrl")
+
+    # Golden params read by forward(). Must match the sub-kernel hardware defaults
+    # (Scale: scale_factor=1, Offset: offset_value=0) so the golden matches the RTL
+    # when a config does not override them — a composite class default does NOT
+    # propagate to the sub-kernel registers (only config/project params do), so a
+    # non-identity default here would make the golden disagree with the hardware.
+    # Configs that set scale_factor/offset_value flow to both golden and RTL.
+    default_params = {"N": 1024, "scale_factor": 1, "offset_value": 0}
 
     # Internal connections: ReadDMA → Scale → Offset → WriteDMA
     connections = [
@@ -85,16 +95,16 @@ class DmaPipelineKernel(CompositeKernel):
         h_cfg = ctx.configure(self)
 
         # Start all sub-kernels
-        h_start_rdma = ctx.write_register(self.rdma_ctrl, {"start": 1}, dep=h_cfg)
+        h_start_rdma = ctx.write_register(self.read_dma_ctrl, {"start": 1}, dep=h_cfg)
         h_start_scale = ctx.write_register(self.scale_ctrl, {"start": 1}, dep=h_cfg)
         h_start_offset = ctx.write_register(self.offset_ctrl, {"start": 1}, dep=h_cfg)
-        h_start_wdma = ctx.write_register(self.wdma_ctrl, {"start": 1}, dep=h_cfg)
+        h_start_wdma = ctx.write_register(self.write_dma_ctrl, {"start": 1}, dep=h_cfg)
 
         # Poll all done flags
-        h_poll_rdma = ctx.poll_register(self.rdma_ctrl, "done", dep=h_start_rdma)
+        h_poll_rdma = ctx.poll_register(self.read_dma_ctrl, "done", dep=h_start_rdma)
         h_poll_scale = ctx.poll_register(self.scale_ctrl, "done", dep=h_start_scale)
         h_poll_offset = ctx.poll_register(self.offset_ctrl, "done", dep=h_start_offset)
-        h_poll_wdma = ctx.poll_register(self.wdma_ctrl, "done", dep=h_start_wdma)
+        h_poll_wdma = ctx.poll_register(self.write_dma_ctrl, "done", dep=h_start_wdma)
 
         # Pull commits after all sub-kernels done
         h_pull.add_commit_dependency(h_poll_rdma)

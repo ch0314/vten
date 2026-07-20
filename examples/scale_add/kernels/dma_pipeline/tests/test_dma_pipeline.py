@@ -21,9 +21,9 @@ class TestDmaPipeline(TestScenario):
     kernel = "dma_pipeline"
 
     configs = [
-        {"name": "default"},                                         # N=1024, scale=2, off=1
+        {"name": "default", "scale_factor": 2, "offset_value": 1},   # N=1024, scale=2, off=1
         {"name": "identity", "scale_factor": 1, "offset_value": 0},  # DMA round-trip
-        {"name": "small_n", "N": 32},                                # minimal DMA
+        {"name": "small_n", "N": 32},                                # minimal DMA (identity)
         {"name": "overflow", "scale_factor": 10, "offset_value": 50},
     ]
 
@@ -49,15 +49,15 @@ class TestDmaPipelineStore(TestScenario):
 
         h_cfg = ctx.configure(k, dep=h_push)
 
-        h_start_rdma = ctx.write_register(k.rdma_ctrl, {"start": 1}, dep=h_cfg)
+        h_start_rdma = ctx.write_register(k.read_dma_ctrl, {"start": 1}, dep=h_cfg)
         h_start_scale = ctx.write_register(k.scale_ctrl, {"start": 1}, dep=h_cfg)
         h_start_offset = ctx.write_register(k.offset_ctrl, {"start": 1}, dep=h_cfg)
-        h_start_wdma = ctx.write_register(k.wdma_ctrl, {"start": 1}, dep=h_cfg)
+        h_start_wdma = ctx.write_register(k.write_dma_ctrl, {"start": 1}, dep=h_cfg)
 
-        h_poll_rdma = ctx.poll_register(k.rdma_ctrl, "done", dep=h_start_rdma)
+        h_poll_rdma = ctx.poll_register(k.read_dma_ctrl, "done", dep=h_start_rdma)
         h_poll_scale = ctx.poll_register(k.scale_ctrl, "done", dep=h_start_scale)
         h_poll_offset = ctx.poll_register(k.offset_ctrl, "done", dep=h_start_offset)
-        h_poll_wdma = ctx.poll_register(k.wdma_ctrl, "done", dep=h_start_wdma)
+        h_poll_wdma = ctx.poll_register(k.write_dma_ctrl, "done", dep=h_start_wdma)
 
         h_pull.add_commit_dependency(h_poll_rdma)
         h_pull.add_commit_dependency(h_poll_scale)
