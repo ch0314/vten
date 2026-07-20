@@ -87,6 +87,28 @@ def infer_direction_composite(
     return infer_direction_unit(tensor, sub_spec)
 
 
+# ── Quant/dtype cross-check ──
+
+
+def check_quant_dtype(tensor: Tensor, spec: KernelSpec) -> None:
+    """Cross-check a declared interface quant block against the tensor dtype.
+
+    The YAML parser cannot see torch dtypes, so this runs here — Stage 0 is
+    where a kernel Tensor first meets its InterfaceSpec. Raises
+    SpecValidationError for contradictions (e.g. unsigned torch dtype with
+    quant signed=true).
+    """
+    try:
+        iface = spec.get_interface(tensor.interface)
+    except KeyError:
+        return
+    if iface.quant is not None:
+        iface.quant.validate_against_dtype(
+            tensor.dtype,
+            context=f"Interface '{iface.name}' (tensor '{tensor.name}'): ",
+        )
+
+
 # ── Flatten ──
 
 
@@ -112,6 +134,7 @@ def wrap_unit_as_flat(kernel: KernelInstance) -> FlattenedKernelView:
 
     exposed: dict[str, ExposedTensor] = {}
     for tensor in kernel.tensors():
+        check_quant_dtype(tensor, kernel.spec)
         direction = infer_direction_unit(tensor, kernel.spec)
         exposed[tensor.name] = ExposedTensor(
             name=tensor.name,
@@ -245,6 +268,7 @@ def flatten_composite(
     for (sub_name, tensor_name), _t_name in auto_exposed.items():
         sub_ki = sub_kernels[sub_name]
         origin_tensor = sub_ki.get_tensor(tensor_name)
+        check_quant_dtype(origin_tensor, sub_ki.spec)
         direction = infer_direction_composite(
             sub_name, origin_tensor, mappings, sub_ki.spec
         )

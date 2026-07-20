@@ -21,6 +21,7 @@ from vten.spec.models import (
     MemoryRegion,
     PackingScheme,
     Protocol,
+    QuantSpec,
     RegisterBankSpec,
     RegisterSpec,
 )
@@ -157,6 +158,11 @@ def _parse_interface(
 
     # Parse sub-structures
     packing = _parse_packing(spec.get("packing")) if "packing" in spec else None
+    quant = _parse_quant(spec["quant"], name, packing) if "quant" in spec else None
+    if quant is not None and packing is not None:
+        # Declared signedness drives serializer sign-extension (overrides
+        # the legacy torch-dtype inference).
+        packing.signed_override = quant.signed
     split = spec.get("split")  # Store as raw dict for dict-style access
     user_register_base = spec.get("user_register_base", 0x14)
 
@@ -258,6 +264,7 @@ def _parse_interface(
         array=array,
         role=role,
         xrt=xrt_config,
+        quant=quant,
     )
 
 
@@ -341,6 +348,69 @@ def _parse_packing(raw: dict) -> PackingScheme:
     if "bus_width" in raw:
         scheme._explicit_bus_width = raw["bus_width"]
     return scheme
+
+
+_QUANT_KEYS = (
+    "bits", "signed", "frac_bits", "overflow", "rounding", "scale", "zero_point",
+)
+
+
+def _parse_quant(
+    raw: dict, iface_name: str, packing: PackingScheme | None
+) -> QuantSpec:
+    """Parse + validate an interface ``quant:`` block → QuantSpec.
+
+    Enforces: required bits/signed, no unknown keys, quant requires a
+    standard-mode packing block, and bits == packing.element_width.
+    Intrinsic field validation (enum values, frac_bits range, Q-format vs
+    affine exclusivity) lives in QuantSpec.validate(); its errors are
+    re-raised here with the interface context.
+    """
+    if not isinstance(raw, dict):
+        raise SpecValidationError(
+            f"Interface '{iface_name}': 'quant' must be a mapping"
+        )
+    for key in ("bits", "signed"):
+        if key not in raw:
+            raise SpecValidationError(
+                f"Interface '{iface_name}': quant.{key} is required"
+            )
+    unknown = set(raw) - set(_QUANT_KEYS)
+    if unknown:
+        raise SpecValidationError(
+            f"Interface '{iface_name}': unknown quant key(s) "
+            f"{sorted(unknown)}; valid keys: {list(_QUANT_KEYS)}"
+        )
+    if packing is None:
+        raise SpecValidationError(
+            f"Interface '{iface_name}': 'quant' requires a 'packing' block "
+            f"(quant.bits must equal packing.element_width)"
+        )
+    if packing.mode == "custom":
+        raise SpecValidationError(
+            f"Interface '{iface_name}': 'quant' is not supported with "
+            f"custom packing mode"
+        )
+
+    try:
+        quant = QuantSpec(
+            bits=raw["bits"],
+            signed=raw["signed"],
+            frac_bits=raw.get("frac_bits", 0),
+            overflow=raw.get("overflow", "saturate"),
+            rounding=raw.get("rounding", "trunc"),
+            scale=raw.get("scale"),
+            zero_point=raw.get("zero_point", 0),
+        )
+    except SpecValidationError as e:
+        raise SpecValidationError(f"Interface '{iface_name}': {e}") from None
+
+    if quant.bits != packing.element_width:
+        raise SpecValidationError(
+            f"Interface '{iface_name}': quant.bits ({quant.bits}) must equal "
+            f"packing.element_width ({packing.element_width})"
+        )
+    return quant
 
 
 def _expand_register_array(entry: dict) -> list[dict]:

@@ -146,9 +146,17 @@ class StreamSerializer:
         num_bytes = (self.packing.bus_width + 7) // 8
         return beat_val.to_bytes(num_bytes, byteorder=self.packing.byte_order)
 
-    @staticmethod
-    def _is_signed(dtype: torch.dtype | None) -> bool:
-        """True if sign-extension applies (unsigned torch dtypes → False)."""
+    def _is_signed(self, dtype: torch.dtype | None) -> bool:
+        """True if sign-extension applies on deserialize.
+
+        A declared QuantSpec wins: the parser copies ``quant.signed`` onto
+        ``PackingScheme.signed_override``, and Stage 0 already errored if it
+        contradicts the tensor dtype — so the override is trusted here.
+        Without a quant block, signedness falls back to torch-dtype
+        inference (unsigned torch dtypes → False).
+        """
+        if self.packing.signed_override is not None:
+            return self.packing.signed_override
         _unsigned_dtypes = {torch.uint8}
         # torch.uint16/uint32/uint64 may not exist in older PyTorch versions
         for _name in ("uint16", "uint32", "uint64"):

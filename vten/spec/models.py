@@ -122,6 +122,9 @@ class PackingScheme:
     mode: str = "standard"
     custom_fields: list[CustomField] | None = None
     _explicit_bus_width: int | None = None
+    # Set by the parser from a declared quant block (quant.signed).
+    # None → serializer infers signedness from the torch dtype (legacy).
+    signed_override: bool | None = None
 
     @property
     def bus_width(self) -> int:
@@ -148,6 +151,167 @@ class PackingScheme:
                         f"conflicts with '{occupied[bit]}' at bit {bit}."
                     )
                 occupied[bit] = cf.name
+
+
+# ── QuantSpec (M1.2 — declarative quantization) ──
+
+_QUANT_OVERFLOW_MODES = ("saturate", "wrap")
+_QUANT_ROUNDING_MODES = ("trunc", "half_up", "half_even")
+
+
+@dataclass
+class QuantSpec:
+    """Declarative quantization/fixed-point semantics for one interface tensor.
+
+    Declared in kernel_spec.yaml as an optional ``quant:`` block (sibling of
+    ``packing:``). Makes the numeric interpretation of the raw integer codes
+    on a bus explicit instead of leaving it implicit in hand-written
+    ``forward()`` arithmetic.
+
+    Exactly ONE quantization model may be declared per tensor:
+
+    * **Q-format (fixed-point)** — ``frac_bits`` fractional bits;
+      real value = ``code * 2**-frac_bits``. Integer-only kernels use
+      ``frac_bits=0`` (the default).
+    * **Affine (NN-style)** — ``scale``/``zero_point``;
+      real value = ``(code - zero_point) * scale``.
+
+    Declaring both (``frac_bits != 0`` together with ``scale``/``zero_point``)
+    is a validation error.
+
+    Attributes:
+        bits: Physical element width in bits. Must equal the interface
+            packing's ``element_width`` (validated by the parser).
+        signed: Explicit signedness of the integer codes. When a quant block
+            is declared this drives sign-extension on deserialize — no more
+            inference from the torch dtype.
+        frac_bits: Q-format fractional bits; ``0 <= frac_bits < bits``.
+        overflow: Overflow behavior — ``"saturate"`` (clamp to [qmin, qmax])
+            or ``"wrap"`` (two's-complement wrap to ``bits``).
+        rounding: Rounding mode for right-shifts / float→code conversion —
+            ``"trunc"`` (floor, Verilog ``>>>``), ``"half_up"``
+            (add half-LSB then floor), or ``"half_even"`` (convergent).
+        scale: Affine scale (real value per code step). ``None`` → Q-format.
+        zero_point: Affine zero point (code representing real 0.0).
+    """
+
+    bits: int
+    signed: bool
+    frac_bits: int = 0
+    overflow: str = "saturate"
+    rounding: str = "trunc"
+    scale: float | None = None
+    zero_point: int = 0
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate field types, enum values, ranges, and model exclusivity.
+
+        Raises SpecValidationError with a message that the parser prefixes
+        with the interface context.
+        """
+        if isinstance(self.bits, bool) or not isinstance(self.bits, int):
+            raise SpecValidationError(
+                f"quant.bits must be an integer, got {self.bits!r}"
+            )
+        if not 1 <= self.bits <= 64:
+            raise SpecValidationError(
+                f"quant.bits must be in [1, 64], got {self.bits}"
+            )
+        if not isinstance(self.signed, bool):
+            raise SpecValidationError(
+                f"quant.signed must be a boolean, got {self.signed!r}"
+            )
+        if isinstance(self.frac_bits, bool) or not isinstance(self.frac_bits, int):
+            raise SpecValidationError(
+                f"quant.frac_bits must be an integer, got {self.frac_bits!r}"
+            )
+        if not 0 <= self.frac_bits < self.bits:
+            raise SpecValidationError(
+                f"quant.frac_bits must satisfy 0 <= frac_bits < bits, "
+                f"got frac_bits={self.frac_bits}, bits={self.bits}"
+            )
+        if self.overflow not in _QUANT_OVERFLOW_MODES:
+            raise SpecValidationError(
+                f"quant.overflow must be one of {_QUANT_OVERFLOW_MODES}, "
+                f"got {self.overflow!r}"
+            )
+        if self.rounding not in _QUANT_ROUNDING_MODES:
+            raise SpecValidationError(
+                f"quant.rounding must be one of {_QUANT_ROUNDING_MODES}, "
+                f"got {self.rounding!r}"
+            )
+        if isinstance(self.zero_point, bool) or not isinstance(self.zero_point, int):
+            raise SpecValidationError(
+                f"quant.zero_point must be an integer, got {self.zero_point!r}"
+            )
+        if self.scale is not None:
+            if not isinstance(self.scale, (int, float)) or self.scale <= 0:
+                raise SpecValidationError(
+                    f"quant.scale must be a positive number, got {self.scale!r}"
+                )
+            if self.frac_bits != 0:
+                raise SpecValidationError(
+                    "quant declares both frac_bits (Q-format) and "
+                    "scale/zero_point (affine): pick ONE quantization model "
+                    "per tensor"
+                )
+            if not self.qmin <= self.zero_point <= self.qmax:
+                raise SpecValidationError(
+                    f"quant.zero_point ({self.zero_point}) must be within "
+                    f"the code range [{self.qmin}, {self.qmax}]"
+                )
+        elif self.zero_point != 0:
+            raise SpecValidationError(
+                "quant.zero_point requires quant.scale (affine model); "
+                "for Q-format use frac_bits instead"
+            )
+
+    # ── Derived helpers ──
+
+    @property
+    def qmin(self) -> int:
+        """Minimum representable integer code for bits/signed."""
+        return -(1 << (self.bits - 1)) if self.signed else 0
+
+    @property
+    def qmax(self) -> int:
+        """Maximum representable integer code for bits/signed."""
+        return (1 << (self.bits - 1)) - 1 if self.signed else (1 << self.bits) - 1
+
+    @property
+    def is_affine(self) -> bool:
+        """True if this spec uses the affine (scale/zero_point) model."""
+        return self.scale is not None
+
+    @property
+    def lsb(self) -> float:
+        """Real-value step per integer code: ``scale`` (affine) or ``2**-frac_bits``."""
+        return float(self.scale) if self.scale is not None else 2.0 ** -self.frac_bits
+
+    def validate_against_dtype(self, dtype: object, *, context: str = "") -> None:
+        """Cross-check declared signedness against a torch dtype, where visible.
+
+        The YAML parser cannot see torch dtypes, so this runs at Stage 0
+        (flatten) where the kernel Tensor meets its InterfaceSpec.
+        ``signed=true`` on an unsigned torch dtype cannot represent negative
+        codes → clear error. The inverse (signed dtype carrying unsigned
+        codes) is allowed — the container is merely wider.
+        """
+        import torch
+
+        unsigned_dtypes = {torch.uint8}
+        for _name in ("uint16", "uint32", "uint64"):
+            if hasattr(torch, _name):
+                unsigned_dtypes.add(getattr(torch, _name))
+        if self.signed and dtype in unsigned_dtypes:
+            raise SpecValidationError(
+                f"{context}quant declares signed=true but the tensor dtype "
+                f"{dtype} is unsigned. Use a signed torch dtype or declare "
+                f"signed=false."
+            )
 
 
 # ── Split (§5.2) ──
@@ -344,6 +508,7 @@ class InterfaceSpec:
     tensor: str | None = None
     tensors: list[str] | None = None
     packing: PackingScheme | None = None
+    quant: QuantSpec | None = None
     split: dict | SplitSpec | None = None
     registers: list[RegisterSpec] | None = None
     register_banks: list[RegisterBankSpec] | None = None
