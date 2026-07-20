@@ -39,8 +39,8 @@ vten report
 **1. Define the interface** (`kernels/my_accel/kernel_spec.yaml`):
 
 ```yaml
-kernel_name: my_accel
-rtl_top: my_accel
+kernel: my_accel
+rtl_top: rtl/my_accel.sv
 
 interfaces:
   data_in:
