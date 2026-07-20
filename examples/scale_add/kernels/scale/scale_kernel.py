@@ -2,8 +2,15 @@ import torch
 
 from vten.kernel.base import Kernel
 from vten.kernel.tensor import Tensor
-from vten.spec.models import Direction
+from vten.runtime.quant import qmul
+from vten.spec.models import Direction, QuantSpec
 from vten.kernel.register import register
+
+# Mirrors the quant: blocks in kernel_spec.yaml — int8 integer codes
+# (Q-format, frac_bits=0), saturating output.
+_DATA_QS = QuantSpec(bits=8, signed=True, frac_bits=0, overflow="saturate")
+# scale_factor register: 8-bit UNSIGNED code (RTL: $signed({1'b0, reg})).
+_SCALE_QS = QuantSpec(bits=8, signed=False, frac_bits=0)
 
 
 class ScaleKernel(Kernel):
@@ -40,8 +47,10 @@ class ScaleKernel(Kernel):
 
     def forward(self, **inputs) -> dict[str, torch.Tensor]:
         data = inputs.get("data_in", self.data_in.data)
-        x = data.to(torch.int16) * self.scale_factor
-        return {"data_out": x.clamp(-128, 127).to(torch.int8)}
+        # Exact-width multiply + saturation driven by the declared QuantSpecs
+        # (widen, multiply, clamp to [-128, 127]) — no hand-written clamps.
+        out = qmul(data, _DATA_QS, self.scale_factor, _SCALE_QS, _DATA_QS)
+        return {"data_out": out.to(torch.int8)}
 
     def run(self, ctx) -> None:
         # Streaming DUT: input_stream.tready = (state==S_RUN) & output_stream.tready,

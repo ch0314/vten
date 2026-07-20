@@ -19,7 +19,8 @@ interfaces:
       - name: offset_value
         offset: 0x00
         access: rw
-        width: 8
+        width: 8          # raw uint8 code, reinterpreted two's-complement by
+                          # the RTL ($signed(reg)) — e.g. 251 means -5
       - name: length
         offset: 0x04
         access: rw
@@ -41,6 +42,10 @@ interfaces:
       element_width: 8
       elements_per_beat: 32
       bit_order: lsb_first
+    quant:            # int8 integer codes (Q-format, frac_bits=0)
+      bits: 8
+      signed: true
+      frac_bits: 0
 
   output_stream:
     rtl_port: m_axis
@@ -50,3 +55,8 @@ interfaces:
       element_width: 8
       elements_per_beat: 32
       bit_order: lsb_first
+    quant:            # widened int9 sum is CLAMPED back to [-128, 127]
+      bits: 8
+      signed: true
+      frac_bits: 0
+      overflow: saturate

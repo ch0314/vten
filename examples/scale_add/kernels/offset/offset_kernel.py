@@ -2,8 +2,16 @@ import torch
 
 from vten.kernel.base import Kernel
 from vten.kernel.tensor import Tensor
-from vten.spec.models import Direction
+from vten.runtime.quant import apply_overflow, qadd
+from vten.spec.models import Direction, QuantSpec
 from vten.kernel.register import register
+
+# Mirrors the quant: blocks in kernel_spec.yaml — int8 integer codes
+# (Q-format, frac_bits=0), saturating output.
+_DATA_QS = QuantSpec(bits=8, signed=True, frac_bits=0, overflow="saturate")
+# offset_value register: arrives as a raw UNSIGNED 8-bit code that the RTL
+# reinterprets two's-complement ($signed(reg)) — a wrap fold, not a clamp.
+_OFFSET_REG_QS = QuantSpec(bits=8, signed=True, frac_bits=0, overflow="wrap")
 
 
 class OffsetKernel(Kernel):
@@ -40,12 +48,11 @@ class OffsetKernel(Kernel):
 
     def forward(self, **inputs) -> dict[str, torch.Tensor]:
         data = inputs.get("data_in", self.data_in.data)
-        # offset_value is register-width (8-bit): handle uint8→signed wrap
-        ov = self.offset_value
-        if ov >= 128:
-            ov = ov - 256
-        x = data.to(torch.int16) + ov
-        return {"data_out": x.clamp(-128, 127).to(torch.int8)}
+        # uint8 register code → signed value via two's-complement wrap
+        # (e.g. 251 → -5), then saturating add — both driven by QuantSpecs.
+        ov = apply_overflow(torch.tensor(self.offset_value), _OFFSET_REG_QS)
+        out = qadd(data, _DATA_QS, ov, _DATA_QS, _DATA_QS)
+        return {"data_out": out.to(torch.int8)}
 
     def run(self, ctx) -> None:
         # Streaming DUT: configure + start FIRST, then push (input) and pull

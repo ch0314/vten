@@ -72,3 +72,9 @@ interfaces:
       element_width: 8
       elements_per_beat: 32
       bit_order: lsb_first
+    quant:            # int8 integer codes (Q-format, frac_bits=0).
+      bits: 8         # Tensor-level format only: overflow is PER-OP in this
+      signed: true    # ALU — ADD/SUB saturate to [-128, 127] but MUL keeps the
+      frac_bits: 0    # raw low 8 bits (wrap). One interface-level block cannot
+      overflow: saturate  # express both; the op-specific choice lives in
+                          # forward() via local QuantSpecs (see the kernel).
