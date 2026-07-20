@@ -362,11 +362,24 @@ class ExecutionContext:
 
     # ── Auto-verify ──
 
-    def _auto_verify_all(self, compiled, output_tensors) -> tuple[int, list]:
+    def _auto_verify_all(
+        self,
+        compiled,
+        output_tensors,
+        *,
+        lsb_tolerance: int | dict[str, int] = 0,
+    ) -> tuple[int, list]:
         """Auto-verify all DEV_TO_HOST tensors against forward() golden.
 
         Uses compute_golden_outputs() for logical-format comparison.
         Stores golden on output tensors for inference chain propagation.
+
+        Args:
+            lsb_tolerance: Opt-in integer-LSB tolerance — an int applied to
+                all outputs, or a dict tensor-name → int (missing names stay
+                bit-exact). Default 0 keeps exact comparison. The interface's
+                declared QuantSpec (if any) is fetched automatically, but
+                purely for report enrichment — it never loosens comparison.
 
         Returns (count, list[VerificationResult]).
         """
@@ -400,12 +413,22 @@ class ExecutionContext:
             if hw is None:
                 continue
 
+            if isinstance(lsb_tolerance, dict):
+                tol = int(lsb_tolerance.get(name, 0))
+            else:
+                tol = int(lsb_tolerance or 0)
+            quant = view.quant_for_tensor(name) if view is not None else None
+
             try:
-                check_match(name, hw.flatten(), golden.flatten(),
-                            shape=tuple(golden.shape))
+                max_lsb_err = check_match(
+                    name, hw.flatten(), golden.flatten(),
+                    shape=tuple(golden.shape),
+                    lsb_tol=tol, quant=quant,
+                )
                 results.append(VerificationResult(
                     tensor_name=name,
                     passed=True,
+                    max_lsb_err=max_lsb_err,
                 ))
                 out_tensor.golden = golden
             except VerificationError as e:
@@ -414,6 +437,7 @@ class ExecutionContext:
                     passed=False,
                     max_diff=e.max_diff,
                     shape=e.shape,
+                    max_lsb_err=e.max_lsb_err,
                 ))
                 if first_error is None:
                     first_error = e
@@ -462,12 +486,20 @@ class ExecutionContext:
 
         return RuntimeEngine.compile_multi(engines)
 
-    def run(self, *, verify: bool = False) -> ExecutionResult:
+    def run(
+        self,
+        *,
+        verify: bool = False,
+        lsb_tolerance: int | dict[str, int] = 0,
+    ) -> ExecutionResult:
         """Compile pending ops → submit → wait → return ExecutionResult.
 
         Args:
             verify: If True, auto-verify all DEV_TO_HOST tensors against
                 golden computed from kernel forward().
+            lsb_tolerance: Opt-in integer-LSB tolerance for verification —
+                an int for all outputs or a dict tensor-name → int.
+                Default 0 keeps integer comparison bit-exact.
         """
         from vten.runtime.engine import RuntimeEngine
 
@@ -545,7 +577,10 @@ class ExecutionContext:
             verification_results: list = []
             if verify:
                 verification_count, verification_results = (
-                    self._auto_verify_all(compiled, output_tensors)
+                    self._auto_verify_all(
+                        compiled, output_tensors,
+                        lsb_tolerance=lsb_tolerance,
+                    )
                 )
                 passed = sum(1 for v in verification_results if getattr(v, 'passed', False))
                 if passed > 0:

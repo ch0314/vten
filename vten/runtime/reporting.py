@@ -54,6 +54,9 @@ class VerificationResult:
     first_mismatch_index: list[int] | None = None
     expected_value: float | None = None
     actual_value: float | None = None
+    # Max integer-LSB error observed. Nonzero on a PASS only when a nonzero
+    # lsb_tol allowed an inexact integer match (signal consumed by reporting).
+    max_lsb_err: int = 0
 
 
 # ── ProbeResult ──

@@ -125,6 +125,7 @@ def _run_single_test(
         kernel_class=kernel_cls,
         configs=run_cfgs,
         verify=verify,
+        lsb_tolerance=getattr(scenario, "lsb_tolerance", 0),
         project_dir=project,
         probes=scenario.probes,
         seed=scenario.seed,

@@ -50,6 +50,7 @@ class TestConv3D(TestScenario):
 | `configs` | `list[dict] \| None` | One dict per config to run. `None` ⇒ a single run using the base parameters. |
 | `probes` | `list[str] \| None` | Declarative probe specifications (see [Probes](#probes)). |
 | `seed` | `int` | Default RNG seed for `generate_inputs()` (default `42`). |
+| `lsb_tolerance` | `int \| dict[str, int]` | Opt-in integer-LSB verification tolerance — an int for all outputs, or tensor-name → int. Default `0` = bit-exact (see [Integer LSB tolerance](#integer-lsb-tolerance-lsb_tolerance)). |
 
 Scenarios are discovered by scanning `kernels/<kernel>/tests/test_*.py` for
 `TestScenario` subclasses ([vten/cli/discovery.py](../vten/cli/discovery.py)).
@@ -142,9 +143,44 @@ Flow:
 | Data | Rule |
 |------|------|
 | **Floating point** | `torch.allclose(hw, golden, atol=1e-6, rtol=1e-5)` |
-| **Integer** | `torch.equal(hw, golden)` — **bit-exact** |
+| **Integer** | `torch.equal(hw, golden)` — **bit-exact** (default), or `max |hw − golden| ≤ lsb_tol` when a scenario opts in |
 
 A shape mismatch always fails.
+
+### Integer LSB tolerance (`lsb_tolerance`)
+
+Quantized datapaths sometimes legitimately differ from the Python golden by a
+rounding LSB. A scenario can opt in to an integer-LSB tolerance — **default
+behavior is unchanged** (bit-exact) unless the scenario asks for slack:
+
+```python
+class TestNpuQuantized(TestScenario):
+    kernel = "npu_pipeline"
+    lsb_tolerance = 1              # int: allow max |hw − golden| ≤ 1 on ALL outputs
+    # lsb_tolerance = {"ofm": 1}   # dict: per-output; unlisted tensors stay bit-exact
+```
+
+The distance is the plain `int64` absolute difference — two's-complement
+wrap-around (e.g. `int8` `-128` vs `127`) counts as 255 LSBs, never 1. When a
+comparison passes only thanks to the tolerance, the observed `max_lsb_err` is
+recorded on the per-tensor `VerificationResult` (and in `summary.json` data).
+
+If the interface declares a `quant:` block in `kernel_spec.yaml`
+([`QuantSpec`](../vten/spec/models.py)), the mismatch report is
+automatically enriched with
+dequantized (real-domain) values and per-element LSB errors — the QuantSpec is
+**reporting-only** and never loosens the comparison by itself:
+
+```
+Verification failed for tensor 'ofm': shape=(64,), dtype=int16,
+max_diff=2.0, max_lsb_err=2, lsb_tol=1, 1/64 elements differ
+  [17]: hw=131 (≈1.02344), golden=129 (≈1.00781), lsb_err=2
+```
+
+The Python API mirrors this: `session.run(..., verify=True, lsb_tol=1)` and
+`net(x, verify=True, lsb_tol=1)` (an `InferenceModel` also accepts a dict
+keyed by *node* name; the scalar form also applies to the E2E reference
+check).
 
 ### What a `VerificationError` reports
 
@@ -153,7 +189,8 @@ On mismatch, `check_match` raises
 
 - `tensor` — the tensor name that failed,
 - `shape` — the effective tensor shape,
-- `max_diff` — maximum element-wise absolute difference.
+- `max_diff` — maximum element-wise absolute difference,
+- `max_lsb_err` — maximum integer-LSB error (`0` for float comparisons).
 
 The message additionally reports dtype, `n_diff / total` elements that differ,
 and up to 4 first-mismatch entries as

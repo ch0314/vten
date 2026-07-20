@@ -382,6 +382,108 @@ class TestEndToEndVerification:
             net(x, verify=True, reference=one_output_ref)
 
 
+# ── M1.2 S3: quant-aware verification — lsb_tol plumbing ──
+
+
+class TestLsbTolPlumbing:
+    """net(x, verify=True, lsb_tol=...) reaches every node + the E2E check."""
+
+    def test_scalar_lsb_tol_reaches_execute_batch(
+        self, session, specs, monkeypatch,
+    ):
+        """Model-level scalar lsb_tol flows node → session.run → execute_batch."""
+        import vten.execution as vex
+
+        seen: list[object] = []
+        orig = vex.execute_batch
+
+        def spy(**kwargs):
+            seen.append(kwargs.get("lsb_tolerance"))
+            return orig(**kwargs)
+
+        monkeypatch.setattr(vex, "execute_batch", spy)
+        net = FanOutNet(session, specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True, lsb_tol=1)
+        assert seen == [1, 1, 1]  # scale, off1, off2
+
+    def test_default_lsb_tol_is_zero(self, session, specs, monkeypatch):
+        """Without opt-in, execute_batch sees lsb_tolerance=0 (unchanged)."""
+        import vten.execution as vex
+
+        seen: list[object] = []
+        orig = vex.execute_batch
+
+        def spy(**kwargs):
+            seen.append(kwargs.get("lsb_tolerance"))
+            return orig(**kwargs)
+
+        monkeypatch.setattr(vex, "execute_batch", spy)
+        net = FanOutNet(session, specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True)
+        assert seen == [0, 0, 0]
+
+    def test_dict_lsb_tol_keyed_by_node_name(self, session, specs, monkeypatch):
+        """Dict form resolves per node; unlisted nodes stay bit-exact."""
+        import vten.execution as vex
+
+        seen: list[object] = []
+        orig = vex.execute_batch
+
+        def spy(**kwargs):
+            seen.append(kwargs.get("lsb_tolerance"))
+            return orig(**kwargs)
+
+        monkeypatch.setattr(vex, "execute_batch", spy)
+        net = FanOutNet(session, specs)
+        net(
+            torch.arange(-16, 16, dtype=torch.int8),
+            verify=True, lsb_tol={"scale": 2, "off2": 1},
+        )
+        assert seen == [2, 0, 1]  # scale, off1, off2
+
+    def test_e2e_one_lsb_off_fails_without_tol(self, session, specs):
+        """Default unchanged: 1-LSB E2E deviation still raises."""
+        from vten.errors import VerificationError
+
+        def off_by_one(x_cpu):
+            a, b = _reference(x_cpu)
+            return a + 1, b
+
+        net = FanOutNet(session, specs)
+        x = torch.arange(-16, 16, dtype=torch.int8)
+        with pytest.raises(VerificationError, match="E2E"):
+            net(x, verify=True, reference=off_by_one)
+
+    def test_e2e_one_lsb_off_passes_with_tol(self, session, specs):
+        """Scalar lsb_tol=1 covers the E2E check; max_lsb_err recorded."""
+
+        def off_by_one(x_cpu):
+            a, b = _reference(x_cpu)
+            return a + 1, b
+
+        net = FanOutNet(session, specs)
+        x = torch.arange(-16, 16, dtype=torch.int8)
+        net(x, verify=True, reference=off_by_one, lsb_tol=1)  # must not raise
+        report = net.verify_report()
+        assert report["e2e"]["passed"] is True
+        outs = {o["name"]: o for o in report["e2e"]["outputs"]}
+        assert outs["output[0]"]["max_lsb_err"] == 1
+        assert outs["output[1]"]["max_lsb_err"] == 0
+
+    def test_e2e_two_lsb_off_fails_with_tol_one(self, session, specs):
+        from vten.errors import VerificationError
+
+        def off_by_two(x_cpu):
+            a, b = _reference(x_cpu)
+            return a + 2, b
+
+        net = FanOutNet(session, specs)
+        x = torch.arange(-16, 16, dtype=torch.int8)
+        with pytest.raises(VerificationError) as exc_info:
+            net(x, verify=True, reference=off_by_two, lsb_tol=1)
+        assert exc_info.value.max_lsb_err == 2
+
+
 # ── Slice D: per-node perf rollup (synthetic CmdStats fixtures) ──
 
 

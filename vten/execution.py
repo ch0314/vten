@@ -83,6 +83,7 @@ def execute_batch(
     spec: Any = None,
     inputs: dict[str, Any] | None = None,
     verify: bool = False,
+    lsb_tolerance: int | dict[str, int] = 0,
     project_dir: Path | None = None,
     probes: list[str] | None = None,
     seed: int = 42,
@@ -108,6 +109,10 @@ def execute_batch(
             or ``vten.Tensor`` (possibly device-resident).
             When *None*, calls ``generate_inputs(seed=...)`` per config.
         verify: Compare HW output against ``forward()`` golden.
+        lsb_tolerance: Opt-in integer-LSB tolerance for verification — an
+            int applied to all outputs, or a dict tensor-name → int
+            (missing names stay bit-exact). Default 0 keeps integer
+            comparison bit-exact.
         project_dir: Project root for spec path resolution.
         probes: Declarative probe specifications.
         seed: Default RNG seed for ``generate_inputs()``.
@@ -160,7 +165,7 @@ def execute_batch(
                 continue
 
             # Compile → execute → verify
-            result = ctx.run(verify=verify)
+            result = ctx.run(verify=verify, lsb_tolerance=lsb_tolerance)
             batch.configs.append(ConfigResult(
                 config_index=idx,
                 result=result,

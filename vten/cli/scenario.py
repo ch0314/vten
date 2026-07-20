@@ -25,12 +25,17 @@ class TestScenario:
             kernel = "npu_pipeline"
             configs = [{"in_ch": 128, "out_ch": 128, ...}]
             probes = ["scale.data_out"]
+            lsb_tolerance = {"ofm": 1}   # opt-in: allow 1-LSB error on 'ofm'
     """
 
     kernel: str = ""
     configs: list[dict] | None = None
     probes: list[str] | None = None
     seed: int = 42
+    # Opt-in integer-LSB verification tolerance: an int applied to all
+    # output tensors, or a dict tensor-name → int (unlisted names stay
+    # bit-exact). Default 0 keeps the exact comparison.
+    lsb_tolerance: int | dict[str, int] = 0
 
     def _discover_kernel_class(self) -> type | None:
         """Find Kernel subclass from self.kernel name.

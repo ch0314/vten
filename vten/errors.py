@@ -167,6 +167,8 @@ class VerificationError(VTenError):
         tensor: Name of the tensor that failed verification.
         shape: Resolved shape of the tensor.
         max_diff: Maximum element-wise difference.
+        max_lsb_err: Maximum integer-LSB error (int64 ``|hw - golden|``);
+            ``0`` for floating-point comparisons.
     """
 
     def __init__(
@@ -176,6 +178,7 @@ class VerificationError(VTenError):
         tensor: str = "",
         shape: tuple[int, ...] | None = None,
         max_diff: float = 0.0,
+        max_lsb_err: int = 0,
         **kwargs,
     ) -> None:
         if not message and tensor:
@@ -187,3 +190,4 @@ class VerificationError(VTenError):
         self.tensor = tensor
         self.shape = shape
         self.max_diff = max_diff
+        self.max_lsb_err = max_lsb_err

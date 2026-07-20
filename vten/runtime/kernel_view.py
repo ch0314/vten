@@ -326,6 +326,22 @@ class FlattenedKernelView:
             t for t in self.exposed_tensors.values() if t.top_interface == top_iface
         ]
 
+    def quant_for_tensor(self, name: str):
+        """Declared QuantSpec for an exposed tensor's interface, or None.
+
+        Resolves through the origin sub-kernel's spec (``"_self"`` for unit
+        kernels), so a composite output picks up the quant block declared on
+        the *sub-kernel* interface that produced it.
+        """
+        exposed = self.exposed_tensors.get(name)
+        if exposed is None:
+            return None
+        sub_name = exposed.origin_path.split(".", 1)[0]
+        sub_ki = self.sub_kernels.get(sub_name)
+        spec = sub_ki.spec if sub_ki is not None else self.top_spec
+        iface = spec.interfaces.get(exposed.origin_tensor.interface)
+        return iface.quant if iface is not None else None
+
     def registers_for_interface(
         self, top_iface: str
     ) -> list[tuple[str, RegisterSpec, int]]:

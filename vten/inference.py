@@ -187,6 +187,7 @@ class InferenceSession:
         inputs: dict[str, torch.Tensor | Tensor] | None = None,
         *,
         verify: bool = False,
+        lsb_tol: int = 0,
         **params: Any,
     ) -> dict[str, Tensor]:
         """Execute a single kernel eagerly.
@@ -200,6 +201,8 @@ class InferenceSession:
                     golden (same CompositeKernel.forward() chain as vten run).
                     Golden data is stored on output Tensor.golden for
                     multi-layer chaining.
+            lsb_tol: Opt-in integer-LSB tolerance for ``verify=True``.
+                    Default 0 keeps integer comparison bit-exact.
             **params: Kernel parameters (merged with base_params).
 
         Returns:
@@ -256,6 +259,7 @@ class InferenceSession:
             spec=spec,
             inputs=inputs if inputs else None,
             verify=verify,
+            lsb_tolerance=lsb_tol,
             project_dir=self._project_dir,
             quiet=True,
             on_error="raise",
@@ -762,6 +766,7 @@ class _Node:
         x: torch.Tensor | Tensor,
         *,
         verify: bool = False,
+        lsb_tol: int = 0,
         **extra_inputs: torch.Tensor | Tensor,
     ) -> Tensor:
         """Run this node eagerly and capture the invocation into the graph.
@@ -771,6 +776,9 @@ class _Node:
                 ``torch.Tensor`` (a graph input) or an on-device / host
                 ``vten.Tensor`` produced by an upstream node (a graph edge).
             verify: Forwarded to ``session.run`` (per-node verify hook).
+            lsb_tol: Integer-LSB tolerance forwarded to ``session.run``.
+                Falls back to the model-level ``net(x, lsb_tol=...)`` value
+                (scalar, or per-node via a dict keyed by node name).
             **extra_inputs: Additional per-call inputs, e.g. a skip connection
                 passed as ``concat_mem=<upstream tensor>``. Each is bound by
                 keyword name and captured as an edge — this is how fan-in /
@@ -795,8 +803,10 @@ class _Node:
         # Model-level ``net(x, verify=True)`` forces per-node verify for every
         # node; a per-call ``node(x, verify=True)`` still works standalone.
         node_verify = verify or getattr(self._model, "_verify", False)
+        node_lsb_tol = lsb_tol if lsb_tol else self._model_lsb_tol()
         result = self._model._session.run(
-            self.kernel_cls, inputs=inputs, verify=node_verify, **self._params,
+            self.kernel_cls, inputs=inputs, verify=node_verify,
+            lsb_tol=node_lsb_tol, **self._params,
         )
         out = result[self.output_name]
 
@@ -817,6 +827,17 @@ class _Node:
         self._model._register_output(out, self, record)
         self._model._on_after_node(self, record, out)  # no-op hook (perf agent)
         return out
+
+    def _model_lsb_tol(self) -> int:
+        """Resolve this node's LSB tolerance from the model-level setting.
+
+        ``net(x, lsb_tol=N)`` applies N to every node; a dict form is keyed
+        by node name (missing names stay bit-exact).
+        """
+        tol = getattr(self._model, "_lsb_tol", 0)
+        if isinstance(tol, dict):
+            return int(tol.get(self.name, 0))
+        return int(tol or 0)
 
 
 class InferenceModel:
@@ -887,6 +908,8 @@ class InferenceModel:
         self._e2e: dict[str, Any] | None = None
         # Set by __call__(verify=): forces per-node verify for the whole forward.
         self._verify = False
+        # Set by __call__(lsb_tol=): int for all nodes, or dict node-name → int.
+        self._lsb_tol: int | dict[str, int] = 0
 
     # ── Declaration ──
 
@@ -983,6 +1006,7 @@ class InferenceModel:
         *,
         verify: bool = False,
         reference: Any = None,
+        lsb_tol: int | dict[str, int] = 0,
     ) -> Tensor:
         """Run the model: lazily ``build()``, reset the graph, then ``forward()``.
 
@@ -1003,6 +1027,11 @@ class InferenceModel:
 
                 Ignored unless ``verify=True``. When omitted under
                 ``verify=True``, only the per-node checks run.
+            lsb_tol: Opt-in integer-LSB tolerance for the verify checks.
+                An int applies to every per-node check and the E2E check;
+                a dict is keyed by node name for per-node checks (missing
+                names stay bit-exact; the E2E check stays bit-exact).
+                Default 0 keeps all integer comparisons bit-exact.
 
         Raises:
             VerificationError: A per-node check failed (raised from the node),
@@ -1016,6 +1045,7 @@ class InferenceModel:
         self._producers = {}
         self._e2e = None
         self._verify = verify  # read by _Node.__call__ to force per-node verify
+        self._lsb_tol = lsb_tol  # read by _Node.__call__ (int or per-node dict)
 
         out = self.forward(x)
 
@@ -1053,25 +1083,34 @@ class InferenceModel:
                 f"model returned {len(actual)}"
             )
 
+        # Scalar model-level tolerance applies E2E; the per-node dict form
+        # is keyed by node name and has no E2E meaning → stay bit-exact.
+        e2e_tol = self._lsb_tol if isinstance(self._lsb_tol, int) else 0
+
         checks: list[dict[str, Any]] = []
         for i, (a, g) in enumerate(zip(actual, golden)):
             a_cpu = a.cpu() if isinstance(a, Tensor) else a
             g_t = g if isinstance(g, torch.Tensor) else torch.as_tensor(g)
             name = f"output[{i}]" if len(actual) > 1 else "output"
             try:
-                verifier.check_match(
+                max_lsb_err = verifier.check_match(
                     name, a_cpu.flatten(), g_t.flatten(),
-                    shape=tuple(g_t.shape),
+                    shape=tuple(g_t.shape), lsb_tol=e2e_tol,
                 )
-                checks.append({"name": name, "passed": True, "max_diff": 0.0})
+                checks.append({
+                    "name": name, "passed": True, "max_diff": 0.0,
+                    "max_lsb_err": max_lsb_err,
+                })
             except VerificationError as e:
                 checks.append({
                     "name": name, "passed": False, "max_diff": e.max_diff,
+                    "max_lsb_err": e.max_lsb_err,
                 })
                 self._e2e = {"passed": False, "outputs": checks}
                 raise VerificationError(
                     f"model E2E verification failed for {name}: {e}",
                     tensor=name, shape=e.shape, max_diff=e.max_diff,
+                    max_lsb_err=e.max_lsb_err,
                 ) from e
 
         self._e2e = {"passed": True, "outputs": checks}
@@ -1183,6 +1222,9 @@ class InferenceModel:
             "passed": all(r.passed for r in chosen),
             "tensors": [r.tensor_name for r in chosen],
             "max_diff": max_diff,
+            "max_lsb_err": max(
+                (getattr(r, "max_lsb_err", 0) for r in chosen), default=0,
+            ),
         }
 
     def _capture_node_stats(self, record: GraphNode) -> None:
