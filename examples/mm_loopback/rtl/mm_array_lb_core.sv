@@ -27,7 +27,7 @@ module mm_array_lb_core #(
     input  logic [31:0] reg_dst_addr_hi,
     input  logic [31:0] reg_length,
     input  logic        reg_ctrl,          // pulse: 1-cycle start trigger
-    output logic        reg_status,        // read-only: done flag
+    output logic [31:0] reg_status,        // read-only: bit[0] = done flag
 
     // ── AXI4 Master Arrays (SV interface) ──
     vten_aximm_if.master mem_in  [N_CH],
@@ -80,10 +80,16 @@ module mm_array_lb_core #(
             all_done = all_done & ch_done[i];
     end
 
+    // Full-width drive so AXI-Lite readback has no Z bits. Hold status low
+    // through the ch_start cycle too: the channels clear ch_done one cycle
+    // after start_pulse, so the stale all_done=1 would otherwise re-latch
+    // done=1 immediately and the poll would false-pass for the whole run.
+    // reg_ctrl must be a 1-cycle pulse (spec: pulse true) — a level-held
+    // ctrl gives no new edge, so config 2+ would never restart.
     always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n)          reg_status <= 1'b0;
-        else if (start_pulse) reg_status <= 1'b0;
-        else if (all_done)   reg_status <= 1'b1;
+        if (!rst_n)                       reg_status <= '0;
+        else if (start_pulse || ch_start) reg_status <= '0;
+        else if (all_done)                reg_status <= 32'h1;
     end
 
     // ── Generate per-channel FSM ──

@@ -18,6 +18,7 @@ interfaces:
       - name: ctrl
         offset: 0x00
         access: rw
+        pulse: true
         fields: { start: "0:0" }
       - name: status
         offset: 0x04

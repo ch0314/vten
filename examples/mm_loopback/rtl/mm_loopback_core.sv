@@ -23,7 +23,7 @@ module mm_loopback_core #(
     input  logic [31:0] reg_dst_addr_hi,
     input  logic [31:0] reg_length,
     input  logic        reg_ctrl,          // pulse: 1-cycle start trigger
-    output logic        reg_status,        // read-only: done flag
+    output logic [31:0] reg_status,        // read-only: bit[0] = done flag
 
     // ── AXI4 Master (SV interface) — read port ──
     vten_aximm_if.master mem_in,
@@ -66,7 +66,8 @@ module mm_loopback_core #(
             state      <= S_IDLE;
             beat_cnt   <= '0;
             data_buf   <= '0;
-            reg_status <= 1'b0;
+            // Full-width drive so AXI-Lite readback has no Z bits
+            reg_status <= '0;
             // AXI4 defaults — read port
             mem_in.arvalid <= 1'b0;
             mem_in.rready  <= 1'b0;
@@ -82,7 +83,7 @@ module mm_loopback_core #(
                                  src_addr, dst_addr, reg_length);
                         state      <= S_AR;
                         beat_cnt   <= '0;
-                        reg_status <= 1'b0;
+                        reg_status <= '0;
                     end
                 end
 
@@ -148,7 +149,11 @@ module mm_loopback_core #(
 
                 S_DONE: begin
                     $display("[mm_core] DONE: %0d beats transferred", beat_cnt);
-                    reg_status <= 1'b1;
+                    reg_status <= 32'h1;
+                    // Back to S_IDLE: a fresh start pulse re-arms the transfer
+                    // (multi-config session replay). reg_ctrl must be a 1-cycle
+                    // pulse (spec: pulse true) — a level-held ctrl gives no new
+                    // edge, so config 2+ would see stale done=1 and never rerun.
                     state      <= S_IDLE;
                 end
 
