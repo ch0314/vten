@@ -11,10 +11,13 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
+from collections import deque
 
 from vten.backend.sim.base import SimBackend
 
 logger = logging.getLogger(__name__)
+_sim_logger = logging.getLogger("vten.sim.verilator")
 
 
 class VerilatorBackend(SimBackend):
@@ -34,6 +37,10 @@ class VerilatorBackend(SimBackend):
         self._threads = veri_cfg.get("threads", 4)
         self._trace = veri_cfg.get("trace", False)
         self._extra_args = veri_cfg.get("extra_args", [])
+        # Rolling tail of simulator output (both pipes), kept for error
+        # diagnostics — the streaming threads consume the pipes themselves.
+        self._output_tail: deque[str] = deque(maxlen=200)
+        self._stream_threads: list[threading.Thread] = []
 
     def _start_simulator(self) -> None:
         """Launch Verilator compiled binary with session_id plusarg.
@@ -90,3 +97,47 @@ class VerilatorBackend(SimBackend):
                 f"simulator binary not found: {binary}\n"
                 f"Build the testbench first with 'vten build'"
             )
+
+        # Continuously drain BOTH pipes (mirrors XsimBackend's stdout
+        # streaming). An undrained PIPE fills its ~64KB kernel buffer and
+        # then BLOCKS the simulator mid-$display/fprintf, wedging the whole
+        # session — first hit by multi-config sessions whose accumulated
+        # bridge/BFM output crossed the buffer size at the 4th batch.
+        self._output_tail.clear()
+        sim_verbose = self._run_ctx.sim_verbose
+        self._stream_threads = []
+        for stream_name, pipe in (
+            ("stdout", self._process.stdout),
+            ("stderr", self._process.stderr),
+        ):
+            t = threading.Thread(
+                target=self._stream_pipe,
+                args=(pipe, stream_name, sim_verbose, self._output_tail),
+                daemon=True,
+            )
+            t.start()
+            self._stream_threads.append(t)
+
+    @staticmethod
+    def _stream_pipe(pipe, stream_name: str, verbose: bool, tail: deque) -> None:
+        """Drain one simulator pipe line-by-line.
+
+        Every line is retained in the bounded ``tail`` for diagnostics;
+        verbose mode additionally routes lines through Python logging.
+        """
+        try:
+            for raw_line in pipe:
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                if not line:
+                    continue
+                tail.append(f"[{stream_name}] {line}")
+                if verbose:
+                    _sim_logger.debug("%s", line)
+        except (OSError, ValueError):
+            pass  # pipe closed
+
+    def _drain_simulator_output(self) -> str:
+        """Return the retained output tail (pipes are consumed by threads)."""
+        for t in self._stream_threads:
+            t.join(timeout=2)
+        return "\n".join(self._output_tail)

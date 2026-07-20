@@ -1,0 +1,65 @@
+kernel: fixed_scale
+rtl_top: rtl/fixed_scale_core.sv
+
+runtime_params:
+  coeff:
+    default: 256          # Q8.8 code: 256 = 1.0 (identity)
+    register: ctrl.coeff
+  length:
+    register: ctrl.length
+
+interfaces:
+  ctrl:
+    rtl_port: s_axilite
+    protocol: axi4_lite
+    addr_width: 16
+    data_width: 32
+    generate_controller: true
+    registers:
+      - name: coeff
+        offset: 0x00
+        access: rw
+        width: 16         # SIGNED Q8.8 fixed-point coefficient: real = code / 256
+      - name: length
+        offset: 0x04
+        access: rw
+      - name: ctrl
+        offset: 0x08
+        access: rw
+        pulse: true       # required for session replay (S_DONE re-arms on the
+                          # next start pulse; a level-held start would re-trigger)
+        fields: { start: "0:0" }
+      - name: status      # core drives the full [31:0] wire, bit0 = done
+        offset: 0x0C
+        access: ro
+        fields: { done: "0:0" }
+
+  input_stream:
+    rtl_port: s_axis
+    protocol: axi4_stream
+    tensor: data_in
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first
+    quant:            # Q1.7 signed fixed-point codes: real = code / 128
+      bits: 8
+      signed: true
+      frac_bits: 7
+      rounding: half_up
+      overflow: saturate
+
+  output_stream:
+    rtl_port: m_axis
+    protocol: axi4_stream
+    tensor: data_out
+    packing:
+      element_width: 8
+      elements_per_beat: 32
+      bit_order: lsb_first
+    quant:            # Q1.7 out: post-multiply shift rounds HALF-UP
+      bits: 8         # ((prod + 128) >>> 8), then SATURATES to [-128, 127]
+      signed: true
+      frac_bits: 7
+      rounding: half_up
+      overflow: saturate
