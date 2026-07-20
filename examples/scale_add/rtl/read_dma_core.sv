@@ -20,7 +20,7 @@ module read_dma_core #(
     input  logic [31:0] reg_src_addr_hi,
     input  logic [31:0] reg_length,
     input  logic        reg_ctrl,          // pulse: 1-cycle start trigger
-    output logic        reg_status,        // read-only: done flag
+    output logic [31:0] reg_status,        // read-only: bit[0] = done flag
 
     // ── AXI4 Master (SV interface) — memory read port ──
     vten_aximm_if.master mem_port,
@@ -52,7 +52,7 @@ module read_dma_core #(
             state              <= S_IDLE;
             beat_cnt           <= '0;
             data_buf           <= '0;
-            reg_status         <= 1'b0;
+            reg_status         <= '0;
             // AXI4 defaults
             mem_port.arvalid   <= 1'b0;
             mem_port.rready    <= 1'b0;
@@ -66,7 +66,7 @@ module read_dma_core #(
                     output_stream.tvalid <= 1'b0;
                     if (reg_ctrl) begin
                         beat_cnt   <= '0;
-                        reg_status <= 1'b0;
+                        reg_status <= '0;
                         if (reg_length == 0)
                             state <= S_DONE;
                         else
@@ -112,8 +112,18 @@ module read_dma_core #(
                 end
 
                 S_DONE: begin
-                    reg_status <= 1'b1;
-                    // Sticky — stay done until reset
+                    reg_status <= 32'h1;
+                    // Re-arm: a fresh start pulse restarts the transfer with the
+                    // current register values (multi-config session replay).
+                    // reg_ctrl must be a 1-cycle pulse (spec: pulse true) — a
+                    // level-held ctrl would spuriously restart here and re-read
+                    // an already-drained PUSH buffer (AXI4 DECERR).
+                    if (reg_ctrl) begin
+                        beat_cnt   <= '0;
+                        reg_status <= '0;
+                        if (reg_length != 0)
+                            state <= S_AR;
+                    end
                 end
 
                 default: state <= S_IDLE;

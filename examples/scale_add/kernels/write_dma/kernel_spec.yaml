@@ -30,6 +30,7 @@ interfaces:
       - name: ctrl
         offset: 0x0C
         access: rw
+        pulse: true
         fields: { start: "0:0" }
       - name: status
         offset: 0x10

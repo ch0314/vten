@@ -20,7 +20,7 @@ module write_dma_core #(
     input  logic [31:0] reg_dst_addr_hi,
     input  logic [31:0] reg_length,
     input  logic        reg_ctrl,          // pulse: 1-cycle start trigger
-    output logic        reg_status,        // read-only: done flag
+    output logic [31:0] reg_status,        // read-only: bit[0] = done flag
 
     // ── AXI4-Stream Slave — input data ──
     vten_axis_if.slave   input_stream,
@@ -62,7 +62,7 @@ module write_dma_core #(
             mem_port.awvalid   <= 1'b0;
             mem_port.wvalid    <= 1'b0;
             mem_port.bready    <= 1'b0;
-            reg_status         <= 1'b0;
+            reg_status         <= '0;
             beat_count         <= 0;
         end else begin
             case (state)
@@ -72,7 +72,7 @@ module write_dma_core #(
                         dst_addr   <= {reg_dst_addr_hi, reg_dst_addr_lo};
                         beats_left <= reg_length;
                         beat_count <= 0;
-                        reg_status <= 1'b0;
+                        reg_status <= '0;
                         if (reg_length == 0)
                             state <= S_DONE;
                         else begin
@@ -133,8 +133,20 @@ module write_dma_core #(
                 end
 
                 S_DONE: begin
-                    reg_status <= 1'b1;
-                    // Sticky — stay done until reset
+                    reg_status <= 32'h1;
+                    // Re-arm: a fresh start pulse re-latches address/length and
+                    // restarts the write engine (multi-config session replay).
+                    // reg_ctrl must be a 1-cycle pulse (spec: pulse true).
+                    if (reg_ctrl) begin
+                        dst_addr   <= {reg_dst_addr_hi, reg_dst_addr_lo};
+                        beats_left <= reg_length;
+                        beat_count <= 0;
+                        reg_status <= '0;
+                        if (reg_length != 0) begin
+                            state               <= S_ACCEPT;
+                            input_stream.tready <= 1'b1;
+                        end
+                    end
                 end
             endcase
         end

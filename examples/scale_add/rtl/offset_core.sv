@@ -9,7 +9,7 @@ module offset_core #(parameter DATA_W = 256)(
     input  logic [7:0]  reg_offset_value,
     input  logic [31:0] reg_length,       // total beats to process
     input  logic [0:0]  reg_ctrl,         // start pulse
-    output logic [0:0]  reg_status,       // done
+    output logic [31:0] reg_status,       // bit[0] = done
 
     // AXI4-Stream (SV interfaces)
     vten_axis_if.slave  input_stream,
@@ -54,7 +54,8 @@ module offset_core #(parameter DATA_W = 256)(
     end
 
     // Status
-    assign reg_status[0] = (state == S_DONE);
+    // Full-width drive so AXI-Lite readback has no Z bits
+    assign reg_status = {31'b0, state == S_DONE};
 
     // Flow control
     assign input_stream.tready  = (state == S_RUN) & output_stream.tready;
