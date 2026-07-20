@@ -484,6 +484,207 @@ class TestLsbTolPlumbing:
         assert exc_info.value.max_lsb_err == 2
 
 
+# ── M1.2 S5: per-node quant-error metrics in verify_report ──
+
+
+def _offset_session(offsets):
+    """InferenceSession over a cpu backend whose k-th kernel run deviates
+    from golden by ``offsets[k]`` LSBs (the S3 off-by-one backend idiom,
+    generalized to a per-run schedule so nodes get distinct errors)."""
+    from vten.backend.cpu import CpuBackend
+
+    class _ScheduledOffsetBackend(CpuBackend):
+        """CPU backend: run k's outputs are golden + offsets[k]."""
+
+        def __init__(self, offsets):
+            super().__init__()
+            self._offsets = list(offsets)
+
+        def execute(self, compiled):
+            result = super().execute(compiled)
+            off = self._offsets.pop(0) if self._offsets else 0
+            if off and result._forward_tensors:
+                result._forward_tensors = {
+                    k: v + off for k, v in result._forward_tensors.items()
+                }
+            return result
+
+    return InferenceSession(
+        _ScheduledOffsetBackend(offsets),
+        project_dir=str(_SCALE_ADD_DIR), log_level="WARNING",
+    )
+
+
+class TestQuantErrorReport:
+    """verify_report(): quant-error columns + worst-node aggregate (S5)."""
+
+    def test_exact_rows_on_cpu(self, session, specs):
+        """cpu golden == hw → every verified node is max_lsb_err=0 'exact'."""
+        net = FanOutNet(session, specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True)
+        report = net.verify_report()
+        for row in report["nodes"]:
+            assert row["max_lsb_err"] == 0
+            assert row["lsb_tol"] == 0
+            assert row["quant_status"] == "exact"
+
+    def test_within_tol_columns(self, specs):
+        """A 1-LSB-off node under lsb_tol=1 shows err/tol/'within-tol'."""
+        net = FanOutNet(_offset_session([0, 1, 0]), specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True, lsb_tol=1)
+        rows = {r["node"]: r for r in net.verify_report()["nodes"]}
+        assert rows["off1"]["max_lsb_err"] == 1
+        assert rows["off1"]["lsb_tol"] == 1
+        assert rows["off1"]["quant_status"] == "within-tol"
+        assert rows["scale"]["quant_status"] == "exact"
+        assert rows["off2"]["max_lsb_err"] == 0
+
+    def test_dict_lsb_tol_column_per_node(self, specs):
+        """Dict-form tolerance shows up per node; unlisted nodes stay 0."""
+        net = FanOutNet(_offset_session([0, 1, 0]), specs)
+        net(
+            torch.arange(-16, 16, dtype=torch.int8),
+            verify=True, lsb_tol={"off1": 1},
+        )
+        rows = {r["node"]: r for r in net.verify_report()["nodes"]}
+        assert rows["off1"]["lsb_tol"] == 1
+        assert rows["scale"]["lsb_tol"] == 0
+        assert rows["off2"]["lsb_tol"] == 0
+
+    def test_worst_node_aggregate(self, specs):
+        """Worst node by max_lsb_err — the quant analogue of bottleneck_node."""
+        net = FanOutNet(_offset_session([1, 2, 0]), specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True, lsb_tol=2)
+        report = net.verify_report()
+        assert report["worst_quant_node"] == "off1"
+        worst = report.worst_quant_node()
+        assert worst["node"] == "off1"
+        assert worst["max_lsb_err"] == 2
+        assert (
+            "worst quant error: off1 (max_lsb_err=2, lsb_tol=2)"
+            in str(report)
+        )
+
+    def test_table_rendering_columns(self, specs):
+        net = FanOutNet(_offset_session([0, 1, 0]), specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True, lsb_tol=1)
+        text = str(net.verify_report())
+        assert "per-node verification" in text
+        for col in ("lsb_err", "lsb_tol", "status"):
+            assert col in text
+        assert "within-tol" in text and "exact" in text
+        assert "scale" in text and "off1" in text and "off2" in text
+
+    def test_e2e_rows(self, specs):
+        """E2E checks carry lsb_tol/quantized and render as table rows."""
+        net = FanOutNet(_offset_session([0, 1, 0]), specs)
+        x = torch.arange(-16, 16, dtype=torch.int8)
+        net(x, verify=True, reference=_reference, lsb_tol=1)
+        report = net.verify_report()
+        outs = {o["name"]: o for o in report["e2e"]["outputs"]}
+        assert outs["output[0]"]["max_lsb_err"] == 1
+        assert outs["output[0]"]["lsb_tol"] == 1
+        assert outs["output[0]"]["quantized"] is True
+        assert outs["output[1]"]["max_lsb_err"] == 0
+        text = str(report)
+        assert "E2E output[0]" in text and "E2E output[1]" in text
+
+    def test_e2e_fail_renders_fail_status(self, session, specs):
+        from vten.errors import VerificationError
+
+        def wrong_reference(x):
+            return (
+                torch.zeros(N, dtype=torch.int8),
+                torch.zeros(N, dtype=torch.int8),
+            )
+
+        net = FanOutNet(session, specs)
+        x = torch.arange(-16, 16, dtype=torch.int8)
+        with pytest.raises(VerificationError):
+            net(x, verify=True, reference=wrong_reference)
+        report = net.verify_report()
+        assert report["e2e"]["passed"] is False
+        assert "FAIL" in str(report)
+
+    def test_unverified_run_degrades(self, session, specs):
+        """Plain run: quant columns are None / '—', no worst-node line."""
+        net = FanOutNet(session, specs)
+        net(torch.arange(-16, 16, dtype=torch.int8))  # no verify
+        report = net.verify_report()
+        for row in report["nodes"]:
+            assert row["max_lsb_err"] is None
+            assert row["lsb_tol"] is None
+            assert row["quant_status"] is None
+        assert report["worst_quant_node"] is None
+        text = str(report)
+        assert "—" in text
+        assert "worst quant error" not in text
+        assert net.quant_error_summary() == []
+
+    def test_float_output_marked_unquantized(self, session, specs, monkeypatch):
+        """A float-dtype output carries no LSB metrics (columns degrade)."""
+        from vten.kernel.tensor import Tensor as VTensor
+        from vten.runtime.reporting import VerificationResult
+
+        net = FanOutNet(session, specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True)
+        rec = net._graph[0]
+        monkeypatch.setattr(
+            net._session, "last_verification_results",
+            lambda: [VerificationResult(tensor_name=rec.output_name, passed=True)],
+        )
+        float_out = VTensor(shape=(N,), dtype=torch.float32, interface="m_axis")
+        net._capture_node_verification(rec, float_out)
+        assert rec.verification["quantized"] is False
+        row = next(
+            r for r in net.verify_report()["nodes"] if r["node"] == "scale"
+        )
+        assert row["verified"] is True
+        assert row["max_lsb_err"] is None
+        assert row["lsb_tol"] is None
+        assert row["quant_status"] is None
+        assert all(s["name"] != "scale" for s in net.quant_error_summary())
+
+    def test_report_is_json_round_trippable(self, session, specs):
+        """Still a plain dict for serializing consumers (Slice-C contract)."""
+        import json
+
+        net = FanOutNet(session, specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True)
+        report = net.verify_report()
+        assert isinstance(report, dict)
+        assert json.loads(json.dumps(report)) == report
+
+
+class TestQuantErrorSummary:
+    """net.quant_error_summary() — structured per-node metrics (M2 feed)."""
+
+    def test_summary_contents(self, specs):
+        net = FanOutNet(_offset_session([1, 2, 0]), specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True, lsb_tol=2)
+        summary = net.quant_error_summary()
+        assert [s["name"] for s in summary] == ["scale", "off1", "off2"]
+        assert all(
+            set(s) == {"name", "max_lsb_err", "lsb_tol", "passed"}
+            for s in summary
+        )
+        by_name = {s["name"]: s for s in summary}
+        assert by_name["scale"] == {
+            "name": "scale", "max_lsb_err": 1, "lsb_tol": 2, "passed": True,
+        }
+        assert by_name["off1"]["max_lsb_err"] == 2
+        assert by_name["off2"]["max_lsb_err"] == 0
+
+    def test_summary_picks_worst_node(self, specs):
+        net = FanOutNet(_offset_session([1, 2, 0]), specs)
+        net(torch.arange(-16, 16, dtype=torch.int8), verify=True, lsb_tol=2)
+        worst = max(
+            net.quant_error_summary(), key=lambda s: s["max_lsb_err"],
+        )
+        assert worst["name"] == "off1"
+        assert worst["name"] == net.verify_report()["worst_quant_node"]
+
+
 # ── Slice D: per-node perf rollup (synthetic CmdStats fixtures) ──
 
 

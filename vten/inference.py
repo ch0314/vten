@@ -614,6 +614,10 @@ class GraphNode:
     params: dict[str, Any] = field(default_factory=dict)
     output_tensor_id: int | None = None
     output_name: str | None = None
+    # Integer-LSB tolerance applied to this node's verify check (M1.2 S5
+    # report column). Recorded unconditionally at capture; meaningful only
+    # when the node actually verified.
+    lsb_tol: int = 0
     # Filled by InferenceModel's post-node hook (Slice C/D). Both start empty so
     # a plain (non-verify) run leaves them untouched; capture/execution never
     # read them, so populating them cannot break the trace.
@@ -733,6 +737,91 @@ class PerfReport:
         return "\n".join(lines)
 
 
+def _quant_status(
+    passed: bool, max_lsb_err: int | None, quantized: bool,
+) -> str | None:
+    """Quant-status column value: "exact" / "within-tol" / "FAIL" / None.
+
+    None (rendered as ``—``) means the row carries no quant metrics — the
+    node did not verify, produced a float output, or has no quant info.
+    """
+    if not quantized or max_lsb_err is None:
+        return None
+    if not passed:
+        return "FAIL"
+    return "within-tol" if max_lsb_err > 0 else "exact"
+
+
+class VerifyReport(dict):
+    """Verify rollup — the Slice-C report dict + a rendered per-node table.
+
+    A plain ``dict`` (every Slice-C key unchanged — subscript access and JSON
+    round-trip exactly as before) whose string form renders a per-node table
+    in the same style as :class:`PerfReport`. M1.2 S5 adds the quantization-
+    error columns (``lsb_err`` / ``lsb_tol`` / ``status``), E2E rows when the
+    E2E check ran, and an aggregate worst-node line — the quant analogue of
+    the perf bottleneck-node line. Rows without quant metrics (node did not
+    verify, or its output is float) degrade to ``—`` in those columns.
+    """
+
+    def worst_quant_node(self) -> dict[str, Any] | None:
+        """Node row with the highest observed LSB error (worst quant error).
+
+        Mirrors :meth:`PerfReport.bottleneck_node`: only rows carrying quant
+        metrics (verified nodes with integer outputs) are candidates; ties
+        keep the first in execution order. ``None`` when no node has them.
+        """
+        rows = [r for r in self["nodes"] if r.get("max_lsb_err") is not None]
+        if not rows:
+            return None
+        return max(rows, key=lambda r: r["max_lsb_err"])
+
+    @staticmethod
+    def _cell(value: int | None) -> str:
+        return "—" if value is None else str(value)
+
+    def __str__(self) -> str:
+        rows = self["nodes"]
+        e2e = self.get("e2e")
+        if not rows and e2e is None:
+            return "no verification data (run the model with verify=True)"
+        header = (
+            f"{'node':<14} {'kernel':<18} {'verified':>8} {'passed':>6} "
+            f"{'lsb_err':>8} {'lsb_tol':>8}  {'status':<10}"
+        )
+        lines = ["── per-node verification ──", header, "-" * len(header)]
+        for r in rows:
+            verified = "yes" if r["verified"] else "—"
+            passed = ("ok" if r["passed"] else "FAIL") if r["verified"] else "—"
+            lines.append(
+                f"{r['node']:<14} {r['kernel']:<18} {verified:>8} {passed:>6} "
+                f"{self._cell(r['max_lsb_err']):>8} "
+                f"{self._cell(r['lsb_tol']):>8}  "
+                f"{r['quant_status'] or '—':<10}"
+            )
+        if e2e is not None:
+            for o in e2e.get("outputs", []):
+                quantized = bool(o.get("quantized", False))
+                err = int(o.get("max_lsb_err", 0)) if quantized else None
+                tol = int(o.get("lsb_tol", 0)) if quantized else None
+                status = _quant_status(bool(o.get("passed")), err, quantized)
+                passed = "ok" if o.get("passed") else "FAIL"
+                lines.append(
+                    f"{'E2E ' + o['name']:<14} {'-':<18} {'yes':>8} "
+                    f"{passed:>6} {self._cell(err):>8} {self._cell(tol):>8}  "
+                    f"{status or '—':<10}"
+                )
+        lines.append("-" * len(header))
+        worst = self.worst_quant_node()
+        if worst is not None:
+            lines.append(
+                f"worst quant error: {worst['node']} "
+                f"(max_lsb_err={worst['max_lsb_err']}, "
+                f"lsb_tol={worst['lsb_tol']})"
+            )
+        return "\n".join(lines)
+
+
 class _Node:
     """A tracked stage in an :class:`InferenceModel`.
 
@@ -823,6 +912,7 @@ class _Node:
             params=captured_params,
             output_tensor_id=id(out),
             output_name=self.output_name,
+            lsb_tol=node_lsb_tol,
         )
         self._model._register_output(out, self, record)
         self._model._on_after_node(self, record, out)  # no-op hook (perf agent)
@@ -890,9 +980,11 @@ class InferenceModel:
     against its ``forward()`` golden (fail-fast); pass a ``reference`` (a
     ``torch.nn.Module`` / callable / tensor) to also check the model's final
     output end-to-end. The post-node hook fills each ``GraphNode.verification``
-    (pass/fail + max_diff) and ``GraphNode.stats`` (a per-node ``PerfSummary``,
-    or ``None`` on backends without ``CmdStats``). Summaries are exposed via
-    :meth:`verify_report` and :meth:`perf_report`.
+    (pass/fail + max_diff + quant-error metrics) and ``GraphNode.stats`` (a
+    per-node ``PerfSummary``, or ``None`` on backends without ``CmdStats``).
+    Summaries are exposed via :meth:`verify_report` and :meth:`perf_report`;
+    per-node quantization-error metrics (M1.2 S5, the M2 accuracy-axis feed)
+    via :meth:`quant_error_summary`.
     """
 
     def __init__(self, session: InferenceSession) -> None:
@@ -1092,6 +1184,11 @@ class InferenceModel:
             a_cpu = a.cpu() if isinstance(a, Tensor) else a
             g_t = g if isinstance(g, torch.Tensor) else torch.as_tensor(g)
             name = f"output[{i}]" if len(actual) > 1 else "output"
+            # LSB metrics are integer-domain only — float comparisons carry
+            # no quant error (S5 reporting renders their columns as "—").
+            quantized = (
+                not a_cpu.is_floating_point() and not g_t.is_floating_point()
+            )
             try:
                 max_lsb_err = verifier.check_match(
                     name, a_cpu.flatten(), g_t.flatten(),
@@ -1100,11 +1197,13 @@ class InferenceModel:
                 checks.append({
                     "name": name, "passed": True, "max_diff": 0.0,
                     "max_lsb_err": max_lsb_err,
+                    "lsb_tol": e2e_tol, "quantized": quantized,
                 })
             except VerificationError as e:
                 checks.append({
                     "name": name, "passed": False, "max_diff": e.max_diff,
                     "max_lsb_err": e.max_lsb_err,
+                    "lsb_tol": e2e_tol, "quantized": quantized,
                 })
                 self._e2e = {"passed": False, "outputs": checks}
                 raise VerificationError(
@@ -1205,10 +1304,12 @@ class InferenceModel:
         ``record.stats`` is set to ``None`` so ``perf_report()`` degrades
         gracefully instead of crashing.
         """
-        self._capture_node_verification(record)
+        self._capture_node_verification(record, output)
         self._capture_node_stats(record)
 
-    def _capture_node_verification(self, record: GraphNode) -> None:
+    def _capture_node_verification(
+        self, record: GraphNode, output: Tensor,
+    ) -> None:
         """Store the last run's verify outcome for this node's output tensor."""
         results = self._session.last_verification_results()
         if not results:
@@ -1218,6 +1319,10 @@ class InferenceModel:
         matched = [r for r in results if r.tensor_name == record.output_name]
         chosen = matched or results
         max_diff = max((r.max_diff for r in chosen), default=0.0)
+        # LSB metrics are integer-domain: a float-dtype output carries no
+        # quant error, so S5 reporting degrades its quant columns to "—".
+        dtype = getattr(output, "dtype", None)
+        quantized = dtype is not None and not dtype.is_floating_point
         record.verification = {
             "passed": all(r.passed for r in chosen),
             "tensors": [r.tensor_name for r in chosen],
@@ -1225,6 +1330,8 @@ class InferenceModel:
             "max_lsb_err": max(
                 (getattr(r, "max_lsb_err", 0) for r in chosen), default=0,
             ),
+            "lsb_tol": int(record.lsb_tol),
+            "quantized": quantized,
         }
 
     def _capture_node_stats(self, record: GraphNode) -> None:
@@ -1246,21 +1353,31 @@ class InferenceModel:
 
     # ── Reports (Slice C verify + Slice D perf rollup) ──
 
-    def verify_report(self) -> dict[str, Any]:
+    def verify_report(self) -> VerifyReport:
         """Summarize the last verify run: per-node pass/fail + the E2E result.
 
-        Returns a plain dict::
+        Returns a :class:`VerifyReport` — a plain ``dict`` (subscriptable and
+        JSON-serializable exactly as before) whose ``str()`` renders a
+        per-node table in the :class:`PerfReport` style::
 
             {
-              "nodes": [{"node", "kernel", "verified", "passed", "max_diff"}, ...],
+              "nodes": [{"node", "kernel", "verified", "passed", "max_diff",
+                         "max_lsb_err", "lsb_tol", "quant_status"}, ...],
               "all_nodes_passed": bool,          # over verified nodes only
               "e2e": {"passed", "outputs": [...]} | None,
               "passed": bool,                    # nodes AND (e2e if present)
+              "worst_quant_node": str | None,    # highest max_lsb_err
             }
 
         ``verified`` is False for a node that ran without ``verify=True`` (its
         ``max_diff`` is then meaningless and ``passed`` defaults True). ``e2e``
         is None unless the run supplied a ``reference``.
+
+        The quant-error columns (M1.2 S5) are ints only for verified nodes
+        with integer (quantized) outputs — ``max_lsb_err`` is the max LSB
+        error observed, ``lsb_tol`` the tolerance applied (0 = exact) and
+        ``quant_status`` one of ``"exact"`` / ``"within-tol"`` / ``"FAIL"``.
+        Unverified nodes and float outputs carry ``None`` (rendered ``—``).
         """
         nodes: list[dict[str, Any]] = []
         all_nodes_passed = True
@@ -1270,20 +1387,53 @@ class InferenceModel:
             passed = bool(v.get("passed", True))
             if verified and not passed:
                 all_nodes_passed = False
+            quantized = verified and bool(v.get("quantized", False))
+            max_lsb_err = int(v.get("max_lsb_err", 0)) if quantized else None
+            lsb_tol = int(v.get("lsb_tol", 0)) if quantized else None
             nodes.append({
                 "node": rec.node_name,
                 "kernel": rec.kernel,
                 "verified": verified,
                 "passed": passed,
                 "max_diff": v.get("max_diff", 0.0),
+                "max_lsb_err": max_lsb_err,
+                "lsb_tol": lsb_tol,
+                "quant_status": _quant_status(passed, max_lsb_err, quantized),
             })
         e2e_passed = self._e2e["passed"] if self._e2e is not None else True
-        return {
-            "nodes": nodes,
-            "all_nodes_passed": all_nodes_passed,
-            "e2e": self._e2e,
-            "passed": all_nodes_passed and e2e_passed,
-        }
+        report = VerifyReport(
+            nodes=nodes,
+            all_nodes_passed=all_nodes_passed,
+            e2e=self._e2e,
+            passed=all_nodes_passed and e2e_passed,
+        )
+        worst = report.worst_quant_node()
+        report["worst_quant_node"] = worst["node"] if worst is not None else None
+        return report
+
+    def quant_error_summary(self) -> list[dict[str, Any]]:
+        """Per-node quantization-error metrics from the last verify run.
+
+        The structured feed for DSE / Pareto-accuracy consumers (M2) — no
+        parsing of the formatted :meth:`verify_report` table required. One
+        dict per verified node with an integer (quantized) output::
+
+            [{"name", "max_lsb_err", "lsb_tol", "passed"}, ...]
+
+        in execution order. Nodes that did not verify or produced float
+        outputs carry no LSB metrics and are omitted; a plain run therefore
+        returns ``[]``.
+        """
+        return [
+            {
+                "name": r["node"],
+                "max_lsb_err": r["max_lsb_err"],
+                "lsb_tol": r["lsb_tol"],
+                "passed": r["passed"],
+            }
+            for r in self.verify_report()["nodes"]
+            if r["max_lsb_err"] is not None
+        ]
 
     def perf_report(self) -> PerfReport:
         """Roll up per-node performance into a model-level :class:`PerfReport`.

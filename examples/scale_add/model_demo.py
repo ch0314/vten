@@ -192,14 +192,23 @@ def main(argv: list[str] | None = None) -> None:
     # checks the model's final output(s) end-to-end against a torch reference.
     print("\n── verify: net(x, verify=True, reference=torch_reference) ──")
     net(x, verify=True, reference=torch_reference)
+    # print(net.verify_report()) renders the per-node table (M1.2 S5): the
+    # quant-error columns (lsb_err / lsb_tol / status), E2E rows, and the
+    # worst-quant-error line. On cpu the golden IS the hw path, so every row
+    # is max_lsb_err=0 / "exact" — nonzero values appear on real HW/SIM runs
+    # that opt in to an lsb_tol.
     report = net.verify_report()
-    for row in report["nodes"]:
-        mark = "ok" if row["passed"] else "FAIL"
-        print(f"  node {row['node']:>6} [{row['kernel']}]: verified={row['verified']} ({mark})")
+    print(report)
     e2e = report["e2e"]
     print(f"  E2E vs torch reference: passed={e2e['passed']} "
           f"({len(e2e['outputs'])} output(s) checked)")
     print(f"  overall verify passed: {report['passed']}")
+
+    # Structured per-node quant metrics (no table parsing) — the accuracy-axis
+    # feed for the DSE milestone: [{"name", "max_lsb_err", "lsb_tol", "passed"}].
+    print("\n── net.quant_error_summary() ──")
+    for row in net.quant_error_summary():
+        print(f"  {row}")
 
     # ── (2) Per-node + model perf rollup (Slice D) ──
     # perf_report() rolls up each node's CmdStats into a per-node table. The cpu
